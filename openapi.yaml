@@ -1,0 +1,1743 @@
+# ==========================================================================
+# DJB Protocol · OpenAPI 3.1（机器可读的协议契约）
+#
+# 本文件是对外协议的**唯一契约**。任何实现（客户端、云端、SDK）都必须以它为准，
+# 不得自行定义字段或状态码。
+#
+# 三条硬规则：
+#   1. 只加不改：同一 MAJOR 内不删字段、不改类型/语义/状态码；未知字段必须被忽略。
+#   2. 反作弊不进 spec：只描述「可能返回 429/403 + 粗粒度原因码 + Retry-After」，
+#      不写阈值、名单、评分权重、判定条件。
+#   3. 所有时间戳 UTC（RFC 3339）；金额与系数用十进制字符串，不用浮点。
+#
+# 校验：python3 -c "import yaml; yaml.safe_load(open('openapi.yaml'))"
+# ==========================================================================
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+info:
+  title: DJB Protocol API
+  version: 1.0.0-skeleton
+  summary: 一期核心端点契约（15 条 / 全量约 62 条）
+  description: |
+    DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
+    契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
+
+    - 命名空间：`/v1/*` 为 OpenAI 兼容网关面；`/api/v1/*` 为控制面（节点/用方/协议/后台）。
+    - 版本：URL 中的 `v1` 是**协议 MAJOR**，冻结；新 MAJOR 走新前缀（`/v2`、`/api/v2`）
+      并与旧前缀并存一个弃用周期，不得在旧前缀内做破坏性变更。
+    - 兼容：同 MAJOR 内只加不改。客户端必须容忍未知字段/未知 enum 值（tolerant reader）。
+    - 错误：统一 `error` 信封（`type` / `code` / `message` / `request_id`）。数字错误码
+      见 `components/schemas/Error`；本版本固化 `40301`、`42601` 两码。
+    - 风控：429/403 只给粗粒度原因码与 `Retry-After`；本文件**不含**任何阈值、名单、
+      评分权重或判定条件——那是私有配置（`djb/risk-config`），不进公开仓。
+    - 幂等：写操作接受 `X-DJB-Idempotency-Key`（24h）；非流式请求体指纹 300s 去重；
+      流式仅请求级 60s 去重。不做请求签名（保 OpenAI 兼容）。
+    - 大小上限、超时与重试：超时/重试在客户端侧，服务端以 429 +
+      `Retry-After` 与 503 表达可重试性。
+
+    说明：少数进阶字段（batch 输入形态、用量汇总分组维度）在首个实现落地前仍需最终确认；
+    此类字段的调整一律先改本 spec 再改实现，不允许实现先行。
+  termsOfService: https://example.invalid/djb/terms
+  contact:
+    name: DJB Protocol WG
+    url: https://example.invalid/djb/spec
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+externalDocs:
+  description: spec 使用与变更流程
+  url: https://example.invalid/djb/README.md
+
+servers:
+  - url: https://api.example.invalid
+    description: 占位：公网网关（真实域名与证书在发布时注入）
+  - url: http://127.0.0.1:1717
+    description: |
+      本机镜像端点：由客户端本地注入凭据，客户端决定实时/慢任务。
+      仅回环绑定；对端仍按同一 spec 校验。
+
+security:
+  - userBearer: []
+
+tags:
+  - name: gateway
+    description: OpenAI 兼容网关（用方）
+  - name: user
+    description: 用方用量与账单
+  - name: node
+    description: 共享节点（客户端）
+  - name: protocol
+    description: 协议能力协商与弃用
+  - name: schedule
+    description: 公开容量公告与快照（可离线复算）
+  - name: admin
+    description: 后台只读查询（内网/VPN + 强 MFA，公网不可达）
+
+paths:
+  # ---------------------------------------------------------------- 网关
+  /v1/chat/completions:
+    post:
+      tags: [gateway]
+      summary: 对话调用（OpenAI 兼容）
+      operationId: createChatCompletion
+      description: |
+        非流式返回单个 `chat.completion`；`stream: true` 返回 SSE（`text/event-stream`），
+        事件以 `data: {...}` 逐块下发、以 `data: [DONE]` 结束。流式请求也计费一次。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+        - $ref: '#/components/parameters/Capabilities'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: |
+            成功。非流式返回 `application/json`（`chat.completion`）；`stream: true`
+            返回 `text/event-stream`，逐块 `data: <json>`，结束为 `data: [DONE]`。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: 'SSE：逐块 `data: <json>`，结束为 `data: [DONE]`。'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/models:
+    get:
+      tags: [gateway]
+      summary: 模型清单与价格
+      operationId: listModels
+      description: |
+        返回可路由模型（模型 slug 不可变，见正式文档 §18.1）。价格是公开信息但不是
+        结算依据；结算以账本分录为准。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      responses:
+        '200':
+          description: 模型清单
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------- 慢任务
+  /v1/batches:
+    post:
+      tags: [gateway]
+      summary: 提交批量任务
+      operationId: createBatch
+      description: |
+        异步受理，立即返回 `batch_id` / `eta_seconds` / 预估成本；实际成本以完成后的
+        收据与账本分录为准。大任务必须走这里，不得占用实时决策资源。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchCreateRequest'
+      responses:
+        '202':
+          description: 已受理
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+            Location:
+              description: 轮询地址（指向 GET /v1/batches/{id}）
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/batches/{id}:
+    get:
+      tags: [gateway]
+      summary: 批量任务进度与结果
+      operationId: getBatch
+      description: |
+        返回进度、检查点恢复次数、结果引用与实际成本。结果内容本身另走签名 URL
+        （≤15 分钟），不在本响应内联。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      responses:
+        '200':
+          description: 任务状态
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Batch'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /v1/batches/{id}/cancel:
+    post:
+      tags: [gateway]
+      summary: 取消批量任务
+      operationId: cancelBatch
+      description: |
+        幂等：对已结束任务重复取消返回当前状态而非报错。已产生的用量照常计费。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      responses:
+        '200':
+          description: 取消结果（含当前状态）
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCancelAck'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # ---------------------------------------------------------------- 用方
+  /api/v1/user/usage/summary:
+    get:
+      tags: [user]
+      summary: 用量汇总
+      operationId: getUserUsageSummary
+      description: |
+        `from`/`to` 为 UTC 日期（含端点）。明细（logs）是另一条端点，未纳入本版本。 分组维度是否含 `day` 待正式文档确认。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - name: group_by
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [model, day]
+            default: model
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      responses:
+        '200':
+          description: 用量汇总
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # ---------------------------------------------------------------- 节点
+  /api/v1/node/register:
+    post:
+      tags: [node]
+      summary: 节点注册
+      operationId: registerNode
+      description: |
+        首次注册进入 `pending`，需人工准入审核（后台 `/api/v1/admin/supply/nodes/{id}/review`）。
+        `hardware_fingerprint` 只上报哈希；平台不回传原始硬件信息。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeRegisterRequest'
+      responses:
+        '201':
+          description: 已受理（pending）
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeRegisterResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/v1/node/heartbeat:
+    post:
+      tags: [node]
+      summary: 心跳 + 容量公告
+      operationId: postNodeHeartbeat
+      description: |
+        心跳携带 `protocol_version` 与 `policy_version`（两者不是一回事，见）
+        以及本轮容量公告（`capacity_announcement`，字段见）。
+        公告是**时序**数据：服务端以最新一次为准，历史进快照。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+        - $ref: '#/components/parameters/Capabilities'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeHeartbeatRequest'
+      responses:
+        '200':
+          description: 心跳确认
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeHeartbeatResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/v1/node/upstream:
+    post:
+      tags: [node]
+      summary: 申报接入方式（A1/A2/B）
+      operationId: declareNodeUpstream
+      description: |
+        申报接入类型、端点与模型清单。**凭据永不上行**（H1）：请求里只放本地凭据句柄
+        `credential_handle`，服务端不接收、不存储、不代持凭据本体。连通性检查走
+        `/api/v1/node/upstream/probe`（本地发起）。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeUpstreamRequest'
+      responses:
+        '200':
+          description: 申报已登记
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeUpstreamResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/v1/node/receipts:
+    post:
+      tags: [node]
+      summary: 批量提交双签收据
+      operationId: submitNodeReceipts
+      description: |
+        收据是计量的原始凭证，**供方与需方各签**（`sig_provider` / `sig_consumer`，
+        字段见）。服务端验签后入账；单边签名或无签名直接拒收。
+        批量提交按 receipt 粒度返回 accepted/rejected，不做整批回滚。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReceiptBatchRequest'
+      responses:
+        '200':
+          description: 逐条受理结果
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReceiptBatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/v1/node/policy:
+    get:
+      tags: [node]
+      summary: 拉取策略与配额（版本化）
+      operationId: getNodePolicy
+      description: |
+        返回按节点下发的策略与配额**结构与当前版本号**。具体数值由服务端下发，
+        spec 不规定数值；客户端只按 `policy_version` 应用，不得猜测。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+        - name: If-None-Match
+          in: header
+          required: false
+          description: 传上次的 `policy_version`；命中则 304，省流量。
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 当前策略
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+            ETag:
+              description: 即 policy_version
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePolicy'
+        '304':
+          description: 未变更（客户端 policy_version 仍有效）
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # ---------------------------------------------------------------- 协议
+  /api/v1/protocol/capabilities:
+    get:
+      tags: [protocol]
+      summary: 能力协商
+      operationId: getProtocolCapabilities
+      description: |
+        返回 `protocol_version` 与 `capabilities[]`。双方只启用交集；**未知 capability
+        忽略不报错**。客户端带 `DJB-Protocol-Version` 且不受支持时返回 426（`42601`）。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/ProtocolVersion'
+        - $ref: '#/components/parameters/Capabilities'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 能力清单
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProtocolCapabilities'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/v1/protocol/deprecations:
+    get:
+      tags: [protocol]
+      summary: 弃用清单与退役日期
+      operationId: getProtocolDeprecations
+      description: |
+        列出已弃用端点/字段、替代方案与 `sunset_at`。弃用提前 ≥90 天公示，
+        且至少跨 2 个 MAJOR。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: protocol_major
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: 弃用清单
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeprecationList'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # ---------------------------------------------------------------- 调度快照
+  /api/v1/schedule/snapshot/{period}:
+    get:
+      tags: [schedule]
+      summary: 公开容量公告与出价快照（离线复算）
+      operationId: getScheduleSnapshot
+      description: |
+        按周期发布的容量公告与出价快照，供任何第三方离线复算。只含**输入**与版本
+        （`quote_version`），不含调度评分、权重或淘汰原因——那些在决策日志里，
+        经审批后按审计流程提供。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 周期快照
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleSnapshot'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # ---------------------------------------------------------------- 账本（后台只读）
+  /api/v1/admin/ledger/entries:
+    get:
+      tags: [admin]
+      summary: 账本只读查询
+      operationId: listLedgerEntries
+      description: |
+        只读查询账本分录（`ledger_entry`，字段见）。账本只追加：
+        没有写接口，调整只能走冲正流程（后台双人复核）。本端点属管理面：
+        内网/VPN + 强 MFA + 敏感页 step-up（≤5 分钟有效），公网不可达。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: entry_type
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, locked, settled, reversed]
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/RequestId'
+        - name: X-Admin-Step-Up
+          in: header
+          required: true
+          description: 敏感页二次认证凭据（≤5 分钟有效）
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 分页分录
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerEntriesPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+# ==========================================================================
+# components
+# ==========================================================================
+components:
+
+  securitySchemes:
+    userBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: DJB-Key
+      description: |
+        用方 API Key（一枚 Key 通吃所有可路由模型）。Key 只显示一次；
+        平台只存哈希；客户端应存于 OS 安全存储，不进日志、不进仓库。
+    nodeClientKey:
+      type: apiKey
+      in: header
+      name: X-Client-Key
+      description: |
+        节点客户端密钥，由 `/api/v1/node/pair` 生成、可轮换（重叠 ≤24h）
+        与撤销（立即停单，在途不受影响）。只存哈希（字段 client_key），
+        平台不回显明文。
+    adminBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: Admin-Session
+      description: |
+        后台会话（强制 MFA；敏感动作 step-up ≤5 分钟；break-glass 只读模式见）。管理面仅内网/VPN，公网不可达。
+
+  parameters:
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: 调用方生成的请求标识（UUID）；服务端原样回显，贯穿日志与链路追踪。
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: X-DJB-Idempotency-Key
+      in: header
+      required: false
+      description: |
+        写操作幂等键，24h 有效且与账本写入同事务。缺省时服务端按
+        请求体指纹做 300s 去重（流式仅 60s）。
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+    ProtocolVersion:
+      name: DJB-Protocol-Version
+      in: header
+      required: false
+      description: 调用方协议版本（`MAJOR.MINOR.PATCH`）。缺省按服务端当前版本；不兼容返回 426。
+      schema:
+        type: string
+        pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    Capabilities:
+      name: DJB-Capabilities
+      in: header
+      required: false
+      description: |
+        调用方启用的能力标识（逗号分隔，如 `chat_completions,batch`）。双方只启用交集；
+        未知 capability **忽略不报错**。
+      schema:
+        type: string
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: 游标分页的不透明游标；首次不传。不得猜测或自行构造。
+      schema:
+        type: string
+        maxLength: 512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: 单页条数上限。服务端可返回更少；`has_more` 判断是否继续。
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    From:
+      name: from
+      in: query
+      required: false
+      description: 起始时间（UTC，含端点）。日期或 RFC 3339 日期时间。
+      schema:
+        type: string
+        format: date-time
+    To:
+      name: to
+      in: query
+      required: false
+      description: 结束时间（UTC，含端点）。
+      schema:
+        type: string
+        format: date-time
+    Period:
+      name: period
+      in: path
+      required: true
+      description: 周期标识（UTC 日期）。
+      schema:
+        type: string
+        pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+    BatchId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  headers:
+    RequestId:
+      description: 服务端/调用方请求标识，原样回显。
+      schema:
+        type: string
+        format: uuid
+    RetryAfter:
+      description: 建议重试等待秒数（429/503）。客户端必须遵守并加抖动。
+      schema:
+        type: integer
+        minimum: 0
+
+  responses:
+    BadRequest:
+      description: 请求不合法（结构、枚举、大小上限）。不得回显内部堆栈或 SQL。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: 未认证或凭据无效/过期。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: |
+        已认证但无权限，或命中风控。对外只给粗粒度原因码（如 `account_restricted`），
+        不返回具体规则/阈值/名单。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: 资源不存在（含无权查看时的统一 404，避免枚举）。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: 状态冲突（重复幂等键的不同载荷、状态机不允许的迁移）。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UpgradeRequired:
+      description: 协议版本不兼容（`42601`，HTTP 426）。响应体给出可升级的版本范围。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: |
+        请求体超过上限（chat 请求建议 ≤1 MiB；receipts 批 ≤500 条/次；上限属实现参数，
+        放宽不算破坏性变更，收紧算）。只给上限提示，不回显请求内容。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: |
+        限流或配额耗尽。只给粗粒度原因码与 `Retry-After`；具体阈值属私有配置，
+        不在响应中暴露。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: 暂时不可用/过载/维护；可安全重试（遵守 `Retry-After`）。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+
+    # ------------------------------------------------------------ 通用
+    Error:
+      type: object
+      additionalProperties: true
+      required: [error]
+      description: |
+        统一错误信封。客户端必须容忍未知字段（只加不改）；`message` 只供人类阅读，
+        程序判断一律用 `type` / `code`，不得解析 `message` 文案。
+      properties:
+        error:
+          type: object
+          additionalProperties: true
+          required: [type, code, message, request_id]
+          properties:
+            type:
+              type: string
+              enum:
+                - invalid_request_error
+                - authentication_error
+                - permission_error
+                - rate_limit_error
+                - not_found_error
+                - conflict_error
+                - protocol_error
+                - server_error
+                - upstream_error
+            code:
+              type: integer
+              description: |
+                数字错误码。已核实：`40301` 管理接口签名失败、
+                `42601` 协议版本不兼容。其余以正式文档 §6.3 为准，
+                本版本不臆造编号。
+            message:
+              type: string
+              description: 人类可读，不含内部堆栈/规则细节/凭据。
+            request_id:
+              type: string
+              format: uuid
+            retry_after:
+              type: integer
+              minimum: 0
+              description: 仅 429/503 有意义；与 `Retry-After` 头一致。
+            reason:
+              type: string
+              enum: [rate_limited, quota_exceeded, account_restricted, policy_blocked]
+              description: |
+                粗粒度原因码，供客户端做退避与提示。**不含**判定细节；
+                具体规则/阈值/名单在私有配置，不对外。
+
+    Page:
+      type: object
+      required: [has_more]
+      additionalProperties: true
+      properties:
+        cursor:
+          type: string
+          description: 本页起始游标（回显；首页为空）。
+        has_more:
+          type: boolean
+        next_cursor:
+          type: [string, 'null']
+          description: 下一页游标；`has_more=false` 时为 `null`。
+
+    # ------------------------------------------------------------ 网关
+    ChatMessage:
+      type: object
+      additionalProperties: false
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+          maxLength: 1048576
+        name:
+          type: string
+
+    ChatCompletionRequest:
+      type: object
+      additionalProperties: true
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: 模型 slug（不可变）。取自 `/v1/models`。
+        messages:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        stream:
+          type: boolean
+          default: false
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        stop:
+          type: array
+          items:
+            type: string
+        user:
+          type: string
+          description: 可选的调用方自定义稳定标识（用于防滥用去重，不留 PII）。
+
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      additionalProperties: true
+      properties:
+        prompt_tokens:
+          type: integer
+          minimum: 0
+        completion_tokens:
+          type: integer
+          minimum: 0
+        total_tokens:
+          type: integer
+          minimum: 0
+
+    ChatCompletionResponse:
+      type: object
+      additionalProperties: true
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: chat.completion
+        created:
+          type: integer
+          description: Unix 秒（UTC）。
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            required: [index, message, finish_reason]
+            properties:
+              index:
+                type: integer
+              message:
+                $ref: '#/components/schemas/ChatMessage'
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter, upstream_error]
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    Model:
+      type: object
+      additionalProperties: true
+      required: [id, object, owned_by]
+      properties:
+        id:
+          type: string
+          description: 模型 slug。
+        object:
+          type: string
+          const: model
+        created:
+          type: integer
+        owned_by:
+          type: string
+        context_window:
+          type: integer
+        unit:
+          type: string
+          description: 计量单位（如 token）。
+        price:
+          type: object
+          additionalProperties: true
+          description: 公开参考价；结算是以账本分录为准，不以本字段为准。
+          properties:
+            amount:
+              type: string
+              description: 十进制字符串（不用浮点）。
+            unit:
+              type: string
+
+    ModelList:
+      type: object
+      additionalProperties: true
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+
+    BatchCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [kind, model, items]
+      properties:
+        kind:
+          type: string
+          enum: [chat, completion]
+          description: 慢任务类型。
+        model:
+          type: string
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: true
+            required: [custom_id]
+            properties:
+              custom_id:
+                type: string
+                maxLength: 128
+              input:
+                $ref: '#/components/schemas/ChatCompletionRequest'
+        deadline_seconds:
+          type: integer
+          minimum: 60
+          description: 期望完成时限（尽力而为，不构成 SLA）。
+        webhook_url:
+          type: string
+          format: uri
+          description: 完成回调（可选；回调带签名，禁止携带凭据）。
+        metadata:
+          type: object
+          additionalProperties: true
+
+    BatchAccepted:
+      type: object
+      additionalProperties: true
+      required: [batch_id, status, eta_seconds]
+      properties:
+        batch_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/BatchStatus'
+        eta_seconds:
+          type: integer
+          minimum: 0
+        cost_estimate:
+          $ref: '#/components/schemas/Amount'
+
+    BatchStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, canceled]
+      description: 未知状态值必须被客户端容忍（只加不改）。
+
+    Amount:
+      type: object
+      additionalProperties: true
+      required: [amount, unit]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?[0-9]+(\.[0-9]+)?$'
+          description: 十进制字符串；不在客户端做浮点运算。
+        unit:
+          type: string
+          description: 计量/计价单位（如 token、gpu_second、gb_hour）。
+
+    Batch:
+      type: object
+      additionalProperties: true
+      required: [batch_id, status, created_at]
+      properties:
+        batch_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/BatchStatus'
+        progress:
+          type: object
+          additionalProperties: true
+          properties:
+            completed:
+              type: integer
+              minimum: 0
+            total:
+              type: integer
+              minimum: 0
+        eta_seconds:
+          type: integer
+          minimum: 0
+        checkpoint_resumes:
+          type: integer
+          minimum: 0
+          description: 检查点恢复次数（抢占/故障后恢复的计数）。
+        results_ref:
+          type: string
+          description: 结果对象签名 URL（≤15 分钟有效）；过期需重新获取。
+        cost:
+          type: object
+          additionalProperties: true
+          properties:
+            estimated:
+              $ref: '#/components/schemas/Amount'
+            actual:
+              $ref: '#/components/schemas/Amount'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    BatchCancelAck:
+      type: object
+      additionalProperties: true
+      required: [batch_id, status]
+      properties:
+        batch_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/BatchStatus'
+        canceled_at:
+          type: string
+          format: date-time
+
+    # ------------------------------------------------------------ 用方
+    UsageSummary:
+      type: object
+      additionalProperties: true
+      required: [period, totals, groups]
+      properties:
+        period:
+          type: object
+          additionalProperties: true
+          required: [from, to]
+          properties:
+            from:
+              type: string
+              format: date-time
+            to:
+              type: string
+              format: date-time
+        totals:
+          type: object
+          additionalProperties: true
+          properties:
+            requests:
+              type: integer
+              minimum: 0
+            prompt_tokens:
+              type: integer
+              minimum: 0
+            completion_tokens:
+              type: integer
+              minimum: 0
+            billable:
+              $ref: '#/components/schemas/Amount'
+        groups:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            required: [key]
+            properties:
+              key:
+                type: string
+                description: 分组键（模型 slug 或 UTC 日期）。
+              requests:
+                type: integer
+                minimum: 0
+              tokens:
+                type: integer
+                minimum: 0
+              billable:
+                $ref: '#/components/schemas/Amount'
+
+    # ------------------------------------------------------------ 节点
+    NodeRegisterRequest:
+      type: object
+      additionalProperties: true
+      required: [platform, hardware_fingerprint, client_version, protocol_version]
+      properties:
+        platform:
+          type: string
+          enum: [macos, windows, linux]
+        hardware_fingerprint:
+          type: string
+          description: |
+            硬件指纹**哈希**（客户端本地计算）。平台不回传原值、不落明文；
+            原始指纹不出客户设备。
+        client_version:
+          type: string
+        protocol_version:
+          type: string
+          pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+        capabilities:
+          type: array
+          items:
+            type: string
+        access_modes:
+          type: array
+          description: 申报的接入方式（A1 直填 Key / A2 本机代理 / B 企业网关）。
+          items:
+            type: string
+            enum: [A1, A2, B]
+
+    NodeRegisterResponse:
+      type: object
+      additionalProperties: true
+      required: [node_id, state, policy_version, protocol_version, server_time]
+      properties:
+        node_id:
+          type: string
+        state:
+          type: string
+          enum: [pending, active, frozen, retired]
+        policy_version:
+          type: string
+        protocol_version:
+          type: string
+        server_time:
+          type: string
+          format: date-time
+
+    CapacityAnnouncement:
+      type: object
+      additionalProperties: true
+      required: [kind, access, model, max_qps, unit]
+      description: |
+        容量公告（字段 capacity_announcement）；时序数据。
+        `ask_price` 是节点要价，**不是**风控/评分权重。
+      properties:
+        kind:
+          type: string
+        access:
+          type: string
+          enum: [A1, A2, B]
+        model:
+          type: string
+        max_qps:
+          type: number
+          minimum: 0
+        ask_price:
+          type: string
+          description: 十进制字符串。
+        unit:
+          type: string
+        resource_level:
+          type: string
+
+    NodeHeartbeatRequest:
+      type: object
+      additionalProperties: true
+      required: [node_id, protocol_version, policy_version]
+      properties:
+        node_id:
+          type: string
+        protocol_version:
+          type: string
+        policy_version:
+          type: string
+        capacity:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapacityAnnouncement'
+        load:
+          type: object
+          additionalProperties: true
+          description: 可选的本机负载自述（仅用于调度输入，不参与信誉分计算）。
+          properties:
+            inflight:
+              type: integer
+              minimum: 0
+            queue_seconds:
+              type: number
+              minimum: 0
+
+    NodeHeartbeatResponse:
+      type: object
+      additionalProperties: true
+      required: [server_time, protocol_version, policy_version]
+      properties:
+        server_time:
+          type: string
+          format: date-time
+        protocol_version:
+          type: string
+        policy_version:
+          type: string
+        next_heartbeat_seconds:
+          type: integer
+          minimum: 1
+        policy_updated:
+          type: boolean
+          description: 为 true 时客户端应立即拉取 `/api/v1/node/policy`。
+
+    NodeUpstreamRequest:
+      type: object
+      additionalProperties: true
+      required: [access_type, base_url, models]
+      properties:
+        access_type:
+          type: string
+          enum: [A1, A2, B]
+          description: |
+            A1 直填 Key（属直连）、A2 本机代理、B 企业网关。分类口径见正式文档
+            「接入方式分类」；H1 约束的是**平台**（不下发/不上传/不托管凭据），
+            不是客户端持有凭据。
+        base_url:
+          type: string
+          format: uri
+          description: 上游端点（可含路径）。不得带用户名/口令等 userinfo。
+        models:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        credential_handle:
+          type: string
+          description: |
+            **本地**凭据句柄（客户端内部标识，如 keychain 条目名）。服务端不解析、
+            不存储、不回显；凭据本体永不上行（H1）。
+        protocol:
+          type: string
+          description: 上游协议（如 openai-chat）。未知值按适配器容错处理。
+
+    NodeUpstreamResponse:
+      type: object
+      additionalProperties: true
+      required: [upstream_id, state, models_declared]
+      properties:
+        upstream_id:
+          type: string
+        state:
+          type: string
+          enum: [declared, probing, verified, rejected]
+        models_declared:
+          type: array
+          items:
+            type: string
+        probe_hint:
+          type: string
+          description: 提示本地发起体检（`/api/v1/node/upstream/probe`），不在服务端探。
+
+    ReceiptInput:
+      type: object
+      additionalProperties: true
+      required:
+        - receipt_id
+        - task_id
+        - access
+        - usage
+        - price
+        - sig_provider
+        - sig_consumer
+      properties:
+        receipt_id:
+          type: string
+        task_id:
+          type: string
+        access:
+          type: string
+          enum: [A1, A2, B]
+        usage:
+          type: object
+          additionalProperties: true
+          required: [amount, unit]
+          properties:
+            amount:
+              type: string
+              pattern: '^[0-9]+(\.[0-9]+)?$'
+            unit:
+              type: string
+        price:
+          $ref: '#/components/schemas/Amount'
+        sig_provider:
+          type: string
+          description: 供方签名（对收据规范字段的签名；算法随协议版本，见协议仓）。
+        sig_consumer:
+          type: string
+          description: 需方签名。双签缺一即拒收。
+        usage_source:
+          type: string
+          enum: [client_reported, server_measured, dual]
+        task_kind:
+          type: string
+
+    ReceiptBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [receipts]
+      properties:
+        receipts:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/ReceiptInput'
+
+    RejectedReceipt:
+      type: object
+      additionalProperties: true
+      required: [receipt_id, code, message]
+      properties:
+        receipt_id:
+          type: string
+        code:
+          type: integer
+        message:
+          type: string
+          description: 拒绝原因（只描述契约问题，如签名不匹配/字段缺失）。
+
+    ReceiptBatchResponse:
+      type: object
+      additionalProperties: true
+      required: [accepted, rejected]
+      properties:
+        accepted:
+          type: array
+          items:
+            type: string
+            description: 已受理的 receipt_id。
+        rejected:
+          type: array
+          items:
+            $ref: '#/components/schemas/RejectedReceipt'
+
+    NodePolicy:
+      type: object
+      additionalProperties: true
+      required: [policy_version, protocol_version, issued_at]
+      properties:
+        policy_version:
+          type: string
+          description: 策略版本号（与 protocol_version 不是一回事）。
+        protocol_version:
+          type: string
+        issued_at:
+          type: string
+          format: date-time
+        effective_at:
+          type: string
+          format: date-time
+        digest:
+          type: string
+          description: 策略包摘要（用于校验下发内容未被篡改）。
+        quotas:
+          type: array
+          description: |
+            配额**结构**由 spec 定义，具体数值由服务端按节点下发（私有配置）。
+            客户端不得内置默认值。
+          items:
+            type: object
+            additionalProperties: true
+            required: [name, window_seconds]
+            properties:
+              name:
+                type: string
+              window_seconds:
+                type: integer
+                minimum: 1
+              value:
+                type: integer
+                description: 窗口内额度；值由服务端给出，spec 不规定。
+        directives:
+          type: array
+          description: 可选指令（如暂停接单、要求升级）；未知指令必须忽略。
+          items:
+            type: string
+
+    # ------------------------------------------------------------ 协议
+    ProtocolCapabilities:
+      type: object
+      additionalProperties: true
+      required: [protocol_version, min_supported_version, capabilities, server_time]
+      properties:
+        protocol_version:
+          type: string
+        min_supported_version:
+          type: string
+          description: 服务端仍接受的最低版本；低于此值返回 426。
+        capabilities:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            required: [id, version]
+            properties:
+              id:
+                type: string
+                description: 能力标识（如 `chat_completions`、`batch`、`receipts`）。
+              version:
+                type: string
+              status:
+                type: string
+                enum: [stable, beta, deprecated]
+        server_time:
+          type: string
+          format: date-time
+
+    DeprecationList:
+      type: object
+      additionalProperties: true
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            required: [path, method, deprecated_at, sunset_at]
+            properties:
+              path:
+                type: string
+              method:
+                type: string
+              deprecated_at:
+                type: string
+                format: date-time
+              sunset_at:
+                type: string
+                format: date-time
+                description: 退役日期；提前 ≥90 天公示，且至少跨 2 个 MAJOR。
+              replacement:
+                type: string
+                description: 替代端点/字段（无替代时为空）。
+              supported_majors:
+                type: array
+                items:
+                  type: string
+
+    # ------------------------------------------------------------ 调度快照
+    SnapshotNode:
+      type: object
+      additionalProperties: true
+      required: [node_id, kind, access, model, max_qps, unit]
+      description: 快照里的单条容量公告（**输入**，不含评分/权重/淘汰原因）。
+      properties:
+        node_id:
+          type: string
+        kind:
+          type: string
+        access:
+          type: string
+          enum: [A1, A2, B]
+        model:
+          type: string
+        max_qps:
+          type: number
+          minimum: 0
+        ask_price:
+          type: string
+        unit:
+          type: string
+        resource_level:
+          type: string
+
+    ScheduleSnapshot:
+      type: object
+      additionalProperties: true
+      required: [period, quote_version, published_at, nodes]
+      properties:
+        period:
+          type: string
+          format: date
+        quote_version:
+          type: string
+          description: 报价版本（复算输入的一部分）。
+        published_at:
+          type: string
+          format: date-time
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotNode'
+        verify_url:
+          type: string
+          format: uri
+          description: 对应周期的 Merkle 根与复算工具（`/verify/{period}`）。
+
+    # ------------------------------------------------------------ 账本
+    LedgerEntry:
+      type: object
+      additionalProperties: true
+      required:
+        - entry_id
+        - entry_type
+        - unit_type
+        - channel_id
+        - asset_ref
+        - amount
+        - status
+        - policy_version
+      description: |
+        账本分录（只追加）。语义字段（`entry_type` / `unit_type` /
+        `status`）语义不因版本改变；旧分录永远可复算。
+      properties:
+        entry_id:
+          type: string
+        entry_type:
+          type: string
+        unit_type:
+          type: string
+        channel_id:
+          type: string
+        asset_ref:
+          type: string
+        amount:
+          type: string
+          pattern: '^-?[0-9]+(\.[0-9]+)?$'
+        ref_id:
+          type: string
+        quality_coef:
+          type: string
+        stability_coef:
+          type: string
+        status:
+          type: string
+          enum: [pending, locked, settled, reversed]
+        lock_until:
+          type: string
+          format: date-time
+        reverse_of:
+          type: [string, 'null']
+          description: 冲正指向的原始 `entry_id`；非冲正为 null。
+        policy_version:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    LedgerEntriesPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/LedgerEntry'
+        page:
+          $ref: '#/components/schemas/Page'

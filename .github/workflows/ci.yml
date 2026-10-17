@@ -1,0 +1,100 @@
+# DJB djb-node · CI 门禁（spec 是唯一契约）
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    name: 密钥扫描
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  spec-lint:
+    name: OpenAPI 结构校验
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: 解析 + 基本断言
+        run: |
+          pip -q install pyyaml
+          python - <<'PY'
+          import sys, yaml
+          d = yaml.safe_load(open('openapi.yaml', encoding='utf-8'))
+          errs = []
+          if str(d.get('openapi','')).split('.')[0] != '3': errs.append('openapi 必须 3.x')
+          if not d.get('info',{}).get('title'):         errs.append('缺 info.title')
+          if not d.get('paths'):                        errs.append('paths 为空')
+          for p, item in d['paths'].items():
+              if not p.startswith('/'):                 errs.append(f'path 必须以 / 开头: {p}')
+              for m in item:
+                  if m not in ('get','post','put','patch','delete','head','options','parameters','summary','description'):
+                      errs.append(f'未知 method {m} @ {p}')
+                  if m in ('get','post','put','patch','delete') and 'responses' not in item[m]:
+                      errs.append(f'{m.upper()} {p} 缺 responses')
+          # 红线：spec 里不得出现反作弊阈值/名单（只允许粗粒度状态码）
+          raw = open('openapi.yaml', encoding='utf-8').read()
+          for bad in ('blocklist','blacklist','score_weight','risk_rules'):
+              if bad in raw: errs.append(f'出现反作弊内部字段: {bad}')
+          print(f"paths={len(d['paths'])}  错误={len(errs)}")
+          for e in errs: print('  -', e)
+          sys.exit(1 if errs else 0)
+          PY
+
+  redline-scan:
+    name: 红线词扫描
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: 代码看实现形态 / 文档看主张式表述
+        run: |
+          set -e
+          fail=0
+
+          echo "== A. 代码里不得出现「代币化 / 绕限制 / 托管凭据」的实现 =="
+          CODE_PAT='(token_?(mint|transfer|withdraw)|airdrop\(|proxy_?(pool|rotation)|rotate_?(account|key_pool)|fingerprint_?spoof|host_?customer_?key|store_?user_?credential)'
+          if grep -rInE "$CODE_PAT" --include='*.py' --include='*.ts' --include='*.rs' --include='*.go' --include='*.js' . ; then
+            echo "::error::代码中出现红线实现形态"; fail=1
+          fi
+
+          echo "== B. 文档不得【主张】这些能力（禁令/否定表述天然不匹配）=="
+          # 只匹配「肯定动词 + 能力」的组合：禁令写成「禁止代币化」「不托管凭据」不会命中
+          DOC_PAT='(支持|提供|实现|允许|开放)(发币|空投|代币化|账号轮换池|托管.{0,4}凭据)|绕过(上游|站点)?限制的(方案|方法|功能)'
+          if grep -rInE "$DOC_PAT" --include='*.md' --include='*.yaml' --include='*.yml' . \
+             | grep -vE '(SECURITY|CONTRIBUTING|CODE_OF_CONDUCT)\.md' ; then
+            echo "::error::文档中出现主张式红线表述"; fail=1
+          fi
+
+          [ "$fail" = 0 ] && echo "✅ 无红线"
+          exit $fail
+
+  dco:
+    name: DCO（Signed-off-by）
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - run: |
+          set -e
+          msg="$(git log -1 --pretty=%B)"; echo "$msg" | head -5
+          echo "$msg" | grep -qiE '^Signed-off-by: .+ <.+@.+>' || { echo "::error::缺 Signed-off-by"; exit 1; }
