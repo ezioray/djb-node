@@ -674,6 +674,284 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
 
+  # ----------------------------------------------------------------------
+  # 配置中心（管理面；RPT-0002 §3 / 产品设计 §21.12）
+  # 写进 spec ≠ 公网可达：内网/加密专线 + 强 MFA + step-up（≤5 分钟）
+  # ----------------------------------------------------------------------
+  /api/v1/admin/config/items:
+    get:
+      tags: [admin]
+      summary: 配置项检索（不返回敏感值）
+      operationId: listConfigItems
+      description: |
+        按前缀/作用域检索配置项元数据。敏感项只返回 `secret_ref` 或脱敏摘要，
+        绝不明文回传。三源（desired / effective / running）漂移见 `listConfigDrifts`。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: prefix
+          in: query
+          required: false
+          schema: { type: string }
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 配置项分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigItemPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/drifts:
+    get:
+      tags: [admin]
+      summary: 配置三源漂移清单（目标 0）
+      operationId: listConfigDrifts
+      description: 返回 desired / effective / running 三源不一致的配置项；目标恒为 0，非 0 即告警。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 漂移清单
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigDriftList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/{key}:
+    get:
+      tags: [admin]
+      summary: 读取单个配置项
+      operationId: getConfigItem
+      description: 按 key 读取；可用 `version` / `scope` 指定历史版本与作用域。敏感值不返回明文。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z][a-z0-9_.-]{2,127}$' }
+        - name: version
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 配置项
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [admin]
+      summary: 创建配置草稿（不生效）
+      operationId: createConfigDraft
+      description: |
+        只建草稿，不改变运行值；生效必须走 `publishConfigItem` 并完成复核。
+        幂等键 24h，与审计记录同事务。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z][a-z0-9_.-]{2,127}$' }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigDraftRequest' }
+      responses:
+        '201':
+          description: 草稿已创建
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/{key}/publish:
+    post:
+      tags: [admin]
+      summary: 发起配置发布（生成发布单）
+      operationId: publishConfigItem
+      description: |
+        发起发布单，进入 `pending_approval`；复核人 ≠ 发起人。P0 配置需 Step-Up + 双人 + 冷却；
+        灰度按桶推进，不自动全量。`expired` **不自动放行**。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z][a-z0-9_.-]{2,127}$' }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigPublishRequest' }
+      responses:
+        '202':
+          description: 发布单已创建（待复核）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigPublishAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/publish-requests/{id}/approve:
+    post:
+      tags: [admin]
+      summary: 复核配置发布（复核人 ≠ 发起人）
+      operationId: approveConfigPublish
+      description: 复核人批准或驳回发布单；自批自核必须被拒绝（返回 403）。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigApprovalRequest' }
+      responses:
+        '200':
+          description: 复核结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigPublishAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/{key}/rollback:
+    post:
+      tags: [admin]
+      summary: 回滚到不可变历史版本
+      operationId: rollbackConfigItem
+      description: 回滚 = 以历史版本为内容生成一次新的发布；历史版本本身不可修改。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z][a-z0-9_.-]{2,127}$' }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigRollbackRequest' }
+      responses:
+        '200':
+          description: 回滚发布单
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigPublishAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/{key}/kill-switch:
+    post:
+      tags: [admin]
+      summary: 紧急收紧开关（只能收紧，≤24h 转正）
+      operationId: killSwitchConfigItem
+      description: |
+        只允许把配置收紧（更保守），不允许借 kill-switch 放开权限或阈值；
+        `ttl_seconds ≤ 86400`，到期自动回到上一生效版本并留审计。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z][a-z0-9_.-]{2,127}$' }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigKillSwitchRequest' }
+      responses:
+        '200':
+          description: 开关已生效
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigPublishAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
 # ==========================================================================
 # components
 # ==========================================================================
@@ -722,6 +1000,14 @@ components:
         type: string
         minLength: 16
         maxLength: 128
+    AdminStepUp:
+      name: X-Admin-Step-Up
+      in: header
+      required: true
+      description: 敏感操作二次认证凭据（≤5 分钟有效）；P0 配置发布必备。
+      schema:
+        type: string
+
     ProtocolVersion:
       name: DJB-Protocol-Version
       in: header
@@ -1744,5 +2030,212 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/LedgerEntry'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    ConfigItem:
+      type: object
+      additionalProperties: true
+      required: [key, scope, version, value_type, state, updated_at]
+      properties:
+        key:
+          type: string
+        scope:
+          type: string
+          description: 作用域（global / chain / tier / bucket 等）
+        version:
+          type: integer
+          minimum: 1
+        value_type:
+          type: string
+          enum: [string, integer, number, boolean, json]
+        value:
+          description: 非敏感配置值；敏感项必须为空，只给 `secret_ref` 或脱敏摘要。
+        secret_ref:
+          type: [string, 'null']
+          description: 敏感值的引用（KMS/密钥库路径），不是明文。
+        state:
+          type: string
+          enum: [draft, active, rolled_back, retired]
+        description:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        updated_by:
+          type: string
+
+    ConfigItemPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigItem'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    ConfigDraftRequest:
+      type: object
+      additionalProperties: false
+      required: [value_type, reason]
+      properties:
+        value:
+          description: 非敏感值；敏感项改用 `secret_ref`。
+        secret_ref:
+          type: string
+        value_type:
+          type: string
+          enum: [string, integer, number, boolean, json]
+        reason:
+          type: string
+          minLength: 4
+        ticket:
+          type: string
+        effective_at:
+          type: string
+          format: date-time
+
+    ConfigPublishRequest:
+      type: object
+      additionalProperties: false
+      required: [version, reason]
+      properties:
+        version:
+          type: integer
+          minimum: 1
+        effective_at:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          minLength: 4
+        ticket:
+          type: string
+        gray_plan:
+          type: object
+          additionalProperties: false
+          properties:
+            buckets:
+              type: array
+              items:
+                type: integer
+                minimum: 0
+                maximum: 100
+            observation_seconds:
+              type: integer
+              minimum: 60
+
+    ConfigApprovalRequest:
+      type: object
+      additionalProperties: false
+      required: [decision, reason]
+      properties:
+        decision:
+          type: string
+          enum: [approve, reject]
+        reason:
+          type: string
+          minLength: 4
+
+    ConfigRollbackRequest:
+      type: object
+      additionalProperties: false
+      required: [target_version, reason]
+      properties:
+        target_version:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          minLength: 4
+        ticket:
+          type: string
+
+    ConfigKillSwitchRequest:
+      type: object
+      additionalProperties: false
+      required: [reason, ttl_seconds]
+      properties:
+        reason:
+          type: string
+          minLength: 4
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: 到期自动回到上一生效版本；上限 24h。
+        tighten_only:
+          type: boolean
+          enum: [true]
+          description: 只允许收紧；借开关放开权限/阈值必须拒绝。
+
+    ConfigPublishAck:
+      type: object
+      additionalProperties: true
+      required: [request_id, state]
+      properties:
+        request_id:
+          type: string
+        state:
+          type: string
+          enum:
+            - pending_approval
+            - approved
+            - scheduled
+            - rolling_out
+            - active
+            - rejected
+            - expired
+            - cancelled
+            - rolled_back
+            - failed
+          description: |
+            发布单状态机：pending_approval → approved → scheduled → rolling_out → active；
+            终止态 rejected / expired / cancelled / rolled_back / failed。
+            `expired` **不自动放行**。
+        version:
+          type: integer
+          minimum: 1
+        effective_at:
+          type: string
+          format: date-time
+        approvals_required:
+          type: integer
+          minimum: 1
+        approvals_received:
+          type: integer
+          minimum: 0
+
+    ConfigDrift:
+      type: object
+      additionalProperties: true
+      required: [key, detected_at]
+      properties:
+        key:
+          type: string
+        scope:
+          type: string
+        desired_version:
+          type: integer
+        effective_version:
+          type: integer
+        running_version:
+          type: integer
+        detected_at:
+          type: string
+          format: date-time
+
+    ConfigDriftList:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigDrift'
         page:
           $ref: '#/components/schemas/Page'
