@@ -642,9 +642,10 @@ paths:
         - name: status
           in: query
           required: false
+          description: 5 值枚举（同 LedgerEntry.status）；reversed 已退役，冲正改用 void + reverse_of。
           schema:
             type: string
-            enum: [pending, locked, settled, reversed]
+            enum: [pending, confirmed, locked, settled, void]
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
         - $ref: '#/components/parameters/RequestId'
@@ -1717,7 +1718,11 @@ components:
           type: string
         status:
           type: string
-          enum: [pending, locked, settled, reversed]
+          enum: [pending, confirmed, locked, settled, void]
+          description: |
+            分录状态。与产品设计 §20.4 对齐：pending → confirmed → locked → settled；
+            异常终止为 void；冲正不改原分录，新增 reverse_of 指向原 entry_id。
+            reversed 退役（v1 未发布，无兼容负担）；客户端仍须容忍未知值。
         lock_until:
           type: string
           format: date-time
