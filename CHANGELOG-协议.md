@@ -20,6 +20,17 @@
    新增参数 `AdminStepUp`（`X-Admin-Step-Up`）。
 4. 发布单状态机：`pending_approval → approved → scheduled → rolling_out → active`；
    终止 `rejected / expired / cancelled / rolled_back / failed`；`expired` 不自动放行。
+5. `source_type` 16 值白名单（`chain_tx`/`payment_attempt`/`conversion_trade`/`usage_settle`/
+   `lock_expiry`/`payout_accrual`/`payout_item`/`payout_batch`/`wallet_transfer`/`refund`/
+   `chargeback`/`rebate`/`fx_reval`/`loss_pool`/`void`/`unidentified`），新增 `SourceType` schema
+   与管理面 `source_type` 查询参数；版本化：新增值按 MINOR 先改 spec。
+6. 通知偏好 / Webhook 订阅 / 报价设置 9 个操作（附录 C.3），含一次性 `secret` 与 P0 不可退订（`40902`）。
+7. 报表中心 5 个操作（附录 C.5）：`recon-daily` / `exceptions` / `por` / `wallet-pool` / `monthly`，
+   `period=YYYY-MM`，返回 `ReportEnvelope`。
+8. 钱包与签名：`TreasuryIntent.kind` 增 `WALLET_PROVISION`（第八值）；`Wallet.status` 七值
+   （`active/paused/draining/retired/provisioning/zero/frozen`）；`SigningEvent.event` 六事件
+   （`requested/presented/signed/verified/co_signed/broadcast`）。
+9. 错误码登记：`40910–40918`、`42210`、`42211`、`40201`（详见 Error schema 与附录 C.4）。
 
 **影响面**
 - 客户端：需容忍新增 enum 值（已有 tolerant reader 规则）；`reversed` 不再出现。

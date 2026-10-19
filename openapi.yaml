@@ -639,6 +639,12 @@ paths:
           required: false
           schema:
             type: string
+        - name: source_type
+          in: query
+          required: false
+          description: 按幂等键来源过滤（16 值白名单，见 SourceType）。
+          schema:
+            $ref: '#/components/schemas/SourceType'
         - name: status
           in: query
           required: false
@@ -952,6 +958,306 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ----------------------------------------------------------------------
+  # 通知偏好 / Webhook 订阅 / 报价设置（附录 C.3，2026-10-19 补登记）
+  # ----------------------------------------------------------------------
+  /api/v1/user/notifications/preferences:
+    get:
+      tags: [user]
+      summary: 读取通知偏好
+      operationId: getNotificationPreferences
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 通知偏好
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreferences' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [user]
+      summary: 覆盖式更新通知偏好
+      operationId: updateNotificationPreferences
+      description: |
+        覆盖式写入（区间/集合整体替换）。P0 通知项**不可退订**，尝试关闭返回 `40902`。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationPreferences' }
+      responses:
+        '200':
+          description: 更新后的偏好
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreferences' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/webhooks:
+    get:
+      tags: [user]
+      summary: 列出 Webhook 订阅
+      operationId: listWebhookSubscriptions
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 订阅列表（不含签名密钥）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookSubscriptionList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [user]
+      summary: 注册 Webhook 订阅（签名密钥仅返回一次）
+      operationId: createWebhookSubscription
+      description: |
+        `events` 支持慢任务完成与 P0 事件；`secret` 只在创建响应里返回一次，
+        服务端只存哈希。重复提交按幂等键去重。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookSubscriptionRequest' }
+      responses:
+        '201':
+          description: 创建成功（含一次性 secret）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookSubscriptionCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/webhooks/{id}:
+    delete:
+      tags: [user]
+      summary: 删除 Webhook 订阅
+      operationId: deleteWebhookSubscription
+      security:
+        - userBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '204':
+          description: 已删除
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/quote-settings:
+    get:
+      tags: [user]
+      summary: 读取用方报价设置（出价范围）
+      operationId: getUserQuoteSettings
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 报价设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuoteSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [user]
+      summary: 覆盖式更新用方报价设置
+      operationId: updateUserQuoteSettings
+      description: 区间整体替换（不是增量合并）。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteSettings' }
+      responses:
+        '200':
+          description: 更新后的设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuoteSettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/provider/quote-settings:
+    get:
+      tags: [node]
+      summary: 读取供方报价设置（价格范围）
+      operationId: getProviderQuoteSettings
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 报价设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuoteSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [node]
+      summary: 覆盖式更新供方报价设置
+      operationId: updateProviderQuoteSettings
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteSettings' }
+      responses:
+        '200':
+          description: 更新后的设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuoteSettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ----------------------------------------------------------------------
+  # 报表中心 5 条（附录 C.5 / v4 §23，只读）
+  # ----------------------------------------------------------------------
+  /api/v1/admin/reports/recon-daily:
+    get:
+      tags: [admin]
+      summary: 日结三方对账报告（REP-01）
+      operationId: getReconDailyReport
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ReportPeriod'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 报表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/reports/exceptions:
+    get:
+      tags: [admin]
+      summary: 差异台账与账龄（REP-02）
+      operationId: getExceptionReport
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ReportPeriod'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 报表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/reports/por:
+    get:
+      tags: [admin]
+      summary: 储备证明快照（REP-03）
+      operationId: getPorReport
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ReportPeriod'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 报表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/reports/wallet-pool:
+    get:
+      tags: [admin]
+      summary: 钱包池水位（REP-04）
+      operationId: getWalletPoolReport
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ReportPeriod'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 报表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/reports/monthly:
+    get:
+      tags: [admin]
+      summary: 月度经营摘要（REP-06）
+      operationId: getMonthlyReport
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ReportPeriod'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 报表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
 # ==========================================================================
 # components
 # ==========================================================================
@@ -1007,6 +1313,15 @@ components:
       description: 敏感操作二次认证凭据（≤5 分钟有效）；P0 配置发布必备。
       schema:
         type: string
+
+    ReportPeriod:
+      name: period
+      in: query
+      required: true
+      description: 自然月 `YYYY-MM`（与 `/verify/{period}` 同粒度；审计锚定日是日粒度）。
+      schema:
+        type: string
+        pattern: '^[0-9]{4}-[0-9]{2}$'
 
     ProtocolVersion:
       name: DJB-Protocol-Version
@@ -1210,9 +1525,9 @@ components:
             code:
               type: integer
               description: |
-                数字错误码。已核实：`40301` 管理接口签名失败、
-                `42601` 协议版本不兼容。其余以正式文档 §6.3 为准，
-                本版本不臆造编号。
+                数字错误码。已核实：`40301` 管理接口签名失败（recon/01:265）、
+                `42601` 协议版本不兼容（recon/01:393）；已登记资金段
+                `40910–40918`、`42210`、`42211`、`40201`。其余以产品设计 §6.3 与附录 C.4 为准。
             message:
               type: string
               description: 人类可读，不含内部堆栈/规则细节/凭据。
@@ -2239,3 +2554,183 @@ components:
             $ref: '#/components/schemas/ConfigDrift'
         page:
           $ref: '#/components/schemas/Page'
+
+    SourceType:
+      type: string
+      description: |
+        记账网关维护的 `source_type` 白名单（16 值，TEC-02）。用于 journal 幂等键
+        `(source_type, source_id, event_seq)`。属**版本化枚举**：新增值按 MINOR 先改 spec，
+        客户端必须容忍未知值（读路径遇未知值由服务端拒绝，不静默记账）。
+      enum:
+        - chain_tx
+        - payment_attempt
+        - conversion_trade
+        - usage_settle
+        - lock_expiry
+        - payout_accrual
+        - payout_item
+        - payout_batch
+        - wallet_transfer
+        - refund
+        - chargeback
+        - rebate
+        - fx_reval
+        - loss_pool
+        - void
+        - unidentified
+
+    NotificationPreferences:
+      type: object
+      additionalProperties: true
+      required: [email, in_app, webhook]
+      properties:
+        email: { type: boolean }
+        in_app: { type: boolean }
+        webhook: { type: boolean }
+        quiet_hours:
+          type: object
+          additionalProperties: false
+          properties:
+            start: { type: string, pattern: '^[0-2][0-9]:[0-5][0-9]$' }
+            end: { type: string, pattern: '^[0-2][0-9]:[0-5][0-9]$' }
+            timezone: { type: string }
+        digest:
+          type: string
+          enum: [realtime, daily, weekly]
+        p0_opt_out:
+          type: boolean
+          enum: [false]
+          description: P0 通知不可退订；写入 true 返回 `40902`。
+
+    WebhookSubscription:
+      type: object
+      additionalProperties: true
+      required: [id, url, events, status]
+      properties:
+        id: { type: string }
+        url: { type: string, format: uri }
+        events:
+          type: array
+          items:
+            type: string
+            enum: [task.completed, task.failed, payment.settled, payout.sent, security.alert]
+        status:
+          type: string
+          enum: [active, paused, disabled]
+        created_at: { type: string, format: date-time }
+
+    WebhookSubscriptionList:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/WebhookSubscription' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    WebhookSubscriptionRequest:
+      type: object
+      additionalProperties: false
+      required: [url, events]
+      properties:
+        url: { type: string, format: uri }
+        events:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [task.completed, task.failed, payment.settled, payout.sent, security.alert]
+        description: { type: string, maxLength: 200 }
+
+    WebhookSubscriptionCreated:
+      allOf:
+        - $ref: '#/components/schemas/WebhookSubscription'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: 签名密钥，**仅创建时返回一次**；服务端只存哈希。
+
+    QuoteSettings:
+      type: object
+      additionalProperties: true
+      required: [min_price, max_price, currency]
+      properties:
+        min_price: { type: string, pattern: '^[0-9]+(\.[0-9]+)?$' }
+        max_price: { type: string, pattern: '^[0-9]+(\.[0-9]+)?$' }
+        currency: { type: string, enum: [USD] }
+        updated_at: { type: string, format: date-time }
+      description: 区间整体替换（PUT 覆盖式）；用方为出价范围，供方为价格范围。
+
+    ReportEnvelope:
+      type: object
+      additionalProperties: true
+      required: [report_id, period, generated_at]
+      properties:
+        report_id:
+          type: string
+          enum: [REP-01, REP-02, REP-03, REP-04, REP-06]
+        period:
+          type: string
+          pattern: '^[0-9]{4}-[0-9]{2}$'
+          description: 自然月 `YYYY-MM`（与 `/verify/{period}` 同粒度；审计锚定日是日粒度）。
+        generated_at: { type: string, format: date-time }
+        data:
+          type: object
+          additionalProperties: true
+          description: 报表主体（字段随 report_id 不同，见 v4 §23.2）。
+
+    TreasuryIntent:
+      type: object
+      additionalProperties: true
+      required: [intent_id, kind, chain_id, expires_at, nonce]
+      properties:
+        intent_id: { type: string }
+        kind:
+          type: string
+          enum: [PAYOUT, REFUND, SWEEP, REBALANCE, GAS_TOPUP, POLICY_CHANGE, RECOVERY, WALLET_PROVISION]
+          description: 第八个取值 `WALLET_PROVISION` 属追加枚举；不复用 `POLICY_CHANGE`。
+        chain_id: { type: integer }
+        wallet_id: { type: string }
+        amount: { type: string, pattern: '^[0-9]+(\.[0-9]+)?$' }
+        expires_at: { type: string, format: date-time }
+        nonce: { type: integer, minimum: 0 }
+        policy_version: { type: string }
+
+    Wallet:
+      type: object
+      additionalProperties: true
+      required: [wallet_id, status]
+      properties:
+        wallet_id: { type: string }
+        status:
+          type: string
+          enum: [active, paused, draining, retired, provisioning, zero, frozen]
+          description: 四值基线 + 退休四步中间态 `provisioning / zero / frozen`；共七值。
+        switch_state:
+          type: string
+          enum: [standby, in_service, switching_out, draining]
+          description: 仅对 `active` 有意义。
+        fund_class: { type: string, enum: [hot, warm, cold] }
+        balance: { type: string, pattern: '^[0-9]+(\.[0-9]+)?$' }
+
+    SigningEvent:
+      type: object
+      additionalProperties: true
+      required: [signing_event_id, signing_request_id, event, occurred_at]
+      properties:
+        signing_event_id: { type: string }
+        signing_request_id: { type: string }
+        event:
+          type: string
+          enum: [requested, presented, signed, verified, co_signed, broadcast]
+        signer_type: { type: string, enum: [owner, reviewer, company] }
+        signer_ref: { type: string }
+        signature_hash: { type: string }
+        device_id: { type: string }
+        auth_hash: { type: string }
+        txid: { type: string }
+        error_code: { type: integer }
+        occurred_at: { type: string, format: date-time }
