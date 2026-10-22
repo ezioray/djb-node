@@ -17,7 +17,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.0.0-skeleton
+  version: 1.1.0
   summary: 一期核心端点契约（15 条 / 全量约 62 条）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
