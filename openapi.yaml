@@ -17,8 +17,8 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.1.0
-  summary: 一期核心端点契约（15 条 / 全量约 62 条）
+  version: 1.2.0
+  summary: W1 契约冻结（67 路径 / 76 操作；覆盖 M01–M06、M10）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
@@ -28,7 +28,8 @@ info:
       并与旧前缀并存一个弃用周期，不得在旧前缀内做破坏性变更。
     - 兼容：同 MAJOR 内只加不改。客户端必须容忍未知字段/未知 enum 值（tolerant reader）。
     - 错误：统一 `error` 信封（`type` / `code` / `message` / `request_id`）。数字错误码
-      见 `components/schemas/Error`；本版本固化 `40301`、`42601` 两码。
+      见 `components/schemas/Error`；1.2.0 起按 00-conventions §5 码段登记（401xx / 402xx /
+      403xx / 409xx / 422xx / 424xx / 426xx / 45xxx–49xxx），本文件不重复阈值与名单。
     - 风控：429/403 只给粗粒度原因码与 `Retry-After`；本文件**不含**任何阈值、名单、
       评分权重或判定条件——那是私有配置（`djb/risk-config`），不进公开仓。
     - 幂等：写操作接受 `X-DJB-Idempotency-Key`（24h）；非流式请求体指纹 300s 去重；
@@ -118,6 +119,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
@@ -198,6 +201,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
@@ -810,6 +815,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /api/v1/admin/config/{key}/publish:
@@ -847,6 +853,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /api/v1/admin/config/publish-requests/{id}/approve:
@@ -883,6 +890,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /api/v1/admin/config/{key}/rollback:
@@ -919,6 +927,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /api/v1/admin/config/{key}/kill-switch:
@@ -956,6 +965,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ----------------------------------------------------------------------
@@ -1261,6 +1271,1384 @@ paths:
 # ==========================================================================
 # components
 # ==========================================================================
+  # ----------------------------------------------------------------------
+  # 身份与租户（M01；spec 1.2.0 补登记：M01 CR-1 / _CR-LOG S1）
+  # /api/v1/auth/* · /user/profile · /user/api-keys · /admin/accounts|tenants
+  # 写进 spec ≠ 公网可达：管理面内网/VPN + 强 MFA + step-up（≤5 分钟）
+  # ----------------------------------------------------------------------
+  /api/v1/auth/login:
+    post:
+      tags: [user]
+      summary: 登录（密码 / OAuth / 验证码）
+      operationId: createAuthSession
+      description: |
+        `method` 区分登录方式，成功后返回会话令牌。MFA 未完成时返回 `mfa_required=true`
+        的短期令牌（只可用于 step-up 换正式令牌）。凭据错误统一 `40110`，
+        **不区分**「账号不存在」与「口令错误」（防枚举）；失败锁定与风控只给
+        429 / 403 + 粗粒度原因码，不含阈值与名单。扫码登录的轮询中间态复用本条端点。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: 登录成功（或 `mfa_required=true` 的短期令牌）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [user]
+      summary: 刷新令牌（轮换）
+      operationId: refreshAuthSession
+      description: |
+        刷新即轮换：旧 `refresh_token` 立即失效，返回新的令牌对。重放已轮换的令牌
+        按 `40103`（令牌已撤销）处理，并要求重新登录。刷新不延长绝对过期时间。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: 新令牌对
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [user]
+      summary: 退出（撤销会话）
+      operationId: revokeAuthSession
+      description: |
+        撤销当前会话；`all_devices=true` 时撤销该账号全部会话（`session_epoch++`，
+        旧令牌立即失效）。幂等：重复退出返回首次结果，不报错。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LogoutRequest' }
+      responses:
+        '200':
+          description: 已撤销
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LogoutAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/profile:
+    get:
+      tags: [user]
+      summary: 账户与租户视图（脱敏）
+      operationId: getUserProfile
+      description: |
+        返回脱敏后的账户与租户视图：只给 `email_hash` 派生的展示掩码，不回传
+        原始邮箱 / 手机号 / 硬件信息。`balance` 是 M06 `account_balances` 的
+        **只读镜像**，结算与对账一律以账本分录为准。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 账户视图
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountProfile' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [user]
+      summary: 修改昵称与语言（局部更新）
+      operationId: updateUserProfile
+      description: |
+        只允许修改展示类字段（`display_name` / `locale`）。未出现的字段保持原值；
+        身份字段（`account_id` / `tenant_id` / `state`）不可经此端点修改。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountProfileUpdateRequest' }
+      responses:
+        '200':
+          description: 更新后的账户视图
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountProfile' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/api-keys:
+    get:
+      tags: [user]
+      summary: 列举 API Key（只回前缀）
+      operationId: listApiKeys
+      description: |
+        只返回 8 位前缀与元数据，**永不回传明文或哈希**。撤销后的 Key 默认不返回，
+        `include_revoked=true` 时可查（保留 24 个月）。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: include_revoked
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Key 分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [user]
+      summary: 创建 API Key（明文只回一次）
+      operationId: createApiKey
+      description: |
+        明文只在本次响应出现一次，平台只存 `sha256(key)` 与前缀。`frozen` / `closed`
+        账户禁止建 Key（403 + `40304`）。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApiKeyCreateRequest' }
+      responses:
+        '201':
+          description: Key 已创建（`key` 仅此一次可见）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/api-keys/{id}:
+    delete:
+      tags: [user]
+      summary: 撤销 API Key（幂等）
+      operationId: revokeApiKey
+      description: |
+        撤销后立即失效；重复撤销返回首次结果（不报 5xx）。跨租户访问一律 404（防枚举）。
+      security:
+        - userBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 撤销结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeySummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/api-keys/{id}/rotate:
+    post:
+      tags: [user]
+      summary: 轮换 API Key（旧钥立即失效）
+      operationId: rotateApiKey
+      description: |
+        生成新 Key 并撤销旧 Key；新明文只在本次响应出现一次。若声明重叠期，
+        重叠 ≤24 h 且旧钥在重叠期内**只验签**、不接受新注册（INV-10）。
+      security:
+        - userBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApiKeyRotateRequest' }
+      responses:
+        '201':
+          description: 新 Key（`key` 仅此一次可见）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/accounts/{id}/freeze:
+    post:
+      tags: [admin]
+      summary: 冻结账户（理由 + 期限必填）
+      operationId: freezeAccount
+      description: |
+        冻结后账户只读 + 可申诉，禁止建 Key / 充值 / 接新单。`frozen_until` 必填且
+        ≤180 天（超期属参数错误，400 + `40001`）。解冻须**非原冻结人**（409 + `40902`）。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountStateChangeRequest' }
+      responses:
+        '200':
+          description: 已冻结
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountStateAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/accounts/{id}/unfreeze:
+    post:
+      tags: [admin]
+      summary: 解冻账户（非原冻结人）
+      operationId: unfreezeAccount
+      description: |
+        解冻人与原冻结人必须不同（409 + `40902`）；到期自动解冻由定时 job 执行并留痕，
+        重放不产生重复状态事件。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountStateChangeRequest' }
+      responses:
+        '200':
+          description: 已解冻
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountStateAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/accounts/{id}/roles:
+    post:
+      tags: [admin]
+      summary: 授予 / 回收后台角色（第二人确认）
+      operationId: updateAccountRoles
+      description: |
+        `admin_role` ∈ 八角色（SUPER / SVC / OPS / AUDIT / RISK / FIN / CS / VIEWER，
+        见 03-facts §5）。授予与回收都必须带复核人（`second_approver` ≠ 操作人），
+        变更后 `session_epoch++`（旧会话 401 + `40102`）。SVC 不得绑自然人邮箱。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountRoleChangeRequest' }
+      responses:
+        '200':
+          description: 角色已更新
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountRoles' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/tenants/{id}/quotas:
+    post:
+      tags: [admin]
+      summary: 修改租户配额（升配额超阈值需 FIN 复核）
+      operationId: updateTenantQuotas
+      description: |
+        配额主体为 `tenant_quotas`（`kind` / `value` / `policy_version`）。生效值 =
+        min(租户, Key, 节点能力)，并随请求写 `policy_version`。升配额超阈值必须 FIN
+        复核（`second_approver` 必填），降配额立即生效。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TenantQuotasRequest' }
+      responses:
+        '200':
+          description: 配额已更新
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantQuotasAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ----------------------------------------------------------------------
+  # 节点供给（M02；spec 1.2.0 补登记：M02 CR-2 / CR-3 / CR-5 / CR-7）
+  # /api/v1/node/pair · /node/binding · /node/upstream/probe · /admin/supply/nodes/{id}/review
+  # 节点侧认证 X-Client-Key；审核属管理面（内网 + 强 MFA + step-up）
+  # ----------------------------------------------------------------------
+  /api/v1/node/pair:
+    post:
+      tags: [node]
+      summary: 生成 / 轮换客户端密钥（明文只回一次）
+      operationId: pairNodeClientKey
+      description: |
+        生成节点客户端密钥（`X-Client-Key`），明文只在本次响应出现一次；平台只存
+        `sha256(key)` 与 8 位前缀。轮换重叠 ≤24 h，重叠期内旧钥**只验签**、
+        不接受新注册。状态非 `active` 的节点拒绝换钥（403 + `40305`）。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodePairRequest' }
+      responses:
+        '201':
+          description: 已签发（`client_key` 仅此一次可见）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodePairResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/node/binding:
+    get:
+      tags: [node]
+      summary: 查询节点绑定（当前账户）
+      operationId: getNodeBinding
+      description: |
+        一个节点同时只有**一条**有效绑定（INV-08）。解绑 / 换绑不删除历史收据与锁定收益。
+        绑定关系存 `nodes` 列 + `node_events` 历史，不建独立表（M02 CR-4）。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - name: node_id
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 绑定状态
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeBinding' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [node]
+      summary: 网页端绑定节点
+      operationId: bindNode
+      description: |
+        用一次性绑定码把节点绑定到当前账户；绑定码一次性、短时效。节点须为 `active`，
+        否则 403 + `40305`（`pending` 未准入 / `frozen` / `retired`）。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeBindingRequest' }
+      responses:
+        '200':
+          description: 绑定成功
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeBinding' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [node]
+      summary: 解绑节点（幂等）
+      operationId: unbindNode
+      description: |
+        解绑后节点停新单，在途任务按清退两段处理（先降权再摘除），不强制中断（INV-09）。
+        重复解绑返回首次结果。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - name: node_id
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已解绑
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeBinding' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/node/upstream/probe:
+    post:
+      tags: [node]
+      summary: 上报本地体检结论（回执式，服务端不探测）
+      operationId: reportNodeUpstreamProbe
+      description: |
+        **服务端不发起探测**：由客户端在本地探测上游连通性后上报结论，服务端只按回执
+        改 `NodeUpstream.state`（`probing → verified / rejected`）。只收结论与耗时，
+        不收凭据、不收上游响应正文（H1）。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeProbeReport' }
+      responses:
+        '200':
+          description: 回执已登记
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeProbeAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/supply/nodes/{id}/review:
+    post:
+      tags: [admin]
+      summary: 节点准入审核（通过 / 驳回）
+      operationId: reviewSupplyNode
+      description: |
+        准入审核：`approve` 使 `pending → active`；`reject` 保留 `pending` 并通知
+        （不落 `retired`）。数据与状态归 M02，页面归 M14。审核必须留理由；
+        状态迁移不合法（如已 `active` 再审）返回 403 + `40305`。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeReviewRequest' }
+      responses:
+        '200':
+          description: 审核结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeReviewAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ----------------------------------------------------------------------
+  # 调度与定价（M04；spec 1.2.0 补登记：M04 CR-2）
+  # /api/v1/schedule/route · /replay · /decisions/{id}
+  # 决策日志只追加、丢弃率 0；不含正文与凭据
+  # ----------------------------------------------------------------------
+  /api/v1/schedule/route:
+    post:
+      tags: [schedule]
+      summary: 内部路由决策（返回 decision_id + chosen + ETA）
+      operationId: createRouteDecision
+      description: |
+        一次请求最多 2 次尝试、只计费一次（计费归 M05）。相同
+        (`snapshot_ts`,`quote_version`,`policy_version`,`request_digest`) 必得同一决策，
+        复算一致率 100%（INV-03）。候选集为空时按降级顺序执行，最终拒绝带
+        `45001` + 三个可选动作。**调用方是 M03 网关**（服务间 mTLS），不对外暴露给终端；
+        终端入口只有 `/v1/chat/completions` 与 `/v1/batches*`。
+      security:
+        - internalMTLS: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RouteRequest' }
+      responses:
+        '201':
+          description: 决策已生成
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RouteDecision' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/schedule/replay:
+    post:
+      tags: [schedule]
+      summary: 异步复算（202 + job_id，并发 1）
+      operationId: createScheduleReplay
+      description: |
+        按窗口重放决策：同一输入必须复现同一 `chosen`；差异 ≠0 即 P0。复算是**只读**的，
+        不改历史决策。同一时刻只允许 1 个复算作业（并发 1），重复提交返回 409 + `40901`。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplayRequest' }
+      responses:
+        '202':
+          description: 已受理（异步复算）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplayAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/schedule/decisions/{decision_id}:
+    get:
+      tags: [schedule]
+      summary: 决策下钻（价格 / 延迟 / 亲和 / 兜底 + 淘汰码）
+      operationId: getRoutingDecision
+      description: |
+        只读下钻单条决策：含价格、ETA、亲和命中、兜底链与**淘汰码**。不含评分权重与
+        阈值（私有配置）；正文与凭据不入决策日志（INV-12）。决策日志保留 12 个月
+        （M04 CR-3），更早的数据按审计流程申请。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: decision_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 决策详情
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RouteDecision' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+
+  # ----------------------------------------------------------------------
+  # 调度定价补充（M04 §4.1：quotes / bids；additive 补登，见证据「裁决假设 AH-1」）
+  # 供方区间报价、用方区间出价；成交价 ∈ [max(a_lo,b_lo), min(a_hi,b_hi)]
+  # ----------------------------------------------------------------------
+  /api/v1/schedule/quotes:
+    post:
+      tags: [node]
+      summary: 供方区间报价（节点侧）
+      operationId: createQuote
+      description: |
+        节点按 `(access, model, unit)` 提交区间要价与 TTL；可成交 ⟺ 区间与用方出价重叠
+        （INV-01），成交价取区间交集内的策略价（mid / floor / ceiling）。报价只追加，
+        过期（`expired`）不复活，只能新建。`ask_price` 是节点要价，**不是**评分权重。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteRequest' }
+      responses:
+        '201':
+          description: 报价已登记
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuoteAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/schedule/bids:
+    post:
+      tags: [user]
+      summary: 用方区间出价（租户侧）
+      operationId: createBid
+      description: |
+        用方按模型提交区间出价：`min_price` 缺省为 0、`max_price` 缺省为不设上限（单边退化
+        为单边比较，INV-01）。出价只追加，过期不复活；成交由 M04 决策产生，本端点不锁量。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BidRequest' }
+      responses:
+        '201':
+          description: 出价已登记
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BidAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ----------------------------------------------------------------------
+  # 计量与收据（M05；spec 1.2.0 补登记：M05 CR-1）
+  # /api/v1/user/usage/records · /node/receipts/{receipt_id} · /admin/usage/*
+  # 收据只追加、逐条受理；校正只追加不改历史
+  # ----------------------------------------------------------------------
+  /api/v1/user/usage/records:
+    get:
+      tags: [user]
+      summary: 用量明细（游标分页）
+      operationId: listUserUsageRecords
+      description: |
+        明细是**逐次调用**的元数据与金额，不含 prompt / response 正文。游标分页，
+        默认 50、上限 200。`state=corrected` 的行带 `correction_id`，原值不可改，
+        差额以追加校正表达（INV-06）。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - name: model
+          in: query
+          required: false
+          schema: { type: string }
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [recorded, settled, corrected] }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 用量明细分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageRecordPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/node/receipts/{receipt_id}:
+    get:
+      tags: [node]
+      summary: 单条收据受理结果（节点自查）
+      operationId: getNodeReceipt
+      description: |
+        节点自查单条收据是否被受理：`accepted` / `rejected` / `duplicate` / `expired`。
+        `duplicate` 表示重复提交且返回首次结果（不重复计量，INV-03）。签名不匹配回
+        `46001`（HTTP 422）。只返回状态与码，不回显收据正文。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - name: receipt_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 收据状态
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReceiptStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/usage/upstream-bills:
+    post:
+      tags: [admin]
+      summary: 上游账单导入（FIN / OPS）
+      operationId: importUpstreamBills
+      description: |
+        导入上游账单行（`imported → reconciled`）。导入**只追加**，不覆盖原用量；
+        与本地计量差异 >1% 进差异工单（INV-07），不静默取大或取小。逐行受理，
+        单行失败不回滚整批。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpstreamBillImportRequest' }
+      responses:
+        '200':
+          description: 逐行受理结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamBillImportAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/usage/corrections:
+    post:
+      tags: [admin]
+      summary: 人工校正（≥50 USD 双人复核）
+      operationId: createUsageCorrection
+      description: |
+        校正只追加（`proposed → applied / rejected`），不改历史行。单条 usage 的累计
+        校正不得超过原额；负向校正（退款方向）必须人工复核；校正额 ≥50 USD 时
+        `second_approver` 必填且 ≠ 操作人（缺复核 409 + `40902`）。写入后由 M06 走冲正。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UsageCorrectionRequest' }
+      responses:
+        '202':
+          description: 校正已受理（`proposed` 或直接 `applied`）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageCorrectionAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ----------------------------------------------------------------------
+  # 账本只读管理面（M06；spec 1.2.0 补登记：M06 CR-L4）
+  # 试算平衡 / 42 科目余额 / 期间 Merkle 根 / 全量复算（只读，不修数据）
+  # 内网/VPN + 强 MFA + step-up（≤5 分钟）；账本无 UPDATE / DELETE
+  # ----------------------------------------------------------------------
+  /api/v1/admin/ledger/trial-balance:
+    get:
+      tags: [admin]
+      summary: 试算平衡（Σ借 = Σ贷）
+      operationId: getLedgerTrialBalance
+      description: |
+        按 `as_of` 汇总试算平衡：同期 Σ借 = Σ贷、科目在 42 条白名单内、未知科目直接报错
+        （不静默跳过，INV-05）。`balanced=false` 即 P0，账本转只读（不自动修数据）。
+        尾差（≤1 最小单位）累积在 `2901`，单独给出 `tail_diff`。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: as_of
+          in: query
+          required: false
+          description: 截止时间（UTC）；缺省为最近一次日结。
+          schema: { type: string, format: date-time }
+        - name: unit_type
+          in: query
+          required: false
+          description: 币种维度；COP 与 USD 不互转（INV-04）。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 试算平衡
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrialBalance' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/ledger/accounts:
+    get:
+      tags: [admin]
+      summary: 42 科目与余额
+      operationId: listLedgerAccounts
+      description: |
+        列举科目表与派生余额（`account_balances` 为唯一余额源，由分录派生、可全量重建）。
+        科目数 42（资产 12 / 负债权益 12 / 收入 6 / 费用损失 10 / 非现金 2，见 03-facts §6）。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: fund_class
+          in: query
+          required: false
+          schema: { type: string, enum: [CLIENT, PLATFORM, FEE] }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 科目与余额分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAccountPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/ledger/merkle/{period}:
+    get:
+      tags: [admin]
+      summary: 期间 Merkle 根与复算入口
+      operationId: getLedgerMerkleRoot
+      description: |
+        期间根可**由当期分录重算复现**；发布后不可改（INV-13）。本端点只读，
+        不触发锚定；`verify_hint` 给出重算所需的只读入口。锚定周期见
+        `ledger.merkle_interval_h`（1 h）。目标期间无根返回 404 + `40924`。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: period
+          in: path
+          required: true
+          description: 锚定周期：日 `YYYY-MM-DD` 或小时 `YYYY-MM-DDTHH`。
+          schema: { type: string, pattern: '^[0-9]{4}-[0-9]{2}(-[0-9]{2}(T[0-9]{2})?)?$' }
+        - name: kind
+          in: query
+          required: false
+          schema: { type: string, enum: [journal, daily_close], default: journal }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 期间根
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerkleCommitment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/ledger/recompute:
+    post:
+      tags: [admin]
+      summary: 触发全量复算（只读，不修数据）
+      operationId: recomputeLedger
+      description: |
+        分页重算 hash 链与余额派生，**只读、不自动修**：差异 ≠0 即 P0 并冻结写入口。
+        复算与日结共用同一入口；`dry_run` 默认 true，显式 false 才发布校验结果
+        （仍不修数据）。同一时刻只允许 1 个复算作业（409 + `40920`）。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecomputeRequest' }
+      responses:
+        '202':
+          description: 复算已受理
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecomputeAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+
+  # ----------------------------------------------------------------------
+  # 账本冲正与凭证（M06 §4.1：journals/{id} · reversals；additive 补登 AH-1）
+  # 冲正是账本**唯一写路径**：整单取反、等额、双人复核；禁部分冲正
+  # ----------------------------------------------------------------------
+  /api/v1/admin/ledger/journals/{id}:
+    get:
+      tags: [admin]
+      summary: 凭证 + 行 + 冲正链（只读）
+      operationId: getLedgerJournal
+      description: |
+        返回单张凭证及其行、以及冲正链（`reversal_of_journal` / `reverse_chain`）。
+        记账后凭证只有 `posted` 与 `voided`（被冲正）两种状态，**禁止覆盖写与部分冲正**。
+        凭证不存在或已归档返回 404 + `40924`。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 凭证详情
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JournalVoucher' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/ledger/reversals:
+    post:
+      tags: [admin]
+      summary: 发起冲正（双人复核、整单等额）
+      operationId: createLedgerReversal
+      description: |
+        对原凭证逐行取反、等额整单冲正（INV-07）：每张原凭证至多一条冲正，禁止部分冲正。
+        必须双人复核（`second_approver` ≠ 操作人）且带理由。原凭证已被冲正返回 409 + `40921`；
+        冲正期间并发冲突返回 409 + `40920`；金额不齐 / 借贷不平衡返回 422 + `42220`。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReversalRequest' }
+      responses:
+        '201':
+          description: 冲正凭证已生成（待复核或已入账）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReversalAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ----------------------------------------------------------------------
+  # 配置中心补充 5 条（M10；spec 1.2.0 补登记：M10 CR-1 / CR-3）
+  # namespaces · {key}/diff · {key}/impact · publish-requests/{id}/promote · {key}/audit
+  # S1 只实现只读三项（namespaces / diff / audit）；impact 与 promote 在 S2 落实现
+  # ----------------------------------------------------------------------
+  /api/v1/admin/config/namespaces:
+    get:
+      tags: [admin]
+      summary: 配置命名空间清单（十域注册）
+      operationId: listConfigNamespaces
+      description: |
+        列出已注册的配置命名空间与键数量（十域注册见 03-facts §9）。`namespaces` 是
+        **保留段**：具体路径优先于模板路径，配置键不得以 `namespaces` 为名注册。
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 命名空间清单
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigNamespaceList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/{key}/diff:
+    get:
+      tags: [admin]
+      summary: 版本差异（结构化 diff）
+      operationId: getConfigDiff
+      description: |
+        比较同一 key 的两个不可变版本，返回字段级 diff。敏感值只给 `masked=true` 的
+        掩码，不返回明文；`content_digest` 可独立复算（`sha256(canonical_json)`）。
+        版本不存在返回 404 + `47006`。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_.-]{2,127}$'
+        - name: from_version
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+        - name: to_version
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 结构化差异
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigDiff' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/{key}/impact:
+    get:
+      tags: [admin]
+      summary: 影响面分析（消费方 / 风险级 / 是否需重启）
+      operationId: getConfigImpact
+      description: |
+        发布前影响面：列出消费方模块、`risk_level`（P0/P1/P2）、是否需要重启或下次锚定
+        生效、以及受影响的键集。影响面是发布单的**前置输入**，不改变运行值。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_.-]{2,127}$'
+        - name: version
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 影响面
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigImpact' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/publish-requests/{id}/promote:
+    post:
+      tags: [admin]
+      summary: 推进发布单（灰度桶前进 / 全量）
+      operationId: promoteConfigPublish
+      description: |
+        按灰度计划 1 → 5 → 25 → 100 推进；观测窗未满不得推进（409 + `47007`），
+        发布窗口外拒绝（409 + `47008`）。`expired` 不自动放行，只能新建发布单。
+        P0 需 step-up + 双人；缺 step-up 返回 424 + `42401`（过渡期 403 + `47009`）。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigPromoteRequest' }
+      responses:
+        '200':
+          description: 发布单新状态
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigPublishAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/config/{key}/audit:
+    get:
+      tags: [admin]
+      summary: 配置审计链（只读）
+      operationId: listConfigAudit
+      description: |
+        该 key 的审计事件（草稿、发布、复核、推进、回滚、kill-switch、漂移）。
+        审计事实源是 M16 `audit_log`，本端点只做按 key 的只读聚合，不提供删除或修改。
+      security:
+        - adminBearer: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_.-]{2,127}$'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 审计事件分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigAuditPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
 components:
 
   securitySchemes:
@@ -1279,6 +2667,11 @@ components:
         节点客户端密钥，由 `/api/v1/node/pair` 生成、可轮换（重叠 ≤24h）
         与撤销（立即停单，在途不受影响）。只存哈希（字段 client_key），
         平台不回显明文。
+    internalMTLS:
+      type: mutualTLS
+      description: |
+        服务间 mTLS + service token（仅集群内可达，公网不可达；不进客户端 SDK，
+        不发动态口令）。仅用于 `/api/v1/schedule/route` 这类**内部**端点。
     adminBearer:
       type: http
       scheme: bearer
@@ -1441,7 +2834,8 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     Conflict:
-      description: 状态冲突（重复幂等键的不同载荷、状态机不允许的迁移）。
+      description: 状态冲突（重复幂等键的不同载荷、状态机不允许的迁移）。无更细码时用通用
+        `40919`；细分码见 `Error.code`。
       headers:
         X-Request-Id:
           $ref: '#/components/headers/RequestId'
@@ -1460,8 +2854,8 @@ components:
             $ref: '#/components/schemas/Error'
     PayloadTooLarge:
       description: |
-        请求体超过上限（chat 请求建议 ≤1 MiB；receipts 批 ≤500 条/次；上限属实现参数，
-        放宽不算破坏性变更，收紧算）。只给上限提示，不回显请求内容。
+        请求体超过上限（HTTP 413，专用码 `40013`；chat 请求建议 ≤1 MiB；receipts 批 ≤500 条/次；
+        上限属实现参数，放宽不算破坏性变更，收紧算）。只给上限提示，不回显请求内容。
       headers:
         X-Request-Id:
           $ref: '#/components/headers/RequestId'
@@ -1489,6 +2883,41 @@ components:
           $ref: '#/components/headers/RequestId'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    PaymentRequired:
+      description: |
+        余额不足 / 欠费（`40201`，HTTP 402）。只给粗粒度原因与充值提示，
+        不返回额度细节、风控阈值或判定条件；客户端应停止重试并引导充值。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    StepUpRequired:
+      description: |
+        二次认证（step-up）缺失或已过期（`42401`，HTTP 424）。敏感动作须重新完成
+        step-up（≤5 分钟有效）后重放；过渡期实现也可返回 403 + `47009`（M10 CR-3），
+        客户端必须同时处理两种。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnprocessableEntity:
+      description: |
+        语义 / 业务校验失败（HTTP 422，`422xx` 段）。具体码值按模块段位登记
+        （如账本 `42220–42223`）；结构与类型错误一律 `400`，两者不混用。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
       content:
         application/json:
           schema:
@@ -1527,7 +2956,18 @@ components:
               description: |
                 数字错误码。已核实：`40301` 管理接口签名失败（recon/01:265）、
                 `42601` 协议版本不兼容（recon/01:393）；已登记资金段
-                `40910–40918`、`42210`、`42211`、`40201`。其余以产品设计 §6.3 与附录 C.4 为准。
+                `40910–40918`、`42210`、`42211`、`40201`。
+
+                spec 1.2.0 新登记（按 00-conventions §5 码段，只加不改）：
+                `40110` 登录凭据错误（M01）；`40013` 请求体超上限（HTTP 413 专用码）与
+                `40919` 状态冲突通用码（HTTP 409 无更细码时）；`40305` 节点状态不允许该动作（M02）；
+                账本 `40920–40924`、`42220–42223`（M06，见 §10.3 CR-L1）；
+                `42401` step-up 缺失或过期（HTTP 424，M10 CR-3）；
+                配置中心 `47001–47009`（47001 校验失败 / 47002 复核人 = 发起人 / 47003 键被未完结发布单锁定 /
+                47004 危险键禁改 / 47005 冷却期未到 / 47006 目标版本不存在 / 47007 灰度或观测窗非法 /
+                47008 发布窗口外 / 47009 需 step-up）。
+
+                未登记的码一律不返回；新增码先改本 spec 与 04 码段表。其余以产品设计 §6.3 与附录 C.4 为准。
             message:
               type: string
               description: 人类可读，不含内部堆栈/规则细节/凭据。
@@ -1747,6 +3187,11 @@ components:
           minimum: 0
         cost_estimate:
           $ref: '#/components/schemas/Amount'
+        price_saved_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: 可选；相对公开参考价的节省比例（仅展示，结算以账本分录为准）。
 
     BatchStatus:
       type: string
@@ -1795,6 +3240,13 @@ components:
         results_ref:
           type: string
           description: 结果对象签名 URL（≤15 分钟有效）；过期需重新获取。
+        cost_estimate:
+          $ref: '#/components/schemas/Amount'
+        price_saved_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: 可选；相对公开参考价的节省比例（仅展示，结算以账本分录为准）。
         cost:
           type: object
           additionalProperties: true
@@ -1962,6 +3414,12 @@ components:
           type: string
         policy_version:
           type: string
+        runtime_state:
+          type: string
+          description: |
+            可选：客户端运行态自述（§5.9 未绑定 / 已上线 / 配额用尽 / 让路暂停 / 用户暂停 / 异常）。
+            约定值 unbound / online / quota_exhausted / yield_paused / user_paused / error；
+            **未知值忽略不报错**（服务端不落成枚举）。仅作调度输入，不参与信誉分计算。
         capacity:
           type: array
           items:
@@ -2734,3 +4192,1197 @@ components:
         txid: { type: string }
         error_code: { type: integer }
         occurred_at: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ 身份与租户（M01，spec 1.2.0）
+    AuthTokens:
+      type: object
+      additionalProperties: true
+      required: [access_token, refresh_token, token_type, expires_in]
+      description: 会话令牌对。`refresh_token` 一次性轮换，旧令牌重放按 `40103` 处理并要求重新登录。
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, const: Bearer }
+        expires_in:
+          type: integer
+          minimum: 1
+          description: access_token 剩余有效期（秒）。
+        session_id: { type: string }
+        refresh_expires_at: { type: string, format: date-time }
+
+    LoginRequest:
+      type: object
+      additionalProperties: true
+      required: [method, identifier]
+      description: 登录入参。`secret` 只上行一次，**不得**进日志、事件或 fixtures。
+      properties:
+        method:
+          type: string
+          enum: [password, oauth, sms_code]
+        identifier:
+          type: string
+          description: 邮箱或手机号（服务端只存不可逆哈希与掩码，不回传原文）。
+        secret:
+          type: string
+          description: 口令或一次性验证码；失败不区分「账号不存在 / 口令错误」。
+        provider:
+          type: string
+          description: OAuth 提供方（`method=oauth` 时必填）。
+        device_id: { type: string }
+        mfa_code:
+          type: string
+          description: 二次认证码（账号启用 MFA 时必填）。
+
+    LoginResponse:
+      type: object
+      additionalProperties: true
+      required: [tokens, account, mfa_required]
+      properties:
+        tokens:
+          $ref: '#/components/schemas/AuthTokens'
+        account:
+          $ref: '#/components/schemas/AccountProfile'
+        mfa_required:
+          type: boolean
+          description: 为 true 时 `tokens.access_token` 只可用于 step-up，不能调用业务接口。
+
+    RefreshRequest:
+      type: object
+      additionalProperties: true
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+
+    LogoutRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        refresh_token:
+          type: string
+          description: 可选；不带时按当前 access_token 定位会话。
+        all_devices:
+          type: boolean
+          default: false
+          description: 为 true 时撤销该账号全部会话（`session_epoch++`）。
+
+    LogoutAck:
+      type: object
+      additionalProperties: true
+      required: [revoked_sessions, revoked_at]
+      properties:
+        revoked_sessions:
+          type: integer
+          minimum: 0
+        revoked_at: { type: string, format: date-time }
+
+    AccountProfile:
+      type: object
+      additionalProperties: true
+      required: [account_id, tenant_id, state, roles, created_at]
+      description: |
+        账户与租户视图（脱敏）。`balance` 是 M06 `account_balances` 的只读镜像，
+        结算与对账一律以账本分录为准。
+      properties:
+        account_id: { type: string }
+        tenant_id: { type: string }
+        display_name: { type: string }
+        locale:
+          type: string
+          description: BCP 47 语言标签（如 `zh-CN`）。
+        state:
+          type: string
+          enum: [pending_verify, normal, frozen, closing, closed]
+          description: 五态机；`closing` / `closed` 只读。客户端须容忍未知值。
+        frozen_until:
+          type: [string, 'null']
+          format: date-time
+          description: 冻结到期（`state=frozen` 时非空，≤180 天）。
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [SUPER, SVC, OPS, AUDIT, RISK, FIN, CS, VIEWER]
+          description: 后台八角色（03-facts §5）；普通用方为空数组。
+        balance:
+          $ref: '#/components/schemas/Amount'
+        created_at: { type: string, format: date-time }
+
+    AccountProfileUpdateRequest:
+      type: object
+      additionalProperties: true
+      minProperties: 1
+      description: 只允许展示类字段；身份字段（account_id / tenant_id / state）不可经此改。
+      properties:
+        display_name:
+          type: string
+          maxLength: 64
+        locale:
+          type: string
+          maxLength: 16
+
+    ApiKeySummary:
+      type: object
+      additionalProperties: true
+      required: [key_id, prefix, created_at]
+      description: Key 元数据。**永不**返回明文或哈希。
+      properties:
+        key_id: { type: string }
+        prefix:
+          type: string
+          description: 8 位前缀（仅展示与排障）。
+        name: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        qps:
+          type: integer
+          minimum: 1
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+        last_used_at:
+          type: [string, 'null']
+          format: date-time
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+        created_at: { type: string, format: date-time }
+
+    ApiKeyPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiKeySummary'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    ApiKeyCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 64
+        scopes:
+          type: array
+          items: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    ApiKeyCreated:
+      type: object
+      additionalProperties: true
+      required: [key_id, key, prefix, created_at]
+      description: 创建 / 轮换响应。`key` 只在本次响应出现一次，平台只存 `sha256(key)`。
+      properties:
+        key_id: { type: string }
+        key: { type: string }
+        prefix: { type: string }
+        name: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ApiKeyRotateRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        name: { type: string }
+        overlap_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 0
+          description: 旧钥重叠期（≤24 h）；重叠期内旧钥只验签、不接受新注册。
+
+    AccountStateChangeRequest:
+      type: object
+      additionalProperties: true
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+        frozen_until:
+          type: string
+          format: date-time
+          description: 冻结必填（≤180 天）；解冻忽略此字段。
+        evidence_ref:
+          type: string
+          description: 证据引用（工单 / 案件号），不得写入 PII。
+
+    AccountStateAck:
+      type: object
+      additionalProperties: true
+      required: [account_id, state, changed_at]
+      properties:
+        account_id: { type: string }
+        state:
+          type: string
+          enum: [pending_verify, normal, frozen, closing, closed]
+        frozen_until:
+          type: [string, 'null']
+          format: date-time
+        changed_at: { type: string, format: date-time }
+
+    AccountRoleChangeRequest:
+      type: object
+      additionalProperties: true
+      required: [reason, second_approver]
+      properties:
+        grant:
+          type: array
+          items:
+            type: string
+            enum: [SUPER, SVC, OPS, AUDIT, RISK, FIN, CS, VIEWER]
+        revoke:
+          type: array
+          items:
+            type: string
+            enum: [SUPER, SVC, OPS, AUDIT, RISK, FIN, CS, VIEWER]
+        scope:
+          type: string
+          description: 角色作用域（如 global / tenant:<id>）。
+        reason:
+          type: string
+          maxLength: 500
+        second_approver:
+          type: string
+          description: 复核人（≠ 操作人）；缺失或不一致 → 409 + `40902`。
+
+    AccountRoles:
+      type: object
+      additionalProperties: true
+      required: [account_id, roles, session_epoch]
+      properties:
+        account_id: { type: string }
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [SUPER, SVC, OPS, AUDIT, RISK, FIN, CS, VIEWER]
+        session_epoch:
+          type: integer
+          minimum: 1
+          description: 角色变更后 +1；旧会话凭 epoch 不符返回 401 + `40102`。
+
+    TenantQuotaEntry:
+      type: object
+      additionalProperties: true
+      required: [kind, value]
+      properties:
+        kind:
+          type: string
+          description: 配额种类（如 concurrency / daily_spend / qps）。
+        value:
+          description: 配额值（数值或结构化阈值；单位见 `unit`）。
+        unit: { type: string }
+        key_id:
+          type: string
+          description: 可选，配额下钻到单个 API Key。
+
+    TenantQuotasRequest:
+      type: object
+      additionalProperties: true
+      required: [quotas, reason]
+      properties:
+        quotas:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/TenantQuotaEntry'
+        reason:
+          type: string
+          maxLength: 500
+        second_approver:
+          type: string
+          description: 升配额超阈值时必填（FIN 复核）；降配额可缺省。
+
+    TenantQuotasAck:
+      type: object
+      additionalProperties: true
+      required: [tenant_id, quotas, policy_version]
+      properties:
+        tenant_id: { type: string }
+        quotas:
+          type: array
+          items:
+            $ref: '#/components/schemas/TenantQuotaEntry'
+        policy_version:
+          type: string
+          description: 配额变更生成新版本，随请求写入，不覆盖历史。
+        effective_at: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ 节点供给（M02，spec 1.2.0）
+    NodePairRequest:
+      type: object
+      additionalProperties: true
+      required: [node_id]
+      properties:
+        node_id: { type: string }
+        rotate:
+          type: boolean
+          default: false
+        overlap_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 0
+          description: 轮换重叠期（≤24 h）；重叠期内旧钥只验签。
+
+    NodePairResponse:
+      type: object
+      additionalProperties: true
+      required: [node_id, key_id, client_key, created_at]
+      description: 'client_key` 只在本次响应出现一次；平台只存 `sha256(key)` 与 8 位前缀。'
+      properties:
+        node_id: { type: string }
+        key_id: { type: string }
+        client_key: { type: string }
+        key_prefix: { type: string }
+        previous_key_expires_at:
+          type: [string, 'null']
+          format: date-time
+        created_at: { type: string, format: date-time }
+
+    NodeBinding:
+      type: object
+      additionalProperties: true
+      required: [node_id, state]
+      description: 一个节点同时只有一条有效绑定；解绑 / 换绑不删除历史收据与锁定收益。
+      properties:
+        node_id: { type: string }
+        state:
+          type: string
+          enum: [unbound, pending, bound, revoked]
+        bound_account_id:
+          type: [string, 'null']
+        bound_at:
+          type: [string, 'null']
+          format: date-time
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+
+    NodeBindingRequest:
+      type: object
+      additionalProperties: true
+      required: [node_id, code]
+      properties:
+        node_id: { type: string }
+        code:
+          type: string
+          description: 一次性绑定码（网页端生成；一次性、短时效）。
+        account_id:
+          type: string
+          description: 可选；缺省绑定到当前会话账户。
+
+    NodeProbeReport:
+      type: object
+      additionalProperties: true
+      required: [upstream_id, reachable, checked_at]
+      description: |
+        本地体检**结论**（服务端不发起探测）。只收结论与耗时，
+        **不收**凭据、上游响应正文或模型输出。
+      properties:
+        upstream_id: { type: string }
+        reachable: { type: boolean }
+        latency_ms:
+          type: integer
+          minimum: 0
+        error_class:
+          type: string
+          description: 粗粒度错误分类（如 timeout / tls / auth / model_missing），不含细节。
+        model_checks:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            required: [model, ok]
+            properties:
+              model: { type: string }
+              ok: { type: boolean }
+              error_class: { type: string }
+        checked_at: { type: string, format: date-time }
+
+    NodeProbeAck:
+      type: object
+      additionalProperties: true
+      required: [upstream_id, state, recorded_at]
+      properties:
+        upstream_id: { type: string }
+        state:
+          type: string
+          enum: [declared, probing, verified, rejected]
+        rejected_reason_code: { type: string }
+        recorded_at: { type: string, format: date-time }
+
+    NodeReviewRequest:
+      type: object
+      additionalProperties: true
+      required: [decision, reason]
+      properties:
+        decision:
+          type: string
+          enum: [approve, reject]
+          description: approve → `pending → active`；reject 保留 `pending` 并通知。
+        reason:
+          type: string
+          maxLength: 500
+        tier:
+          type: string
+          description: 可选准入档位（用于下发初始策略，不改变状态机）。
+
+    NodeReviewAck:
+      type: object
+      additionalProperties: true
+      required: [node_id, state, reviewed_at]
+      properties:
+        node_id: { type: string }
+        state:
+          type: string
+          enum: [pending, active, frozen, retired]
+        reviewed_at: { type: string, format: date-time }
+        policy_version:
+          type: string
+          description: 准入通过后生成的策略版本（客户端据此拉取策略）。
+
+    # ------------------------------------------------------------ 调度与定价（M04，spec 1.2.0）
+    RouteRequest:
+      type: object
+      additionalProperties: true
+      required: [model, kind]
+      description: 路由输入。选填项缺省时取快照默认值；金额一律十进制字符串（Amount）。
+      properties:
+        model: { type: string }
+        kind:
+          type: string
+          enum: [realtime, batch]
+          description: 只允许 realtime 抢 batch；batch 互不抢占（INV-09）。
+        requested_tokens:
+          type: integer
+          minimum: 1
+        deadline_seconds:
+          type: integer
+          minimum: 1
+        required_access:
+          type: array
+          items:
+            type: string
+            enum: [A1, A2, B]
+        max_price:
+          $ref: '#/components/schemas/Amount'
+        tenant_id: { type: string }
+        trace_id:
+          type: string
+          description: 调用方链路标识（与 `X-Request-Id` 一致时便于关联）。
+
+    RouteChosen:
+      type: object
+      additionalProperties: true
+      required: [node_id, upstream_id, access, model]
+      properties:
+        node_id: { type: string }
+        upstream_id: { type: string }
+        access:
+          type: string
+          enum: [A1, A2, B]
+        model: { type: string }
+
+    RouteDecision:
+      type: object
+      additionalProperties: true
+      required: [decision_id, chosen, quote_version, decided_at]
+      description: |
+        只追加的决策记录。相同 (`snapshot_ts`,`quote_version`,`policy_version`,`request_digest`)
+        必得同一决策；**不含**评分权重、阈值与正文。
+      properties:
+        decision_id: { type: string }
+        chosen:
+          $ref: '#/components/schemas/RouteChosen'
+        eta_seconds:
+          type: integer
+          minimum: 0
+        price:
+          $ref: '#/components/schemas/Amount'
+        price_saved_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: 可选；相对公开参考价的节省比例（仅展示，结算以账本为准）。
+        quote_version: { type: string }
+        policy_version: { type: string }
+        snapshot_ts: { type: string, format: date-time }
+        tie_break:
+          type: string
+          description: 固定顺序：内网亲和 → 质量系数 → node_id 字典序；不含平台收入因子。
+        fallback_used: { type: boolean }
+        fallbacks:
+          type: array
+          items:
+            $ref: '#/components/schemas/RouteChosen'
+        eliminated:
+          type: array
+          description: 淘汰候选与**粗粒度淘汰码**（不含阈值）。
+          items:
+            type: object
+            additionalProperties: true
+            required: [node_id, reason_code]
+            properties:
+              node_id: { type: string }
+              reason_code: { type: string }
+        decided_at: { type: string, format: date-time }
+
+    ReplayRequest:
+      type: object
+      additionalProperties: true
+      required: [from, to]
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        kind:
+          type: string
+          enum: [realtime, batch]
+        decision_ids:
+          type: array
+          description: 可选；只复算指定决策（缺省复算窗口内全部）。
+          items: { type: string }
+
+    ReplayAccepted:
+      type: object
+      additionalProperties: true
+      required: [job_id, state, requested_at]
+      properties:
+        job_id: { type: string }
+        state:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        decisions_total:
+          type: integer
+          minimum: 0
+        requested_at: { type: string, format: date-time }
+
+
+    # ------------------------------------------------------------ 定价补充（M04 §4.1，AH-1）
+    QuoteRequest:
+      type: object
+      additionalProperties: true
+      required: [access, model, unit, ttl_s]
+      description: 供方区间报价。区间可单边缺省（缺省端按 0 / 不设上限处理）。
+      properties:
+        node_id:
+          type: string
+          description: 可选；缺省按当前 `X-Client-Key` 对应节点。
+        access:
+          type: string
+          enum: [A1, A2, B]
+        model: { type: string }
+        unit:
+          type: string
+          description: 计量单位（与 Amount.unit 一致，如 token）。
+        price_min:
+          $ref: '#/components/schemas/Amount'
+        price_max:
+          $ref: '#/components/schemas/Amount'
+        ttl_s:
+          type: integer
+          minimum: 1
+          description: 报价有效期（秒）；到期转 `expired`，不复活。
+
+    QuoteAck:
+      type: object
+      additionalProperties: true
+      required: [quote_id, state, quote_version, expires_at]
+      properties:
+        quote_id: { type: string }
+        state:
+          type: string
+          enum: [active, consumed, expired]
+        quote_version: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    BidRequest:
+      type: object
+      additionalProperties: true
+      required: [model]
+      description: 用方区间出价。未设端取 0 / 不设上限（单边比较，INV-01）。
+      properties:
+        model: { type: string }
+        min_price:
+          $ref: '#/components/schemas/Amount'
+        max_price:
+          $ref: '#/components/schemas/Amount'
+        strategy:
+          type: string
+          enum: [mid, floor, ceiling]
+          description: 取价策略（mid 默认 / floor 冷启动 / ceiling 供给紧张）。
+        window_seconds:
+          type: integer
+          minimum: 1
+          description: 出价有效窗口（秒）。
+
+    BidAck:
+      type: object
+      additionalProperties: true
+      required: [bid_id, state, expires_at]
+      properties:
+        bid_id: { type: string }
+        state:
+          type: string
+          enum: [active, expired]
+        expires_at: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ 计量与收据（M05，spec 1.2.0）
+    UsageRecord:
+      type: object
+      additionalProperties: true
+      required: [usage_id, request_id, state, recorded_at]
+      description: 用量明细（逐次调用）。只含元数据与金额，**不含** prompt / response 正文。
+      properties:
+        usage_id: { type: string }
+        request_id: { type: string }
+        attempt_no:
+          type: integer
+          minimum: 1
+        node_id: { type: string }
+        model: { type: string }
+        access:
+          type: string
+          enum: [A1, A2, B]
+        tokens_in:
+          type: integer
+          minimum: 0
+        tokens_out:
+          type: integer
+          minimum: 0
+        amount:
+          $ref: '#/components/schemas/Amount'
+        usage_source:
+          type: string
+          enum: [client_reported, server_measured, dual, estimated]
+        state:
+          type: string
+          enum: [recorded, settled, corrected]
+        receipt_id: { type: string }
+        correction_id:
+          type: [string, 'null']
+          description: 'state=corrected` 时指向追加的校正记录。'
+        recorded_at: { type: string, format: date-time }
+
+    UsageRecordPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageRecord'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    ReceiptStatus:
+      type: object
+      additionalProperties: true
+      required: [receipt_id, state, received_at]
+      description: 收据受理状态（节点自查）。`duplicate` 返回首次结果，不重复计量。
+      properties:
+        receipt_id: { type: string }
+        state:
+          type: string
+          enum: [accepted, rejected, duplicate, expired]
+        code:
+          type: integer
+          description: 拒绝 / 过期时的数字错误码（如 `46001` 签名不匹配）。
+        message:
+          type: string
+          description: 只描述契约问题（签名 / 字段），不含内部细节。
+        received_at: { type: string, format: date-time }
+        settled_at:
+          type: [string, 'null']
+          format: date-time
+
+    UpstreamBillRow:
+      type: object
+      additionalProperties: true
+      required: [row_id, amount]
+      properties:
+        row_id:
+          type: string
+          description: 上游账单行号（幂等键的一半：(usage_id, upstream_bill_id)）。
+        access:
+          type: string
+          enum: [A1, A2, B]
+        model: { type: string }
+        usage_id: { type: string }
+        amount:
+          $ref: '#/components/schemas/Amount'
+
+    RejectedBillRow:
+      type: object
+      additionalProperties: true
+      required: [row_id, code, message]
+      properties:
+        row_id: { type: string }
+        code: { type: integer }
+        message: { type: string }
+
+    UpstreamBillImportRequest:
+      type: object
+      additionalProperties: true
+      required: [provider, period, rows]
+      description: 逐行受理，单行失败不回滚整批；导入只追加，不覆盖原用量。
+      properties:
+        provider:
+          type: string
+          description: 上游供应方标识。
+        period:
+          type: string
+          pattern: '^[0-9]{4}-[0-9]{2}$'
+        checksum:
+          type: string
+          description: 账单文件校验和（用于重放检测；同名同校验和重复导入幂等）。
+        rows:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/UpstreamBillRow'
+
+    UpstreamBillImportAck:
+      type: object
+      additionalProperties: true
+      required: [import_id, rows_accepted, rows_rejected, imported_at]
+      properties:
+        import_id: { type: string }
+        rows_accepted:
+          type: integer
+          minimum: 0
+        rows_rejected:
+          type: integer
+          minimum: 0
+        total_amount:
+          $ref: '#/components/schemas/Amount'
+        rejected:
+          type: array
+          items:
+            $ref: '#/components/schemas/RejectedBillRow'
+        imported_at: { type: string, format: date-time }
+
+    UsageCorrectionRequest:
+      type: object
+      additionalProperties: true
+      required: [usage_id, delta, reason_code]
+      description: |
+        校正只追加（不改历史行）。校正额 ≥50 USD 时 `second_approver` 必填且 ≠ 操作人；
+        负向校正（退款方向）必须人工复核。
+      properties:
+        usage_id: { type: string }
+        upstream_bill_id: { type: string }
+        delta:
+          $ref: '#/components/schemas/Amount'
+        reason_code: { type: string }
+        evidence_ref: { type: string }
+        second_approver: { type: string }
+
+    UsageCorrectionAck:
+      type: object
+      additionalProperties: true
+      required: [correction_id, state]
+      properties:
+        correction_id: { type: string }
+        state:
+          type: string
+          enum: [proposed, applied, rejected]
+        applied_at:
+          type: [string, 'null']
+          format: date-time
+
+    # ------------------------------------------------------------ 账本管理面（M06，spec 1.2.0）
+    TrialBalanceLine:
+      type: object
+      additionalProperties: true
+      required: [coa_code, debit, credit]
+      properties:
+        coa_code: { type: string }
+        name: { type: string }
+        fund_class:
+          type: string
+          enum: [CLIENT, PLATFORM, FEE]
+        debit:
+          $ref: '#/components/schemas/Amount'
+        credit:
+          $ref: '#/components/schemas/Amount'
+        balance:
+          $ref: '#/components/schemas/Amount'
+
+    TrialBalance:
+      type: object
+      additionalProperties: true
+      required: [as_of, unit_type, balanced, totals, accounts]
+      description: 试算平衡。`balanced=false` 即 P0，账本转只读且**不自动修数据**。
+      properties:
+        as_of: { type: string, format: date-time }
+        unit_type:
+          type: string
+          description: 币种维度；COP 与 USD 不互转，借贷平衡只在本 unit_type 内判定。
+        balanced: { type: boolean }
+        totals:
+          type: object
+          additionalProperties: true
+          required: [debit, credit]
+          properties:
+            debit:
+              $ref: '#/components/schemas/Amount'
+            credit:
+              $ref: '#/components/schemas/Amount'
+        tail_diff:
+          $ref: '#/components/schemas/Amount'
+        entry_count:
+          type: integer
+          minimum: 0
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrialBalanceLine'
+
+    LedgerAccount:
+      type: object
+      additionalProperties: true
+      required: [coa_code, unit_type, balance]
+      description: 科目与派生余额（`account_balances` 为唯一余额源，可由分录全量重建）。
+      properties:
+        coa_code: { type: string }
+        name: { type: string }
+        unit_type: { type: string }
+        fund_class:
+          type: string
+          enum: [CLIENT, PLATFORM, FEE]
+        balance:
+          $ref: '#/components/schemas/Amount'
+        updated_at: { type: string, format: date-time }
+
+    LedgerAccountPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/LedgerAccount'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    MerkleCommitment:
+      type: object
+      additionalProperties: true
+      required: [period, kind, root, entry_count, published_at]
+      description: 期间根。可由当期分录重算复现；发布后不可改（INV-13）。
+      properties:
+        period:
+          type: string
+          description: 锚定周期；日 `YYYY-MM-DD` 或小时 `YYYY-MM-DDTHH`。
+        kind:
+          type: string
+          enum: [journal, daily_close]
+          description: M06 负责 journal / daily_close 两类根；audit / por 根归 M16 / M09。
+        root:
+          type: string
+          description: Merkle 根（十六进制）。
+        entry_count:
+          type: integer
+          minimum: 0
+        published_at: { type: string, format: date-time }
+        reproducible:
+          type: boolean
+          description: 重算一致为 true；false 表示存在差异（P0，转只读）。
+        verify_hint:
+          type: string
+          description: 重算所需的只读入口提示（不返回内部算法参数）。
+
+    RecomputeRequest:
+      type: object
+      additionalProperties: true
+      description: 全量复算入参。复算只读，不修数据；`dry_run` 默认 true。
+      properties:
+        period:
+          type: string
+          pattern: '^[0-9]{4}-[0-9]{2}(-[0-9]{2}(T[0-9]{2})?)?$'
+          description: 可选；缺省复算全部期间。
+        scope:
+          type: string
+          enum: [period, all]
+          default: all
+        dry_run:
+          type: boolean
+          default: true
+          description: 为 false 时发布校验结果（仍不修数据）。
+
+    RecomputeAck:
+      type: object
+      additionalProperties: true
+      required: [job_id, state, requested_at]
+      properties:
+        job_id: { type: string }
+        state:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        dry_run: { type: boolean }
+        diff_count:
+          type: integer
+          minimum: 0
+          description: 差异条数；≠0 即 P0，冻结账本写入口。
+        verified: { type: boolean }
+        requested_at: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ 账本凭证与冲正（M06 §4.1，AH-1）
+    JournalLine:
+      type: object
+      additionalProperties: true
+      required: [line_no, coa_code, dc, amount]
+      properties:
+        line_no:
+          type: integer
+          minimum: 1
+        ledger_entry_id: { type: string }
+        account_id: { type: string }
+        coa_code:
+          type: string
+          description: 科目代码（42 条白名单内；未知科目读路径报错，不静默跳过）。
+        dc:
+          type: string
+          enum: [debit, credit]
+          description: 借贷方向（库内 `D` / `C`，对外统一为 debit / credit）。
+        amount:
+          $ref: '#/components/schemas/Amount'
+        fund_class:
+          type: string
+          enum: [CLIENT, PLATFORM, FEE]
+        wallet_id: { type: string }
+
+    JournalVoucher:
+      type: object
+      additionalProperties: true
+      required: [journal_id, ts, state, lines]
+      description: 凭证（一次资金事件的凭证）。只有 posted / voided 两种状态，禁止覆盖写。
+      properties:
+        journal_id: { type: string }
+        ts: { type: string, format: date-time }
+        unit_type:
+          type: string
+          description: 币种维度；借贷平衡只在本 unit_type 内判定。
+        source_type:
+          $ref: '#/components/schemas/SourceType'
+        source_id: { type: string }
+        event_seq:
+          type: integer
+          minimum: 1
+        policy_version: { type: string }
+        fx_rate_ref: { type: string }
+        reversal_of_journal:
+          type: [string, 'null']
+          description: 冲正指向的原凭证；非冲正为 null。
+        reverse_chain:
+          type: array
+          description: 冲正链（按时间顺序的 journal_id）。
+          items: { type: string }
+        hash: { type: string }
+        state:
+          type: string
+          enum: [posted, voided]
+        lines:
+          type: array
+          minItems: 2
+          items:
+            $ref: '#/components/schemas/JournalLine'
+
+    ReversalRequest:
+      type: object
+      additionalProperties: true
+      required: [journal_id, reason, second_approver]
+      properties:
+        journal_id:
+          type: string
+          description: 待冲正的原凭证；每张原凭证至多一条冲正。
+        reason:
+          type: string
+          maxLength: 500
+        evidence_ref: { type: string }
+        second_approver:
+          type: string
+          description: 复核人（≠ 操作人）；缺失或不一致 → 409 + `40902`。
+
+    ReversalAck:
+      type: object
+      additionalProperties: true
+      required: [reversal_id, journal_id, state, created_at]
+      properties:
+        reversal_id:
+          type: string
+          description: 冲正凭证 `journal_id`（新凭证，不改原凭证）。
+        journal_id:
+          type: string
+          description: 原凭证 `journal_id`。
+        state:
+          type: string
+          enum: [pending_approval, posted, rejected]
+        created_at: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ 配置中心补充（M10，spec 1.2.0）
+    ConfigNamespace:
+      type: object
+      additionalProperties: true
+      required: [namespace, item_count]
+      properties:
+        namespace:
+          type: string
+          description: 配置命名空间（十域注册见 03-facts §9）。
+        item_count:
+          type: integer
+          minimum: 0
+        prefixes:
+          type: array
+          items: { type: string }
+        consumers:
+          type: array
+          items: { type: string }
+        dangerous_keys:
+          type: array
+          description: 不可经 API 修改的危险键（危险键禁改，403 + `47004`）。
+          items: { type: string }
+
+    ConfigNamespaceList:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigNamespace'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    ConfigDiffChange:
+      type: object
+      additionalProperties: true
+      required: [path, before, after]
+      properties:
+        path:
+          type: string
+          description: 变更位置（JSON Pointer）。
+        before:
+          description: 旧值；敏感项为掩码。
+        after:
+          description: 新值；敏感项为掩码。
+        masked:
+          type: boolean
+          default: false
+          description: 为 true 时 before / after 已脱敏，**永不**返回明文。
+
+    ConfigDiff:
+      type: object
+      additionalProperties: true
+      required: [key, from_version, to_version, changes]
+      properties:
+        key: { type: string }
+        scope: { type: string }
+        from_version:
+          type: integer
+          minimum: 1
+        to_version:
+          type: integer
+          minimum: 1
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigDiffChange'
+        digest_before: { type: string }
+        digest_after: { type: string }
+
+    ConfigImpact:
+      type: object
+      additionalProperties: true
+      required: [key, risk_level, consumers, affected_modules]
+      description: 发布前影响面（发布单前置输入，不改变运行值）。
+      properties:
+        key: { type: string }
+        scope: { type: string }
+        risk_level:
+          type: string
+          enum: [P0, P1, P2]
+        consumers:
+          type: array
+          items: { type: string }
+        affected_modules:
+          type: array
+          items: { type: string }
+        requires_restart:
+          type: boolean
+          description: 为 true 时需消费方重启或重新加载才生效。
+        effective_on:
+          type: string
+          enum: [immediate, next_anchor, next_restart]
+        gray_buckets:
+          type: array
+          description: 灰度桶序列（1 → 5 → 25 → 100）；P0 不得跳过观测窗。
+          items:
+            type: integer
+            minimum: 1
+            maximum: 100
+        notes:
+          type: string
+
+    ConfigPromoteRequest:
+      type: object
+      additionalProperties: true
+      required: [target_stage]
+      properties:
+        target_stage:
+          type: string
+          enum: [next_bucket, full]
+        reason:
+          type: string
+          maxLength: 500
+        observe_window_satisfied:
+          type: boolean
+          description: 观测窗已满方可推进；false 或缺失 → 409 + `47007`。
+
+    ConfigAuditEvent:
+      type: object
+      additionalProperties: true
+      required: [at, action, result]
+      description: 配置审计事件（事实源为 M16 `audit_log`，本端点只读聚合）。
+      properties:
+        at: { type: string, format: date-time }
+        action:
+          type: string
+          enum: [draft_created, publish_requested, approved, rejected, promoted, rolled_back, kill_switch, drift_detected]
+        actor: { type: string }
+        key: { type: string }
+        scope: { type: string }
+        version:
+          type: integer
+          minimum: 1
+        request_id: { type: string }
+        result:
+          type: string
+          enum: [ok, denied, failed]
+
+    ConfigAuditPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigAuditEvent'
+        page:
+          $ref: '#/components/schemas/Page'
