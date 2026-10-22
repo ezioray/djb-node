@@ -17,7 +17,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.0
+  version: 1.2.1
   summary: W1 契约冻结（67 路径 / 76 操作；覆盖 M01–M06、M10）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
@@ -1285,7 +1285,8 @@ paths:
         `method` 区分登录方式，成功后返回会话令牌。MFA 未完成时返回 `mfa_required=true`
         的短期令牌（只可用于 step-up 换正式令牌）。凭据错误统一 `40110`，
         **不区分**「账号不存在」与「口令错误」（防枚举）；失败锁定与风控只给
-        429 / 403 + 粗粒度原因码，不含阈值与名单。扫码登录的轮询中间态复用本条端点。
+        429 / 403 + 粗粒度原因码，不含阈值与名单。扫码登录的**轮询中间态**复用本条端点：
+        票据未确认时返回 `202` + `ScanStatus`，确认后返回 `200` 令牌。
       security: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1303,6 +1304,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/LoginResponse' }
+        '202':
+          description: |
+            扫码登录中间态（轮询）。响应体**顶层即 `ScanStatus`**（`status` / `expires_at` /
+            `retry_after_s`），客户端按 `retry_after_s` 继续轮询同一条端点；`confirmed` 后
+            下一次轮询返回 `200` 令牌；过期 / 已用 / 未知票据返回 `409` + `40905`（一次性令牌家族）。
+            **过渡期**：M01-T2 额外携带一份 `scan` 同值包裹（`{status, expires_at, retry_after_s}`），
+            属纯增量；`ScanStatus` 声明 `additionalProperties: true` 允许该包裹，客户端只读顶层字段。
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanStatus' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -2967,6 +2980,10 @@ components:
                 47004 危险键禁改 / 47005 冷却期未到 / 47006 目标版本不存在 / 47007 灰度或观测窗非法 /
                 47008 发布窗口外 / 47009 需 step-up）。
 
+                spec 1.2.1 新登记（M01 T2 已在用，仅文档补登；不改结构/响应/枚举）：
+                `40103` 刷新令牌无效 / 已轮换或撤销（重放）/ 过期 → 重新登录（HTTP 401）；
+                `40905` 一次性令牌失效（扫码票据 / 邀请令牌：已用、过期、票据与账户不匹配）→ 重新发起（HTTP 409）。
+
                 未登记的码一律不返回；新增码先改本 spec 与 04 码段表。其余以产品设计 §6.3 与附录 C.4 为准。
             message:
               type: string
@@ -4517,6 +4534,35 @@ components:
           type: string
           description: 配额变更生成新版本，随请求写入，不覆盖历史。
         effective_at: { type: string, format: date-time }
+
+    ScanStatus:
+      type: object
+      additionalProperties: true
+      required: [status, expires_at, retry_after_s]
+      description: |
+        扫码登录票据的轮询状态（一次性票据，中间态 TTL ≤120 s）。票据只存 `sha256(ticket)`，
+        明文只出现在二维码里一次，不落库、不落日志。`202` 响应**顶层**即本 schema 的三个字段；
+        过渡期另带 `scan` 同值包裹（`additionalProperties: true` 允许，客户端读顶层）。
+        正常收尾：`confirmed` 后下一次轮询返回 `200` 令牌；过期 / 已用 / 未知票据返回
+        `409` + `40905`。202 中实际可见 `pending` 与 `scanned`；M01-T2 已把内部 `created`
+        映射为对外 `pending`。
+      properties:
+        status:
+          type: string
+          enum: [pending, created, scanned, confirmed, expired]
+          description: |
+            票据状态。`created` 是 M01-T2 更早的内部实现值，与 `pending` **同义**；对外已映射为
+            `pending`（S1 保留同义值，S2 前收敛，见 CR-5），客户端两者都必须接受。
+            `confirmed` / `expired` 保留以覆盖同义实现，正常收尾分别为 `200` / `409`。
+            未知值忽略不报错（tolerant reader，只加不改）。
+        expires_at:
+          type: string
+          format: date-time
+          description: 票据到期时间（UTC）；到期后必须重新发起扫码，不得续期。
+        retry_after_s:
+          type: integer
+          minimum: 1
+          description: 建议轮询间隔（秒）；实现取 min(5, 剩余秒)，下限 1。
 
     # ------------------------------------------------------------ 节点供给（M02，spec 1.2.0）
     NodePairRequest:
