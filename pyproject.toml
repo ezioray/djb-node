@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "djb-node"
+version = "0.1.0"
+description = "DJB 联脑 · M15 client-runtime（Linux CLI + daemon，S1）"
+readme = "README-CLIENT.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "DJB M15 client-seat" }]
+keywords = ["djb", "node", "client", "cli", "daemon"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "License :: OSI Approved :: Apache Software License",
+]
+# S1 刻意零第三方运行时依赖：只用标准库，便于在最小服务器镜像上安装。
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+djb = "djb_node.cli:main"
+
+[tool.setuptools]
+packages = ["djb_node"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
