@@ -17,8 +17,8 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.3
-  summary: W1 冻结 + M16 审计链 + W2 通知/对账（80 路径 / 90 操作；覆盖 M01–M06、M09、M10、M12、M16）
+  version: 1.2.4
+  summary: W1 冻结 + M16 审计链 + W2 模块面（97 路径 / 109 操作；覆盖 M01–M13、M16）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
@@ -3110,6 +3110,521 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ---------------------------------------------------------------- 信誉与 COP（M07）
+  /api/v1/user/reputation:
+    get:
+      tags: [user]
+      operationId: getMyReputation
+      summary: 我的信誉分、等级与四项系数
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 信誉档案
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReputationProfile' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/reputation/events:
+    get:
+      tags: [user]
+      operationId: listMyReputationEvents
+      summary: 指标事件（游标分页，可复算）
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 指标事件分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReputationEventPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/cop:
+    get:
+      tags: [user]
+      operationId: getMyCopBalance
+      summary: COP 可用 / 锁定 / 累计
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: COP 余额
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CopBalance' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/cop/ledger:
+    get:
+      tags: [user]
+      operationId: listMyCopLedger
+      summary: COP 台账（来源、锁定到期）
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: COP 台账分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CopLedgerPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/cop/redemptions:
+    post:
+      tags: [user]
+      operationId: createCopRedemption
+      summary: 申请兑换（扣减 COP，发 cop.spent）
+      description: 只扣 available；locked 不可兑换。余额不足返回 402 + 40201；开关/锁定/校验失败返回 409 + 40902 或 422 + 42240。
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CopRedemptionRequest' }
+      responses:
+        '201':
+          description: 兑换单
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CopRedemption' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/cop/redemptions/{id}:
+    get:
+      tags: [user]
+      operationId: getCopRedemption
+      summary: 兑换单状态
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 兑换单
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CopRedemption' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/user/cop/transfers:
+    post:
+      tags: [user]
+      operationId: createCopTransfer
+      summary: 用户间转让（points.transfer_enabled=true 时）
+      description: 开关关闭返回 409 + 40902；锁定期内、超额、自转等校验失败返回 422 + 42240。收款方所得入 locked。
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CopTransferRequest' }
+      responses:
+        '201':
+          description: 转让结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CopTransfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/cop/invites:
+    get:
+      tags: [user]
+      operationId: listMyInvites
+      summary: 我的邀请、绑定状态与累计奖励
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 邀请概览
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InviteOverview' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/reputation/scores:
+    get:
+      tags: [admin]
+      operationId: listReputationScores
+      summary: 后台只读：账户评分与等级
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: tier
+          in: query
+          required: false
+          schema: { type: string, enum: [L1, L2, L3, L4, L5] }
+        - name: min_score
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, maximum: 1000 }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 评分分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReputationScorePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/reputation/grants:
+    post:
+      tags: [admin]
+      operationId: createReputationGrant
+      summary: 人工授予 / 扣回 COP（双人复核 + 理由）
+      description: 必须带 step-up（424/42401）与理由；复核人不得等于发起人（409/40919）。账户不存在返回 404 + 40401。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReputationGrantRequest' }
+      responses:
+        '201':
+          description: 授予结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReputationGrant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- 风控（M11）
+  /api/v1/admin/risk/rules:
+    get:
+      tags: [admin]
+      operationId: listRiskRules
+      summary: 规则元数据列表（不含阈值）
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: enabled
+          in: query
+          required: false
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 规则分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskRulePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [admin]
+      operationId: createRiskRule
+      summary: 注册 / 变更规则元数据（阈值仍在 M10 配置，不入库不入响应）
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RiskRuleRequest' }
+      responses:
+        '201':
+          description: 规则
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskRule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+
+  /api/v1/admin/risk/limits:
+    get:
+      tags: [admin]
+      operationId: listRiskLimits
+      summary: 限额查询（subject 过滤）
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: subject_type
+          in: query
+          required: false
+          schema: { type: string, enum: [account, node, key, address] }
+        - name: subject_id
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 限额分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskLimitPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [admin]
+      operationId: setRiskLimit
+      summary: 设置 / 调整限额
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RiskLimitRequest' }
+      responses:
+        '201':
+          description: 限额
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskLimit' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+
+  /api/v1/admin/risk/cases:
+    get:
+      tags: [admin]
+      operationId: listRiskCases
+      summary: 案件列表
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [opened, triaged, actioned, appealed, in_review, closed, merged, dismissed]
+        - name: subject
+          in: query
+          required: false
+          description: 主体哈希（不接受明文账号 / IP / 设备号）
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 案件分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskCasePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/risk/cases/{id}:
+    get:
+      tags: [admin]
+      operationId: getRiskCase
+      summary: 案件详情（证据引用，不含阈值 / 名单）
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 案件详情
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskCaseDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin/risk/cases/{id}/decisions:
+    post:
+      tags: [admin]
+      operationId: decideRiskCase
+      summary: 处置决定（冻结 / 解冻 / 清退提案 / 驳回 / 并案 / 关闭）
+      description: 必须带理由与 step-up；无证据引用返回 400 + 48004；越权返回 403 + 48006。冻结只产生提案事件给 M01，本模块不改账户状态。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RiskDecisionRequest' }
+      responses:
+        '201':
+          description: 处置结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskDecision' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+
+  /api/v1/admin/risk/appeals:
+    post:
+      tags: [admin]
+      operationId: createRiskAppeal
+      summary: 受理申诉
+      description: 同一案件重复申诉或超期返回 409 + 48003。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RiskAppealRequest' }
+      responses:
+        '201':
+          description: 申诉
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskAppeal' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/admin/risk/appeals/{id}/decide:
+    post:
+      tags: [admin]
+      operationId: decideRiskAppeal
+      summary: 申诉裁决（维持 / 撤销并恢复）
+      description: 裁决人不得是原处置人（403 + 48006）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RiskAppealDecisionRequest' }
+      responses:
+        '200':
+          description: 裁决
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskAppeal' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+
 components:
 
   securitySchemes:
@@ -3433,6 +3948,11 @@ components:
                 spec 1.2.1 新登记（M01 T2 已在用，仅文档补登；不改结构/响应/枚举）：
                 `40103` 刷新令牌无效 / 已轮换或撤销（重放）/ 过期 → 重新登录（HTTP 401）；
                 `40905` 一次性令牌失效（扫码票据 / 邀请令牌：已用、过期、票据与账户不匹配）→ 重新发起（HTTP 409）。
+
+                spec 1.2.4 新登记（W2 信誉 / 风控错误码，仅文档补登）：
+                `42240` COP 兑换 / 转让校验失败（锁定期、限额、自转等，HTTP 422）；
+                风控 `48001` 限额命中（对外只给粗粒度原因）/ `48002` 案件已存在 / `48003` 申诉超期或重复 /
+                `48004` 证据缺失 / `48005` 规则或限额版本冲突 / `48006` 处置越权（HTTP 400–409）。
 
                 spec 1.2.3 新登记（W2 通知 / 对账错误码，仅文档补登）：
                 `40902` 不可退订 / 偏好冲突（M12：P0 通知不得退订，HTTP 409）；
@@ -6315,4 +6835,407 @@ components:
           type: array
           items: { type: string }
           description: 人类可读的拒绝原因（不含凭证正文 / 签名 / 金额明细）。
+
+
+    ReputationProfile:
+      type: object
+      additionalProperties: true
+      required: [score, tier, quality_coef, stability_coef, window_days, policy_version, computed_at]
+      properties:
+        score: { type: integer, minimum: 0, maximum: 1000 }
+        tier:
+          type: string
+          enum: [L1, L2, L3, L4, L5]
+        quality_coef: { type: number }
+        stability_coef: { type: number }
+        window_days: { type: integer, minimum: 1 }
+        policy_version: { type: string }
+        computed_at: { type: string, format: date-time }
+        reasons:
+          type: array
+          items: { type: string }
+          description: 最近变化原因（人类可读，不含阈值）
+
+    ReputationEvent:
+      type: object
+      additionalProperties: true
+      required: [id, metric, value, weight, delta, occurred_at]
+      properties:
+        id: { type: string }
+        metric: { type: string }
+        value: { type: number }
+        weight: { type: number }
+        delta: { type: number }
+        ref_id: { type: [string, 'null'] }
+        occurred_at: { type: string, format: date-time }
+
+    ReputationEventPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/ReputationEvent' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    ReputationScoreRow:
+      type: object
+      additionalProperties: true
+      required: [account_id, score, tier, computed_at]
+      properties:
+        account_id: { type: string }
+        score: { type: integer, minimum: 0, maximum: 1000 }
+        tier:
+          type: string
+          enum: [L1, L2, L3, L4, L5]
+        computed_at: { type: string, format: date-time }
+
+    ReputationScorePage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/ReputationScoreRow' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    CopBalance:
+      type: object
+      additionalProperties: true
+      required: [available, locked, total_earned, unit, updated_at]
+      properties:
+        available: { type: integer, minimum: 0 }
+        locked: { type: integer, minimum: 0 }
+        total_earned: { type: integer, minimum: 0 }
+        unit:
+          type: string
+          enum: [COP]
+        redeemable: { type: boolean }
+        transferable: { type: boolean }
+        updated_at: { type: string, format: date-time }
+
+    CopLedgerEntry:
+      type: object
+      additionalProperties: true
+      required: [id, direction, amount, source, status, created_at]
+      properties:
+        id: { type: string }
+        direction:
+          type: string
+          enum: [credit, debit]
+        amount: { type: integer, minimum: 1 }
+        source:
+          type: string
+          enum: [usage, invite, reward, transfer_in, transfer_out, redeem, revoke]
+        ref_id: { type: string }
+        status:
+          type: string
+          enum: [pending, locked, available, spent, revoked]
+        lock_until: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    CopLedgerPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/CopLedgerEntry' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    CopRedemptionRequest:
+      type: object
+      additionalProperties: true
+      required: [units]
+      properties:
+        units: { type: integer, minimum: 1, description: 兑换的 COP 单位数（整数）。 }
+        target:
+          type: string
+          enum: [service_fee]
+          description: 兑换去向；S1 只支持抵扣服务费。
+
+    CopRedemption:
+      type: object
+      additionalProperties: true
+      required: [redemption_id, units, state, created_at]
+      properties:
+        redemption_id: { type: string }
+        units: { type: integer, minimum: 1 }
+        state:
+          type: string
+          enum: [requested, posted, rejected, expired]
+        created_at: { type: string, format: date-time }
+
+    CopTransferRequest:
+      type: object
+      additionalProperties: true
+      required: [to_account_id, units]
+      properties:
+        to_account_id: { type: string }
+        units: { type: integer, minimum: 1 }
+
+    CopTransfer:
+      type: object
+      additionalProperties: true
+      required: [transfer_id, units, state, created_at]
+      properties:
+        transfer_id: { type: string }
+        units: { type: integer, minimum: 1 }
+        state:
+          type: string
+          enum: [posted, rejected]
+        created_at: { type: string, format: date-time }
+
+    InviteRecord:
+      type: object
+      additionalProperties: true
+      required: [invite_id, status]
+      properties:
+        invite_id: { type: string }
+        invitee_id: { type: [string, 'null'] }
+        status:
+          type: string
+          enum: [sent, bound, expired, revoked]
+        bound_at: { type: [string, 'null'], format: date-time }
+        expire_at: { type: [string, 'null'], format: date-time }
+        earned_units: { type: integer, minimum: 0 }
+
+    InviteOverview:
+      type: object
+      additionalProperties: true
+      required: [data, totals, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/InviteRecord' }
+        totals:
+          type: object
+          additionalProperties: true
+          properties:
+            bound: { type: integer, minimum: 0 }
+            pending: { type: integer, minimum: 0 }
+            earned_units: { type: integer, minimum: 0 }
+        page: { $ref: '#/components/schemas/Page' }
+
+    ReputationGrantRequest:
+      type: object
+      additionalProperties: true
+      required: [account_id, kind, units, reason]
+      properties:
+        account_id: { type: string }
+        kind:
+          type: string
+          enum: [grant, clawback]
+        units: { type: integer, minimum: 1 }
+        reason: { type: string, minLength: 1, maxLength: 512 }
+        approval_id: { type: [string, 'null'] }
+
+    ReputationGrant:
+      type: object
+      additionalProperties: true
+      required: [grant_id, account_id, kind, units, reason, created_at]
+      properties:
+        grant_id: { type: string }
+        account_id: { type: string }
+        kind:
+          type: string
+          enum: [grant, clawback]
+        units: { type: integer, minimum: 1 }
+        reason: { type: string }
+        approval_id: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    RiskRule:
+      type: object
+      additionalProperties: true
+      required: [rule_key, version, enabled, severity, action_class]
+      properties:
+        rule_key: { type: string }
+        version: { type: integer, minimum: 1 }
+        enabled: { type: boolean }
+        severity:
+          type: string
+          enum: [P0, P1, P2, P3]
+        action_class:
+          type: string
+          enum: [observe, throttle, freeze, retire, manual_review]
+        config_ref:
+          type: [string, 'null']
+          description: M10 配置键引用（阈值只在配置里，不进本接口）。
+
+    RiskRuleRequest:
+      type: object
+      additionalProperties: true
+      required: [rule_key, severity, action_class]
+      properties:
+        rule_key: { type: string }
+        enabled: { type: boolean, default: true }
+        severity:
+          type: string
+          enum: [P0, P1, P2, P3]
+        action_class:
+          type: string
+          enum: [observe, throttle, freeze, retire, manual_review]
+        config_ref: { type: [string, 'null'] }
+
+    RiskRulePage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/RiskRule' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    RiskLimit:
+      type: object
+      additionalProperties: true
+      required: [subject_type, subject_id, limit_type, value, window_s]
+      properties:
+        subject_type:
+          type: string
+          enum: [account, node, key, address]
+        subject_id: { type: string }
+        limit_type: { type: string }
+        value: { type: integer, minimum: 0 }
+        window_s: { type: integer, minimum: 0 }
+        expires_at: { type: [string, 'null'], format: date-time }
+
+    RiskLimitRequest:
+      type: object
+      additionalProperties: true
+      required: [subject_type, subject_id, limit_type, value, window_s]
+      properties:
+        subject_type:
+          type: string
+          enum: [account, node, key, address]
+        subject_id: { type: string }
+        limit_type: { type: string }
+        value: { type: integer, minimum: 0 }
+        window_s: { type: integer, minimum: 0 }
+        expires_at: { type: [string, 'null'], format: date-time }
+
+    RiskLimitPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/RiskLimit' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    RiskCase:
+      type: object
+      additionalProperties: true
+      required: [case_id, subject_hash, risk_type, severity, status, opened_at]
+      properties:
+        case_id: { type: string }
+        subject_hash: { type: string, description: 加盐哈希或簇 ID，不存明文。 }
+        risk_type:
+          type: string
+          enum: [self_trade, wash_volume, sybil, malicious_occupancy, receipt_mismatch, key_leak, chargeback_abuse, payout_address, content_abuse]
+        severity:
+          type: string
+          enum: [P0, P1, P2, P3]
+        status:
+          type: string
+          enum: [opened, triaged, actioned, appealed, in_review, closed, merged, dismissed]
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+
+    RiskCasePage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/RiskCase' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    RiskCaseDetail:
+      type: object
+      additionalProperties: true
+      required: [case, evidence_refs]
+      properties:
+        case: { $ref: '#/components/schemas/RiskCase' }
+        evidence_refs:
+          type: array
+          items: { type: string }
+          description: 证据引用（事件 id / 收据 id / 交易号 / 举报单），不含正文与阈值。
+        decisions:
+          type: array
+          items: { $ref: '#/components/schemas/RiskDecision' }
+        appeals:
+          type: array
+          items: { $ref: '#/components/schemas/RiskAppeal' }
+
+    RiskDecisionRequest:
+      type: object
+      additionalProperties: true
+      required: [action, reason, evidence_refs]
+      properties:
+        action:
+          type: string
+          enum: [freeze, unfreeze, retire_proposal, dismiss, merge, close]
+        reason: { type: string, minLength: 1, maxLength: 512 }
+        evidence_refs:
+          type: array
+          minItems: 1
+          items: { type: string }
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: 冻结期限（≤180 天）。
+
+    RiskDecision:
+      type: object
+      additionalProperties: true
+      required: [case_id, action, decided_by, decided_at]
+      properties:
+        case_id: { type: string }
+        action:
+          type: string
+          enum: [freeze, unfreeze, retire_proposal, dismiss, merge, close]
+        reason: { type: string }
+        decided_by: { type: string }
+        decided_at: { type: string, format: date-time }
+        proposal_id: { type: [string, 'null'] }
+
+    RiskAppeal:
+      type: object
+      additionalProperties: true
+      required: [appeal_id, case_id, status, submitted_at, sla_due]
+      properties:
+        appeal_id: { type: string }
+        case_id: { type: string }
+        status:
+          type: string
+          enum: [submitted, in_review, upheld, overturned, closed]
+        submitted_at: { type: string, format: date-time }
+        sla_due: { type: string, format: date-time }
+        outcome: { type: [string, 'null'] }
+
+    RiskAppealRequest:
+      type: object
+      additionalProperties: true
+      required: [case_id, reason]
+      properties:
+        case_id: { type: string }
+        reason: { type: string, minLength: 1, maxLength: 512 }
+
+    RiskAppealDecisionRequest:
+      type: object
+      additionalProperties: true
+      required: [outcome, reason]
+      properties:
+        outcome:
+          type: string
+          enum: [upheld, overturned]
+        reason: { type: string, minLength: 1, maxLength: 512 }
 

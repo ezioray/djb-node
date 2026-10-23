@@ -3,6 +3,43 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.4 · 2026-10-23 · MINOR
+
+**类型**：MINOR（新增 17 条路径 / 19 个操作 / 30 个 schema；无删除、无类型更改、无既有字段语义变更）
+
+**变更**
+1. M07 信誉与 COP 补齐 10 条（CR-2 / CR-4）：
+   用户面 `GET /user/reputation`、`GET /user/reputation/events`、`GET /user/cop`、`GET /user/cop/ledger`、
+   `POST /user/cop/redemptions`、`GET /user/cop/redemptions/{id}`、`POST /user/cop/transfers`、
+   `GET /user/cop/invites`；管理面 `GET /admin/reputation/scores`、`POST /admin/reputation/grants`。
+2. M11 风控补齐 9 个操作（CR-1 / CR-4）：
+   `GET|POST /admin/risk/rules`、`GET|POST /admin/risk/limits`、`GET /admin/risk/cases`、
+   `GET /admin/risk/cases/{id}`、`POST /admin/risk/cases/{id}/decisions`、
+   `POST /admin/risk/appeals`、`POST /admin/risk/appeals/{id}/decide`。
+   阈值 / 权重 / 名单**不入库、不入响应、不入事件**，只出现 `config_ref` 与 `rule_version`（M11 INV-01）。
+3. `Error.code` 文档补登：`42240`（M07 兑换/转让校验失败）、风控段 `48001–48006`。
+4. 既有 1.2.0–1.2.3 的路径、操作、schema、enum、错误码**逐字节未变**。
+
+**影响面**
+- M07 reputation-cop：S1 基础面（评分 / COP 台账 / 邀请）冻结；转让默认关（K4）。
+- M11 risk-abuse：管理面 9 条冻结；限额执行仍由 M03/M04/M08 读 `v_risk_limits` 本地判定，本模块不进转发路径。
+- M14：Ops Console 只读复用两模块列表接口。
+- M08：出款前风控可经信封扩展字段对接（不新增端点）。
+
+**兼容矩阵**
+- v1 未发布 → N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无**（`python3 ci/spec_breaking.py b4a4e7d`）。
+- 与 1.2.3 的关系：纯增量；80 → 97 路径、90 → 109 操作、141 → 171 schema。
+
+**复核人**
+- 提议 / 实现：lead（contract-integrator）
+- 复核：release-manager 发布前复核（内部/管理面）
+
+**备注（复核要点）**
+- `40201`（余额不足）与 `40902`（开关/状态冲突）沿用既有登记；M07 的校验失败统一 `42240`（**不占用** M06 的 `42220–42223`）。
+- `subject_hash` 只接受加盐哈希 / 簇 ID；不接受明文账号 / IP / 设备号（M11 INV-05）。
+- 风控处置只产生提案（`proposal_id`），账户状态仍由 M01 执行（M11 INV-04）。
+
 ## 1.2.3 · 2026-10-23 · MINOR
 
 **类型**：MINOR（新增 10 条路径 / 10 个操作 / 14 个 schema；无删除、无类型更改、无既有字段语义变更）
