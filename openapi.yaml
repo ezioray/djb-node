@@ -17,8 +17,8 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.5
-  summary: W1 冻结 + M16 审计链 + W2 模块面（122 路径 / 140 操作；覆盖 M01–M14、M16）
+  version: 1.2.6
+  summary: W1 冻结 + M16 审计链 + W2/W3 契约面（125 路径 / 143 操作；覆盖 M01–M14、M16）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
@@ -77,12 +77,10 @@ tags:
     description: 后台只读查询（内网/VPN + 强 MFA，公网不可达）
   - name: ops
     description: 平台运维内部面（mTLS + 服务令牌；公网不可达；审计链只追加）
-  - name: Treasury
-    description: 支付与资金面（M08：订单 / 回调 / 钱包池 / 归集 / 分润 / 退款 / 签名意图；资金写不自动重试）
-  - name: AdminData
-    description: 数据治理（M14：导出申请 / 保留任务；只读聚合 + Owner 执行）
-  - name: AdminOps
-    description: 运维中心（M14：健康总览 / 变更日历 / 批量五步 / 操作回放；只读聚合）
+  - name: pay
+    description: 用方支付面（M08：支付订单 / PSP 回调 / 退款；资金写不自动重试；管理面见 admin）
+  - name: provider
+    description: 共享方控制台面（M08 分润 / 出款地址；M04 报价设置；不与 pay 合并）
 
 paths:
   # ---------------------------------------------------------------- 网关
@@ -147,7 +145,9 @@ paths:
       operationId: listModels
       description: |
         返回可路由模型（模型 slug 不可变，见正式文档 §18.1）。价格是公开信息但不是
-        结算依据；结算以账本分录为准。
+        结算依据；结算以账本分录为准。鉴权保持 `userBearer`（1.2.6 **不改**鉴权）；
+        `price_version` 为**可选**字段：公开侧（未登录文档站 / 降级镜像）可缺省或不返回，
+        客户端必须容忍缺失并按降级展示，不得据此推断结算价。
       security:
         - userBearer: []
       parameters:
@@ -1134,7 +1134,7 @@ paths:
 
   /api/v1/provider/quote-settings:
     get:
-      tags: [node]
+      tags: [provider]
       summary: 读取供方报价设置（价格范围）
       operationId: getProviderQuoteSettings
       security:
@@ -1150,7 +1150,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     put:
-      tags: [node]
+      tags: [provider]
       summary: 覆盖式更新供方报价设置
       operationId: updateProviderQuoteSettings
       security:
@@ -3636,7 +3636,7 @@ paths:
   # 敏感边界：schema 不含卡号、私钥 / 助记词、完整签名；只存结论与哈希引用。
   /api/v1/pay/orders:
     post:
-      tags: [Treasury]
+      tags: [pay]
       operationId: createPaymentOrder
       summary: 创建支付订单（PSP 通道 / 链上收款；一单一币种）
       description: |
@@ -3670,7 +3670,7 @@ paths:
 
   /api/v1/pay/orders/{id}:
     get:
-      tags: [Treasury]
+      tags: [pay]
       operationId: getPaymentOrder
       summary: 订单状态与尝试明细（只读）
       description: |
@@ -3702,7 +3702,7 @@ paths:
 
   /api/v1/pay/webhooks/{provider}:
     post:
-      tags: [Treasury]
+      tags: [pay]
       operationId: receivePaymentWebhook
       summary: PSP 回调（独立验签端点，不进用户鉴权）
       description: |
@@ -3743,7 +3743,7 @@ paths:
 
   /api/v1/pay/refund-requests:
     post:
-      tags: [Treasury]
+      tags: [pay]
       operationId: createRefundRequest
       summary: 退款申请（原路、14 天窗口、唯一 refund_request）
       description: |
@@ -3778,7 +3778,7 @@ paths:
 
   /api/v1/provider/payouts:
     get:
-      tags: [Treasury]
+      tags: [provider]
       operationId: listProviderPayouts
       summary: 共享方分润批次与明细（只读）
       description: |
@@ -3811,7 +3811,7 @@ paths:
 
   /api/v1/provider/payout-address:
     post:
-      tags: [Treasury]
+      tags: [provider]
       operationId: updateProviderPayoutAddress
       summary: 出款地址新增 / 变更（72h 冷却 + 首笔试转）
       description: |
@@ -3846,7 +3846,7 @@ paths:
 
   /api/v1/admin/treasury/pools:
     get:
-      tags: [Treasury]
+      tags: [admin]
       operationId: listTreasuryPools
       summary: 钱包池深度（只读）
       description: |
@@ -3878,7 +3878,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: createTreasuryPool
       summary: 新建钱包池（池键不可变）
       description: |
@@ -3912,7 +3912,7 @@ paths:
 
   /api/v1/admin/treasury/provision:
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: provisionTreasuryWallets
       summary: 预生成钱包（描述符 + 批次；不碰钱）
       description: |
@@ -3946,7 +3946,7 @@ paths:
 
   /api/v1/admin/treasury/activate/{batch}:
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: activateTreasuryBatch
       summary: 批量激活（HSM 验 2/3 签；24h TTL）
       description: |
@@ -3987,7 +3987,7 @@ paths:
 
   /api/v1/admin/treasury/switch:
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: switchTreasuryWallet
       summary: 手动 / 重试地址切换（自动切换走内部事件）
       description: |
@@ -4022,7 +4022,7 @@ paths:
 
   /api/v1/admin/treasury/retire:
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: retireTreasuryWallet
       summary: 钱包退休四步（drain → zero → frozen → retire）
       description: |
@@ -4057,7 +4057,7 @@ paths:
 
   /api/v1/admin/treasury/payouts:
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: createTreasuryPayoutBatch
       summary: 分润批次制单（≤50 笔；审批后明细冻结）
       description: |
@@ -4093,7 +4093,7 @@ paths:
 
   /api/v1/admin/treasury/payouts/{id}/approve:
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: approveTreasuryPayoutBatch
       summary: 分润批次复核（须有效 attestation；复核人 ≠ 制单人）
       description: |
@@ -4134,7 +4134,7 @@ paths:
 
   /api/v1/admin/treasury/payouts/{id}/sign-request:
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: requestTreasuryPayoutSignature
       summary: 发起决策人签名请求（不是签名）
       description: |
@@ -4170,7 +4170,7 @@ paths:
 
   /api/v1/admin/treasury/addresses:
     get:
-      tags: [Treasury]
+      tags: [admin]
       operationId: listTreasuryAddresses
       summary: 收款地址白名单与冷却状态（只读）
       description: |
@@ -4202,7 +4202,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: upsertTreasuryAddress
       summary: 新增 / 变更收款地址白名单（72h 冷却 + 首笔试转）
       description: |
@@ -4237,7 +4237,7 @@ paths:
 
   /api/v1/admin/treasury/deposit-address:
     get:
-      tags: [Treasury]
+      tags: [admin]
       operationId: getTreasuryDepositAddress
       summary: 平台收款地址（只读；发布走 POST）
       description: |
@@ -4263,7 +4263,7 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: publishTreasuryDepositAddress
       summary: 发布 / 轮换平台收款地址（GA 强制；S3 开放）
       description: |
@@ -4296,7 +4296,7 @@ paths:
 
   /api/v1/admin/treasury/gas-policy:
     get:
-      tags: [Treasury]
+      tags: [admin]
       operationId: getTreasuryGasPolicy
       summary: gas 策略快照（只读）
       description: |
@@ -4322,7 +4322,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
-      tags: [Treasury]
+      tags: [admin]
       operationId: updateTreasuryGasPolicy
       summary: 切换 gas 模式（下一批生效、不追溯）
       description: |
@@ -4358,7 +4358,7 @@ paths:
   # 链接一次性、TTL ≤15 分钟、文件 7 天失效、导出本身进审计；响应不返回 prompt / 凭据 / 完整签名。
   /api/v1/admin/data/export-requests:
     get:
-      tags: [AdminData]
+      tags: [admin]
       operationId: listAdminDataExportRequests
       summary: 导出申请列表（游标分页）
       description: |
@@ -4395,7 +4395,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
-      tags: [AdminData]
+      tags: [admin]
       operationId: createAdminDataExportRequest
       summary: 建导出申请（step-up + 理由 + 范围）
       description: |
@@ -4430,7 +4430,7 @@ paths:
 
   /api/v1/admin/data/export-requests/{export_id}:
     get:
-      tags: [AdminData]
+      tags: [admin]
       operationId: getAdminDataExportRequest
       summary: 申请状态 + 一次性下载链接（≤15 分钟）
       description: |
@@ -4460,12 +4460,14 @@ paths:
 
   /api/v1/admin/data/export-requests/{export_id}/cancel:
     post:
-      tags: [AdminData]
+      tags: [admin]
       operationId: cancelAdminDataExportRequest
       summary: 取消未执行的导出申请（step-up）
       description: |
-        仅作用于未执行（pending / approved）申请；running / done / failed / expired 返回
-        `409` + `40901`（对象被待复核动作锁定 / 状态不允许）。取消也留痕进审计。
+        取消只作用于未执行（pending / approved）申请，效果为 `state → failed` +
+        `failure_reason=cancelled_by_requester`（**不新增** cancelled 状态值，state 枚举不变）；
+        重复取消幂等返回同一结果（`cancelled_at` 不变）；running / done / failed / expired 返回
+        `409` + `40901`（状态不允许 / 对象被待复核动作锁定）。取消也留痕进审计。
       security: [{ adminBearer: [] }]
       parameters:
         - name: export_id
@@ -4478,7 +4480,7 @@ paths:
         - $ref: '#/components/parameters/RequestId'
       responses:
         '200':
-          description: 已取消（返回更新后的申请；`cancelled_at` / `cancelled_by` 留痕）
+          description: 已取消（`state=failed`、`failure_reason=cancelled_by_requester`；`cancelled_at` / `cancelled_by` 留痕）
           headers:
             X-Request-Id: { $ref: '#/components/headers/RequestId' }
           content:
@@ -4493,7 +4495,7 @@ paths:
 
   /api/v1/admin/data/retention-jobs:
     post:
-      tags: [AdminData]
+      tags: [admin]
       operationId: createRetentionJob
       summary: 触发保留任务（dry-run 可选；step-up）
       description: |
@@ -4527,7 +4529,7 @@ paths:
         '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     get:
-      tags: [AdminData]
+      tags: [admin]
       operationId: listRetentionJobs
       summary: 保留任务与删除报告（只读）
       description: |
@@ -4564,7 +4566,7 @@ paths:
 
   /api/v1/admin/ops/health:
     get:
-      tags: [AdminOps]
+      tags: [admin]
       operationId: getOpsHealth
       summary: 七块健康总览（红 / 黄 / 绿 + 最近变更）
       description: |
@@ -4587,7 +4589,7 @@ paths:
 
   /api/v1/admin/ops/changes:
     get:
-      tags: [AdminOps]
+      tags: [admin]
       operationId: listOpsChanges
       summary: 变更日历（窗口 / 回滚方案 / 影响面）
       description: |
@@ -4614,7 +4616,7 @@ paths:
 
   /api/v1/admin/ops/batch-ops:
     post:
-      tags: [AdminOps]
+      tags: [admin]
       operationId: executeOpsBatch
       summary: 批量操作五步（预览 / 执行 / 撤销）
       description: |
@@ -4658,7 +4660,7 @@ paths:
 
   /api/v1/admin/ops/audit-replay:
     get:
-      tags: [AdminOps]
+      tags: [admin]
       operationId: replayOpsAudit
       summary: 操作回放（按 trace_id / owner_id / action 合并时间线；只读）
       description: |
@@ -4696,6 +4698,132 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+  # ---------------------------------------------------------------- 用户态补丁（M02 / M05，spec 1.2.6）
+  # M13 CR-1 / CR-2：用户控制台所需的节点绑定视图与账单导出；归属 M02 / M05，鉴权 userBearer。
+  /api/v1/user/nodes:
+    get:
+      tags: [user]
+      operationId: listUserNodes
+      summary: 我的节点（绑定状态 / 最近心跳 / 已生效版本）
+      description: |
+        当前账户名下节点（含已解绑历史，`state=revoked`）。`state` 为绑定视图状态
+        （unbound / pending_receipt / bound / revoked），`lifecycle_state` 为 M02 权威生命周期
+        （pending / active / frozen / retired）；两者不一致时以 M02 心跳与 node_events 为准。
+        `applied_version` 为节点回传的已生效版本（M10 running applied_version），未回传为 null；
+        `pending_reason` 给 pending / pending_receipt 的粗粒度原因（不含规则、名单或内部判定）。
+        只返回本账户节点；对象级越权一律 404 + `40401`（不泄露存在性）。
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [unbound, pending_receipt, bound, revoked] }
+        - name: lifecycle_state
+          in: query
+          required: false
+          schema: { type: string, enum: [pending, active, frozen, retired] }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 节点分页（按最近心跳倒序，无心跳排后）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserNodePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/nodes/{node_id}/unbind:
+    post:
+      tags: [user]
+      operationId: unbindUserNode
+      summary: 解绑我的节点（幂等；需 step-up）
+      description: |
+        解绑当前账户下的节点：解除绑定并撤销该节点客户端密钥（立即停单；在途任务允许完成，
+        历史收据与锁定收益不删除，M02 INV-08）。
+        幂等：重复调用返回同一结果（`state=revoked`，`bound_at` 保留，`unbound_at` 不变）。
+        需二次认证（缺 step-up → 424 + `42401`）；节点不属于本账户统一 404 + `40401`；
+        状态不允许（已清退 / 冻结）→ 409（M02 `40902` / `40903` 段）。
+        密钥撤销后旧 `X-Client-Key` 立即失效；换绑需重新配对（`POST /api/v1/node/pair`）。
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserNodeUnbindRequest' }
+      responses:
+        '200':
+          description: 解绑后的节点视图（重复调用返回同一结果）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserNode' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/billing/export:
+    get:
+      tags: [user]
+      operationId: exportUserBilling
+      summary: 导出我的账单（流式 CSV / JSON；Content-Disposition + TTL）
+      description: |
+        流式账单导出，只含当前账户有权数据；不含 prompt / response 正文、凭据与 PII 正文。
+        `format=csv` 返回 `text/csv`（UTF-8 含表头），`format=json` 返回 `application/json`
+        （JSON 数组或 NDJSON 流，按实现；客户端按行 / 数组解析均应容忍）。
+        文件名走 `Content-Disposition: attachment`；流 / 下载凭据有效期由
+        `X-DJB-Export-Expires-At` 给出（TTL，≤15 分钟，过期需重新申请）。
+        服务端不落导出正文；导出本身进审计。时间窗过大请拆分（超限 → 400 + `40001`）。
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: format
+          in: query
+          required: false
+          schema: { type: string, enum: [csv, json], default: csv }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 流式账单（CSV / JSON；错误仍为 JSON 错误信封）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+            Content-Disposition:
+              description: '`attachment; filename="billing-<period>.<csv|json>"`；不暴露内部路径。'
+              schema: { type: string }
+            X-DJB-Export-Expires-At:
+              description: 流 / 下载凭据过期时间（RFC 3339 UTC，TTL ≤15 分钟）；过期需重新申请。
+              schema: { type: string, format: date-time }
+          content:
+            text/csv:
+              schema:
+                type: string
+                description: CSV 文本流（UTF-8，含表头）。
+            application/json:
+              schema:
+                type: string
+                description: JSON 数组或 NDJSON 流（UTF-8）；元素结构按账单口径。
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
 components:
 
   securitySchemes:
@@ -5025,6 +5153,10 @@ components:
                 风控 `48001` 限额命中（对外只给粗粒度原因）/ `48002` 案件已存在 / `48003` 申诉超期或重复 /
                 `48004` 证据缺失 / `48005` 规则或限额版本冲突 / `48006` 处置越权（HTTP 400–409）。
 
+                spec 1.2.6 新登记（仅文档补登；不改结构 / 响应 / 枚举）：
+                `40101` 通用未认证码（HTTP 401）：未认证 / 凭据无效或过期 / 鉴权未接线（fail-closed）；
+                M01 会话、M02 节点密钥、M08 / M14 的未认证路径统一复用，不再另造 401 子码。
+
                 spec 1.2.5 新登记（W2 资金 / 数据与 Ops 错误码，仅文档补登；不改结构 / 响应 / 枚举）：
                 `40310` 支付通道未开启 / `40311` 地区不支持 / `40312` 入金未达所需风控等级（M08，HTTP 403）；
                 `40001` 输入校验失败（HTTP 400）、`40901` 对象被待复核动作锁定（HTTP 409）与
@@ -5209,6 +5341,12 @@ components:
               description: 十进制字符串（不用浮点）。
             unit:
               type: string
+
+        price_version:
+          type: [string, 'null']
+          description: |
+            价格快照版本（M04 model_catalog.price_version / M10 同族），用于三处同源校验。
+            公开侧（未登录文档站 / 降级镜像）可缺省为 null；客户端不得据此推断结算价。
 
     ModelList:
       type: object
@@ -9005,7 +9143,7 @@ components:
         state:
           type: string
           enum: [pending, approved, running, done, failed, expired]
-          description: pending → approved → running → done；终止 failed / expired，过期不自动续期（INV-04）。
+          description: pending → approved → running → done；终止 failed / expired，过期不自动续期（INV-04）。取消经 failed + failure_reason=cancelled_by_requester 表达（不新增 cancelled 值）。
         rows:
           type: integer
           minimum: 0
@@ -9030,7 +9168,7 @@ components:
           description: 文件水印标识（追责用；不含正文）。
         failure_reason:
           type: [string, 'null']
-          description: 失败原因摘要（人类可读；不含内部堆栈 / 凭据）。
+          description: 失败原因摘要（人类可读；不含内部堆栈 / 凭据）；取消时为 cancelled_by_requester。
         cancelled_at: { type: [string, 'null'], format: date-time }
         cancelled_by: { type: [string, 'null'] }
         download:
@@ -9249,7 +9387,7 @@ components:
         step:
           type: string
           enum: [preview, execute, undo]
-          description: 五步流程的入口（无 preview 禁止 execute；INV-03）。
+          description: 五步流程的入口（无 preview 禁止 execute；INV-03）。1.2.6 冻结为三值，增改走 MINOR + 双写。
         action_type:
           type: string
           enum: [notify, tag, freeze, unfreeze, retire, limit_adjust, payout_proposal, refund_proposal]
@@ -9385,3 +9523,50 @@ components:
               type: string
               enum: [ok, unavailable]
         observed_at: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ 用户态补丁（M02 / M05，spec 1.2.6）
+    UserNode:
+      type: object
+      additionalProperties: true
+      required: [node_id, state]
+      properties:
+        node_id: { type: string }
+        state:
+          type: string
+          enum: [unbound, pending_receipt, bound, revoked]
+          description: 绑定视图状态；pending_receipt = 绑定已下发、待节点回执（M13 NodeBindingView 口径）。
+        lifecycle_state:
+          type: string
+          enum: [pending, active, frozen, retired]
+          description: M02 权威生命周期（以心跳与 node_events 为准）。
+        last_seen:
+          type: [string, 'null']
+          format: date-time
+          description: 最近心跳时间（无心跳为 null）。
+        applied_version:
+          type: [string, 'null']
+          description: 节点回传的已生效版本（M10 running applied_version）；未回传为 null。
+        pending_reason:
+          type: [string, 'null']
+          description: pending / pending_receipt 的粗粒度原因（不含规则、名单或内部判定）。
+        bound_at: { type: [string, 'null'], format: date-time }
+        unbound_at: { type: [string, 'null'], format: date-time }
+
+    UserNodePage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/UserNode' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    UserNodeUnbindRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        reason:
+          type: [string, 'null']
+          maxLength: 512
+          description: 解绑原因（人类可读；审计留痕，不含凭据）。

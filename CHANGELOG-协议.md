@@ -3,6 +3,67 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.6 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 3 条路径 / 3 个操作 / 3 个 schema；tag 归一 + 1 个可选字段 + 取消语义与错误码补登；
+无删除、无类型更改、无既有 path / schema 语义变更）
+
+**变更**
+1. **tag 归一（元数据）**：`/api/v1/admin/**` → `tag=admin`；`/api/v1/pay/**` → `tag=pay`（用方支付面）；
+   `/api/v1/provider/**` → **新增 `tag=provider`**（共享方控制台面，不并入 `pay`）。
+   1.2.5 引入的 `Treasury` / `AdminData` / `AdminOps` 三个 tag 全部下线（tag 级出现 0 次），
+   全局 tags 保留 `admin` / `pay` / `provider` 等小写 tag。既有 `/api/v1/provider/quote-settings`
+   （GET / PUT）由 `node` 改为 `provider`，属**仅元数据**变更（鉴权与语义不变，M04 报价设置仍属该端点）。
+2. **M14 枚举与取消语义**：批量操作 `step` 冻结为 `preview|execute|undo`（增改走 MINOR + 双写）；
+   导出取消统一表达为 `state → failed` + `failure_reason=cancelled_by_requester`，
+   **不新增** `cancelled` 状态值（`ExportRequest.state` 六值不变），重复取消幂等。
+3. **M02 用户态端点（M13 CR-1 阻塞）**：
+   `GET /api/v1/user/nodes`（`listUserNodes`）：返回 node_id / state（绑定视图 unbound·pending_receipt·bound·revoked）/
+   lifecycle_state（M02 权威 pending·active·frozen·retired）/ last_seen / applied_version / pending_reason；
+   `POST /api/v1/user/nodes/{node_id}/unbind`（`unbindUserNode`）：幂等解绑（重复调用返回同一结果，
+   撤销客户端密钥、立即停单、保留历史收据与锁定收益），需 step-up（424 + `42401`）。
+   新增 schema `UserNode` / `UserNodePage` / `UserNodeUnbindRequest`；鉴权 `userBearer`。
+4. **`/v1/models` 增补**：`Model.price_version` 为**可选**字段（价格快照版本，M04 model_catalog / M10 同族）；
+   鉴权**不变**（保持 `userBearer`）：公开侧（未登录文档站 / 降级镜像）可缺省该字段，客户端必须容忍缺失。
+5. **M05 账单导出**：`GET /api/v1/user/billing/export`（`exportUserBilling`，归属 M05，`userBearer`）：
+   流式 `text/csv` / `application/json`，`Content-Disposition: attachment`，有效期由
+   `X-DJB-Export-Expires-At` 表达（TTL ≤15 分钟，过期重新申请）；不含正文 / 凭据 / PII 正文。
+6. `Error.code` 文档补登（仅文档）：`40101` 通用未认证码（HTTP 401；未认证 / 凭据无效或过期 /
+   鉴权未接线 fail-closed），M01 会话、M02 节点密钥、M08 / M14 未认证路径统一复用。
+7. 既有 1.2.0–1.2.5 的路径、操作、schema、enum、错误码**语义未变**；仅 tag 元数据归一（见 1）。
+
+**影响面**
+- M02 node-supply：新增用户态节点列表 / 解绑两个端点（所有权仍属 M02；M13 只读消费）。
+- M05 metering-receipt：新增账单导出端点（M05 §4.1 与 01-ownership 需回填 `/api/v1/user/billing/*`）。
+- M13 portal-web：控制台节点绑定视图与账单导出接入；tag 分组变化（admin / pay / provider / user）需同步 SDK 生成。
+- M08 payments-treasury：端点语义不变，仅 tag 由 `Treasury` 归一为 `admin` / `pay` / `provider`。
+- M15 client-runtime：本地镜像 `/v1/models` 已回传 `price_version`；公开侧缺失时按降级展示。
+- 客户端 / SDK：`/v1/models` 新增可选字段；未知字段 / 未知 enum 仍按 tolerant reader 忽略。
+
+**兼容矩阵**
+- v1 未发布 → N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无**（`python3 ci/spec_breaking.py 6b135ae` → ✅ 无破坏性变更；tag 变更不计破坏性）。
+- 与 1.2.5 的关系：纯增量；122 → 125 路径、140 → 143 操作、217 → 220 schema。
+
+**复核人**
+- 提议 / 实现：contract-integrator（task-6 / DEV-SPEC-1.2.6）
+- 复核：lead（「未定项」见证据 `ops/audit/reports/DEV-W0-SPEC-1.2.6-<UTC>.txt`）
+
+**备注（复核要点）**
+- tag 归一：既有 `/api/v1/admin/**` 原本已是 `admin`，未改动；本次只改 1.2.5 新增面与
+  `/api/v1/provider/quote-settings` 一处既有 tag（node → provider）。若下游按 tag 生成 SDK 分组，需重建客户端。
+- **裁决 A（用户节点 state，写入契约不改结构）**：`state` 固定为用户面四值
+  `unbound|pending_receipt|bound|revoked`；响应同时带 `lifecycle_state`（M02 权威
+  `pending|active|frozen|retired`）。映射：无绑定→`unbound`、`pending`→`pending_receipt`、
+  `active`→`bound`、`frozen`→`bound`（另带 restricted 提示，读 `lifecycle_state=frozen`）、
+  `retired`→`revoked`。M02 内部 `NodeBinding.state` 不改名，只做视图映射。
+- **裁决 B（版本命名）**：`applied_version` 保持契约名（M10 running 口径）；
+  M13 规格里的 `last_applied_version` 由 BFF 做字段映射，**不改契约**。
+- **裁决 C（账单导出口径）**：接受 TTL 头（`X-DJB-Export-Expires-At`）表达有效期；
+  若 M05 以后改为离线打包 + 一次性 token，**只加 optional**，不破坏 1.2.6。
+- **裁决 D（回填责任）**：模块规格（M02 §4.1 / M05 §4.1）与 01-ownership 的回填由 Lead 处理，本席不改 modules。
+- 新增端点尚未有实现路由：M02 / M05 需按本契约补 routes；M13 接入前只显示桩（M13 CR-2 口径）。
+
 ## 1.2.5 · 2026-10-24 · MINOR
 
 **类型**：MINOR（新增 25 条路径 / 31 个操作 / 46 个 schema / 3 个 tag；无删除、无类型更改、无既有字段语义变更）
