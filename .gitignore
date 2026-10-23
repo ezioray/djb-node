@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# 本地运行目录 / 凭据 / 数据库 —— 永不入库
+.djb-home/
+*.db
+*.db-wal
+*.db-shm
+credentials.json
+*.key
+logs/
+diagnostics/
