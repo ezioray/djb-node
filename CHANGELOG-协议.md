@@ -3,6 +3,92 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.5 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 25 条路径 / 31 个操作 / 46 个 schema / 3 个 tag；无删除、无类型更改、无既有字段语义变更）
+
+**变更**
+1. M08 支付与资金补齐 21 个操作 / 17 条路径（M08 CR-P3 / CR-P4，M14 CR-2）：
+   - 收款面（用方身份）：`POST /api/v1/pay/orders`（`createPaymentOrder`，201）、
+     `GET /api/v1/pay/orders/{id}`（`getPaymentOrder`）、
+     `POST /api/v1/pay/webhooks/{provider}`（`receivePaymentWebhook`，`security: []` 独立验签端点，不进用户鉴权）、
+     `POST /api/v1/pay/refund-requests`（`createRefundRequest`，201）。
+   - 共享方面：`GET /api/v1/provider/payouts`（`listProviderPayouts`）、
+     `POST /api/v1/provider/payout-address`（`updateProviderPayoutAddress`）。
+   - 钱包池面（管理面，step-up + 幂等键）：`GET|POST /api/v1/admin/treasury/pools`（`listTreasuryPools` / `createTreasuryPool`）、
+     `POST /api/v1/admin/treasury/provision`（`provisionTreasuryWallets`，201）、
+     `POST /api/v1/admin/treasury/activate/{batch}`（`activateTreasuryBatch`）、
+     `POST /api/v1/admin/treasury/switch`（`switchTreasuryWallet`）、
+     `POST /api/v1/admin/treasury/retire`（`retireTreasuryWallet`）。
+   - 出款面：`POST /api/v1/admin/treasury/payouts`（`createTreasuryPayoutBatch`，201）、
+     `POST /api/v1/admin/treasury/payouts/{id}/approve`（`approveTreasuryPayoutBatch`）、
+     `POST /api/v1/admin/treasury/payouts/{id}/sign-request`（`requestTreasuryPayoutSignature`，201）。
+   - 地址与 gas：`GET|POST /api/v1/admin/treasury/addresses`、`GET|POST /api/v1/admin/treasury/deposit-address`、
+     `GET|POST /api/v1/admin/treasury/gas-policy`。
+   新增 schema 31 个：PaymentOrder / PaymentOrderCreateRequest / PaymentAttempt / PaymentOrderDetail /
+   PaymentWebhookAck / RefundRequest / RefundRequestCreateRequest / PayoutItem / PayoutItemInput /
+   PayoutBatch / PayoutBatchCreateRequest / PayoutBatchPage / PayoutApproveRequest / SigningRequest /
+   TreasuryWallet / TreasuryPool / TreasuryPoolPage / TreasuryPoolCreateRequest / TreasuryProvisionRequest /
+   TreasuryProvisionBatch / TreasuryActivateRequest / TreasurySwitchRequest / TreasurySwitchAck /
+   TreasuryRetireRequest / TreasuryAddress / TreasuryAddressRequest / TreasuryAddressPage / DepositAddress /
+   DepositAddressRequest / GasPolicy / GasPolicyRequest。
+   字段名与 M08 席位 T1 模型（`worktrees/M08-treasury/app/treasury/models.py` 的 payload / parser）对齐。
+2. M14 数据治理与 Ops 补齐 10 个操作 / 8 条路径（M14 CR-2）：
+   `GET|POST /api/v1/admin/data/export-requests`（`listAdminDataExportRequests` / `createAdminDataExportRequest`，201）、
+   `GET /api/v1/admin/data/export-requests/{export_id}`（`getAdminDataExportRequest`）、
+   `POST /api/v1/admin/data/export-requests/{export_id}/cancel`（`cancelAdminDataExportRequest`）、
+   `POST|GET /api/v1/admin/data/retention-jobs`（`createRetentionJob`，201 / `listRetentionJobs`）、
+   `GET /api/v1/admin/ops/health`（`getOpsHealth`）、`GET /api/v1/admin/ops/changes`（`listOpsChanges`）、
+   `POST /api/v1/admin/ops/batch-ops`（`executeOpsBatch`）、`GET /api/v1/admin/ops/audit-replay`（`replayOpsAudit`）。
+   新增 schema 15 个：ExportRequest / ExportRequestCreateRequest / ExportRequestPage / ExportDownload /
+   RetentionJob / RetentionJobCreateRequest / RetentionJobPage / OpsHealth / OpsHealthBlock / OpsChange /
+   OpsChangePage / OpsBatchOpRequest / OpsBatchOp / AuditReplay / AuditReplayEvent。
+   字段名与 M14 席位 T1 模型 / router（`worktrees/M14-admin/app/data_gov`）对齐；`operationId` 取实现已注册值。
+3. 新增 tag `Treasury` / `AdminData` / `AdminOps`（按 Lead 指令逐字写入；既有 tag 保持小写不变）。
+4. `Error.code` 文档补登（仅文档，不改结构 / 响应 / 枚举）：`40310–40312`、`40001`、`40901`、`40919`、`49001`；
+   并逐码钉死 `40910–40918` 的资金语义（重复回调 / 金额不符 / 确认数不足 / 链·资产不支持 / 扩容批次过期 /
+   地址冲突 / 缺 attestation / 退款处理中 / 退款失败），`42210` / `42211` 出款准入与风控拒绝。
+5. 敏感红线：schema 不含卡号、私钥 / 助记词、keystore、完整签名；退款只回 `original_route_hash`（不回原文），
+   签名只以 `signing_request_id` / `auth_hash_prefix` / `signature_verified` 结论出现；
+   webhook 请求体为通道原始事件，不落正文。
+6. 既有 1.2.0–1.2.4 的路径、操作、schema、enum、错误码**逐字节未变**。
+
+**影响面**
+- M08 payments-treasury：S1（无真钱）接口面冻结；真钱动作仍受 S1–S2 置灰约束（K1；S3 才开真钱）。
+- M14 admin-data：导出 / 保留 / Ops 只读面冻结；写动作一律调 Owner API，M14 不写业务表。
+- M13 portal-web：支付页接 `POST /pay/orders` + 轮询 `GET /pay/orders/{id}`；共享方 payout 页接 `/provider/payouts`，
+  导出详情页用 `download`（一次性链接，≤15 分钟）。
+- M09 / M16：出款闸门读取 `attestation_ref`（M09）；健康总览 / 变更日历只读复用 M16 审计链与 `deploy_runs` 口径。
+- 客户端 / SDK：仅新增端点与可选字段；未知 enum 仍按 tolerant reader 忽略。
+
+**兼容矩阵**
+- v1 未发布 → N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无**（`python3 ci/spec_breaking.py f7e6b54` → ✅ 无破坏性变更）。
+- 与 1.2.4 的关系：纯增量；97 → 122 路径、109 → 140 操作、171 → 217 schema。
+
+**复核人**
+- 提议 / 实现：contract-integrator（task-5 / DEV-SPEC-1.2.5）
+- 复核：lead（「未定字段」清单见证据 `ops/audit/reports/DEV-W0-SPEC-1.2.5-<UTC>.txt`）
+
+**备注（复核要点）**
+- tag 大小写：既有 `admin` / `user` / `node` 等保持小写；新增 `Treasury` / `AdminData` / `AdminOps` 按 Lead
+  指令逐字写入，消费方按精确字符串过滤（大小写敏感）。
+- 未定字段（裁决后按「只加不改」补）：`FundClass` 取值（CR-P5）；地址白名单 / 平台收款地址的 `status` 枚举
+  （实现为 pending / whitelisted / rejected / revoked，本 spec 已在地址面冻结、平台收款地址面留 string）；
+  `TreasuryRetireRequest.wallet_id` 的位置（本 spec 放 body；M08 现 `parse_retire` 只收 `step` / `attestation_ref`）；
+  `createTreasuryPool` 的 body 字段（无实现，取自 facts §2）；收银台跳转 URL 字段名（M13 接入时补 optional）。
+- M08 §7 与实现的口径差异（CR-P7）：回调验签失败本 spec 采用 `400 + 40001`（实现口径），
+  重复回调 `409 + 40910`、金额不符 `409 + 40911`；§7 原文把验签失败也归 40910，待 Lead 回改正文。
+- gas 模式两套写法：03-facts §9 `billing.gas_fee_mode`（INTERNAL / EXTERNAL + bearer）与 M08 §8.1
+  三值（INTERNAL / EXTERNAL_PLATFORM / EXTERNAL_PAYER）；本 spec 采用三值 + 可选 `gas_bearer`，
+  归一逻辑在实现（`normalize_gas_mode`），待 Lead 统一正文与配置键命名。
+- 路径口径：M08 §4.1 用 `/api/v1/admin/treasury/*`；产品 §19.10.2 早期建议 `/api/v1/treasury/wallets/*` 与
+  `/treasury/wallets/activate/{batch_id}/activate`。本版按 M08 §4.1 + 任务卡路径冻结，旧建议路径**不实现**。
+- 状态机口径：导出 `pending → approved → running → done`，终止 `failed / expired`；删除类操作只出报告不删账本；
+  批量五步的状态集（`previewed / executed / undone / failed`）按实现冻结；`activate` 只收 `signing_request_id`，
+  不接受签名字节；`sign-request` 只 propose，签名仍由决策人链下完成。
+- 事件契约本版未动（M08 的 7 个生产事件与 M14 的 2 个生产事件均已在 02-events 登记）。
+
 ## 1.2.4 · 2026-10-23 · MINOR
 
 **类型**：MINOR（新增 17 条路径 / 19 个操作 / 30 个 schema；无删除、无类型更改、无既有字段语义变更）

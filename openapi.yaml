@@ -17,8 +17,8 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.4
-  summary: W1 冻结 + M16 审计链 + W2 模块面（97 路径 / 109 操作；覆盖 M01–M13、M16）
+  version: 1.2.5
+  summary: W1 冻结 + M16 审计链 + W2 模块面（122 路径 / 140 操作；覆盖 M01–M14、M16）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
@@ -77,6 +77,12 @@ tags:
     description: 后台只读查询（内网/VPN + 强 MFA，公网不可达）
   - name: ops
     description: 平台运维内部面（mTLS + 服务令牌；公网不可达；审计链只追加）
+  - name: Treasury
+    description: 支付与资金面（M08：订单 / 回调 / 钱包池 / 归集 / 分润 / 退款 / 签名意图；资金写不自动重试）
+  - name: AdminData
+    description: 数据治理（M14：导出申请 / 保留任务；只读聚合 + Owner 执行）
+  - name: AdminOps
+    description: 运维中心（M14：健康总览 / 变更日历 / 批量五步 / 操作回放；只读聚合）
 
 paths:
   # ---------------------------------------------------------------- 网关
@@ -3625,6 +3631,1071 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '424': { $ref: '#/components/responses/StepUpRequired' }
 
+  # ---------------------------------------------------------------- 支付与资金（M08，spec 1.2.5）
+  # 写进 spec ≠ 公网可达：管理面内网/VPN + 强 MFA + step-up（≤5 分钟）；资金写不自动重试。
+  # 敏感边界：schema 不含卡号、私钥 / 助记词、完整签名；只存结论与哈希引用。
+  /api/v1/pay/orders:
+    post:
+      tags: [Treasury]
+      operationId: createPaymentOrder
+      summary: 创建支付订单（PSP 通道 / 链上收款；一单一币种）
+      description: |
+        金额用整数最小单位（分，`amount_minor`；INV-07），不做浮点与四舍五入；超精度直接拒绝。
+        同一 `X-DJB-Idempotency-Key` 重放返回首次结果，不重复下单。
+        通道未开启 → `403` + `40310`；地区不支持 → `403` + `40311`；入金风控等级不足 → `403` + `40312`。
+        PSP 会话与密钥由服务端持有，本接口不回传密钥 / 卡数据；收银台跳转 URL 由通道适配器返回
+        （字段待 M13 接入时按需补 optional，本版不含）。
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentOrderCreateRequest' }
+      responses:
+        '201':
+          description: 订单已创建（`status=created`）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentOrder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/pay/orders/{id}:
+    get:
+      tags: [Treasury]
+      operationId: getPaymentOrder
+      summary: 订单状态与尝试明细（只读）
+      description: |
+        `id` 接受订单号 `order_no`。状态机 created → pending → paid → credited，
+        终止 failed / closed / expired（终态不可回退）。链上收款确认不足只返回确认中态、不入账；
+        链 / 资产不支持 → `409` + `40913`，确认数不足 / 充值未到账 → `409` + `40912`。
+        响应带 `attempts`（每次向 PSP / 链上发起）与 `signature_verified` 结论，**不含**签名字节。
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 订单号 `order_no`（对外单号，≤32 字符，创建后不变）。
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 订单详情
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentOrderDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/pay/webhooks/{provider}:
+    post:
+      tags: [Treasury]
+      operationId: receivePaymentWebhook
+      summary: PSP 回调（独立验签端点，不进用户鉴权）
+      description: |
+        服务端验签端点：**不做用户鉴权**（`security: []`），只按通道独立密钥验签。
+        原始 body 参与验签（先验签再反序列化）、时间戳 ±5 分钟、事件 ID 幂等；
+        PSP 重试时幂等返回首次结果（`duplicate=true`），我方返回 2xx 才停止重试。
+        验签失败 → `400` + `40001`（spec 通用码）；重复回调 → `409` + `40910`（幂等返回首次结果，
+        不重复入账）；金额不符 → `409` + `40911`（挂账，入账前不计）；`responseUrl` 不作为入账依据，
+        webhook 也不是结算依据（以 PSP 结算报告 + 银行流水为准）。
+        请求体为通道原始事件（结构随通道而异），本 spec 只约束响应与状态码。
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: 通道标识（与 `PaymentProvider.id()` 一致）；密钥按通道分域、独立轮换。
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: PSP 原始事件体（只验签并解析必要字段，不落正文）。
+      responses:
+        '200':
+          description: 已接收（首次或重复回调；重复返回首次处理结果）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentWebhookAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/pay/refund-requests:
+    post:
+      tags: [Treasury]
+      operationId: createRefundRequest
+      summary: 退款申请（原路、14 天窗口、唯一 refund_request）
+      description: |
+        只回原路、金额 ≤ 已付未消耗、窗口 14 天（03-facts §5），唯一一条 `refund_request`；
+        不向第三方地址退款。原路退款排队 → `409` + `40917`；原路不可用 → `409` + `40918`
+        （转人工，不换路）；金额不符 / 超额 → `409` + `40911`。
+        高危动作：二次认证（step-up ≤5 分钟）+ 双人复核；缺 step-up 返回 `424` + `42401`。
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefundRequestCreateRequest' }
+      responses:
+        '201':
+          description: 已受理（`status=requested`；进入审批与执行队列）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefundRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/provider/payouts:
+    get:
+      tags: [Treasury]
+      operationId: listProviderPayouts
+      summary: 共享方分润批次与明细（只读）
+      description: |
+        当前账户作为共享方的分润批次（`payout_batches` + `payout_items`，≤50 笔 / 批）。
+        只返回本账户相关批次；三项金额（gross / fee / net）均为整数最小单位。
+        `fee > gross` 的明细 `status=carried`（滚存下批），不在本批出款。
+        批次状态机 draft → prepared → checked → signed → broadcast → settled / partial / failed。
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [draft, prepared, checked, signed, broadcast, settled, partial, failed] }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 分润批次分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutBatchPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/provider/payout-address:
+    post:
+      tags: [Treasury]
+      operationId: updateProviderPayoutAddress
+      summary: 出款地址新增 / 变更（72h 冷却 + 首笔试转）
+      description: |
+        出款主体准入（白名单 / 所有权签名挑战未完成 → `422` + `42210`；风控 / 地址风险拒绝 → `422` + `42211`）。
+        72h 冷却后才生效；首笔 ≤100 USDT 试转；出款前 7 天禁改；旧地址继续监听 ≥90 天。
+        只接受一期链（Polygon PoS）地址。高敏：二次认证（缺 step-up → `424` + `42401`）+ 双人复核 + 冷却。
+        响应只回地址、白名单状态与冷却 / 生效时间，**不回**签名挑战原文或完整签名。
+      security: [{ userBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TreasuryAddressRequest' }
+      responses:
+        '200':
+          description: 已登记（冷却期 / 生效时间见响应；未生效地址不得出款）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasuryAddress' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/pools:
+    get:
+      tags: [Treasury]
+      operationId: listTreasuryPools
+      summary: 钱包池深度（只读）
+      description: |
+        池键 `chain:role:fund_class` 创建后不可变（INV-01）。`depth_ready` = `active ∧ gas_ok`
+        的可用只数（INV-03），`depth_available` 供切换判定；池空 **不停止收款**（INV-06），
+        只暂停新地址分发并摊量到现有钱包。`role` / `fund_class` 取值收敛以 CR-P5 裁决为准。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [active, paused, retired] }
+        - name: role
+          in: query
+          required: false
+          schema: { type: string, enum: [hot, warm] }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 池分页（含深度；可带池内钱包摘要）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasuryPoolPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Treasury]
+      operationId: createTreasuryPool
+      summary: 新建钱包池（池键不可变）
+      description: |
+        一期只建 Polygon × {客户热、客户温、平台温}（平台热不建）。cap 与 max_active 受
+        facts §2 约束：单钱包 cap ≤10,000 USD 且 ≥1,000 USD；池合计上限 50,000 USD 或
+        treasury 10% 取小；`max_active` 自动上调只升不降（INV-04 / INV-05）。池键冲突 → `409`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TreasuryPoolCreateRequest' }
+      responses:
+        '201':
+          description: 池已创建
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasuryPool' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/provision:
+    post:
+      tags: [Treasury]
+      operationId: provisionTreasuryWallets
+      summary: 预生成钱包（描述符 + 批次；不碰钱）
+      description: |
+        生成 N 只钱包描述符 → `batch_id` + 描述符 Merkle 根（INV-02：批次内不得夹带转账指令）。
+        每批默认 4 只、硬顶 8；批次 TTL 24h，过期作废重签。只返回批次与描述符哈希，
+        **不返回**私钥 / 助记词 / keystore（平台零可签名材料）。池已暂停 / 不可扩容 → `409`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TreasuryProvisionRequest' }
+      responses:
+        '201':
+          description: 批次已生成（`status=draft` 或 `pending_sign`；激活另走 activate）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasuryProvisionBatch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/activate/{batch}:
+    post:
+      tags: [Treasury]
+      operationId: activateTreasuryBatch
+      summary: 批量激活（HSM 验 2/3 签；24h TTL）
+      description: |
+        批次 draft → pending_sign → signed → activated（activated 不可回退）；HSM 验 2/3 签后批量激活。
+        批次过期 → `409` + `40914`（整批不激活，重签）；地址冲突 → `409` + `40915`。
+        缺 2/3 签名不得激活（INV-10 / INV-02）。激活 ≠ 可用：`ready = active ∧ gas_ok`（INV-03）。
+        请求体只引用签名请求（`signing_request_id`），**不接受**签名字节。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: batch
+          in: path
+          required: true
+          description: 预生成批次 id（`batch_id` / `WALLET_PROVISION` 批次）。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TreasuryActivateRequest' }
+      responses:
+        '200':
+          description: 已激活（返回批次最新状态与激活时间）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasuryProvisionBatch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/switch:
+    post:
+      tags: [Treasury]
+      operationId: switchTreasuryWallet
+      summary: 手动 / 重试地址切换（自动切换走内部事件）
+      description: |
+        切换只影响**新地址分配**，不搬旧钱（跨池调钱是一笔真实转账 + 分录）。
+        候选钱包由服务端按 least_utilized（余额 / cap 最低）→ newest_activated 选择；
+        被换下的钱包进入 switching_out → draining 后不再接新地址；切回需新 switch_id。
+        切换失败重试 1 次后转人工。单人可「停」，改分配需 step-up + 双人复核（§19.11.2）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TreasurySwitchRequest' }
+      responses:
+        '200':
+          description: 切换已触发（`status=triggered` / `executing` / `done`）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasurySwitchAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/retire:
+    post:
+      tags: [Treasury]
+      operationId: retireTreasuryWallet
+      summary: 钱包退休四步（drain → zero → frozen → retire）
+      description: |
+        `step ∈ {drain, zero, frozen, retire}`；余额非 0 不得退休，缺对账 attestation
+        不得进入 retired（`409` + `40916`）。退休后地址不复用、`wallet_id` 永久可解析、
+        旧地址监听 ≥90 天。退休是终态，不可回退。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TreasuryRetireRequest' }
+      responses:
+        '200':
+          description: 已推进退休步骤（返回钱包最新状态）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasuryWallet' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/payouts:
+    post:
+      tags: [Treasury]
+      operationId: createTreasuryPayoutBatch
+      summary: 分润批次制单（≤50 笔；审批后明细冻结）
+      description: |
+        制单 ≤50 笔（PAYOUT_BATCH_MAX_ITEMS）；制单人 ≠ 复核人。批次状态机
+        draft → prepared → checked → signed → broadcast → settled / partial / failed；
+        审批后明细冻结，改单 = 新批次。`fee > gross` 的 item 置 carried 滚存下批。
+        请求体含应付明细（gross 与可选 fee）；net 与 gas 结算由服务端按 `policy_version` 计算，
+        gas 模式按批次快照、下一批生效（INV-14）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutBatchCreateRequest' }
+      responses:
+        '201':
+          description: 批次已制单（`status=draft` / `prepared`；明细冻结前可改）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutBatch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/payouts/{id}/approve:
+    post:
+      tags: [Treasury]
+      operationId: approveTreasuryPayoutBatch
+      summary: 分润批次复核（须有效 attestation；复核人 ≠ 制单人）
+      description: |
+        复核 = maker–checker 的 checker；须 M09 有效 attestation、未结 P0 / P1 为 0、
+        审批链完整，否则 `409` + `40916`（缺 attestation / 未对账平）。审批 30 分钟内可执行，
+        超时作废（PAYOUT_APPROVAL_EXPIRE_S）；复核人 = 制单人 → `409`。
+        状态推进：prepared → checked。请求体为可选备注，不含签名字节。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 分润批次号 `batch_no`。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutApproveRequest' }
+      responses:
+        '200':
+          description: 已复核（`status=checked`；明细冻结）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutBatch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/payouts/{id}/sign-request:
+    post:
+      tags: [Treasury]
+      operationId: requestTreasuryPayoutSignature
+      summary: 发起决策人签名请求（不是签名）
+      description: |
+        只 propose：生成 `treasury_intent`（`kind=PAYOUT`）+ `signing_request` 并推送到签名设备；
+        签名本身是链下 / 链上独立动作，不在 RBAC 内（§19.11.3）。签名请求 TTL 1800s
+        （SIGNING_TTL_S），超时过期；缺 attestation / 未对账平 → `409` + `40916`。
+        响应只回签名请求 id、状态与 `auth_hash` 前缀，**不回**签名字节。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 分润批次号 `batch_no`。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '201':
+          description: 签名请求已创建（`status=pending`；推送至签名设备）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SigningRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/addresses:
+    get:
+      tags: [Treasury]
+      operationId: listTreasuryAddresses
+      summary: 收款地址白名单与冷却状态（只读）
+      description: |
+        地址是可公开的链上标识；响应只含地址、标签、归属与冷却 / 变更时间，不含密钥或签名材料。
+        72h 冷却内的地址不得用于出款；出款前 7 天禁改（INV-13）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: chain
+          in: query
+          required: false
+          description: 链标识（一期 `polygon`）。
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [pending, whitelisted, rejected, revoked] }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 地址分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasuryAddressPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Treasury]
+      operationId: upsertTreasuryAddress
+      summary: 新增 / 变更收款地址白名单（72h 冷却 + 首笔试转）
+      description: |
+        所有权签名挑战 + 人工复核 + 72h 冷却；首笔 ≤100 USDT 试转；出款前 7 天禁改。
+        链 / 地址不支持 → `409` + `40913`；出款主体未准入 / 风控拒绝 → `422` + `42210` / `42211`。
+        step-up 必需（`424` + `42401`）；地址不可复用（退休地址只监听）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TreasuryAddressRequest' }
+      responses:
+        '201':
+          description: 已登记（冷却中或直接生效取决于白名单 / 冷却状态）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TreasuryAddress' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/deposit-address:
+    get:
+      tags: [Treasury]
+      operationId: getTreasuryDepositAddress
+      summary: 平台收款地址（只读；发布走 POST）
+      description: |
+        返回当前生效的平台收款地址与旧地址监听到期日。链不支持 → `409` + `40913`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: chain
+          in: query
+          required: false
+          description: 链标识（一期 `polygon`）。
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 当前平台收款地址
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepositAddress' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Treasury]
+      operationId: publishTreasuryDepositAddress
+      summary: 发布 / 轮换平台收款地址（GA 强制；S3 开放）
+      description: |
+        二次认证（GA OTP）+ `reason` + `ticket` 必填；24h 冷却；发布后旧地址继续监听 ≥90 天，
+        切换不退不补。链不支持 → `409` + `40913`。发布本身进审计链。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DepositAddressRequest' }
+      responses:
+        '200':
+          description: 已发布（返回生效地址与新版本时间）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepositAddress' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/gas-policy:
+    get:
+      tags: [Treasury]
+      operationId: getTreasuryGasPolicy
+      summary: gas 策略快照（只读）
+      description: |
+        返回 gas 模式 / 承担方 / 作用域与 `policy_version`。按批次快照、下一批生效、不追溯（INV-14）；
+        低于 gas 预留（≥10 POL）暂停归集并告警（03-facts §1）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: chain
+          in: query
+          required: false
+          description: 链标识（一期 `polygon`）。
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 当前 gas 策略
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GasPolicy' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Treasury]
+      operationId: updateTreasuryGasPolicy
+      summary: 切换 gas 模式（下一批生效、不追溯）
+      description: |
+        `gas_mode ∈ {INTERNAL, EXTERNAL_PLATFORM, EXTERNAL_PAYER}`；EXTERNAL_* 必须指定 `gas_bearer`。
+        24h 冷却，下一批生效、不追溯，切换不退不补（INV-14）。step-up + 双人复核；
+        策略发布人 ≠ 出款人（策略发布 ≠ 出款，§19.11.2）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GasPolicyRequest' }
+      responses:
+        '200':
+          description: 已登记（下一批次生效）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GasPolicy' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- 数据治理与 Ops（M14，spec 1.2.5）
+  # 只读聚合：M14 不写业务表；写动作一律调 Owner API。导出链接与水印是敏感面：
+  # 链接一次性、TTL ≤15 分钟、文件 7 天失效、导出本身进审计；响应不返回 prompt / 凭据 / 完整签名。
+  /api/v1/admin/data/export-requests:
+    get:
+      tags: [AdminData]
+      operationId: listAdminDataExportRequests
+      summary: 导出申请列表（游标分页）
+      description: |
+        只返回请求人有权范围的申请；`state ∈ {pending, approved, running, done, failed, expired}`，
+        过期不自动续期（INV-04）。列表**不返回**下载链接（链接只在详情、一次性、TTL ≤15 分钟）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [pending, approved, running, done, failed, expired] }
+        - name: object
+          in: query
+          required: false
+          schema: { type: string, enum: [usage, receipts, tickets, logs, backups, analytics] }
+        - name: requester
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 导出申请分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportRequestPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [AdminData]
+      operationId: createAdminDataExportRequest
+      summary: 建导出申请（step-up + 理由 + 范围）
+      description: |
+        step-up 必带；`reason` 与 `scope.object` 必填。>1,000 行或含个人信息需双人复核；
+        同一人 24h ≤1 次大导出（INV-04）。越权 → `403` + `40301`；超出导出上限
+        （行数 > `data.export_max_rows` / 大导出配额）→ `400` 或 `413` + `49001`（提示拆范围）；
+        请求结构 / 值非法 → `400` + `40001`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportRequestCreateRequest' }
+      responses:
+        '201':
+          description: 申请已建（`state=pending`；进入审批）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/data/export-requests/{export_id}:
+    get:
+      tags: [AdminData]
+      operationId: getAdminDataExportRequest
+      summary: 申请状态 + 一次性下载链接（≤15 分钟）
+      description: |
+        `state=done` 且未消费时返回带水印的一次性签名下载链接（TTL ≤15 分钟；文件 7 天后失效）；
+        其余情况 `download.available=false` 并给 `download.reason`。申请人 / 复核人之外不可见
+        （越权统一 `404` + `40401`）。链接只能用一次。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: export_id
+          in: path
+          required: true
+          description: 导出申请 id（UUID）。
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 申请详情
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/data/export-requests/{export_id}/cancel:
+    post:
+      tags: [AdminData]
+      operationId: cancelAdminDataExportRequest
+      summary: 取消未执行的导出申请（step-up）
+      description: |
+        仅作用于未执行（pending / approved）申请；running / done / failed / expired 返回
+        `409` + `40901`（对象被待复核动作锁定 / 状态不允许）。取消也留痕进审计。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: export_id
+          in: path
+          required: true
+          description: 导出申请 id（UUID）。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已取消（返回更新后的申请；`cancelled_at` / `cancelled_by` 留痕）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/data/retention-jobs:
+    post:
+      tags: [AdminData]
+      operationId: createRetentionJob
+      summary: 触发保留任务（dry-run 可选；step-up）
+      description: |
+        按 §22.5 保留矩阵执行；同一 (`object`, `cutoff`) 只执行一次（幂等），
+        重复提交返回 `409` + `40901`。`dry_run=true` 只算将删条数、不执行。
+        job 状态 queued → running → done / failed；失败 P1 + 幂等重放，连续 2 次升级 P0。
+        `cutoff` 与 `policy_days` 二选一或同时给出（同时给出时必须一致）。
+        请求结构 / 值非法 → `400` + `40001`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetentionJobCreateRequest' }
+      responses:
+        '201':
+          description: 任务已创建（`state=queued` 或已执行完成）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionJob' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [AdminData]
+      operationId: listRetentionJobs
+      summary: 保留任务与删除报告（只读）
+      description: |
+        任务与删除报告（已删 / 部分保留及原因 / 最迟清除日 / 方式）只读查询；
+        `report_ref` 为报告引用，`report` 为结构化摘要（不含被删数据正文）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: object
+          in: query
+          required: false
+          schema: { type: string, enum: [usage, receipts, tickets, logs, backups, analytics] }
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [queued, running, done, failed] }
+        - name: dry_run
+          in: query
+          required: false
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 任务分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionJobPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/ops/health:
+    get:
+      tags: [AdminOps]
+      operationId: getOpsHealth
+      summary: 七块健康总览（红 / 黄 / 绿 + 最近变更）
+      description: |
+        七块：gateway / scheduling / ledger / recon / wallet / config / notification；
+        每块给红黄绿、原因摘要与最近一次变更。只给结论与组件名，**不含**阈值、名单、依赖地址或凭据。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 健康总览
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpsHealth' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/ops/changes:
+    get:
+      tags: [AdminOps]
+      operationId: listOpsChanges
+      summary: 变更日历（窗口 / 回滚方案 / 影响面）
+      description: |
+        所有生产变更挂变更单（窗口、回滚方案、影响面）；冻结窗口默认月末 2 天与重大活动期，
+        窗口外变更 100% 被拒。只读聚合，变更执行在 M16。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 变更分页（按发生时间倒序）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpsChangePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/ops/batch-ops:
+    post:
+      tags: [AdminOps]
+      operationId: executeOpsBatch
+      summary: 批量操作五步（预览 / 执行 / 撤销）
+      description: |
+        五步：① `step=preview` 返回影响清单 + 数量 + 随机 ≤10 条逐条确认（无预览禁止执行；201）；
+        ② 二次认证（step-up）；③ >50 条或涉资金 / 冻结需双人复核（响应 `dual_review_required`）；
+        ④ `step=execute` 单次 ≤200 条，执行后 10 分钟撤销窗口（`undo_deadline`）；
+        ⑤ 受影响用户 P1 通知。`step=undo` 一键反向（撤销也留痕）。
+        结构 / 值非法 → `400` + `40001`；越权 / 超上限 → `403`（`49001` 提示拆分）；
+        重复执行、窗口已关或对象被锁定 → `409` + `40901`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpsBatchOpRequest' }
+      responses:
+        '200':
+          description: 执行 / 撤销结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpsBatchOp' }
+        '201':
+          description: 预览结果（含影响清单与抽样；无预览不得执行）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpsBatchOp' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/ops/audit-replay:
+    get:
+      tags: [AdminOps]
+      operationId: replayOpsAudit
+      summary: 操作回放（按 trace_id / owner_id / action 合并时间线；只读）
+      description: |
+        审计链 + 事件 outbox 按 `trace_id` / `owner_id` / `action` 合并时间线；
+        只读、不可修改任何日志。至少给一个过滤条件，否则 `400` + `40001`。
+        返回脱敏摘要（不含 prompt / 凭据 / 完整签名 / before-after 原文）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: trace_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: owner_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: action
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 合并时间线（按 occurred_at 倒序，同刻按来源排序）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditReplay' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 components:
 
   securitySchemes:
@@ -3953,6 +5024,16 @@ components:
                 `42240` COP 兑换 / 转让校验失败（锁定期、限额、自转等，HTTP 422）；
                 风控 `48001` 限额命中（对外只给粗粒度原因）/ `48002` 案件已存在 / `48003` 申诉超期或重复 /
                 `48004` 证据缺失 / `48005` 规则或限额版本冲突 / `48006` 处置越权（HTTP 400–409）。
+
+                spec 1.2.5 新登记（W2 资金 / 数据与 Ops 错误码，仅文档补登；不改结构 / 响应 / 枚举）：
+                `40310` 支付通道未开启 / `40311` 地区不支持 / `40312` 入金未达所需风控等级（M08，HTTP 403）；
+                `40001` 输入校验失败（HTTP 400）、`40901` 对象被待复核动作锁定（HTTP 409）与
+                `40919` 状态冲突通用码——M14 / M08 复用；
+                `40910–40918` 资金段语义按产品 §19.10.4 逐码钉死：40910 重复回调 / 40911 金额不符 /
+                40912 确认数不足 / 40913 链·资产不支持 / 40914 扩容批次过期 / 40915 地址冲突 /
+                40916 缺 attestation / 40917 退款处理中 / 40918 退款失败；
+                `42210` 出款主体未准入 / `42211` 风控或地址风险拒绝（M08，HTTP 422）；
+                `49001` 导出 / 查询结果过大（M14，HTTP 400 或 413；M06 复用；提示拆分范围）。
 
                 spec 1.2.3 新登记（W2 通知 / 对账错误码，仅文档补登）：
                 `40902` 不可退订 / 偏好冲突（M12：P0 通知不得退订，HTTP 409）；
@@ -7239,3 +8320,1068 @@ components:
           enum: [upheld, overturned]
         reason: { type: string, minLength: 1, maxLength: 512 }
 
+
+    # ------------------------------------------------------------ 支付与资金（M08，spec 1.2.5）
+    # 敏感字段红线：不含卡号 / 私钥 / 助记词 / keystore / 完整签名；签名材料只以 hash 或 signing_request 引用出现。
+    # 字段名与 M08 席位的 T1 模型（worktrees/M08-treasury）对齐；未落地项在证据「未定字段」列出。
+    PaymentOrderCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [amount_minor, currency, method]
+      properties:
+        amount_minor:
+          type: integer
+          minimum: 1
+          description: 金额整数最小单位（分）；不接受浮点，超精度直接拒绝（INV-07）。
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: ISO-4217；一单一个币种。
+        method:
+          type: string
+          enum: [card, bank_transfer, wechat, alipay]
+          description: |
+            支付方式（PSP 通道能力）。通道未开启 → 403 + `40310`；地区不支持 → 403 + `40311`；
+            入金风控等级不足 → 403 + `40312`。链上收款走收款地址 + 回调，不用本字段。
+        provider:
+          type: [string, 'null']
+          description: 通道适配器标识（如 mock / upg / gifpay）；缺省按服务端默认。新增通道属只加不改。
+        description:
+          type: [string, 'null']
+          maxLength: 512
+          description: 订单备注（人类可读；不含凭据 / 卡数据 / 个人信息）。
+        expires_in_s:
+          type: [integer, 'null']
+          minimum: 60
+          maximum: 604800
+          description: 订单有效期（秒），60s–7d；缺省按通道默认。
+
+    PaymentOrder:
+      type: object
+      additionalProperties: true
+      required: [order_id, order_no, status, amount_minor, currency, created_at]
+      properties:
+        order_id: { type: string, description: 内部主键（UUID）。 }
+        order_no:
+          type: string
+          description: 对外订单号（≤32 字符，全局唯一，创建后不变）。
+        amount_minor: { type: integer, minimum: 1, description: 整数最小单位（分）。 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        method:
+          type: string
+          enum: [card, bank_transfer, wechat, alipay]
+        provider: { type: [string, 'null'] }
+        status:
+          type: string
+          enum: [created, pending, paid, credited, failed, closed, expired]
+          description: created → pending → paid → credited；终止 failed / closed / expired（终态不可回退）。
+        credited_minor:
+          type: integer
+          minimum: 0
+          description: 已入账金额（确认数 ≥64，大额 ≥200；未达只挂账、不进本字段）。
+        description: { type: [string, 'null'] }
+        expires_at: { type: [string, 'null'], format: date-time }
+        paid_at: { type: [string, 'null'], format: date-time }
+        credited_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    PaymentAttempt:
+      type: object
+      additionalProperties: true
+      required: [attempt_id, provider, status]
+      properties:
+        attempt_id: { type: string }
+        provider: { type: string, description: 通道 / 链标识（PaymentProvider.id()）。 }
+        provider_status:
+          type: [string, 'null']
+          description: 通道原始状态（已映射到 status；原样值可能随通道变化，客户端按 status 判断）。
+        status:
+          type: string
+          enum: [initiated, succeeded, failed]
+        amount_minor: { type: [integer, 'null'], minimum: 0 }
+        currency: { type: [string, 'null'] }
+        signature_verified:
+          type: boolean
+          description: 验签结论（只存结论；原始签名 / 密钥不进 DB、不进响应）。
+        failure_code:
+          type: [string, 'null']
+          description: 失败原因码（通道无关的粗粒度码；不含通道原文）。
+        created_at: { type: [string, 'null'], format: date-time }
+
+    PaymentOrderDetail:
+      type: object
+      additionalProperties: true
+      required: [order]
+      properties:
+        order: { $ref: '#/components/schemas/PaymentOrder' }
+        attempts:
+          type: array
+          items: { $ref: '#/components/schemas/PaymentAttempt' }
+
+    PaymentWebhookAck:
+      type: object
+      additionalProperties: true
+      required: [received]
+      properties:
+        received:
+          type: boolean
+          description: 恒 true；验签失败走 400 + 40001，金额不符走 409 + 40911。
+        duplicate:
+          type: boolean
+          description: true 表示重复回调，返回首次处理结果（幂等，不重复入账；409 + 40910 亦表示重复）。
+        order_no: { type: [string, 'null'] }
+        provider_txn_id: { type: [string, 'null'] }
+        status:
+          type: [string, 'null']
+          description: 处理后订单状态（同 PaymentOrder.status）；未关联订单时为 null。
+
+    RefundRequestCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [order_no, amount_minor, reason_code, original_route]
+      properties:
+        order_no: { type: string, minLength: 3, maxLength: 32 }
+        amount_minor:
+          type: integer
+          minimum: 1
+          description: ≤ 已付未消耗（INV-12）；币种与原单一致。
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: 退款原因码 / 说明（人类可读；不含凭据）。
+        original_route:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: 原路标识（与支付方式一致）；服务端只存哈希，不回显原文（只回原路）。
+        evidence_ref: { type: [string, 'null'], maxLength: 128 }
+
+    RefundRequest:
+      type: object
+      additionalProperties: true
+      required: [refund_request_id, refund_no, order_no, amount_minor, currency, status, deadline_at, created_at]
+      properties:
+        refund_request_id: { type: string }
+        refund_no:
+          type: string
+          description: 对外退款单号（唯一；一条订单唯一 refund_request）。
+        order_no: { type: string }
+        amount_minor: { type: integer, minimum: 1 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        reason_code: { type: [string, 'null'] }
+        status:
+          type: string
+          enum: [requested, approved, executing, succeeded, failed, cancelled]
+        original_route_hash:
+          type: [string, 'null']
+          description: 原路哈希（不回原文 / 卡令牌 / 地址明文；INV-12）。
+        deadline_at:
+          type: string
+          format: date-time
+          description: 退款申请窗口截止（14 天；03-facts §5）。
+        approved_at: { type: [string, 'null'], format: date-time }
+        succeeded_at: { type: [string, 'null'], format: date-time }
+        failure_code: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    PayoutItemInput:
+      type: object
+      additionalProperties: true
+      required: [payee_account_id, payee_address, gross_minor]
+      properties:
+        payee_account_id: { type: string }
+        payee_address:
+          type: string
+          pattern: '^0x[0-9a-fA-F]{40}$'
+          description: 收款地址（须在白名单且冷却期满；INV-13）。
+        gross_minor:
+          type: integer
+          minimum: 0
+          description: 应付金额（整数最小单位）；net 由服务端按 policy_version 计算。
+        fee_minor: { type: [integer, 'null'], minimum: 0 }
+        address_id: { type: [string, 'null'] }
+
+    PayoutBatchCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: 单批 ≤50 笔（PAYOUT_BATCH_MAX_ITEMS）；超出 → 400。
+          items: { $ref: '#/components/schemas/PayoutItemInput' }
+        gas_mode:
+          type: string
+          enum: [INTERNAL, EXTERNAL_PLATFORM, EXTERNAL_PAYER]
+          description: 本批 gas 模式快照；缺省按当前策略（下一批生效、不追溯，INV-14）。
+        attestation_ref:
+          type: [string, 'null']
+          description: M09 对账凭证引用；出款四要素之一（缺则 409 + 40916，INV-10）。
+
+    PayoutItem:
+      type: object
+      additionalProperties: true
+      required: [item_id, gross_minor, fee_minor, net_minor, status]
+      properties:
+        item_id: { type: string }
+        payee_account_id: { type: [string, 'null'] }
+        payee_address:
+          type: [string, 'null']
+          description: 出款地址（链上公开标识）；只读展示，不含密钥。
+        gross_minor: { type: integer, minimum: 0 }
+        fee_minor: { type: integer, minimum: 0 }
+        net_minor: { type: integer, minimum: 0 }
+        status:
+          type: string
+          enum: [pending, sent, carried, failed]
+          description: fee > gross 时置 carried，滚存下批（不在本批出款）。
+        gas_mode:
+          type: string
+          enum: [INTERNAL, EXTERNAL_PLATFORM, EXTERNAL_PAYER]
+        chain_tx_id: { type: [string, 'null'] }
+        failure_reason: { type: [string, 'null'] }
+
+    PayoutBatch:
+      type: object
+      additionalProperties: true
+      required: [batch_id, batch_no, status, item_count, total_gross_minor, total_fee_minor, total_net_minor, created_at]
+      properties:
+        batch_id: { type: string }
+        batch_no:
+          type: string
+          description: 对外批次号（≤32 字符，全局唯一）；审批后明细冻结，改单 = 新批次。
+        status:
+          type: string
+          enum: [draft, prepared, checked, signed, broadcast, settled, partial, failed]
+        item_count: { type: integer, minimum: 0 }
+        total_gross_minor: { type: integer, minimum: 0 }
+        total_fee_minor: { type: integer, minimum: 0 }
+        total_net_minor: { type: integer, minimum: 0 }
+        items_hash:
+          type: [string, 'null']
+          description: 明细哈希（审批后冻结的锚；用于证明批次未被改单）。
+        attestation_ref:
+          type: [string, 'null']
+          description: M09 对账凭证引用；出款四要素之一（缺则 409 + 40916，INV-10）。
+        gas_mode:
+          type: string
+          enum: [INTERNAL, EXTERNAL_PLATFORM, EXTERNAL_PAYER]
+        policy_version: { type: [string, 'null'] }
+        maker_id: { type: [string, 'null'], description: 制单人（≠ 复核人）。 }
+        checker_id: { type: [string, 'null'], description: 复核人（≠ 制单人）。 }
+        checked_at: { type: [string, 'null'], format: date-time }
+        settled_at: { type: [string, 'null'], format: date-time }
+        chain_tx_id: { type: [string, 'null'] }
+        failure_reason: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PayoutItem' }
+
+    PayoutBatchPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/PayoutBatch' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    PayoutApproveRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        note:
+          type: [string, 'null']
+          maxLength: 512
+          description: 复核备注（人类可读）；不含签名字节。复核人 ≠ 制单人。
+
+    SigningRequest:
+      type: object
+      additionalProperties: true
+      required: [signing_request_id, intent_id, status, expires_at]
+      properties:
+        signing_request_id: { type: string }
+        intent_id:
+          type: string
+          description: treasury_intent id（kind = PAYOUT / REFUND / SWEEP / REBALANCE / GAS_TOPUP / POLICY_CHANGE / RECOVERY / WALLET_PROVISION）。
+        status:
+          type: string
+          enum: [pending, signed, expired, failed]
+        expires_at:
+          type: string
+          format: date-time
+          description: 签名有效期（SIGNING_TTL_S = 1800s；WALLET_PROVISION 放宽 86400s）。
+        signer_threshold:
+          type: integer
+          minimum: 1
+          description: 签名门限（钱包与批次 2-of-3，SIGNER_THRESHOLD）。
+        auth_hash_prefix:
+          type: [string, 'null']
+          description: 授权对象哈希前 16 位，供线下核对；完整哈希不进响应。
+        created_at: { type: [string, 'null'], format: date-time }
+
+    TreasuryWallet:
+      type: object
+      additionalProperties: true
+      required: [wallet_id, status]
+      properties:
+        wallet_id: { type: string }
+        chain: { type: [string, 'null'], description: 链标识（一期 polygon）。 }
+        address:
+          type: [string, 'null']
+          description: 链上地址（公开标识；后台 / 对账可见，不含密钥）。
+        pool_id: { type: [string, 'null'] }
+        role:
+          type: string
+          enum: [hot, warm]
+        fund_class:
+          type: [string, 'null']
+          description: 资金分类（客户 / 平台）；取值收敛见 CR-P5。
+        status:
+          type: string
+          enum: [provisioning, active, paused, draining, zero, frozen, retired, provisioning_failed]
+          description: 规格 7 值 + 预生成失败终态；终态不可回退。
+        switch_state:
+          type: string
+          enum: [standby, in_service, switching_out, draining]
+          description: 仅对 active 有意义。
+        cap_minor: { type: [integer, 'null'], minimum: 0 }
+        balance_minor: { type: integer, minimum: 0 }
+        gas_ok: { type: boolean, description: gas 预留是否健康（INV-03）。 }
+        ready:
+          type: boolean
+          description: ready = active ∧ gas_ok（INV-03）；仅 ready 钱包可接新地址。
+        provisioned_at: { type: [string, 'null'], format: date-time }
+        activated_at: { type: [string, 'null'], format: date-time }
+        retired_at: { type: [string, 'null'], format: date-time }
+
+    TreasuryPool:
+      type: object
+      additionalProperties: true
+      required: [pool_id, status]
+      properties:
+        pool_id:
+          type: string
+          description: 池键 chain:role:fund_class，创建后不可变（INV-01）。
+        chain: { type: [string, 'null'], description: 链标识（如 polygon）。 }
+        role:
+          type: string
+          enum: [hot, warm]
+        fund_class:
+          type: [string, 'null']
+          description: 资金分类（客户 / 平台）。取值收敛见 CR-P5，本版不冻结枚举。
+        status:
+          type: string
+          enum: [active, paused, retired]
+        min_spare: { type: integer, minimum: 0, maximum: 8 }
+        max_active: { type: integer, minimum: 1, maximum: 20 }
+        switch_threshold_pct: { type: integer, minimum: 50, maximum: 95 }
+        activate_batch_size: { type: integer, minimum: 1, maximum: 8 }
+        provision_lead_time_h: { type: integer, minimum: 1, maximum: 48 }
+        pool_cap_minor:
+          type: integer
+          minimum: 0
+          description: 池合计上限（分）；50,000 USD 或 treasury 10% 取小（03-facts §2）。
+        depth_ready:
+          type: integer
+          minimum: 0
+          description: 可用只数（ready = active ∧ gas_ok，INV-03）；0 即池空 P0，但不停收款（INV-06）。
+        depth_available:
+          type: integer
+          minimum: 0
+          description: 可摊量 / 可切换的地址深度。
+        in_service_count: { type: integer, minimum: 0 }
+        active_balance_minor: { type: integer, minimum: 0 }
+        policy_version: { type: [string, 'null'] }
+        wallets:
+          type: array
+          description: 池内钱包摘要（深度下钻；只读）。
+          items: { $ref: '#/components/schemas/TreasuryWallet' }
+
+    TreasuryPoolPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/TreasuryPool' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    TreasuryPoolCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [chain, role, fund_class]
+      properties:
+        chain: { type: string, description: 链标识（一期 polygon；一期单链 K6）。 }
+        role:
+          type: string
+          enum: [hot, warm]
+        fund_class:
+          type: string
+          description: 资金分类；取值见 CR-P5（本版不冻结枚举）。
+        min_spare: { type: integer, minimum: 0, maximum: 8, default: 3 }
+        max_active: { type: integer, minimum: 1, maximum: 20 }
+        switch_threshold_pct: { type: integer, minimum: 50, maximum: 95, default: 70 }
+        pool_cap_minor: { type: integer, minimum: 0 }
+        activate_batch_size: { type: integer, minimum: 1, maximum: 8, default: 4 }
+        provision_lead_time_h: { type: integer, minimum: 1, maximum: 48, default: 12 }
+        reason: { type: [string, 'null'], maxLength: 512 }
+
+    TreasuryProvisionRequest:
+      type: object
+      additionalProperties: true
+      required: [pool_id]
+      properties:
+        pool_id: { type: string }
+        wallet_count:
+          type: integer
+          minimum: 1
+          maximum: 8
+          default: 4
+          description: 本批只数（默认 activate_batch_size=4；硬顶 MAX_BATCH_SIZE=8）。
+
+    TreasuryProvisionBatch:
+      type: object
+      additionalProperties: true
+      required: [batch_id, batch_no, status, wallet_count, created_at]
+      properties:
+        batch_id: { type: string }
+        batch_no: { type: string, description: 对外批次号（≤32 字符）。 }
+        pool_id: { type: [string, 'null'] }
+        kind:
+          type: [string, 'null']
+          description: 批次用途；预生成即 WALLET_PROVISION（TreasuryIntent.kind 第八值）。
+        wallet_count: { type: integer, minimum: 0 }
+        descriptor_merkle_root:
+          type: [string, 'null']
+          description: 描述符 Merkle 根（可反证钱包属于哪一批、由谁签、何时生效）。
+        status:
+          type: string
+          enum: [draft, pending_sign, signed, activated, expired, failed, cancelled]
+          description: draft → pending_sign → signed → activated；终止 expired / failed / cancelled。
+        nonce: { type: integer, minimum: 0 }
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: 批次 TTL 截止（24h；过期作废重签）。
+        signing_request_id: { type: [string, 'null'] }
+        activated_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    TreasuryActivateRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        signing_request_id:
+          type: [string, 'null']
+          description: 已收齐 2/3 签的签名请求 id；不接受签名字节或私钥材料。
+        reason: { type: [string, 'null'], maxLength: 512 }
+
+    TreasurySwitchRequest:
+      type: object
+      additionalProperties: true
+      required: [pool_id, reason]
+      properties:
+        pool_id: { type: string }
+        reason: { type: string, minLength: 1, maxLength: 512 }
+
+    TreasurySwitchAck:
+      type: object
+      additionalProperties: true
+      required: [pool_id, status]
+      properties:
+        pool_id: { type: string }
+        status:
+          type: string
+          enum: [triggered, executing, done]
+          description: 切换事件状态机；失败重试 1 次后转人工。
+        from_wallet_id: { type: [string, 'null'] }
+        to_wallet_id: { type: [string, 'null'] }
+        switched_at: { type: [string, 'null'], format: date-time }
+
+    TreasuryRetireRequest:
+      type: object
+      additionalProperties: true
+      required: [wallet_id, step]
+      properties:
+        wallet_id: { type: string }
+        step:
+          type: string
+          enum: [drain, zero, frozen, retire]
+          description: 退休四步；retire 前须余额 0 且有有效 attestation（缺 → 409 + 40916）。
+        attestation_ref: { type: [string, 'null'] }
+        reason: { type: [string, 'null'], maxLength: 512 }
+
+    TreasuryAddressRequest:
+      type: object
+      additionalProperties: true
+      required: [chain, address, ownership_challenge_ref]
+      properties:
+        chain: { type: string, description: 链标识（一期 polygon）。 }
+        address: { type: string, pattern: '^0x[0-9a-fA-F]{40}$' }
+        ownership_challenge_ref:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: 所有权签名挑战的引用（不含签名原文）；服务端校验归属。
+        risk_level:
+          type: [string, 'null']
+          enum: [low, medium, high, null]
+          description: 地址风险评分结论（粗粒度；明细在私有配置）。
+        label: { type: [string, 'null'], maxLength: 128 }
+
+    TreasuryAddress:
+      type: object
+      additionalProperties: true
+      required: [address_id, chain, address, status]
+      properties:
+        address_id: { type: string }
+        account_id: { type: [string, 'null'], description: 归属账户（共享方出款地址时为本账户）。 }
+        chain: { type: [string, 'null'], description: 链标识（一期 polygon）。 }
+        address: { type: string, pattern: '^0x[0-9a-fA-F]{40}$' }
+        status:
+          type: string
+          enum: [pending, whitelisted, rejected, revoked]
+          description: 待冷却 / 已白名单 / 拒绝 / 撤销；仅 whitelisted 且冷却期满可出款。
+        label: { type: [string, 'null'] }
+        cooldown_until: { type: [string, 'null'], format: date-time }
+        first_transfer_at: { type: [string, 'null'], format: date-time }
+        first_transfer_minor:
+          type: [integer, 'null']
+          minimum: 0
+          description: 首笔试转金额（USDT 最小单位；≤100 USDT，03-facts §3）。
+        changed_at: { type: [string, 'null'], format: date-time }
+        approved_at: { type: [string, 'null'], format: date-time }
+        risk_level: { type: [string, 'null'], enum: [low, medium, high, null] }
+
+    TreasuryAddressPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/TreasuryAddress' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    DepositAddress:
+      type: object
+      additionalProperties: true
+      required: [chain, address, updated_at]
+      properties:
+        chain: { type: [string, 'null'], description: 链标识（一期 polygon）。 }
+        address: { type: string, pattern: '^0x[0-9a-fA-F]{40}$' }
+        status:
+          type: [string, 'null']
+          description: 生效 / 已退役（取值待 M08 定稿，本版不冻结枚举）。
+        published_at: { type: [string, 'null'], format: date-time }
+        retired_at: { type: [string, 'null'], format: date-time }
+        monitoring_until:
+          type: [string, 'null']
+          format: date-time
+          description: 旧地址继续监听至（≥90 天）。
+        updated_at: { type: string, format: date-time }
+
+    DepositAddressRequest:
+      type: object
+      additionalProperties: true
+      required: [chain, address, reason, ticket]
+      properties:
+        chain: { type: string, description: 链标识（一期 polygon）。 }
+        address: { type: string, pattern: '^0x[0-9a-fA-F]{40}$' }
+        reason: { type: string, minLength: 1, maxLength: 512 }
+        ticket:
+          type: string
+          minLength: 1
+          description: 变更单号（高危四件套留痕；发布本身进审计链）。
+        effective_at: { type: [string, 'null'], format: date-time }
+
+    GasPolicy:
+      type: object
+      additionalProperties: true
+      required: [gas_mode, policy_version]
+      properties:
+        gas_mode:
+          type: string
+          enum: [INTERNAL, EXTERNAL_PLATFORM, EXTERNAL_PAYER]
+          description: |
+            03-facts §9 的 billing.gas_fee_mode 为 INTERNAL / EXTERNAL + bearer；
+            M08 §8.1 把 EXTERNAL 拆成 EXTERNAL_PLATFORM / EXTERNAL_PAYER（等价于 bearer 组合）。
+            两套写法的归一由 M08 policy.normalize_gas_mode 处理；差异见证据「未定字段」。
+        gas_bearer:
+          type: [string, 'null']
+          enum: [PLATFORM, PAYER, null]
+          description: EXTERNAL_* 时生效；INTERNAL 时为 null（03-facts §9）。
+        scope:
+          type: [string, 'null']
+          enum: [global, chain, batch, null]
+        policy_version: { type: string }
+        updated_at: { type: [string, 'null'], format: date-time }
+
+    GasPolicyRequest:
+      type: object
+      additionalProperties: true
+      required: [gas_mode]
+      properties:
+        gas_mode:
+          type: string
+          enum: [INTERNAL, EXTERNAL_PLATFORM, EXTERNAL_PAYER]
+        gas_bearer:
+          type: [string, 'null']
+          enum: [PLATFORM, PAYER, null]
+          description: EXTERNAL_* 必填；INTERNAL 须为 null（跨字段校验）。
+        scope:
+          type: [string, 'null']
+          enum: [global, chain, batch, null]
+        reason: { type: [string, 'null'], maxLength: 512 }
+
+    # ------------------------------------------------------------ 数据治理与 Ops（M14，spec 1.2.5）
+    # 只读聚合：不写业务表；导出 / 删除 / 批量一律由 Owner 执行，M14 只留申请与报告。
+    # 敏感红线：不返回 prompt / response 正文、凭据明文、完整签名；审计只回脱敏摘要。
+    # 字段名与 M14 席位的 T1 模型 / router（worktrees/M14-admin）对齐。
+    ExportRequestCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [scope, reason]
+      properties:
+        scope:
+          type: object
+          additionalProperties: true
+          required: [object]
+          description: 导出范围（对象 + 时间窗 + 租户）；只允许请求人有权范围。
+          properties:
+            object:
+              type: string
+              enum: [usage, receipts, tickets, logs, backups, analytics]
+              description: 导出对象（M14 §5 同一枚举）。
+            from: { type: [string, 'null'], format: date-time }
+            to: { type: [string, 'null'], format: date-time }
+            tenant_id: { type: [string, 'null'] }
+        format:
+          type: array
+          minItems: 1
+          description: 导出格式；缺省一次打包 JSON + CSV（产品 §22.5）。
+          items:
+            type: string
+            enum: [json, csv]
+        reason: { type: string, minLength: 1, maxLength: 512 }
+        estimated_rows:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 0
+          description: 预估行数（用于双人复核判定；缺省 0）。
+        contains_personal_data:
+          type: boolean
+          default: false
+          description: 是否含个人信息（命中即强制双人复核；INV-04）。
+
+    ExportRequest:
+      type: object
+      additionalProperties: true
+      required: [export_id, export_no, scope, format, state, created_at, expires_at]
+      properties:
+        export_id: { type: string }
+        export_no:
+          type: string
+          description: 对外申请号（≤32 字符，全局唯一）。
+        requester: { type: [string, 'null'] }
+        scope:
+          type: object
+          additionalProperties: true
+          description: 导出范围（对象 + 时间窗 + 租户）。
+        format:
+          type: array
+          items:
+            type: string
+            enum: [json, csv]
+        reason: { type: [string, 'null'] }
+        state:
+          type: string
+          enum: [pending, approved, running, done, failed, expired]
+          description: pending → approved → running → done；终止 failed / expired，过期不自动续期（INV-04）。
+        rows:
+          type: integer
+          minimum: 0
+          description: 实际导出条数（row_count）。
+        estimated_rows:
+          type: integer
+          minimum: 0
+          description: 预估条数；>1,000 或含个人信息强制双人复核。
+        contains_personal_data: { type: boolean }
+        approval_required: { type: boolean, description: 是否需双人复核。 }
+        approver: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        approved_at: { type: [string, 'null'], format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        expires_at:
+          type: string
+          format: date-time
+          description: 文件失效时间（7 天；INV-04）。
+        watermark:
+          type: [string, 'null']
+          description: 文件水印标识（追责用；不含正文）。
+        failure_reason:
+          type: [string, 'null']
+          description: 失败原因摘要（人类可读；不含内部堆栈 / 凭据）。
+        cancelled_at: { type: [string, 'null'], format: date-time }
+        cancelled_by: { type: [string, 'null'] }
+        download:
+          $ref: '#/components/schemas/ExportDownload'
+
+    ExportDownload:
+      type: object
+      additionalProperties: true
+      required: [available]
+      properties:
+        available:
+          type: boolean
+          description: 当前是否可下载（未完成 / 已过期 / 已消费 / 已签发新链接时为 false）。
+        reason:
+          type: [string, 'null']
+          description: 不可用原因（state_* / file_expired / already_downloaded）。
+        url:
+          type: [string, 'null']
+          description: 一次性签名下载链接（TTL ≤15 分钟）；带水印；不返回文件内容。
+        expires_at: { type: [string, 'null'], format: date-time }
+        ttl_s: { type: [integer, 'null'], minimum: 0 }
+        one_time: { type: boolean, description: 链接一次性（第二次 409 + 40901）。 }
+        watermark: { type: [string, 'null'] }
+
+    ExportRequestPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/ExportRequest' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    RetentionJobCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [object]
+      properties:
+        object:
+          type: string
+          enum: [usage, receipts, tickets, logs, backups, analytics]
+          description: 保留对象（产品 §22.5 矩阵）；同一 (object, cutoff) 只执行一次。
+        cutoff:
+          type: [string, 'null']
+          format: date-time
+          description: 保留截止时间（UTC 日界）；与 policy_days 二选一或同时给出（同时须一致）。
+        policy_days:
+          type: [integer, 'null']
+          minimum: 1
+          description: 保留天数；缺省与 cutoff 互推，均缺省时按 §22.5 矩阵。
+        dry_run:
+          type: boolean
+          default: false
+          description: true 只计算将删条数、不执行。
+        reason: { type: [string, 'null'], maxLength: 512 }
+
+    RetentionJob:
+      type: object
+      additionalProperties: true
+      required: [job_id, job_no, object, cutoff, state, dry_run, created_at]
+      properties:
+        job_id: { type: string }
+        job_no: { type: string, description: 对外任务号。 }
+        object:
+          type: string
+          enum: [usage, receipts, tickets, logs, backups, analytics]
+        policy_days: { type: integer, minimum: 0 }
+        cutoff: { type: string, format: date-time }
+        state:
+          type: string
+          enum: [queued, running, done, failed]
+          description: queued → running → done；失败可幂等重放，连续 2 次升级 P0（INV-07）。
+        dry_run: { type: boolean }
+        deleted_count: { type: integer, minimum: 0 }
+        retained_count:
+          type: integer
+          minimum: 0
+          description: 部分保留条数（争议保全 / 账本类只去关联化）。
+        report:
+          type: object
+          additionalProperties: true
+          description: 删除报告摘要（已删 / 部分保留及原因 / 最迟清除日 / 方式）；不含被删数据正文。
+        report_ref: { type: [string, 'null'], description: 报告引用。 }
+        failure_reason: { type: [string, 'null'] }
+        replay_count: { type: integer, minimum: 0 }
+        requested_by: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        sla:
+          type: object
+          additionalProperties: true
+          description: SLA 口径（30 天办结 / 40 天抽样，M14 §8.2）。
+          properties:
+            due_at: { type: [string, 'null'], format: date-time }
+            overdue: { type: boolean }
+            window_days: { type: integer, minimum: 0 }
+            sampling_days: { type: integer, minimum: 0 }
+
+    RetentionJobPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/RetentionJob' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    OpsHealthBlock:
+      type: object
+      additionalProperties: true
+      required: [block, status]
+      properties:
+        block:
+          type: string
+          enum: [gateway, scheduling, ledger, recon, wallet, config, notification]
+          description: 七块健康总览（产品 §22.21）。
+        status:
+          type: string
+          enum: [green, yellow, red]
+        reason:
+          type: [string, 'null']
+          description: 粗粒度原因（probe_not_wired / unavailable / probe_error 等）；不含阈值。
+        detail:
+          type: [string, 'null']
+          description: 结论摘要（组件名 + 状态；不含阈值 / 名单 / 依赖地址）。
+        metrics:
+          type: object
+          additionalProperties: true
+          description: 关键指标摘要（只读聚合；不含名单与判定条件）。
+        checked_at: { type: [string, 'null'], format: date-time }
+        last_change:
+          type: object
+          additionalProperties: true
+          description: 最近一次变更（来源审计链；无则 null）。
+          properties:
+            action: { type: string }
+            actor: { type: [string, 'null'] }
+            at: { type: string, format: date-time }
+
+    OpsHealth:
+      type: object
+      additionalProperties: true
+      required: [data, overall, observed_at]
+      properties:
+        data:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/OpsHealthBlock' }
+        overall:
+          type: string
+          enum: [green, yellow, red]
+          description: 取七块最差级别；红块须 5 分钟内可定位到组件与变更单。
+        observed_at: { type: string, format: date-time }
+        block_count: { type: integer, minimum: 0 }
+
+    OpsChange:
+      type: object
+      additionalProperties: true
+      required: [change_id, kind, action, status, window, rollback_plan, impact_scope, occurred_at]
+      properties:
+        change_id: { type: string }
+        kind:
+          type: string
+          enum: [config_publish, config_rollback, deploy, backup, upgrade, release]
+        action: { type: string, description: 审计动作名（如 config.publish）。 }
+        status:
+          type: string
+          enum: [completed, failed, rolled_back, in_progress, recorded]
+          description: 由审计动作推导的变更状态（执行在 M16，M14 只读展示）。
+        actor: { type: [string, 'null'] }
+        target: { type: [string, 'null'] }
+        window:
+          type: object
+          additionalProperties: true
+          description: 变更窗口（无登记时 start=end=发生时间）。
+          properties:
+            start: { type: string, format: date-time }
+            end: { type: string, format: date-time }
+        rollback_plan:
+          type: string
+          description: 回滚方案（人类可读）；未登记时标注以 M16 发布单为准。
+        impact_scope:
+          type: string
+          description: 影响面（组件 / 用户可见性）；不含阈值与内部名单。
+        occurred_at: { type: string, format: date-time }
+        ticket: { type: [string, 'null'] }
+        evidence: { type: [string, 'null'] }
+
+    OpsChangePage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/OpsChange' }
+        page: { $ref: '#/components/schemas/Page' }
+        source:
+          type: object
+          additionalProperties: true
+          description: 数据源可用性（审计链 / 事件 outbox）。
+          properties:
+            audit_log:
+              type: string
+              enum: [ok, unavailable]
+        observed_at: { type: string, format: date-time }
+
+    OpsBatchOpRequest:
+      type: object
+      additionalProperties: true
+      required: [step]
+      properties:
+        step:
+          type: string
+          enum: [preview, execute, undo]
+          description: 五步流程的入口（无 preview 禁止 execute；INV-03）。
+        action_type:
+          type: string
+          enum: [notify, tag, freeze, unfreeze, retire, limit_adjust, payout_proposal, refund_proposal]
+          description: preview 必填：批量动作类型（涉资金 / 冻结类强制双人复核）。
+        target:
+          type: object
+          additionalProperties: true
+          description: preview 用范围；无 target.ids 时必须接线 Owner 查询适配器（不猜影响面）。
+          properties:
+            object:
+              type: string
+              enum: [account, node, key, wallet, ticket, config]
+            ids:
+              type: array
+              maxItems: 200
+              items: { type: string }
+            filter:
+              type: object
+              additionalProperties: true
+        reason: { type: [string, 'null'], maxLength: 512 }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+          description: 预览展示用的标签（id → 人类可读名）；不含 PII 正文。
+        batch_id:
+          type: [string, 'null']
+          description: execute / undo 必填：预览返回的批次操作 id（UUID）。
+
+    OpsBatchOp:
+      type: object
+      additionalProperties: true
+      required: [batch_id, state, step, action_type, count, dual_review_required]
+      properties:
+        batch_id: { type: string }
+        state:
+          type: string
+          enum: [previewed, executed, undone, failed]
+        step: { type: string, enum: [preview, execute, undo] }
+        action_type:
+          type: string
+          enum: [notify, tag, freeze, unfreeze, retire, limit_adjust, payout_proposal, refund_proposal]
+        target:
+          type: object
+          additionalProperties: true
+        reason: { type: [string, 'null'] }
+        count: { type: integer, minimum: 0 }
+        impact:
+          type: array
+          description: 影响清单（id + 展示标签）。
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              id: { type: string }
+              label: { type: [string, 'null'] }
+        sample:
+          type: array
+          description: 随机抽样（≤10 条，逐条确认）。
+          items: { type: string }
+        sample_size: { type: integer, minimum: 0 }
+        dual_review_required: { type: boolean }
+        max_items: { type: integer, minimum: 1 }
+        undo_window_s: { type: integer, minimum: 0 }
+        initiator: { type: [string, 'null'] }
+        approver: { type: [string, 'null'] }
+        previewed_at: { type: [string, 'null'], format: date-time }
+        executed_at: { type: [string, 'null'], format: date-time }
+        undo_deadline:
+          type: [string, 'null']
+          format: date-time
+          description: 撤销窗口截止（执行后 10 分钟）；过期不可撤销（409 + 40901）。
+        results:
+          type: array
+          description: 逐条执行回执（保留成功项 + 失败清单）。
+          items:
+            type: object
+            additionalProperties: true
+        undo_results:
+          type: array
+          description: 逐条撤销回执（撤销也留痕）。
+          items:
+            type: object
+            additionalProperties: true
+        succeeded_count: { type: integer, minimum: 0 }
+        failed_count: { type: integer, minimum: 0 }
+
+    AuditReplayEvent:
+      type: object
+      additionalProperties: true
+      required: [occurred_at, source, action]
+      properties:
+        occurred_at: { type: string, format: date-time }
+        source:
+          type: string
+          enum: [audit, event]
+          description: audit = 审计链条目；event = 事件 outbox 记录。
+        trace_id: { type: [string, 'null'] }
+        owner_id: { type: [string, 'null'], description: 操作者内部 id（不写邮箱 / 手机）。 }
+        action: { type: string }
+        target: { type: [string, 'null'] }
+        reason_code: { type: [string, 'null'] }
+        evidence: { type: [string, 'null'] }
+        detail:
+          type: object
+          additionalProperties: true
+          description: 脱敏后的审计 after 摘要（最多 3 层 / 200 字符；敏感键被剔除）。
+        event_id: { type: [string, 'null'] }
+        aggregate_type: { type: [string, 'null'] }
+        state: { type: [string, 'null'] }
+        payload:
+          type: object
+          additionalProperties: true
+          description: 脱敏后的事件 payload（不含正文 / PII / 密钥）。
+
+    AuditReplay:
+      type: object
+      additionalProperties: true
+      required: [data, page, observed_at]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/AuditReplayEvent' }
+        page: { $ref: '#/components/schemas/Page' }
+        source:
+          type: object
+          additionalProperties: true
+          description: 数据源可用性。
+          properties:
+            audit_log:
+              type: string
+              enum: [ok, unavailable]
+            outbox:
+              type: string
+              enum: [ok, unavailable]
+        observed_at: { type: string, format: date-time }
