@@ -17,7 +17,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.6
+  version: 1.2.7
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面（125 路径 / 143 操作；覆盖 M01–M14、M16）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
@@ -3677,7 +3677,8 @@ paths:
         `id` 接受订单号 `order_no`。状态机 created → pending → paid → credited，
         终止 failed / closed / expired（终态不可回退）。链上收款确认不足只返回确认中态、不入账；
         链 / 资产不支持 → `409` + `40913`，确认数不足 / 充值未到账 → `409` + `40912`。
-        响应带 `attempts`（每次向 PSP / 链上发起）与 `signature_verified` 结论，**不含**签名字节。
+        响应带 `attempts`（每次向 PSP / 链上发起）与 `signature_verified` 结论，**不含**签名字节；
+        `original_route_masked` 为原路展示掩码（只读、仅展示，无成功 attempt 时为 null）。
       security: [{ userBearer: [] }]
       parameters:
         - name: id
@@ -3748,8 +3749,10 @@ paths:
       summary: 退款申请（原路、14 天窗口、唯一 refund_request）
       description: |
         只回原路、金额 ≤ 已付未消耗、窗口 14 天（03-facts §5），唯一一条 `refund_request`；
-        不向第三方地址退款。原路退款排队 → `409` + `40917`；原路不可用 → `409` + `40918`
-        （转人工，不换路）；金额不符 / 超额 → `409` + `40911`。
+        不向第三方地址退款。`original_route` 可省略：省略时服务端按 `order_no` 对应的唯一成功
+        `payment_attempt` 推导真实原路；无法唯一确定（无成功 attempt / 多次成功）→ `409` + `40919`
+        （`reason=original_route_unavailable`）。原路退款排队 → `409` + `40917`；原路不可用 →
+        `409` + `40918`（转人工，不换路）；金额不符 / 超额 → `409` + `40911`。
         高危动作：二次认证（step-up ≤5 分钟）+ 双人复核；缺 step-up 返回 `424` + `42401`。
       security: [{ userBearer: [] }]
       parameters:
@@ -5198,10 +5201,12 @@ components:
               description: 仅 429/503 有意义；与 `Retry-After` 头一致。
             reason:
               type: string
-              enum: [rate_limited, quota_exceeded, account_restricted, policy_blocked]
+              enum: [rate_limited, quota_exceeded, account_restricted, policy_blocked, original_route_unavailable]
               description: |
                 粗粒度原因码，供客户端做退避与提示。**不含**判定细节；
                 具体规则/阈值/名单在私有配置，不对外。
+                `original_route_unavailable`：退款原路无法由服务端唯一推导（无成功 attempt / 多次成功），
+                与 `409` + `40919` 一起返回；客户端应提示补填原路或转人工，不得重试猜测。
 
     Page:
       type: object
@@ -8552,6 +8557,13 @@ components:
       required: [order]
       properties:
         order: { $ref: '#/components/schemas/PaymentOrder' }
+        original_route_masked:
+          type: [string, 'null']
+          readOnly: true
+          description: |
+            原路展示用掩码（`psp:<provider>:****<末4>`，末 4 位为原路标识末尾）；
+            无成功 `payment_attempt` 时为 null。**只用于展示，永不作为入参**；
+            真实原路不入响应（退款只回原路哈希）。
         attempts:
           type: array
           items: { $ref: '#/components/schemas/PaymentAttempt' }
@@ -8576,7 +8588,7 @@ components:
     RefundRequestCreateRequest:
       type: object
       additionalProperties: true
-      required: [order_no, amount_minor, reason_code, original_route]
+      required: [order_no, amount_minor, reason_code]
       properties:
         order_no: { type: string, minLength: 3, maxLength: 32 }
         amount_minor:
@@ -8592,7 +8604,11 @@ components:
           type: string
           minLength: 1
           maxLength: 512
-          description: 原路标识（与支付方式一致）；服务端只存哈希，不回显原文（只回原路）。
+          description: |
+            原路标识（与支付方式一致）。**可省略**：省略时服务端按 `order_no` 对应的**唯一**成功
+            `payment_attempt` 推导真实原路；提供时必须**逐字等于**真实原路（掩码串
+            `psp:<provider>:****<末4>` 不接受）。无法唯一确定（无成功 attempt 或多次成功）
+            → `409` + `40919`（`reason=original_route_unavailable`）。服务端只存哈希，不回显原文。
         evidence_ref: { type: [string, 'null'], maxLength: 128 }
 
     RefundRequest:
@@ -8613,7 +8629,7 @@ components:
           enum: [requested, approved, executing, succeeded, failed, cancelled]
         original_route_hash:
           type: [string, 'null']
-          description: 原路哈希（不回原文 / 卡令牌 / 地址明文；INV-12）。
+          description: 原路哈希（不回原文 / 卡令牌 / 地址明文；INV-12）。请求省略 original_route 时，按服务端推导出的真实原路计算，掩码不回传。
         deadline_at:
           type: string
           format: date-time

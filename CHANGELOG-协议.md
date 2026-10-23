@@ -3,6 +3,45 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.7 · 2026-10-24 · MINOR
+
+**类型**：MINOR（1 个只读可选响应字段 + 1 个请求字段由必填改为可选 + `Error.reason` 新增 1 个枚举值；
+无删除、无类型更改、无既有 path 语义变更；路径 / 操作 / schema 数不变）
+
+**变更**
+1. `PaymentOrderDetail` 新增 `original_route_masked`（`string|null`，`readOnly: true`）：
+   形态 `psp:<provider>:****<末4>`，无成功 `payment_attempt` 时为 `null`；
+   **只用于展示，永不作为入参**；真实原路不入响应（退款只回 `original_route_hash`）。
+2. `RefundRequestCreateRequest.original_route` 由**必填改为可选**：省略时服务端按 `order_no` 对应的
+   **唯一**成功 `payment_attempt` 推导真实原路；提供时必须**逐字等于**真实原路，掩码串
+   （`psp:<provider>:****<末4>`）不接受。
+3. 无法唯一确定原路（无成功 attempt 或多次成功）→ `409` + `40919`（`reason=original_route_unavailable`）；
+   **不新造错误码**（40919 沿用 1.2.5 登记的「状态冲突通用码」）。
+4. `Error.reason` 枚举新增 `original_route_unavailable`（新增 enum 值，客户端须容忍未知值）。
+5. 既有 1.2.0–1.2.6 的路径、操作、schema、enum、错误码**语义未变**。
+
+**影响面**
+- M08 payments-treasury：退款创建允许服务端推导原路；订单详情新增只读掩码原路，供 M13 退款页展示。
+- M13 portal-web：退款页展示 `psp:<provider>:****<末4>`；提交时可省略 `original_route`，不再要求用户填明文。
+- 客户端 / SDK：响应新增可选只读字段 + `Error.reason` 新增枚举值（tolerant reader 必须忽略未知值）；
+  请求侧放宽（字段由必填改可选）对老客户端无影响。
+- M09 / M16：无影响（不涉及对账 / 审计字段）。
+
+**兼容矩阵**
+- v1 未发布 → N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无**（`python3 ci/spec_breaking.py 91991f5` → ✅ 无破坏性变更；仅 1 条「不再强制 original_route」兼容提示）。
+- 与 1.2.6 的关系：纯补丁；125 → 125 路径、143 → 143 操作、220 → 220 schema（仅字段级增改）。
+
+**复核人**：contract-integrator（提议 / 实现，task-10 / DEV-SPEC-1.2.7）· lead（复核；证据 `ops/audit/reports/DEV-W0-SPEC-1.2.7-<UTC>.txt`）
+
+**备注（复核要点）**
+- `original_route_masked` 的 `<末4>` 取自真实原路标识末尾 4 位；前缀统一为 `psp:<provider>:`，
+  与 `PaymentAttempt.provider` 对齐；**不得**把掩码回传为退款入参（服务端按字面校验拒绝）。
+- 原路推导只认「唯一成功 attempt」：0 个或 ≥2 个成功都返回 409 + 40919 + `original_route_unavailable`，
+  不做启发式猜测；同一笔退款仍受唯一 `refund_request` 约束。
+- 40919 语义为「状态冲突通用码」，本补丁复用而不新增码；若要独立子码，走 1.2.8 MINOR（不本版）。
+- 掩码原路属于展示字段，`readOnly: true` 明确不可写；SDK 生成时不应把它放进请求模型。
+
 ## 1.2.6 · 2026-10-24 · MINOR
 
 **类型**：MINOR（新增 3 条路径 / 3 个操作 / 3 个 schema；tag 归一 + 1 个可选字段 + 取消语义与错误码补登；
