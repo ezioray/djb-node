@@ -17,8 +17,8 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.2
-  summary: W1 契约冻结 + M16 审计链（70 路径 / 80 操作；覆盖 M01–M06、M10、M16）
+  version: 1.2.3
+  summary: W1 冻结 + M16 审计链 + W2 通知/对账（80 路径 / 90 操作；覆盖 M01–M06、M09、M10、M12、M16）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
@@ -2792,6 +2792,324 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
+  # ---------------------------------------------------------------- 站内信（M12）
+  /api/v1/user/notifications:
+    get:
+      tags: [user]
+      operationId: listNotifications
+      summary: 站内信列表（游标分页；P0 不可退订但可标记已读）
+      description: |
+        只返回当前账户的站内记录；按 `created_at` 倒序。`unread_only=true` 只返回未读。
+        `payload` 只含 id / 金额 / 时间 / 原因码，不含正文与 PII（M12 INV-07）。
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: level
+          in: query
+          required: false
+          schema: { type: string, enum: [P0, P1, P2] }
+        - name: unread_only
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 站内信分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/notifications/{id}/read:
+    post:
+      tags: [user]
+      operationId: markNotificationRead
+      summary: 标记单条已读；`id=all` 标记该账户全部未读
+      description: |
+        重复标记无副作用（幂等）。`id=all` 是保留字，不对应任何真实通知 id。
+        已读只影响未读提醒，不移除站内记录（M12 INV-02）。
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 通知 id；保留值 `all` 表示全部已读。
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已读结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationReadAck' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- 对账（M09）
+  /api/v1/admin/treasury/recon/runs:
+    get:
+      tags: [admin]
+      operationId: listReconRuns
+      summary: 对账批次列表（按 cutoff_at 倒序）
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string, enum: [chain, psp, bank, receipt, daily_close] }
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [scheduled, running, matched, exceptions_open, signed_off, closed] }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 批次分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconRunPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/recon/runs/{run_id}:
+    get:
+      tags: [admin]
+      operationId: getReconRun
+      summary: 批次详情 + 差异汇总（按严重度 / 状态）
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 批次详情
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconRunDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/recon/runs/{run_id}/sign-off:
+    post:
+      tags: [admin]
+      operationId: signOffReconRun
+      summary: 双人签核（存在未结 P0/P1 时拒绝）
+      description: |
+        制单人与复核人必须不同（INV-05）；存在未结 P0/P1 差异返回 409 + `49202`；
+        已签核或已关闭再签返回 409 + `49203`。签核后批次只读。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReconSignOffRequest' }
+      responses:
+        '200':
+          description: 已签核的批次
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconRun' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/recon/exceptions:
+    get:
+      tags: [admin]
+      operationId: listReconExceptions
+      summary: 差异列表（severity / status / owner / 到期）
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: run_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: severity
+          in: query
+          required: false
+          schema: { type: string, enum: [P0, P1, P2] }
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [open, investigating, escalated, resolved, accepted, closed] }
+        - name: owner
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 差异分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconExceptionPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/recon/exceptions/{exception_id}/resolve:
+    post:
+      tags: [admin]
+      operationId: resolveReconException
+      summary: 差异处置（调整分录 / 外部修正 / 核销 / 误报）
+      description: |
+        `resolution_code=adjust_journal` 必须带 `resolution_journal_id`（已入账的调整分录）；
+        关闭后不可重开，新差异开新 run（M09 §3.2）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: exception_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReconExceptionResolveRequest' }
+      responses:
+        '200':
+          description: 已处置的差异
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconException' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/recon/attestations:
+    post:
+      tags: [admin]
+      operationId: submitReconAttestation
+      summary: 提交复核凭证（同一期间 + batch_hash 只能一个 valid）
+      description: |
+        签名覆盖 `ledger_root + batch_hash + balances + payable_total_minor`；复核人 ≠ 制单人。
+        同 `(period_start, period_end, batch_hash)` 已有 valid 凭证返回 409 + `49205`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReconAttestationRequest' }
+      responses:
+        '201':
+          description: 已受理的凭证
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconAttestation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/recon/attestations/{attestation_id}:
+    get:
+      tags: [admin]
+      operationId: getReconAttestation
+      summary: 查询复核凭证
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: attestation_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 凭证
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconAttestation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/recon/attestations/{attestation_id}/validate:
+    get:
+      tags: [admin]
+      operationId: validateReconAttestation
+      summary: 出款前校验（服务间调用；只返回结论，不返回凭证正文）
+      description: |
+        供 M08 出款前置校验：`valid=true` 且未过期才允许出款。服务间 mTLS + 服务令牌，
+        不具备 admin 会话也能调用，但只返回 `valid/status/reasons`。
+      security: [{ internalMTLS: [] }]
+      parameters:
+        - name: attestation_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 校验结论
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconAttestationValidation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
 components:
 
   securitySchemes:
@@ -2854,10 +3172,12 @@ components:
       name: period
       in: query
       required: true
-      description: 自然月 `YYYY-MM`（与 `/verify/{period}` 同粒度；审计锚定日是日粒度）。
+      description: |
+        报表周期：自然月 `YYYY-MM`，或日粒度 `YYYY-MM-DD`（REP-01/02/04 需要日粒度时用；
+        `/admin/ledger/merkle/{period}` 仍只接受月）。日粒度只加不改，月粒度行为不变。
       schema:
         type: string
-        pattern: '^[0-9]{4}-[0-9]{2}$'
+        pattern: '^[0-9]{4}-[0-9]{2}(-[0-9]{2})?$'
 
     ProtocolVersion:
       name: DJB-Protocol-Version
@@ -3113,6 +3433,13 @@ components:
                 spec 1.2.1 新登记（M01 T2 已在用，仅文档补登；不改结构/响应/枚举）：
                 `40103` 刷新令牌无效 / 已轮换或撤销（重放）/ 过期 → 重新登录（HTTP 401）；
                 `40905` 一次性令牌失效（扫码票据 / 邀请令牌：已用、过期、票据与账户不匹配）→ 重新发起（HTTP 409）。
+
+                spec 1.2.3 新登记（W2 通知 / 对账错误码，仅文档补登）：
+                `40902` 不可退订 / 偏好冲突（M12：P0 通知不得退订，HTTP 409）；
+                `49201` 对账批次不存在（404）/ `49202` 存在未结 P0·P1 不得签核（409）/
+                `49203` 批次已签核或已关闭（409）/ `49204` 差异状态不允许该处置（409）/
+                `49205` 同一期间 + batch_hash 已有 valid 凭证（409）/ `49206` 出款前凭证校验失败（403）/
+                `49210` 报表周期非法或无数据（404）/ `49211` 渲染件不存在（404）/ `49212` 凭证不存在（404）。
 
                 spec 1.2.2 新登记（M03 网关错误码，仅文档补登；不改结构 / 响应 / 枚举）：
                 `42901` QPS 超限 / `42902` 每日花费上限（HTTP 429）；
@@ -5752,4 +6079,240 @@ components:
           type: array
           items: { type: string }
           description: 人类可读的问题清单（不含密钥 / 正文）。
+
+
+    Notification:
+      type: object
+      additionalProperties: true
+      required: [id, level, type, channel_count, status, created_at]
+      properties:
+        id: { type: string }
+        level:
+          type: string
+          enum: [P0, P1, P2]
+        type: { type: string }
+        template_key: { type: string }
+        channels:
+          type: array
+          items: { type: string, enum: [in_app, email, webhook] }
+        channel_count:
+          type: integer
+          minimum: 1
+          description: 合并去重后的实际条数（M12 INV-03 同窗口合并时 >1）。
+        status:
+          type: string
+          enum: [queued, sending, delivered, partial, failed, dead]
+        created_at: { type: string, format: date-time }
+        sent_at: { type: [string, 'null'], format: date-time }
+        read_at: { type: [string, 'null'], format: date-time }
+
+    NotificationList:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Notification' }
+        page: { $ref: '#/components/schemas/Page' }
+        unread:
+          type: integer
+          minimum: 0
+
+    NotificationReadAck:
+      type: object
+      additionalProperties: true
+      required: [marked, unread]
+      properties:
+        notification_id:
+          type: [string, 'null']
+          description: "当 id=all（全部已读）时为 null。"
+        marked:
+          type: integer
+          minimum: 0
+        unread:
+          type: integer
+          minimum: 0
+        read_at: { type: string, format: date-time }
+
+    ReconRun:
+      type: object
+      additionalProperties: true
+      required: [run_id, scope, period_start, period_end, cutoff_at, status, diff_minor]
+      properties:
+        run_id: { type: string }
+        scope:
+          type: string
+          enum: [chain, psp, bank, receipt, daily_close]
+        subject_ref: { type: [string, 'null'] }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        cutoff_at: { type: string, format: date-time }
+        block_height: { type: [integer, 'null'] }
+        book_minor: { type: integer }
+        external_minor: { type: integer }
+        diff_minor: { type: integer, description: 有符号整数最小单位（分）。 }
+        matched_count: { type: integer, minimum: 0 }
+        unmatched_count: { type: integer, minimum: 0 }
+        status:
+          type: string
+          enum: [scheduled, running, matched, exceptions_open, signed_off, closed]
+        rule_version: { type: string }
+        policy_version: { type: [string, 'null'] }
+        report_ref: { type: [string, 'null'] }
+        signed_off_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    ReconRunPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/ReconRun' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    ReconDiffSummary:
+      type: object
+      additionalProperties: true
+      required: [pending_p0_p1, by_severity, by_status]
+      properties:
+        pending_p0_p1: { type: integer, minimum: 0 }
+        by_severity:
+          type: object
+          additionalProperties: true
+          properties:
+            P0: { type: integer, minimum: 0 }
+            P1: { type: integer, minimum: 0 }
+            P2: { type: integer, minimum: 0 }
+        by_status:
+          type: object
+          additionalProperties: true
+          properties:
+            open: { type: integer, minimum: 0 }
+            investigating: { type: integer, minimum: 0 }
+            escalated: { type: integer, minimum: 0 }
+            resolved: { type: integer, minimum: 0 }
+            accepted: { type: integer, minimum: 0 }
+            closed: { type: integer, minimum: 0 }
+
+    ReconRunDetail:
+      type: object
+      additionalProperties: true
+      required: [run, diff_summary]
+      properties:
+        run: { $ref: '#/components/schemas/ReconRun' }
+        diff_summary: { $ref: '#/components/schemas/ReconDiffSummary' }
+
+    ReconException:
+      type: object
+      additionalProperties: true
+      required: [exception_id, run_id, scope, kind, severity, diff_minor, status, sla_due]
+      properties:
+        exception_id: { type: string }
+        run_id: { type: string }
+        scope:
+          type: string
+          enum: [chain, psp, bank, receipt, daily_close]
+        kind: { type: string }
+        severity:
+          type: string
+          enum: [P0, P1, P2]
+        ref_type: { type: [string, 'null'] }
+        ref_id: { type: [string, 'null'] }
+        diff_minor: { type: integer }
+        owner: { type: [string, 'null'] }
+        sla_due: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [open, investigating, escalated, resolved, accepted, closed]
+        resolution_code:
+          type: [string, 'null']
+          enum: [adjust_journal, external_fix, write_off, false_positive, null]
+        resolution_journal_id: { type: [string, 'null'] }
+        root_cause: { type: [string, 'null'] }
+        evidence_ref: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+
+    ReconExceptionPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/ReconException' }
+        page: { $ref: '#/components/schemas/Page' }
+
+    ReconSignOffRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        reviewer_note: { type: string, maxLength: 512 }
+        attestation_id: { type: [string, 'null'] }
+
+    ReconExceptionResolveRequest:
+      type: object
+      additionalProperties: true
+      required: [resolution_code]
+      properties:
+        resolution_code:
+          type: string
+          enum: [adjust_journal, external_fix, write_off, false_positive]
+        root_cause: { type: string, maxLength: 512 }
+        resolution_journal_id: { type: [string, 'null'] }
+        evidence_ref: { type: [string, 'null'] }
+
+    ReconAttestationRequest:
+      type: object
+      additionalProperties: true
+      required: [period_start, period_end, ledger_root, batch_hash, payable_total_minor, signature_ref]
+      properties:
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        ledger_root: { type: string }
+        chain_snapshot_ref: { type: [string, 'null'] }
+        bank_snapshot_ref: { type: [string, 'null'] }
+        payable_total_minor: { type: integer, minimum: 0 }
+        batch_hash: { type: string }
+        signature_ref: { type: string }
+
+    ReconAttestation:
+      type: object
+      additionalProperties: true
+      required: [attestation_id, period_start, period_end, ledger_root, batch_hash, payable_total_minor, status, signature_ref, created_at]
+      properties:
+        attestation_id: { type: string }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        ledger_root: { type: string }
+        chain_snapshot_ref: { type: [string, 'null'] }
+        bank_snapshot_ref: { type: [string, 'null'] }
+        payable_total_minor: { type: integer, minimum: 0 }
+        batch_hash: { type: string }
+        reviewer_id: { type: [string, 'null'] }
+        reviewer_pubkey_ref: { type: [string, 'null'] }
+        signature_ref: { type: string }
+        hsm_verified_at: { type: [string, 'null'], format: date-time }
+        status:
+          type: string
+          enum: [valid, superseded, revoked]
+        created_at: { type: string, format: date-time }
+
+    ReconAttestationValidation:
+      type: object
+      additionalProperties: true
+      required: [valid, status, checked_at]
+      properties:
+        valid: { type: boolean }
+        status:
+          type: string
+          enum: [valid, superseded, revoked, expired, unknown]
+        checked_at: { type: string, format: date-time }
+        reasons:
+          type: array
+          items: { type: string }
+          description: 人类可读的拒绝原因（不含凭证正文 / 签名 / 金额明细）。
 

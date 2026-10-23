@@ -3,6 +3,47 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.3 · 2026-10-23 · MINOR
+
+**类型**：MINOR（新增 10 条路径 / 10 个操作 / 14 个 schema；无删除、无类型更改、无既有字段语义变更）
+
+**变更**
+1. M12 站内信补齐 2 条（CR-2）：
+   `GET /api/v1/user/notifications`（`listNotifications`，游标分页、level / unread_only 过滤、返回 unread 计数）；
+   `POST /api/v1/user/notifications/{id}/read`（`markNotificationRead`，`id=all` 为保留值表示全部已读，重复无副作用）。
+   新增 schema `Notification` / `NotificationList` / `NotificationReadAck`。
+2. M09 对账补齐 8 条（CR-1 / CR-2）：
+   `GET /api/v1/admin/treasury/recon/runs`、`GET .../runs/{run_id}`（含差异汇总）、
+   `POST .../runs/{run_id}/sign-off`（双人签核，未结 P0/P1 拒绝）、
+   `GET .../exceptions`、`POST .../exceptions/{id}/resolve`、
+   `POST .../attestations`、`GET .../attestations/{id}`、`GET .../attestations/{id}/validate`（内部面，出款前校验）。
+   新增 schema `ReconRun` / `ReconRunPage` / `ReconDiffSummary` / `ReconRunDetail` / `ReconException` /
+   `ReconExceptionPage` / `ReconSignOffRequest` / `ReconExceptionResolveRequest` / `ReconAttestation` /
+   `ReconAttestationRequest` / `ReconAttestationValidation`。
+3. `Error.code` 文档补登：`40902`（M12 P0 不可退订）、对账段 `49201–49206` / `49210–49212`（M09 CR-3）。
+4. `ReportPeriod` 支持日粒度 `YYYY-MM-DD`（M09 CR-1，只加不改；月粒度行为不变）。
+5. 既有 1.2.0 / 1.2.1 / 1.2.2 的路径、操作、schema、enum、错误码**逐字节未变**。
+
+**影响面**
+- M12 notification：S1 站内信 + 偏好 + Webhook 三条读/写端点齐套；S2 邮件/重试/死信按实现接。
+- M09 recon-reports：批次 / 差异 / 凭证三个聚合的读写面冻结；报表 5 条沿用 1.1.0。
+- M08：出款前校验走 `validate` 内部面（无需 admin 会话）。
+- M14：Ops Console 只读调用 M09 的 runs / exceptions。
+
+**兼容矩阵**
+- v1 未发布 → N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无**（`python3 ci/spec_breaking.py b4a4e7d` → ✅ 无破坏性变更）。
+- 与 1.2.2 的关系：纯增量；70 → 80 路径、80 → 90 操作、127 → 141 schema。
+
+**复核人**
+- 提议 / 实现：lead（contract-integrator 职责）
+- 复核：release-manager 发布前复核（内部/管理面契约，不对外）
+
+**备注（复核要点）**
+- `id=all` 是路径保留值，不对应真实通知 id；客户端传 `all` 时 `notification_id` 返回 null。
+- 对账金额一律有符号整数最小单位；`diff_minor` 不取绝对值，符号即方向。
+- `validate` 只返回 `valid/status/reasons`，不返回凭证正文、签名或金额明细（避免出款侧拿到不必要信息）。
+
 ## 1.2.2 · 2026-10-23 · MINOR
 
 **类型**：MINOR（新增 3 条路径 / 4 个操作 / 7 个 schema / 1 个 tag；无删除、无类型更改、无既有字段语义变更）
