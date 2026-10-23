@@ -45,9 +45,7 @@
 - 破坏性变更：**无**（`python3 ci/spec_breaking.py 6b135ae` → ✅ 无破坏性变更；tag 变更不计破坏性）。
 - 与 1.2.5 的关系：纯增量；122 → 125 路径、140 → 143 操作、217 → 220 schema。
 
-**复核人**
-- 提议 / 实现：contract-integrator（task-6 / DEV-SPEC-1.2.6）
-- 复核：lead（「未定项」见证据 `ops/audit/reports/DEV-W0-SPEC-1.2.6-<UTC>.txt`）
+**复核人**：contract-integrator（提议 / 实现，task-6 / DEV-SPEC-1.2.6）· lead（复核；未定项见证据 `ops/audit/reports/DEV-W0-SPEC-1.2.6-<UTC>.txt`）
 
 **备注（复核要点）**
 - tag 归一：既有 `/api/v1/admin/**` 原本已是 `admin`，未改动；本次只改 1.2.5 新增面与
@@ -127,9 +125,7 @@
 - 破坏性变更：**无**（`python3 ci/spec_breaking.py f7e6b54` → ✅ 无破坏性变更）。
 - 与 1.2.4 的关系：纯增量；97 → 122 路径、109 → 140 操作、171 → 217 schema。
 
-**复核人**
-- 提议 / 实现：contract-integrator（task-5 / DEV-SPEC-1.2.5）
-- 复核：lead（「未定字段」清单见证据 `ops/audit/reports/DEV-W0-SPEC-1.2.5-<UTC>.txt`）
+**复核人**：contract-integrator（提议 / 实现，task-5 / DEV-SPEC-1.2.5）· lead（复核；未定字段清单见证据 `ops/audit/reports/DEV-W0-SPEC-1.2.5-<UTC>.txt`）
 
 **备注（复核要点）**
 - tag 大小写：既有 `admin` / `user` / `node` 等保持小写；新增 `Treasury` / `AdminData` / `AdminOps` 按 Lead
@@ -178,9 +174,7 @@
 - 破坏性变更：**无**（`python3 ci/spec_breaking.py b4a4e7d`）。
 - 与 1.2.3 的关系：纯增量；80 → 97 路径、90 → 109 操作、141 → 171 schema。
 
-**复核人**
-- 提议 / 实现：lead（contract-integrator）
-- 复核：release-manager 发布前复核（内部/管理面）
+**复核人**：lead（contract-integrator 职责，提议 / 实现）· release-manager（发布前复核，内部/管理面）
 
 **备注（复核要点）**
 - `40201`（余额不足）与 `40902`（开关/状态冲突）沿用既有登记；M07 的校验失败统一 `42240`（**不占用** M06 的 `42220–42223`）。
@@ -219,9 +213,7 @@
 - 破坏性变更：**无**（`python3 ci/spec_breaking.py b4a4e7d` → ✅ 无破坏性变更）。
 - 与 1.2.2 的关系：纯增量；70 → 80 路径、80 → 90 操作、127 → 141 schema。
 
-**复核人**
-- 提议 / 实现：lead（contract-integrator 职责）
-- 复核：release-manager 发布前复核（内部/管理面契约，不对外）
+**复核人**：lead（contract-integrator 职责，提议 / 实现）· release-manager（发布前复核，内部/管理面契约）
 
 **备注（复核要点）**
 - `id=all` 是路径保留值，不对应真实通知 id；客户端传 `all` 时 `notification_id` 返回 null。
@@ -265,9 +257,7 @@
 - 破坏性变更：**无**（`python3 ci/spec_breaking.py b4a4e7d` → ✅ 无破坏性变更，仅 1 条 202 提示为 1.2.1 遗留）。
 - 与 1.2.1 的关系：纯增量；67 → 70 路径、76 → 80 操作、120 → 127 schema。
 
-**复核人**
-- 提议 / 实现：lead（contract-integrator 职责）
-- 复核：待 release-manager 在发布前复核（S1 内部契约，不影响对外）
+**复核人**：lead（contract-integrator 职责，提议 / 实现）· release-manager（待发布前复核；S1 内部契约，不影响对外）
 
 **备注（复核要点）**
 - 内部端点沿用 1.1.0 已登记的 `internalMTLS` 安全域，不新增安全方案。
