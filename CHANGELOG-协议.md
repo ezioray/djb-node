@@ -3,6 +3,53 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.2 · 2026-10-23 · MINOR
+
+**类型**：MINOR（新增 3 条路径 / 4 个操作 / 7 个 schema / 1 个 tag；无删除、无类型更改、无既有字段语义变更）
+
+**变更**
+1. 新增 `GET /healthz`（`operationId: getHealthz`）：存活 / 就绪探针，只返回 `status`（`ok` / `degraded`）、
+   `version`、`checked_at` 与依赖健康摘要，不暴露拓扑 / 地址 / 凭据；`security: []` 公开端点。
+2. 新增 `POST /internal/ops/audit/entries`（`appendAuditEntry`）：业务模块写审计的唯一入口。
+   append-only、HMAC-SHA256 链（`prev_hash` + canonical JSON）、幂等键去重；高危动作缺
+   `reason_code` / `ticket` / `before` / `after` / `approval_chain` 即拒（403 + `40301`）；
+   断链 / 并发写锁返回 409（`40901`）或 423（`42301`）。安全域 `internalMTLS`（mTLS + 服务令牌，公网不可达）。
+3. 新增 `GET /internal/ops/audit/entries`（`listAuditEntries`）：只读查询（`from_seq` / `action` /
+   `target` / `limit`），**不提供** UPDATE / DELETE，供 M14 后台与排障读取。
+4. 新增 `POST /internal/ops/audit/verify`（`verifyAuditChain`）：逐条重算校验 + 可选 `seal=true` 固化当日
+   Merkle 根（同日幂等）。断链不修链：返回 `200` + `ok=false` + `broken_seq` + `problems`。
+5. 新增 schema：`HealthStatus`、`AuditEntry`、`AuditAppendRequest`、`AuditAppendResponse`、
+   `AuditEntryPage`、`AuditVerifyRequest`、`AuditVerifyResponse`；新增 tag `ops`。
+7. `Error.code` 文档补登 M03 网关码段（仅文档，不改结构 / 响应 / 枚举）：
+   `42901/42902`（429）、`44101`（441）、`45001`（500）、`45201/45202/45203`（408/202/403）、
+   `50901/50902/50903`（503/504/502）、`50904`（鉴权不可用，S1 过渡仍用 503+45001）、
+   `40401`（404 专用码）、`42601`（426）；M10 `47010`（角色不足，403）、`47011`（审计不可用，503）。
+   对应 CR 台账 M03 CR-6 / CR-8 / CR-10、M10 CR-13 / CR-23；M04 的 `42230–42235` 子码含义待
+   M04 实现定稿，排 1.2.3。
+
+6. 既有 1.2.0 / 1.2.1 的路径、操作、schema、enum、错误码**逐字节未变**。
+
+**影响面**
+- M16 platform-infra：审计链接线所需契约冻结（对应 M16 §4.1 的内部 ops 面；部署 / 备份运行端点留待 T5/T6 的 1.2.3）。
+- M14 admin-data：Ops Console 读审计走 `GET /internal/ops/audit/entries`。
+- M06 hashchain / M10 AuditSink：改为经 `POST /internal/ops/audit/entries` 统一入链（实现侧接线，不改契约）。
+- 客户端 / 门户：无影响（内部端点不进 SDK，公网不可达）。
+
+**兼容矩阵**
+- v1 未发布 → N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无**（`python3 ci/spec_breaking.py b4a4e7d` → ✅ 无破坏性变更，仅 1 条 202 提示为 1.2.1 遗留）。
+- 与 1.2.1 的关系：纯增量；67 → 70 路径、76 → 80 操作、120 → 127 schema。
+
+**复核人**
+- 提议 / 实现：lead（contract-integrator 职责）
+- 复核：待 release-manager 在发布前复核（S1 内部契约，不影响对外）
+
+**备注（复核要点）**
+- 内部端点沿用 1.1.0 已登记的 `internalMTLS` 安全域，不新增安全方案。
+- `audit_log` / `audit_anchors` 的字段与 M16 §5 一一对应；`alg` 冻结为 `hmac-sha256`，
+  与 `ops/audit` 现行链一致（sha256 旧链已归档）。
+- 423 只在「校验进行中 / 密钥缺失」时返回，避免把锁冲突误报成 409。
+
 ## 1.2.1 · 2026-10-23 · MINOR
 
 **类型**：MINOR（新增 1 个响应码 202 与 1 个 schema；无删除、无类型更改、无必填字段新增）

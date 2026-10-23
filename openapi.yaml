@@ -17,8 +17,8 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.1
-  summary: W1 契约冻结（67 路径 / 76 操作；覆盖 M01–M06、M10）
+  version: 1.2.2
+  summary: W1 契约冻结 + M16 审计链（70 路径 / 80 操作；覆盖 M01–M06、M10、M16）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
@@ -75,6 +75,8 @@ tags:
     description: 公开容量公告与快照（可离线复算）
   - name: admin
     description: 后台只读查询（内网/VPN + 强 MFA，公网不可达）
+  - name: ops
+    description: 平台运维内部面（mTLS + 服务令牌；公网不可达；审计链只追加）
 
 paths:
   # ---------------------------------------------------------------- 网关
@@ -2662,6 +2664,134 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ---------------------------------------------------------------- 平台运维（内部）
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: getHealthz
+      summary: 存活 / 就绪探针（只返回状态与版本，不暴露拓扑）
+      security: []
+      responses:
+        '200':
+          description: 服务状态
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+        '500':
+          description: 依赖不可用（数据库 / 审计链密钥 / 配置服务）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/ops/audit/entries:
+    post:
+      tags: [ops]
+      operationId: appendAuditEntry
+      summary: 追加审计条目（append-only，HMAC-SHA256 链；高危字段缺失即拒）
+      description: |
+        业务模块写审计的唯一入口。服务端在同一事务内读上一条 `hash` → 计算
+        `hmac-sha256(prev_hash + canonical_json(entry))` → 追加；`prev_hash` 断链即 409。
+        高危动作（`reason_code` 非空的动作）必须给 `actor_type` / `role` / `before` /
+        `after` / `reason_code` / `ticket`，且 `approval_chain` 至少两人、propose ≠ approve。
+        幂等：同 `X-DJB-Idempotency-Key` 重复提交返回首次结果（`duplicate=true`），不重复入链。
+      security: [{ internalMTLS: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuditAppendRequest' }
+      responses:
+        '201':
+          description: 已追加
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditAppendResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '423':
+          description: 审计链锁定（校验进行中 / 密钥缺失或未激活），拒绝写入
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    get:
+      tags: [ops]
+      operationId: listAuditEntries
+      summary: 只读查询审计链（管理后台 / 排障用；不提供 UPDATE / DELETE）
+      security: [{ internalMTLS: [] }]
+      parameters:
+        - name: from_seq
+          in: query
+          required: false
+          description: 起始序号（含）；缺省从 1 开始。
+          schema: { type: integer, minimum: 1 }
+        - name: action
+          in: query
+          required: false
+          schema: { type: string }
+        - name: target
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 审计条目分页（按 seq 升序）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditEntryPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /internal/ops/audit/verify:
+    post:
+      tags: [ops]
+      operationId: verifyAuditChain
+      summary: 逐条重算校验审计链（可选固化当日 Merkle 根）
+      description: |
+        逐条重算 `hash` 并校验 `prev_hash`、算法一致、字段完整、审批链非自批、
+        `pending_approval` 超时；发现断链返回 200 + `ok=false` + `broken_seq`（不修链、不重算覆盖）。
+        `seal=true` 时同日幂等写 `audit_anchors`（同日重复调用返回同一 `merkle_root`）。
+      security: [{ internalMTLS: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuditVerifyRequest' }
+      responses:
+        '200':
+          description: 校验结果（`ok=false` 表示断链 / 算法降级 / 自批 / 超时）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditVerifyResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
 components:
 
   securitySchemes:
@@ -2983,6 +3113,17 @@ components:
                 spec 1.2.1 新登记（M01 T2 已在用，仅文档补登；不改结构/响应/枚举）：
                 `40103` 刷新令牌无效 / 已轮换或撤销（重放）/ 过期 → 重新登录（HTTP 401）；
                 `40905` 一次性令牌失效（扫码票据 / 邀请令牌：已用、过期、票据与账户不匹配）→ 重新发起（HTTP 409）。
+
+                spec 1.2.2 新登记（M03 网关错误码，仅文档补登；不改结构 / 响应 / 枚举）：
+                `42901` QPS 超限 / `42902` 每日花费上限（HTTP 429）；
+                `44101` 流式中断、用量按估算（HTTP 441）；
+                `45001` 统一错误模型自检失败兜底（HTTP 500）；
+                `45201` 慢任务超 ETA / `45202` 需确认预估成本 / `45203` 组网准入不足（HTTP 408 / 202 / 403）；
+                `50901` 无可用节点 / `50902` 上游超时 / `50903` 上游异常（HTTP 503 / 504 / 502）；
+                `50904` 鉴权不可用（S1 过渡期用 503 + 45001 + reason=unavailable，登记后切换）；
+                `40401` 资源不存在（HTTP 404 专用码，无更细码时）；`42601` 协议版本不兼容（HTTP 426）；
+                `47010` 角色不足 / 越权（M10，HTTP 403；在 47002 之外区分「角色不足」与「复核人=发起人」）；
+                `47011` 审计不可用（M10 → M16 接线后，HTTP 503；未接线前沿用 409 + 40919）。
 
                 未登记的码一律不返回；新增码先改本 spec 与 04 码段表。其余以产品设计 §6.3 与附录 C.4 为准。
             message:
@@ -5432,3 +5573,183 @@ components:
             $ref: '#/components/schemas/ConfigAuditEvent'
         page:
           $ref: '#/components/schemas/Page'
+
+    HealthStatus:
+      type: object
+      additionalProperties: true
+      required: [status, version, checked_at]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+        checked_at:
+          type: string
+          format: date-time
+        checks:
+          type: object
+          additionalProperties: true
+          description: 依赖健康摘要（只给状态，不给拓扑 / 地址 / 凭据）。
+
+    AuditEntry:
+      type: object
+      additionalProperties: true
+      required: [seq, entry_id, ts, actor, actor_type, role, action, target, status, alg, prev_hash, hash]
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+        entry_id:
+          type: string
+        ts:
+          type: string
+          format: date-time
+        actor:
+          type: string
+        actor_type:
+          type: string
+          enum: [human, agent, service, lead]
+        role:
+          type: string
+        action:
+          type: string
+          description: 点分动作名（如 `authorize.window`、`execute.release`）。
+        target:
+          type: string
+        before:
+          type: object
+          additionalProperties: true
+        after:
+          type: object
+          additionalProperties: true
+        reason_code:
+          type: string
+        ticket:
+          type: string
+        evidence:
+          type: string
+        approval_chain:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              actor: { type: string }
+              role: { type: string }
+              decision: { type: string, enum: [propose, approve, execute, reject] }
+              at: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [recorded, pending_approval, approved, rejected, revoked]
+        alg:
+          type: string
+          enum: [hmac-sha256]
+        prev_hash:
+          type: string
+        hash:
+          type: string
+
+    AuditAppendRequest:
+      type: object
+      additionalProperties: true
+      required: [actor, actor_type, role, action, target]
+      properties:
+        actor: { type: string }
+        actor_type:
+          type: string
+          enum: [human, agent, service, lead]
+        role: { type: string }
+        action: { type: string }
+        target: { type: string }
+        before:
+          type: object
+          additionalProperties: true
+        after:
+          type: object
+          additionalProperties: true
+        reason_code: { type: string }
+        ticket: { type: string }
+        evidence: { type: string }
+        approval_chain:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        status:
+          type: string
+          enum: [recorded, pending_approval, approved, rejected, revoked]
+        alg:
+          type: string
+          enum: [hmac-sha256]
+
+    AuditAppendResponse:
+      type: object
+      additionalProperties: true
+      required: [entry_id, seq, ts, alg, prev_hash, hash]
+      properties:
+        entry_id: { type: string }
+        seq: { type: integer, minimum: 1 }
+        ts: { type: string, format: date-time }
+        alg:
+          type: string
+          enum: [hmac-sha256]
+        prev_hash: { type: string }
+        hash: { type: string }
+        duplicate:
+          type: boolean
+          description: 幂等命中时为 true（返回首次结果，不重复入链）。
+
+    AuditEntryPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEntry'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    AuditVerifyRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        period:
+          type: string
+          description: 归档周期（`YYYY-MM-DD`，UTC 日）。缺省为当日。
+        seal:
+          type: boolean
+          default: false
+          description: 为 true 时固化当日 Merkle 根（同日幂等）。
+        expected_alg:
+          type: string
+          enum: [hmac-sha256]
+
+    AuditVerifyResponse:
+      type: object
+      additionalProperties: true
+      required: [ok, period, entries, alg, checked_at]
+      properties:
+        ok: { type: boolean }
+        period: { type: string }
+        entries: { type: integer, minimum: 0 }
+        alg:
+          type: string
+          enum: [hmac-sha256]
+        checked_at: { type: string, format: date-time }
+        merkle_root:
+          type: [string, 'null']
+        sealed:
+          type: boolean
+        broken_seq:
+          type: [integer, 'null']
+        expired_pending:
+          type: integer
+          minimum: 0
+        problems:
+          type: array
+          items: { type: string }
+          description: 人类可读的问题清单（不含密钥 / 正文）。
+
