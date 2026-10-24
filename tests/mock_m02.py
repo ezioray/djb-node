@@ -32,6 +32,11 @@ def policy_payload(*, policy_version: str = POLICY_VERSION, quotas=None,
         "digest": "b" * 64,
         "quotas": quotas or [],
         "directives": [],
+        # 固定纪元 + 1h TTL 会在真实时钟 01:00Z 后永久过期（子进程用真实时钟）。
+        # 统一给 10 年 TTL；过期场景由用例自行覆写 expires_at / policy_override。
+        # 显式远期 expires_at：parse_policy 对 policy_ttl_s 有 30 天上限，
+        # 超出会回退到默认 1h（真实时钟 01:00Z 后必过期）。过期场景由用例覆写。
+        "expires_at": "2036-01-01T00:00:00Z",
         "settings": {"policy_ttl_s": 3600},
     }
 
