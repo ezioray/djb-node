@@ -29,19 +29,20 @@ from typing import Any, Callable
 
 from . import facts, policy as policy_mod, protocol
 from .api import NodeApi, PolicyFetch
-from .config import ClientConfig, Paths, load_config
+from .config import ClientConfig, Paths, feature_flag, load_config
 from .errors import (AuthError, DjbError, ForbiddenError, NetworkError, NotInstalledError,
                      PolicyError, PortInUseError, RateLimitError, UsageError)
 from .httpclient import HttpClient
 from .limits import Decision, Limiter, YieldDetector, YieldResult
 from .logging_setup import event, setup_logging
 from .outbox import ReceiptFactory, SealedReceiptBuffer
+from .probe import periodic_interval_s
 from .secure import CredentialStore
 from .server import Admission, LocalApiServer, RouteTarget
 from .state import StateMachine, Snapshot, reason_label
 from .store import Store, UpstreamRecord
 from .update import UpdateManager
-from .upstream import UpstreamManager
+from .upstream import ModelEntry, UpstreamManager
 from .util import (iso, new_request_id, new_token, parse_iso, sha256_hex, utcnow)
 
 
@@ -236,6 +237,11 @@ class Daemon:
         self._policy_invalid = bool(self.store.get_kv("policy_invalid", False))
         self._announce_kind = facts.TOKEN_RELAY_KIND
         self._last_health: dict[str, Any] = {}
+        # C7 探针调度（全部走注入时钟，测试不 sleep）
+        self._probe_failures = 0
+        self._probe_interval_s = facts.PROBE_PERIODIC_DEFAULT_S
+        self._next_probe_at = self._now()
+        self._last_probe: dict[str, Any] = {}
 
     # ── 状态持久化
     def _persist(self) -> None:
@@ -341,7 +347,10 @@ class Daemon:
                 self._persist()
                 return
         self.api.client_key = self.credentials.client_key()
-        # 3) 首次心跳 + 策略
+        # 3) 公告门控前置：启动做一次 L1–L3 校验（预算内），未验证的模型不进容量
+        #    （C7）。这是「公告前校验」，与周期复探开关解耦：开关关闭时它只发生一次。
+        self._probe_upstreams(self._now(), reason="startup")
+        # 4) 首次心跳 + 策略
         self._heartbeat(self._now(), initial=True)
         if self._policy_updated:
             self._policy_updated = False
@@ -429,6 +438,8 @@ class Daemon:
         candidates = [(self._next_heartbeat_at - now).total_seconds(),
                       (self._next_receipt_flush_at - now).total_seconds(),
                       1.0]
+        if self._periodic_probe_enabled():
+            candidates.append((self._next_probe_at - now).total_seconds())
         return max(0.1, min(candidates))
 
     def tick(self, now: datetime | None = None) -> dict[str, Any]:
@@ -445,6 +456,9 @@ class Daemon:
                     if self.api is not None:
                         self.api.client_key = self.credentials.client_key()
                     self._next_heartbeat_at = moment
+        # 周期复探在心跳之前：让本轮心跳带的是最新容量（C7）
+        if self._periodic_probe_enabled() and moment >= self._next_probe_at:
+            self._probe_upstreams(moment, reason="periodic")
         if moment >= self._next_heartbeat_at:
             self._heartbeat(moment)
         if self._policy_updated:
@@ -474,7 +488,7 @@ class Daemon:
             "protocol_version": facts.PROTOCOL_VERSION,
             "policy_version": current_policy.policy_version if current_policy else "",
             "runtime_state": snapshot.runtime_state(),
-            "capacity": self.upstreams.announce_capacity(profile),
+            "capacity": self.upstreams.announce_capacity(profile, now=now),
             "load": {"inflight": self._inflight, "queue_seconds": 0.0},
         }
         try:
@@ -549,6 +563,68 @@ class Daemon:
             self.machine.pause("conservative",
                                next_step="连续失败进入保守模式（不接新单）；网络恢复后自动重试")
             self._persist()
+
+    # ── 探针调度（C7：L1–L3 + 公告门控前置 + 周期复探）
+    def _periodic_probe_enabled(self) -> bool:
+        """开关 `client.probe.periodic.enabled`（默认关闭；见 facts.FEATURE_FLAGS）。"""
+        return feature_flag(self.config, facts.PROBE_FLAG_PERIODIC)
+
+    def _probe_upstreams(self, now: datetime, *, reason: str) -> dict[str, Any]:
+        """对启用中的上游做一轮探针（L1→L2/L3），结论写回本地模型。
+
+        永不抛异常：`facts.PROBE_PASS_BUDGET_S` 是单轮预算，
+        超预算的模型留到下一轮（`not_probed`，不算失败）。
+        失败按指数退避拉长下一轮间隔（`probe.periodic_interval_s`）。
+        """
+        deadline = now + timedelta(seconds=facts.PROBE_PASS_BUDGET_S)
+        verified = 0
+        failed = 0
+        models = 0
+        for record in self.upstreams.list():
+            if not record.enabled:
+                continue
+            if self._now() >= deadline:
+                break
+            try:
+                payload = self.upstreams.probe(
+                    record.id, timeout=facts.PROBE_TIMEOUT_S, now=now,
+                    deadline=deadline, clock=self._now)
+            except DjbError as exc:
+                failed += 1
+                event("upstream.probe_failed", level="warning", reason=reason,
+                      upstream_id=record.id, error=type(exc).__name__, code=exc.code)
+                continue
+            except Exception as exc:                        # pragma: no cover - 防御
+                failed += 1
+                event("upstream.probe_error", level="warning", reason=reason,
+                      upstream_id=record.id, error=type(exc).__name__)
+                continue
+            checks = payload.get("model_checks") or []
+            models += len(checks)
+            if any(item.get("ok") for item in checks):
+                verified += 1
+            else:
+                failed += 1
+        self._probe_failures = min(self._probe_failures + 1, facts.PROBE_MAX_BACKOFF_SHIFT) \
+            if failed else 0
+        self._probe_interval_s = periodic_interval_s(self._upstream_model_count(),
+                                                     self._probe_failures)
+        self._next_probe_at = now + timedelta(seconds=self._probe_interval_s)
+        self._last_probe = {"at": iso(now), "reason": reason, "verified": verified,
+                            "failed": failed, "models": models,
+                            "failures": self._probe_failures,
+                            "interval_s": self._probe_interval_s}
+        event("upstream.probe_pass", reason=reason, verified=verified, failed=failed,
+              models=models, failures=self._probe_failures,
+              interval_s=self._probe_interval_s)
+        return self._last_probe
+
+    def _upstream_model_count(self) -> int:
+        return sum(len(item.model_ids()) for item in self.upstreams.list() if item.enabled)
+
+    def probe_now(self, *, reason: str = "manual") -> dict[str, Any]:
+        """手动触发一轮探针（控制通道 / 测试用；不受周期开关影响）。"""
+        return self._probe_upstreams(self._now(), reason=reason)
 
     # ── 策略
     def _fetch_policy(self, now: datetime) -> None:
@@ -811,7 +887,17 @@ class Daemon:
             "upstream": {"count": len(upstreams),
                          "reachable": any(item.state in ("declared", "probing", "verified")
                                           for item in upstreams),
-                         "models": len(self.upstreams.catalog())},
+                         "models": len(self.upstreams.catalog()),
+                         # C7 公告门控可见性（只加）：已验证 / 可公告 / 过期
+                         "announced": len(self.upstreams.announceable_models(
+                             self._now())),
+                         "verified_models": sum(
+                             1 for item in upstreams for raw in item.models
+                             if ModelEntry.from_dict(raw).verified()),
+                         "stale_models": sum(
+                             1 for item in upstreams for raw in item.models
+                             if ModelEntry.from_dict(raw).verified()
+                             and not ModelEntry.from_dict(raw).fresh(self._now()))},
             "policy": {"present": policy_summary.get("present"),
                        "usable": policy_summary.get("usable"),
                        "policy_version": policy_summary.get("policy_version"),
@@ -866,6 +952,18 @@ class Daemon:
             "heartbeat": {"failures": self._consecutive_failures,
                           "interval_s": self._heartbeat_interval_s,
                           "next_at": iso(self._next_heartbeat_at)},
+            # C7：探针调度 + 特性开关（三字段齐全，见 facts.FEATURE_FLAGS）
+            "probe": {"periodic_enabled": self._periodic_probe_enabled(),
+                      "interval_s": self._probe_interval_s,
+                      "next_at": iso(self._next_probe_at),
+                      "failures": self._probe_failures,
+                      "last_pass": dict(self._last_probe),
+                      "fresh_window_s": facts.PROBE_FRESH_S,
+                      "models": [entry for item in self.upstreams.list()
+                                 for entry in self.upstreams.probe_details(
+                                     item.id, now=self._now())]},
+            "flags": {name: {"enabled": feature_flag(self.config, name), **spec}
+                      for name, spec in facts.FEATURE_FLAGS.items()},
             "update": self.update.status(),
             "env": {"authorized_at": (self.store.env_state() or {}).get("authorized_at")},
             "yield": self._last_yield,

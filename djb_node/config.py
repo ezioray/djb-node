@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -195,19 +196,34 @@ def load_config(paths: Paths) -> ClientConfig:
 _TRUE_TEXT = ("1", "true", "on", "yes", "y", "enabled")
 
 
-def feature_flag(config: ClientConfig, name: str) -> bool:
-    """特性开关求值（**默认关闭**；未知开关一律按默认值）。
+def _extra_of(config: Any) -> dict[str, Any]:
+    """把 ClientConfig / 形状等价的 mapping（`config.extra`）统一成 extra 字典。"""
+    if isinstance(config, ClientConfig):
+        return config.extra if isinstance(config.extra, dict) else {}
+    if isinstance(config, Mapping):
+        extra = config.get("extra")
+        if isinstance(extra, Mapping):
+            return dict(extra)          # 形状等价于 config.json 的 {"extra": {...}}
+        return dict(config)             # 直接就是 extra 字典
+    return {}
+
+
+def feature_flag(config: Any, name: str) -> bool:
+    """特性开关求值（**默认关闭**；未知开关一律按定义默认值）。
 
     M17 §9：开关必须三字段齐全（owner / expire_at / rollback_rule）且默认关闭，
     定义在 `facts.FEATURE_FLAGS`。本机取值只读 config.json 的非敏感 `extra`
     （`feature_flags` 子字典优先，其次同名平铺键），不覆盖服务端 policy。
+
+    这是全队唯一的开关求值入口：`config` 接受 `ClientConfig`，也接受形状等价的
+    mapping（即 `config.extra` 本身，或含 `extra` 键的 dict），便于其他模块复用。
     """
     spec = facts.FEATURE_FLAGS.get(str(name)) or {}
     default = bool(spec.get("default", False))
-    extra = config.extra if isinstance(config.extra, dict) else {}
+    extra = _extra_of(config)
     nested = extra.get("feature_flags")
     value: Any = None
-    if isinstance(nested, dict) and name in nested:
+    if isinstance(nested, Mapping) and name in nested:
         value = nested[name]
     elif name in extra:
         value = extra[name]
