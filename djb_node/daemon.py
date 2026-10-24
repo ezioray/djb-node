@@ -36,7 +36,7 @@ from .errors import (AuthError, DjbError, ForbiddenError, NetworkError, NotInsta
 from .httpclient import HttpClient
 from .limits import Decision, Limiter, YieldDetector, YieldResult
 from .logging_setup import event, setup_logging
-from .model_sync import ModelSyncClient, model_sync_enabled
+from .model_sync import ModelSyncClient, model_sync_enabled, verifier_from_env
 from .notifications import NotificationStore, notifications_enabled
 from .outbox import ReceiptFactory, SealedReceiptBuffer
 from .probe import periodic_interval_s
@@ -518,7 +518,8 @@ class Daemon:
         api = self._api_factory(self.config.gateway_url, self.credentials.client_key())
         self._model_sync_stop = threading.Event()
         self._model_sync = ModelSyncClient(self.paths, self.config, self.credentials,
-                                           http=self.http, api=api, now=self._now)
+                                           http=self.http, api=api, now=self._now,
+                                           verifier=verifier_from_env())
         self._model_sync_thread = threading.Thread(target=self._model_sync_runner,
                                                    name="djb-model-sync", daemon=True)
         self._model_sync_thread.start()

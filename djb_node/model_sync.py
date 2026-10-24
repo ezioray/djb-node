@@ -37,6 +37,8 @@ bundle 形状（M18a 定稿）::
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import threading
@@ -60,7 +62,7 @@ __all__ = [
     "bundle_file",
     "canonical_bundle",
     "model_sync_enabled",
-    "payload_hash",
+    "payload_hash", "hmac_verifier", "verifier_from_env",
 ]
 
 #: 签名校验器：``verifier(canonical_payload, signature) -> bool``（S3 用 Ed25519 / S2 用 HMAC）
@@ -175,6 +177,26 @@ class SyncOutcome:
 
 
 # ─────────────────────────────────────────────────────────── 客户端
+def hmac_verifier(secret: bytes) -> Verifier:
+    """S2 测试网 HMAC 验签器：``hmac-sha256:<hex>`` = HMAC(key, payload_hash ASCII)。"""
+    key = bytes(secret)
+
+    def verify(payload: dict[str, Any], signature: str) -> bool:
+        if not signature.startswith("hmac-sha256:"):
+            return False
+        expected = hmac.new(key, payload_hash(payload).encode("ascii"),
+                            hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature.split(":", 1)[1].strip())
+
+    return verify
+
+
+def verifier_from_env(name: str = "DJB_MODEL_SYNC_HMAC_KEY") -> Verifier | None:
+    """从环境读 S2 HMAC 密钥；未设置返回 None（客户端标 unverified，不拒绝）。"""
+    secret = (os.environ.get(name) or "").strip()
+    return hmac_verifier(secret.encode("utf-8")) if secret else None
+
+
 class ModelSyncClient:
     """拉取签名 bundle → 校验 → 应用本地 JSON → 上报状态（不接单、不改 tokenizer 实现）。"""
 

@@ -587,3 +587,23 @@ def test_uninstall_residual_includes_model_sync_file(paths, credentials, clock):
     client.sync()
     assert os.path.exists(state_file(paths))
     assert state_file(paths) in _residual_hits(paths, keep_logs=True)
+
+
+def test_hmac_verifier_roundtrip_and_tamper():
+    import hashlib
+    import hmac
+
+    from djb_node.model_sync import hmac_verifier, payload_hash
+
+    payload = {"version": 3, "expires_at": "2026-10-25T00:00:00.000Z",
+               "models": [{"vendor": "openai", "canonical": "openai/gpt-4o-mini",
+                           "aliases": [], "context_window": 128000,
+                           "tokenizer_family": "o200k_base", "tokenizer_version": "2026-10",
+                           "tokenizer_hash": None, "effective_at": None}]}
+    key = b"test-secret"
+    sig = "hmac-sha256:" + hmac.new(key, payload_hash(payload).encode("ascii"),
+                                    hashlib.sha256).hexdigest()
+    verify = hmac_verifier(key)
+    assert verify(payload, sig) is True
+    assert verify(payload, sig[:-1] + "0") is False
+    assert verify(payload, "ed25519:deadbeef") is False
