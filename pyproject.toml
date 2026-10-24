@@ -26,7 +26,7 @@ test = ["pytest>=8"]
 djb = "djb_node.cli:main"
 
 [tool.setuptools]
-packages = ["djb_node"]
+packages = ["djb_node", "djb_node.platform"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
