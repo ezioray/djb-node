@@ -37,6 +37,7 @@ from .httpclient import HttpClient
 from .limits import Decision, Limiter, YieldDetector, YieldResult
 from .logging_setup import event, setup_logging
 from .model_sync import ModelSyncClient, model_sync_enabled
+from .notifications import NotificationStore, notifications_enabled
 from .outbox import ReceiptFactory, SealedReceiptBuffer
 from .probe import periodic_interval_s
 from .secure import CredentialStore
@@ -234,6 +235,10 @@ class Daemon:
         self._model_sync: ModelSyncClient | None = None
         self._model_sync_thread: threading.Thread | None = None
         self._model_sync_stop: threading.Event | None = None
+        # C16 消息中心（默认关闭：关闭时不拉取、不建线程；本地库只读保留）
+        self._notifications: NotificationStore | None = None
+        self._notifications_thread: threading.Thread | None = None
+        self._notifications_stop: threading.Event | None = None
         # 运行态
         self._user_paused = bool(self.store.get_kv("user_paused", False))
         self._consecutive_failures = 0
@@ -316,6 +321,7 @@ class Daemon:
         self._bootstrap()
         self._start_channel()
         self._start_model_sync()
+        self._start_notifications()
         if self._user_paused:
             self._transition_pause("user_paused")
         return self.status()
@@ -423,6 +429,7 @@ class Daemon:
         self._stop_event.set()
         self._stop_channel()
         self._stop_model_sync()
+        self._stop_notifications()
         try:
             self.server.shutdown()
         except Exception:                                  # pragma: no cover - 防御
@@ -553,6 +560,65 @@ class Daemon:
                         "verified": False, "next_at": None}
         snapshot.update({"enabled": enabled, "running": running,
                          "interval_s": facts.MODEL_SYNC_INTERVAL_S})
+        return snapshot
+
+    # ── C16 消息中心（默认关闭）
+    def _start_notifications(self) -> None:
+        """开关开（或 DJB_NOTIFY=1）时起消息同步线程；关闭时不建线程、不动本地库。"""
+        if not notifications_enabled(self.config):
+            return
+        if (self._notifications_thread is not None
+                and self._notifications_thread.is_alive()):
+            return
+        api = self._api_factory(self.config.gateway_url, self.credentials.client_key())
+        self._notifications_stop = threading.Event()
+        self._notifications = NotificationStore(self.paths, config=self.config, api=api,
+                                                http=self.http, now=self._now)
+        self._notifications_thread = threading.Thread(
+            target=self._notifications_runner, name="djb-notifications", daemon=True)
+        self._notifications_thread.start()
+        event("notifications.thread_started_by_daemon",
+              interval_s=facts.NOTIFICATIONS_INTERVAL_S)
+
+    def _notifications_runner(self) -> None:
+        """线程体：异常只记事件（消息中心坏了不影响接单）。"""
+        store, stop = self._notifications, self._notifications_stop
+        if store is None or stop is None:                   # pragma: no cover - 防御
+            return
+        try:
+            store.run_periodic(stop)
+        except Exception as exc:                            # pragma: no cover - 防御
+            event("notifications.thread_crashed", level="warning",
+                  error=type(exc).__name__)
+        finally:
+            try:
+                store.close()
+            except Exception:                               # pragma: no cover - 防御
+                pass
+
+    def _stop_notifications(self) -> None:
+        """置停止位并 join ≤ facts.NOTIFICATIONS_STOP_JOIN_S（本地消息与队列保留）。"""
+        if self._notifications_stop is not None:
+            self._notifications_stop.set()
+        thread = self._notifications_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=facts.NOTIFICATIONS_STOP_JOIN_S)
+        if thread is not None:
+            event("notifications.thread_joined", alive=thread.is_alive())
+        self._notifications_thread = None
+
+    def _notifications_status(self) -> dict[str, Any]:
+        """status / 诊断用：未读数 / 最近同步 / 待补发（不含 payload）。"""
+        enabled = notifications_enabled(self.config)
+        running = bool(self._notifications_thread is not None
+                       and self._notifications_thread.is_alive())
+        if self._notifications is not None:
+            snapshot = self._notifications.status()
+        else:
+            snapshot = {"unread": 0, "total": 0, "pending": 0, "last_sync": None,
+                        "last_error": None, "cursor": None, "syncs": 0}
+        snapshot.update({"enabled": enabled, "running": running,
+                         "interval_s": facts.NOTIFICATIONS_INTERVAL_S})
         return snapshot
 
     # ── tick
@@ -1089,6 +1155,8 @@ class Daemon:
             "channel": self._channel_status(),
             # M18b 模型/tokenizer 同步（默认关闭；关闭时 running 恒为 False）
             "model_sync": self._model_sync_status(),
+            # C16 消息中心（默认关闭；只暴露未读/同步/队列计数）
+            "notifications": self._notifications_status(),
             "flags": {name: {"enabled": feature_flag(self.config, name), **spec}
                       for name, spec in facts.FEATURE_FLAGS.items()},
             "update": self.update.status(),

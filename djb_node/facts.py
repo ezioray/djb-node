@@ -497,3 +497,37 @@ MODEL_SYNC_ERROR_CLASSES: tuple[str, ...] = (
 MODEL_SYNC_DRIFT_FIELDS: tuple[str, ...] = ("tokenizer_family", "tokenizer_version",
                                             "tokenizer_hash", "context_window")
 """漂移只比这几项（其余字段变化不算漂移，避免噪声）。"""
+
+# ─────────────────────────────────────────────────────────── C16 客户端消息中心
+# 口径：服务端下发**站内信**（severity/category/template_key/payload），客户端本地存一份，
+# 支持未读、已读、ack、离线补拉与离线读态重试；**只存元数据，不存正文/凭据**。
+# 默认关闭；S2 测试网用环境变量 DJB_NOTIFY=1 显式激活（不做 GUI，只提供数据层）。
+FEATURE_FLAGS["client.notifications.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "关闭后停拉取、保留本地消息与待补发读态（本地只读不删）",
+    "description": "客户端消息中心（C16）：拉取站内信、未读/已读/ack、离线补拉，默认关闭",
+}
+NOTIFICATIONS_FLAG = "client.notifications.enabled"
+NOTIFICATIONS_ENV = "DJB_NOTIFY"
+"""S2 测试网显式激活开关（值 "1" 生效；不改变 facts 里的默认关闭定义）。"""
+NOTIFICATIONS_PATH = "/api/v1/node/notifications"
+NOTIFICATIONS_UNREAD_PATH = "/api/v1/node/notifications/unread-count"
+NOTIFICATIONS_DB = "notifications.db"
+"""本地消息库（独立 SQLite 文件，不动 state.db 的 schema 版本）。"""
+NOTIFICATIONS_SCHEMA_VERSION = 1
+NOTIFICATIONS_DEFAULT_LIMIT = 50
+NOTIFICATIONS_MAX_LIMIT = 200
+NOTIFICATIONS_SYNC_TIMEOUT_S = 20
+NOTIFICATIONS_ACTION_TIMEOUT_S = 15
+NOTIFICATIONS_INTERVAL_S = 15 * 60
+"""周期同步间隔（启动即拉一次，之后每 15 min）。"""
+NOTIFICATIONS_BACKOFF_S: tuple[int, ...] = (60, 300, 900, 1800)
+NOTIFICATIONS_STOP_JOIN_S = 5
+NOTIFICATIONS_RETENTION_DAYS = 180
+"""本地保留天数（超过即 prune；服务端另有保留策略）。"""
+NOTIFICATIONS_MAX_PENDING = 500
+"""离线读态队列上限（超过丢最旧，避免无界增长）。"""
+NOTIFICATIONS_SEVERITIES: tuple[str, ...] = ("P0", "P1", "P2")
+NOTIFICATIONS_ACTIONS: tuple[str, ...] = ("read", "ack")

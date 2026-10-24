@@ -17,6 +17,10 @@
     POST /api/v1/node/channel/result      200  回传 job 结果（幂等键 = job_id）
     GET  /api/v1/node/model-catalog       200 / 304（M18b 模型/tokenizer 签名 bundle）
     POST /api/v1/node/model-sync/state    200  上报已应用版本 / 漂移 / 错误类
+    GET  /api/v1/node/notifications       200  站内信列表（游标 since / limit / category）
+    GET  /api/v1/node/notifications/unread-count  200 未读数
+    POST /api/v1/node/notifications/{id}/read     200 标记已读（幂等）
+    POST /api/v1/node/notifications/{id}/ack      200 确认（幂等）
 
 硬规则：出站头只用 spec 头名；凭据只在 X-Client-Key 头里出现，绝不进 URL / body /
 日志；错误信封只按 type / code / reason 判断，不解析 message 文案。
@@ -254,6 +258,52 @@ class NodeApi:
         if not isinstance(body, dict) or "accepted" not in body:
             raise NetworkError("模型同步状态响应缺少 accepted（契约不匹配）", code=45001)
         return body
+
+    # ─────────────────────────────────────────────────────── 站内信（C16）
+    def list_node_notifications(self, since: str | None = None, limit: int = 50,
+                                category: str | None = None) -> dict[str, Any]:
+        """GET /api/v1/node/notifications 拉站内信（游标分页）。
+
+        返回原始 JSON 对象（``items`` / ``notifications`` / ``data`` 任一都认，由调用方归一）；
+        缺列表字段时按空列表处理，避免把「无消息」当错误。
+        """
+        count = max(1, min(int(limit), facts.NOTIFICATIONS_MAX_LIMIT))
+        query = ["limit=" + str(count)]
+        if since:
+            query.append("since=" + _quote(str(since)))
+        if category:
+            query.append("category=" + _quote(str(category)))
+        path = facts.NOTIFICATIONS_PATH + "?" + "&".join(query)
+        response = self._call("GET", path, timeout=facts.NOTIFICATIONS_SYNC_TIMEOUT_S)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {"items": []}
+
+    def node_notification_unread_count(self) -> dict[str, Any]:
+        """GET /api/v1/node/notifications/unread-count 服务端未读数。"""
+        response = self._call("GET", facts.NOTIFICATIONS_UNREAD_PATH,
+                              timeout=facts.NOTIFICATIONS_ACTION_TIMEOUT_S)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
+    def read_node_notification(self, notification_id: str) -> dict[str, Any]:
+        """POST /api/v1/node/notifications/{id}/read（服务端幂等）。"""
+        return self._notification_action(notification_id, "read")
+
+    def ack_node_notification(self, notification_id: str) -> dict[str, Any]:
+        """POST /api/v1/node/notifications/{id}/ack（服务端幂等）。"""
+        return self._notification_action(notification_id, "ack")
+
+    def _notification_action(self, notification_id: str, action: str) -> dict[str, Any]:
+        key = str(notification_id or "").strip()
+        if not key:
+            raise UsageError("通知 id 不能为空")
+        if action not in facts.NOTIFICATIONS_ACTIONS:
+            raise UsageError("未知通知动作：" + str(action))
+        path = facts.NOTIFICATIONS_PATH + "/" + _quote(key) + "/" + action
+        response = self._call("POST", path, json_body={},
+                              timeout=facts.NOTIFICATIONS_ACTION_TIMEOUT_S)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
 
     # ─────────────────────────────────────────────────────── 收据（M05）
     def submit_receipts(self, receipts: list[dict[str, Any]], *,

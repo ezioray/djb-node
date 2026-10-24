@@ -33,6 +33,7 @@ from .limits import (Limiter, YieldDetector, in_schedule, parse_schedule_windows
                      resource_caps_valid)
 from .logging_setup import get_logger, prune_old_logs, setup_logging
 from .model_sync import ModelSyncClient, bundle_file, model_sync_enabled
+from .notifications import NotificationStore, notifications_enabled
 from .outbox import ReceiptFactory, validate_receipt
 from .policy import summary as policy_summary
 from .relay import RelayError, RelayManager
@@ -865,6 +866,78 @@ def cmd_attest(args: argparse.Namespace) -> int:
     return 0
 
 
+# ─────────────────────────────────────────────────────────── notify（C16）
+def _notify_store(args: argparse.Namespace) -> tuple[Any, NotificationStore]:
+    paths, config, _store = _context(args)
+    credentials = CredentialStore(paths)
+    api = NodeApi(config.gateway_url, client_key=credentials.client_key())
+    return config, NotificationStore(paths, config=config, api=api)
+
+
+def cmd_notify(args: argparse.Namespace) -> int:
+    """消息中心：list / read / ack / unread / sync（本地优先；离线读态进队列不丢）。"""
+    config, store = _notify_store(args)
+    action = getattr(args, "notify_action", "list") or "list"
+    as_json = _json_flag(args)
+    if action == "list":
+        rows = store.list(category=getattr(args, "category", None),
+                          unread_only=bool(getattr(args, "unread_only", False)),
+                          limit=int(getattr(args, "limit", 0)
+                                    or facts.NOTIFICATIONS_DEFAULT_LIMIT))
+        payload = {"items": rows, "count": len(rows), "unread": store.unread_count(),
+                   "enabled": notifications_enabled(config)}
+        _emit(payload, as_json=as_json,
+              text=lambda value: ("\n".join(
+                  ("• " if item["unread"] else "  ") + item["severity"] + " "
+                  + item["created_at"] + " " + item["category"] + " "
+                  + item["template_key"] + " (" + item["id"] + ")"
+                  for item in value["items"])
+                  + ("\n" if value["items"] else "") + "未读 " + str(value["unread"]) + " 条"))
+        return 0
+    if action in ("read", "ack"):
+        notification_id = str(getattr(args, "id", "") or "").strip()
+        if not notification_id:
+            raise UsageError("缺 --id")
+        result = store.mark_read(notification_id) if action == "read" \
+            else store.ack(notification_id)
+        payload = {"action": action, **result}
+        _emit(payload, as_json=as_json,
+              text=lambda value: (("已标记" + ("已读 " if value["action"] == "read"
+                                              else "确认 "))
+                                  + value["id"]
+                                  + ("（已上报）" if value["synced"]
+                                     else "（离线：已排队，联网后自动补发）")))
+        return 0
+    if action == "unread":
+        local = store.unread_count()
+        remote = store.server_unread_count()
+        payload = {"unread": local, "server_unread": remote,
+                   "pending": len(store.pending_acks()),
+                   "enabled": notifications_enabled(config)}
+        _emit(payload, as_json=as_json,
+              text=lambda value: ("未读 " + str(value["unread"]) + " 条"
+                                  + ("（服务端 " + str(value["server_unread"]) + "）"
+                                     if value["server_unread"] is not None else "")
+                                  + ("；待补发 " + str(value["pending"])
+                                     if value["pending"] else "")))
+        return 0
+    if action == "sync":
+        result = store.sync()
+        flushed = store.flush()
+        payload = {"action": "sync", **result, "flush": flushed,
+                   "unread": store.unread_count()}
+        _emit(payload, as_json=as_json,
+              text=lambda value: ("同步完成：新增 " + str(value["added"])
+                                  + "，更新 " + str(value["updated"])
+                                  + ("，过期跳过 " + str(value["skipped_expired"])
+                                     if value["skipped_expired"] else "")
+                                  + ("；失败 " + str(value["error_class"])
+                                     if value.get("error_class") else "")
+                                  + "；未读 " + str(value["unread"])))
+        return 0
+    raise UsageError("未知 notify 子命令：" + str(action))
+
+
 # ─────────────────────────────────────────────────────────── model-sync（M18b）
 def cmd_model_sync(args: argparse.Namespace) -> int:
     """模型 / tokenizer 同步：``status`` 只读本地；``sync`` 手动拉一次（不打印 key/token）。"""
@@ -1353,6 +1426,24 @@ def build_parser() -> argparse.ArgumentParser:
     token_count.add_argument("--messages", help="JSON messages 数组（含 chat template 开销）")
     token_count.add_argument("--tools", help="JSON tools 数组")
     for child in token_sub.choices.values():
+        _sub_flags(child)
+
+    notify = add_common(cmd_notify, "notify",
+                        "消息中心：列表 / 已读 / 确认 / 未读 / 同步（本地优先，离线读态排队）")
+    notify_sub = notify.add_subparsers(dest="notify_action", metavar="<action>")
+    notify_list = notify_sub.add_parser("list", help="列出消息（默认按时间倒序）")
+    notify_list.add_argument("--category", help="按分类过滤")
+    notify_list.add_argument("--unread", dest="unread_only", action="store_true",
+                             help="只看未读")
+    notify_list.add_argument("--limit", type=int,
+                             default=facts.NOTIFICATIONS_DEFAULT_LIMIT)
+    for name, help_text in (("read", "标记已读（本地先落，失败离线补发）"),
+                            ("ack", "确认消息（本地先落，失败离线补发）")):
+        item = notify_sub.add_parser(name, help=help_text)
+        item.add_argument("--id", required=True, help="消息 id")
+    notify_sub.add_parser("unread", help="未读数（本地 + 服务端）")
+    notify_sub.add_parser("sync", help="手动拉取一次并补发离线读态")
+    for child in notify_sub.choices.values():
         _sub_flags(child)
 
     model_sync = add_common(cmd_model_sync, "model-sync",
