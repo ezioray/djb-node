@@ -13,6 +13,8 @@
     GET  /api/v1/node/policy              200 / 304（If-None-Match = policy_version）
     GET  /api/v1/protocol/capabilities    200
     GET  /api/v1/protocol/deprecations    200
+    POST /api/v1/node/channel/poll        200 / 204（C10c 长轮询取 job；204 = 暂无 job）
+    POST /api/v1/node/channel/result      200  回传 job 结果（幂等键 = job_id）
 
 硬规则：出站头只用 spec 头名；凭据只在 X-Client-Key 头里出现，绝不进 URL / body /
 日志；错误信封只按 type / code / reason 判断，不解析 message 文案。
@@ -177,6 +179,43 @@ class NodeApi:
         return PolicyFetch(status=response.status,
                            payload=payload if isinstance(payload, dict) else None,
                            etag=response.headers.get("etag"), not_modified=False)
+
+    # ─────────────────────────────────────────────────────── 出站长轮询通道（C10c）
+    def poll_channel(self, wait_s: int = facts.CHANNEL_POLL_WAIT_S) -> dict[str, Any] | None:
+        """POST /api/v1/node/channel/poll 长轮询取 job。
+
+        * 200 → 解析 job（JSON 对象；形状由 channel.parse_job 校验）；
+        * 204 → 本轮没有 job，返回 None（调用方立即再 poll）；
+        * >=400 → 抛错（401/403 由调用方判停，其余走退避）。
+
+        超时按 ``wait_s + 10s`` 余量，避免服务端挂起时间略超就判网络失败。
+        """
+        response = self.http.request(
+            "POST", self.url(facts.CHANNEL_POLL_PATH),
+            headers=self._headers(), json_body={"wait_s": int(wait_s)},
+            timeout=facts.CHANNEL_POLL_TIMEOUT_S)
+        if response.status == 204:
+            return None
+        if response.status >= 400:
+            raise raise_for_response(response, what=facts.CHANNEL_POLL_PATH)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
+
+    def submit_channel_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST /api/v1/node/channel/result 回传执行结果（幂等键 = job_id）。
+
+        返回 ``{"accepted": [...], "duplicate": bool}``；缺 accepted 视为契约不匹配。
+        """
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            raise UsageError("通道结果缺少 job_id（无法幂等回传）")
+        response = self._call("POST", facts.CHANNEL_RESULT_PATH, json_body=payload,
+                              idempotency_key=job_id,
+                              timeout=facts.CHANNEL_RESULT_TIMEOUT_S)
+        body = response.json()
+        if not isinstance(body, dict) or "accepted" not in body:
+            raise NetworkError("通道结果响应缺少 accepted（契约不匹配）", code=45001)
+        return body
 
     # ─────────────────────────────────────────────────────── 收据（M05）
     def submit_receipts(self, receipts: list[dict[str, Any]], *,

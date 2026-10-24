@@ -29,6 +29,7 @@ from typing import Any, Callable
 
 from . import facts, policy as policy_mod, protocol
 from .api import NodeApi, PolicyFetch
+from .channel import ChannelClient, channel_enabled
 from .config import ClientConfig, Paths, feature_flag, load_config
 from .errors import (AuthError, DjbError, ForbiddenError, NetworkError, NotInstalledError,
                      PolicyError, PortInUseError, RateLimitError, UsageError)
@@ -224,6 +225,10 @@ class Daemon:
         self._stop_event = threading.Event()
         self._control: ControlServer | None = None
         self._started = False
+        # C10c 出站长轮询通道（默认关闭：开关关闭时不创建线程，行为与无通道版本一致）
+        self._channel: ChannelClient | None = None
+        self._channel_thread: threading.Thread | None = None
+        self._channel_stop: threading.Event | None = None
         # 运行态
         self._user_paused = bool(self.store.get_kv("user_paused", False))
         self._consecutive_failures = 0
@@ -304,6 +309,7 @@ class Daemon:
         event("daemon.started", port=self.server.port, pid=os.getpid(),
               protocol_version=facts.PROTOCOL_VERSION)
         self._bootstrap()
+        self._start_channel()
         if self._user_paused:
             self._transition_pause("user_paused")
         return self.status()
@@ -409,6 +415,7 @@ class Daemon:
             return
         event("daemon.stopping")
         self._stop_event.set()
+        self._stop_channel()
         try:
             self.server.shutdown()
         except Exception:                                  # pragma: no cover - 防御
@@ -432,6 +439,60 @@ class Daemon:
                 pass
         self._started = False
         event("daemon.stopped")
+
+    # ── C10c 出站长轮询通道（默认关闭）
+    def _start_channel(self) -> None:
+        """开关 ``client.channel.enabled`` 打开时起通道线程；关闭时不创建任何线程。"""
+        if not channel_enabled(self.config):
+            return
+        if self._channel_thread is not None and self._channel_thread.is_alive():
+            return
+        api = self._api_factory(self.config.gateway_url, self.credentials.client_key())
+        self._channel_stop = threading.Event()
+        self._channel = ChannelClient(self.paths, self.config, self.credentials,
+                                      port=self.server.port, local_token=self.token,
+                                      http=self.http, now=self._now, api=api)
+        self._channel_thread = threading.Thread(target=self._channel_runner,
+                                                name="djb-channel", daemon=True)
+        self._channel_thread.start()
+        event("channel.thread_started", port=self.server.port,
+              wait_s=facts.CHANNEL_POLL_WAIT_S)
+
+    def _channel_runner(self) -> None:
+        """线程体：异常只记事件，绝不向上抛（不影响 daemon 主循环，M15 §7）。"""
+        channel, stop = self._channel, self._channel_stop
+        if channel is None or stop is None:                 # pragma: no cover - 防御
+            return
+        try:
+            channel.run(stop)
+        except Exception as exc:                            # pragma: no cover - 防御
+            event("channel.thread_crashed", level="warning", error=type(exc).__name__)
+
+    def _stop_channel(self) -> None:
+        """置停止位并 join ≤ facts.CHANNEL_STOP_JOIN_S；已取 job 由通道自己尽力回传。"""
+        if self._channel_stop is not None:
+            self._channel_stop.set()
+        thread = self._channel_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=facts.CHANNEL_STOP_JOIN_S)
+        if thread is not None:
+            event("channel.thread_joined", alive=thread.is_alive())
+        self._channel_thread = None
+
+    def _channel_status(self) -> dict[str, Any]:
+        """status / 诊断用（只有状态与计数，无正文、无令牌）。"""
+        enabled = channel_enabled(self.config)
+        snapshot = self._channel.snapshot() if self._channel is not None else {}
+        running = bool(self._channel_thread is not None
+                       and self._channel_thread.is_alive())
+        return {"enabled": enabled, "running": running,
+                "state": snapshot.get("state", "idle"),
+                "port": self.server.port,
+                "wait_s": facts.CHANNEL_POLL_WAIT_S,
+                "jobs_done": int(snapshot.get("jobs_done", 0)),
+                "jobs_failed": int(snapshot.get("jobs_failed", 0)),
+                "last_job_id": snapshot.get("last_job_id"),
+                "last_error": snapshot.get("last_error")}
 
     # ── tick
     def _seconds_until_next_due(self) -> float:
@@ -963,6 +1024,8 @@ class Daemon:
                       "models": [entry for item in self.upstreams.list()
                                  for entry in self.upstreams.probe_details(
                                      item.id, now=self._now())]},
+            # C10c 出站长轮询通道（默认关闭；关闭时 running 恒为 False）
+            "channel": self._channel_status(),
             "flags": {name: {"enabled": feature_flag(self.config, name), **spec}
                       for name, spec in facts.FEATURE_FLAGS.items()},
             "update": self.update.status(),
