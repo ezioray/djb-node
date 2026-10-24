@@ -292,7 +292,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     token = new_token(32)
     if getattr(args, "foreground", False):
         daemon = Daemon(paths, config=config, local_token=token)
-        print("local_token=" + token, flush=True)
+        if not getattr(args, "no_token", False):
+            print("local_token=" + token, flush=True)
         return daemon.run()
     _spawn_daemon(paths, config, token)
     deadline = time.monotonic() + float(getattr(args, "timeout", 20) or 20)
@@ -1214,6 +1215,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = add_common(cmd_start, "start", "启动 daemon（本机回环 127.0.0.1:1717/v1）")
     start.add_argument("--foreground", action="store_true", help="前台运行（调试）")
+    start.add_argument("--no-token", action="store_true",
+                       help="不把一次性 local_token 打到 stdout（容器/日志采集；用 djb status --show-token 读取）")
     start.add_argument("--port", type=int, help="覆盖镜像端口")
     start.add_argument("--timeout", type=float, default=20.0, help="等待启动秒数")
 

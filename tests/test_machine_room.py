@@ -127,9 +127,23 @@ def test_dockerfile_creates_non_root_uid_10001_and_runs_as_it() -> None:
 def test_dockerfile_entrypoint_and_default_cmd() -> None:
     text = read(DEPLOY / "Dockerfile")
     assert 'ENTRYPOINT ["djb"]' in text
-    assert 'CMD ["start", "--foreground"]' in text
+    assert 'CMD ["start", "--foreground", "--no-token"]' in text
     # 装的是本仓 wheel，且不引入第三方运行时依赖
     assert "pip install --no-build-isolation ." in text
+
+
+def test_start_supports_no_token_flag() -> None:
+    """机房制品默认 `--no-token`：一次性 local_token 不进入容器 stdout/日志。"""
+    from djb_node.cli import build_parser
+
+    args = build_parser().parse_args(["start", "--foreground", "--no-token"])
+    assert args.no_token is True
+
+
+def test_helm_workloads_use_no_token() -> None:
+    for name in ("deployment.yaml", "daemonset.yaml"):
+        text = read(DEPLOY / "helm" / "djb-node" / "templates" / name)
+        assert '"start", "--foreground", "--no-token"' in text
 
 
 def test_dockerfile_has_no_inbound_port_and_no_privileged_bits() -> None:

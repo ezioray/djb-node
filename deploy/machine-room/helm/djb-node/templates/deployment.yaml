@@ -140,7 +140,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # 显式给命令，不依赖镜像 ENTRYPOINT 被 Helm 覆盖；前台跑 = 容器 PID 1 + SIGTERM 优雅停止
           command: ["djb"]
-          args: ["start", "--foreground"]
+          args: ["start", "--foreground", "--no-token"]
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           env:

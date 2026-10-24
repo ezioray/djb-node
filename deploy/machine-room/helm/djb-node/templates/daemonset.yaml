@@ -130,7 +130,7 @@ spec:
           image: {{ include "djb-node.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["djb"]
-          args: ["start", "--foreground"]
+          args: ["start", "--foreground", "--no-token"]
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           env:

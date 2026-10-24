@@ -81,4 +81,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
 # 卷是空的首次启动会以 exit 3「未初始化」退出（INV-01：不留静默失败）——
 # 先 `djb init --no-env`，Helm 里由 initContainer 统一完成（见 templates/deployment.yaml）。
 ENTRYPOINT ["djb"]
-CMD ["start", "--foreground"]
+CMD ["start", "--foreground", "--no-token"]

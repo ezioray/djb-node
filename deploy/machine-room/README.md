@@ -227,7 +227,7 @@ python3 $F --inventory deploy/machine-room/fleet/inventory.example.csv \
 
 ## 8. 已知限制 / 待办（如实记录，不粉饰）
 
-1. **容器日志里有一次性令牌**：`djb start --foreground` 会把进程级 `local_token` 打到 stdout
+1. **容器日志里有一次性令牌（已缓解）**：`djb start --foreground --no-token` 不再打印进程级 `local_token`；机房制品默认已带 `--no-token`
    （客户端运行时代码，本卡不改）。该令牌只在内存、退出即失效、不落盘，但仍属敏感流：
    机房版请把容器 stdout 当敏感日志（限制采集范围与保留期），或覆盖 CMD 为
    `["python","-m","djb_node.daemon"]`（daemon 直接启动，不打印令牌，令牌用 `DJB_LOCAL_TOKEN` 注入）。
