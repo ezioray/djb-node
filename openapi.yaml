@@ -17,7 +17,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.14
+  version: 1.2.15
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面（127 路径 / 145 操作；覆盖 M01–M14、M16；1.2.9 增 C10 节点通道）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
@@ -2009,6 +2009,158 @@ paths:
 
 
 
+
+
+  # ----------------------------------------------------------------------
+  # M17 canary / L4 行为指纹（C13，spec 1.2.15）
+  # 合成题面；响应正文不落库，只存 hash/score
+  # ----------------------------------------------------------------------
+  /api/v1/admin/supply/integrity/canary/runs:
+    post:
+      tags: [admin]
+      summary: 发一条 canary（同一节点/模型同时只 1 条 issued）
+      operationId: issueCanaryRun
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CanaryIssueRequest' }
+      responses:
+        '201':
+          description: 已发题（合成 prompt；可复算 selection）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CanaryIssueResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    get:
+      tags: [admin]
+      summary: canary 运行列表
+      operationId: listCanaryRuns
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+        - name: node_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: model
+          in: query
+          required: false
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [issued, passed, failed, missed] }
+      responses:
+        '200':
+          description: 运行列表
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CanaryRunList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/supply/integrity/canary/runs/{id}/result:
+    post:
+      tags: [admin]
+      summary: 回填 canary 响应（只比对；正文不落库）
+      operationId: submitCanaryResult
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CanaryResultRequest' }
+      responses:
+        '200':
+          description: 已判定
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CanaryResultResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/admin/supply/integrity/canary/stats:
+    get:
+      tags: [admin]
+      summary: canary 统计（pass/fail/missed + L4 线索）
+      operationId: getCanaryStats
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: node_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: model
+          in: query
+          required: true
+          schema: { type: string }
+        - name: window
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200 }
+      responses:
+        '200':
+          description: 统计
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CanaryStats' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/supply/integrity/canary/expire:
+    post:
+      tags: [admin]
+      summary: 把超期 issued 翻 missed（运维）
+      operationId: expireCanaryRuns
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已翻状态
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CanaryExpireResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   # ----------------------------------------------------------------------
   # M17 可验证随机抽检（C14b，spec 1.2.14）
@@ -7940,6 +8092,113 @@ components:
 
 
 
+
+
+    # ------------------------------------------------------------ M17 canary（C13，spec 1.2.15）
+    CanaryIssueRequest:
+      type: object
+      additionalProperties: true
+      required: [node_id, model]
+      properties:
+        node_id: { type: string }
+        model: { type: string }
+        upstream_id: { type: [string, 'null'] }
+
+    CanaryRun:
+      type: object
+      additionalProperties: true
+      required: [id, node_id, model, prompt_id, status, created_at, deadline_at]
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string }
+        upstream_id: { type: [string, 'null'] }
+        model: { type: string }
+        prompt_id: { type: string, format: uuid }
+        status: { type: string, enum: [issued, passed, failed, missed] }
+        response_hash: { type: [string, 'null'] }
+        score: { type: [number, 'null'] }
+        detail: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        deadline_at: { type: string, format: date-time }
+        resolved_at: { type: [string, 'null'], format: date-time }
+
+    CanaryIssueResponse:
+      type: object
+      additionalProperties: true
+      required: [run_id, node_id, model, prompt, nonce, deadline_at, status]
+      properties:
+        run_id: { type: string, format: uuid }
+        node_id: { type: string }
+        upstream_id: { type: [string, 'null'] }
+        model: { type: string }
+        prompt_key: { type: string }
+        selection: { type: string }
+        prompt: { type: string }
+        nonce: { type: string }
+        max_tokens: { type: integer, minimum: 1 }
+        issued_at: { type: string, format: date-time }
+        deadline_at: { type: string, format: date-time }
+        status: { type: string, const: issued }
+
+    CanaryResultRequest:
+      type: object
+      additionalProperties: true
+      required: [response_text]
+      properties:
+        response_text: { type: string }
+        usage_prompt_tokens: { type: [integer, 'null'], minimum: 0 }
+        latency_ms: { type: [integer, 'null'], minimum: 0 }
+
+    CanaryMatch:
+      type: object
+      additionalProperties: true
+      required: [passed, score, match, reason]
+      properties:
+        passed: { type: boolean }
+        score: { type: number }
+        match: { type: string }
+        reason: { type: string }
+        response_hash: { type: [string, 'null'] }
+
+    CanaryResultResponse:
+      type: object
+      additionalProperties: true
+      required: [run, match]
+      properties:
+        run: { $ref: '#/components/schemas/CanaryRun' }
+        match: { $ref: '#/components/schemas/CanaryMatch' }
+
+    CanaryRunList:
+      type: object
+      additionalProperties: true
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CanaryRun' }
+        has_more: { type: boolean }
+        next_cursor: { type: [string, 'null'] }
+
+    CanaryStats:
+      type: object
+      additionalProperties: true
+      required: [node_id, model, window, total, passed, failed, missed]
+      properties:
+        node_id: { type: string }
+        model: { type: string }
+        window: { type: integer, minimum: 1 }
+        total: { type: integer, minimum: 0 }
+        passed: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        missed: { type: integer, minimum: 0 }
+        pass_rate: { type: [number, 'null'] }
+
+    CanaryExpireResponse:
+      type: object
+      additionalProperties: true
+      required: [runs]
+      properties:
+        runs: { type: integer, minimum: 0 }
 
     # ------------------------------------------------------------ M17 抽检（C14b，spec 1.2.14）
     SamplingContribution:

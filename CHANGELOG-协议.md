@@ -22,6 +22,21 @@
 
 **复核人**：lead（C15 实现 / 规格登记；证据 `DEV-C15-PUSH-20261024T200821Z.txt`）
 
+## 1.2.15 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 4 条管理面路径、5 个操作、9 个 schema）
+**计数**：149 → 153 路径、171 → 176 操作、272 → 281 schema
+
+**变更**
+1. M17 canary/L4：`POST|GET /api/v1/admin/supply/integrity/canary/runs`、`POST /runs/{id}/result`、
+   `GET /stats`、`POST /expire`。
+2. 5 条内置合成题面（exact/contains/regex）；响应**只存 sha256/score**，正文不落库。
+3. 超期 120s → missed；重放/跨节点 409/404；同一 (node,model) 只 1 条 issued。
+4. 连续 3 次 pass → L4 行为线索（**不直接改定级**，由 C12/风控裁决）。
+5. 开关 `supply.canary.enabled` 默认关；`DJB_CANARY=1` S2 激活；不写账本。
+
+**复核人**：lead（C13 实现 / 规格登记；证据 `DEV-C13-CANARY-20261024T203204Z.txt`）
+
 ## 1.2.14 · 2026-10-24 · MINOR
 
 **类型**：MINOR（新增 5 条管理面路径、6 个操作、13 个 schema）
