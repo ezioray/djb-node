@@ -14,6 +14,7 @@
     errors.py     错误码 / 退出码 / Error 信封
     util.py       时间、JSON、ID、脱敏、原子写
     config.py     本机路径与 client.* 默认值
+    platform/     三端平台抽象（paths / service / credentials；Linux 行为零变化）
     store.py      SQLite 本地状态（PRAGMA user_version 只前进）
     crypto.py     收据缓冲的密封 / 校验（S1 标准库构造，见 README-CLIENT CR 表）
     secure.py     凭据（0600 文件，S1 允许并显式标注；日志/诊断绝不出现）
