@@ -422,3 +422,39 @@ FEATURE_FLAGS["client.probe.periodic.enabled"] = {
     "description": "客户端周期复探（L2/L3），默认关闭",
 }
 PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
+
+# ─────────────────────────────────────────────────────────── C10c 出站长轮询通道
+# 口径：客户端不开放入站端口，主动长轮询平台取 job → 调本机 127.0.0.1 镜像端点执行 →
+# 回传结果。默认关闭；关闭时 daemon 不起线程，行为与无通道版本完全一致。
+FEATURE_FLAGS["client.channel.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "关闭后停长轮询、退回无通道模式；已取 job 尽力回传后停止",
+    "description": "客户端出站长轮询通道（C10c）：平台下发 job、本机执行、回传结果，默认关闭",
+}
+CHANNEL_FLAG = "client.channel.enabled"
+CHANNEL_POLL_PATH = "/api/v1/node/channel/poll"
+"""平台长轮询端点（spec 侧由 C10a/b 落地；客户端只消费）。"""
+CHANNEL_RESULT_PATH = "/api/v1/node/channel/result"
+CHANNEL_POLL_WAIT_S = 25
+"""长轮询 wait_s（服务端最多挂起该秒数；204 = 无 job）。"""
+CHANNEL_POLL_TIMEOUT_S = 35
+"""poll 的客户端超时：wait_s + 10s 网络余量。"""
+CHANNEL_BACKOFF_S: tuple[int, ...] = (1, 5, 30)
+"""poll 失败退避序列（秒）：用尽后停在最后一档，不退出。"""
+CHANNEL_RESULT_TIMEOUT_S = 20
+CHANNEL_RESULT_ATTEMPTS = 2
+"""结果回传尝试次数（幂等键 = job_id；重复提交由服务端判 duplicate）。"""
+CHANNEL_RESULT_RETRY_S = 1
+CHANNEL_JOB_TIMEOUT_DEFAULT_S = 120
+"""job 未给 timeout_s 时的默认上限。"""
+CHANNEL_JOB_TIMEOUT_MAX_S = 300
+"""本地执行上限：超过即截断（单在途，不能把 poll 主循环拖死）。"""
+CHANNEL_JOB_TIMEOUT_MIN_S = 1
+CHANNEL_BODY_FIELDS: tuple[str, ...] = ("model", "messages", "max_tokens", "temperature",
+                                        "stop")
+"""转发给本机镜像端点的字段白名单（不透传未知字段，避免把平台注入物带到上游）。"""
+CHANNEL_STOP_JOIN_S = 5
+"""daemon 停止时等待通道线程的秒数。"""
+CHANNEL_STATUS_KINDS: tuple[str, ...] = ("idle", "polling", "executing", "stopping")
