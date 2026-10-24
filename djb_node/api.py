@@ -15,6 +15,8 @@
     GET  /api/v1/protocol/deprecations    200
     POST /api/v1/node/channel/poll        200 / 204（C10c 长轮询取 job；204 = 暂无 job）
     POST /api/v1/node/channel/result      200  回传 job 结果（幂等键 = job_id）
+    GET  /api/v1/node/model-catalog       200 / 304（M18b 模型/tokenizer 签名 bundle）
+    POST /api/v1/node/model-sync/state    200  上报已应用版本 / 漂移 / 错误类
 
 硬规则：出站头只用 spec 头名；凭据只在 X-Client-Key 头里出现，绝不进 URL / body /
 日志；错误信封只按 type / code / reason 判断，不解析 message 文案。
@@ -215,6 +217,42 @@ class NodeApi:
         body = response.json()
         if not isinstance(body, dict) or "accepted" not in body:
             raise NetworkError("通道结果响应缺少 accepted（契约不匹配）", code=45001)
+        return body
+
+    # ─────────────────────────────────────────────────────── 模型同步（M18b）
+    def model_catalog(self, since: int | str | None = None) -> dict[str, Any]:
+        """GET /api/v1/node/model-catalog 拉签名 bundle。
+
+        * 带 ``since`` 时作为查询参数（服务端可回 304 / ``not_modified=true``）；
+        * 200 → bundle JSON；304 → ``{"not_modified": True}``（调用方据此跳过应用）。
+
+        返回值只做形状兜底，字段语义交给 ``model_sync.sync()`` 校验。
+        """
+        path = facts.MODEL_CATALOG_PATH
+        if since is not None and str(since).strip() != "":
+            path = path + "?since=" + _quote(str(since).strip())
+        response = self.http.request(
+            "GET", self.url(path), headers=self._headers(),
+            timeout=facts.MODEL_SYNC_TIMEOUT_S)
+        if response.status == 304:
+            return {"not_modified": True, "version": since}
+        if response.status >= 400:
+            raise raise_for_response(response, what=facts.MODEL_CATALOG_PATH)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise NetworkError("模型目录响应不是 JSON 对象（契约不匹配）", code=45001)
+        return payload
+
+    def submit_model_sync_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST /api/v1/node/model-sync/state 上报应用状态（只版本/漂移/错误类）。
+
+        返回 ``{"accepted": bool, "server_version": ...}``；缺 accepted 视为契约不匹配。
+        """
+        response = self._call("POST", facts.MODEL_SYNC_STATE_PATH, json_body=payload,
+                              timeout=facts.MODEL_SYNC_STATE_TIMEOUT_S)
+        body = response.json()
+        if not isinstance(body, dict) or "accepted" not in body:
+            raise NetworkError("模型同步状态响应缺少 accepted（契约不匹配）", code=45001)
         return body
 
     # ─────────────────────────────────────────────────────── 收据（M05）

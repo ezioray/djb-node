@@ -32,6 +32,7 @@ from .httpclient import HttpClient
 from .limits import (Limiter, YieldDetector, in_schedule, parse_schedule_windows,
                      resource_caps_valid)
 from .logging_setup import get_logger, prune_old_logs, setup_logging
+from .model_sync import ModelSyncClient, bundle_file, model_sync_enabled
 from .outbox import ReceiptFactory, validate_receipt
 from .policy import summary as policy_summary
 from .relay import RelayError, RelayManager
@@ -864,6 +865,43 @@ def cmd_attest(args: argparse.Namespace) -> int:
     return 0
 
 
+# ─────────────────────────────────────────────────────────── model-sync（M18b）
+def cmd_model_sync(args: argparse.Namespace) -> int:
+    """模型 / tokenizer 同步：``status`` 只读本地；``sync`` 手动拉一次（不打印 key/token）。"""
+    paths, config, store = _context(args)
+    credentials = CredentialStore(paths)
+    action = getattr(args, "model_sync_action", "status") or "status"
+    client = ModelSyncClient(paths, config, credentials,
+                             api=NodeApi(config.gateway_url,
+                                         client_key=credentials.client_key()))
+    if action == "sync":
+        outcome = client.sync()
+        payload = {"action": "sync", "enabled": model_sync_enabled(config), **outcome,
+                   "status": client.status()}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: ("同步完成：版本 " + str(value["applied_version"])
+                                  + ("（已更新）" if value["changed"] else "（无变化）")
+                                  + ("；错误 " + str(value["error_class"])
+                                     if value.get("error_class") else "")
+                                  + "；本地模型 " + str(value["status"]["models"]) + " 个"
+                                  + ("；unsupported " + str(len(value["status"]["unsupported"]))
+                                     if value["status"]["unsupported"] else "")))
+        return 0
+    if action != "status":
+        raise UsageError("未知 model-sync 子命令：" + action)
+    status = client.status()
+    _emit(status, as_json=_json_flag(args),
+          text=lambda value: ("model-sync 开关：" + ("开" if value["enabled"] else "关（默认）")
+                              + "；当前版本 " + str(value["current_version"])
+                              + "；模型 " + str(value["models"]) + " 个"
+                              + ("；unsupported " + str(len(value["unsupported"]))
+                                 if value["unsupported"] else "")
+                              + ("；漂移 " + str(len(value["drift"])) if value["drift"] else "")
+                              + ("；最近错误 " + str(value["last_error"])
+                                 if value["last_error"] else "")))
+    return 0
+
+
 # ─────────────────────────────────────────────────────────── announce
 def cmd_announce(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
@@ -1074,7 +1112,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
                paths.provider_key_file,
                os.path.join(paths.keys_dir, "update_mock.key"),
                paths.db_file, paths.db_file + "-wal", paths.db_file + "-shm",
-               paths.config_file,
+               paths.config_file, bundle_file(paths),
                os.path.join(paths.runtime_dir, "daemon.out")]
     if not keep_logs:
         targets.extend(_log_files(paths.logs_dir))
@@ -1146,7 +1184,7 @@ def _residual_hits(paths: Paths, *, keep_logs: bool) -> list[str]:
     """卸载残留自检：服务 / 凭据 / 数据 / 缓存 / 配置（日志可显式保留）。"""
     candidates = [paths.credentials_file, paths.buffer_key_file, paths.provider_key_file,
                   paths.db_file, paths.db_file + "-wal", paths.db_file + "-shm",
-                  paths.config_file,
+                  paths.config_file, bundle_file(paths),
                   os.path.join(paths.runtime_dir, "daemon.sock"),
                   os.path.join(paths.runtime_dir, "daemon.pid"),
                   control_socket_file(paths)]
@@ -1315,6 +1353,15 @@ def build_parser() -> argparse.ArgumentParser:
     token_count.add_argument("--messages", help="JSON messages 数组（含 chat template 开销）")
     token_count.add_argument("--tools", help="JSON tools 数组")
     for child in token_sub.choices.values():
+        _sub_flags(child)
+
+    model_sync = add_common(cmd_model_sync, "model-sync",
+                            "模型/tokenizer 同步：查看本地版本或手动拉取签名 bundle")
+    model_sync_sub = model_sync.add_subparsers(dest="model_sync_action",
+                                               metavar="<action>")
+    model_sync_sub.add_parser("status", help="查看本地已应用版本 / unsupported / 漂移")
+    model_sync_sub.add_parser("sync", help="手动拉取并应用一次（失败保留旧版）")
+    for child in model_sync_sub.choices.values():
         _sub_flags(child)
 
     flags = add_common(cmd_flags, "flags", "查看 / 设置本机特性开关（默认关闭）")
