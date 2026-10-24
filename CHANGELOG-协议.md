@@ -3,6 +3,76 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.9 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 2 条节点面路径 + 5 个 schema + **首次使用 `204`**；无删除、无类型更改、
+无既有 path / 字段语义变更；路径 125 → 127、操作 143 → 145、schema 220 → 225）
+
+**变更**
+1. `POST /api/v1/node/channel/poll`（`pollNodeChannel`）：节点出站**长轮询**取一个任务。
+   请求 `wait_s`（number，1–30，默认 25，可选）与 `capabilities`（string[]，可选，未知值忽略）；
+   命中返回 `200` + `{job, server_time}`；`wait_s` 内无任务返回 **`204`（无响应体）**。
+   单节点同时 1 个在途任务由通道层保证（不写进本文件阈值）。
+2. `POST /api/v1/node/channel/result`（`submitNodeChannelResult`）：回传结果。
+   请求 `job_id`(uuid) / `status`(completed|failed) / `content` / `finish_reason` /
+   `tokens_in` / `tokens_out` / `usage_source`(actual|estimated|dual，可空) / `latency_ms` /
+   `first_byte_ms` / `error_code`（字符串，可空）/ `error_class` / `upstream_request_id`；
+   返回 `200` + `{accepted, duplicate}`。**不接受** `succeeded` / `node_id` / `duration_ms` /
+   `completed_at` / `usage` 嵌套（未知字段一律忽略）。
+   **按 `job_id` 幂等**：同载荷重放 `duplicate=true`（只受理一次）；同 `job_id` 不同载荷 → `409` + `40919`；
+   `job_id` 不存在 / 不属于该节点 → `404` + `40401`。`status=failed` 必须给 `error_code` 或 `error_class`。
+3. 新增 5 个 schema：`NodeChannelPollRequest`、`NodeChannelJob`、`NodeChannelPollResponse`、
+   `NodeChannelResultRequest`、`NodeChannelResultAck`。`NodeChannelJob` 字段：
+   `job_id` / `kind:"chat.completions"` / `request_id` / **`request`**（对象：`model`、`messages`、
+   `max_tokens`、`temperature`、`stop`）/ `timeout_s`（可选）/ `lease_expires_at`——
+   **`model` / `messages` 不在 job 顶层**（与客户端 `parse_job` 对齐）。
+   job **不含任何凭据 / 上游端点**（H1 口径不变；`request` 为正文，只在内存与响应体过一手）。
+4. 错误码**只复用不新造**：`50903`（通道不可用 / 未接线 → 503）、`40401`（任务不存在或越权）、
+   `40919`（同 `job_id` 不同载荷）、`42901`（通道限流）、`42601`（协议不兼容，与其余节点端点同口径）。
+5. 既有 1.2.0–1.2.8 的路径、操作、schema、enum、错误码**语义未变**；旧客户端忽略新路径即可。
+
+**影响面**
+- M02 node-supply（C10a）：两条端点 + `app/supply/channel.py` 接线位；队列未接线 → `503` / `50903`（fail-closed），
+  不 import M03、不建表、正文不落库。
+- M03 gateway-protocol（C10b）：提供队列后端（内存队列 / 租约 / 重派），经 `channel.set_channel_backend` 注入。
+- M15 / 客户端（C10c）：长轮询循环；客户端零第三方运行时依赖（stdlib `http.client`）。
+- M04 / M05 / M16：无影响（通道不新增事件，也不改收据 / 审计字段）。
+
+**兼容矩阵**
+- v1 未发布 → N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无**（`python3 ci/spec_breaking.py HEAD` → ✅ 无破坏性变更，无兼容提示）。
+- 与 1.2.8 的关系：纯新增；125 → 127 路径、143 → 145 操作、220 → 225 schema。
+- `204` 是**新操作**上的新响应码，不改变任何既有操作的响应集合。
+
+**复核人**：lead（本席实现 C10a；证据 `ops/audit/reports/DEV-C10-CONTRACT-<UTC>.txt`）
+
+## 1.2.8 · 2026-10-24 · MINOR
+
+**类型**：MINOR（`Model` 新增 2 个可选响应字段；无删除、无类型更改、无既有 path 语义变更；
+路径 / 操作 / schema 数不变：125 / 143 / 220）
+
+**变更**
+1. `Model.available`（`boolean`，可选）：当前是否可服务。服务端按「有正容量公告 + 上游
+   `state=verified` 且 `verified_at` 在新鲜窗口（默认 900 s）内」判定；**缺省表示未计算/
+   降级镜像，客户端不得推断为可用**。
+2. `Model.probe`（`object`，可选）：可用性依据，`additionalProperties=false`；字段：
+   `level`（string|null）、`verified_at`（date-time|null）、`fresh`（boolean）、
+   `reason`（`no_capacity` / `unverified` / `stale` / null）。
+3. 既有 1.2.0–1.2.7 的路径、操作、schema、enum、错误码**语义未变**；旧客户端忽略新字段即可。
+
+**影响面**
+- M03 gateway：`/v1/models` 透传可选字段（`providers._MODEL_FIELDS` / `router._MODEL_FIELDS`）。
+- M13 portal-web：C9c 已按三态消费；1.2.8 后从「状态未知」升级为真实状态。
+- M02/M04：只读 `v_supply_capacity_latest` 与 `v_supply_upstream_verified`，不新增写入。
+- 客户端 / SDK：tolerant reader；不传该字段的服务端仍兼容。
+
+**兼容矩阵**
+- v1 未发布 → N/N-1/N-2 不适用。
+- 破坏性变更：**无**（纯字段级新增；`ci/spec_breaking.py` 复核）。
+- 与 1.2.7 的关系：纯补丁；125/143/220 不变。
+
+**复核人**：lead（本席实现 C9 收尾；证据 `ops/audit/reports/DEV-C9-CLOSE-<UTC>.txt`）
+
 ## 1.2.7 · 2026-10-24 · MINOR
 
 **类型**：MINOR（1 个只读可选响应字段 + 1 个请求字段由必填改为可选 + `Error.reason` 新增 1 个枚举值；

@@ -17,8 +17,8 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.8
-  summary: W1 冻结 + M16 审计链 + W2/W3 契约面（125 路径 / 143 操作；覆盖 M01–M14、M16）
+  version: 1.2.9
+  summary: W1 冻结 + M16 审计链 + W2/W3 契约面（127 路径 / 145 操作；覆盖 M01–M14、M16；1.2.9 增 C10 节点通道）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
@@ -1887,6 +1887,83 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/node/channel/poll:
+    post:
+      tags: [node]
+      summary: 长轮询取一个任务（wait_s 内无任务 → 204）
+      operationId: pollNodeChannel
+      description: |
+        **节点出站长轮询**（C10 决策单 A：HTTP 长轮询 + 内存队列，正文不落库、默认关）。
+        客户端用 `X-Client-Key` 鉴权，携带 `wait_s` 阻塞至多 N 秒取一个任务；到点无任务返回
+        `204`（无响应体）。单节点同时只允许 **1 个在途任务**（由通道层保证）。
+        任务正文（`messages`）**只在内存与响应体过一手**：平台不落库、不进日志、不进事件。
+        未接线 / 通道关闭 / 节点离线 → `503` + `50903`（不静默回落 Echo；是否回落由部署层显式选择）。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeChannelPollRequest' }
+      responses:
+        '200':
+          description: 派发一个任务
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeChannelPollResponse' }
+        '204':
+          description: 在 `wait_s` 内没有任务（长轮询到点）；无响应体。
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/node/channel/result:
+    post:
+      tags: [node]
+      summary: 回传任务结果（按 job_id 幂等）
+      operationId: submitNodeChannelResult
+      description: |
+        节点执行完（或失败）后回传结果。**按 `job_id` 幂等**：同一 `job_id` 同一载荷重复提交
+        返回 `200` + `duplicate: true`（通道只受理一次）；同一 `job_id` 不同载荷 → `409` + `40919`。
+        `job_id` 不存在 / 不属于该节点 → `404` + `40401`（不泄露存在性）。
+        正文只保留在内存：服务端落库的只有 usage / 元数据与请求摘要（sha256），**不落正文**。
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeChannelResultRequest' }
+      responses:
+        '200':
+          description: 结果已受理（`duplicate=true` = 重复提交被幂等去重，未再次受理）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeChannelResultAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /api/v1/admin/supply/nodes/{id}/review:
     post:
@@ -5188,6 +5265,13 @@ components:
                 `47010` 角色不足 / 越权（M10，HTTP 403；在 47002 之外区分「角色不足」与「复核人=发起人」）；
                 `47011` 审计不可用（M10 → M16 接线后，HTTP 503；未接线前沿用 409 + 40919）。
 
+                spec 1.2.9 新登记（C10 节点通道，仅文档补登；不改结构 / 响应 / 枚举 / 码值）：
+                `50903` **复用**为「节点通道不可用」——C10b 队列未接线 / 通道关闭 / 节点离线导致
+                长轮询不可用（HTTP 503，可安全重试并遵守 `Retry-After`）；不新造 503 子码。
+                `40401` 复用为「通道任务不存在或不属于该节点」（HTTP 404，不泄露存在性）；
+                `40919` 复用为「同一 `job_id` 提交了不同结果载荷」（HTTP 409）；
+                `42901` 复用为通道侧限流（HTTP 429，只给粗粒度原因码与 `Retry-After`）。
+
                 未登记的码一律不返回；新增码先改本 spec 与 04 码段表。其余以产品设计 §6.3 与附录 C.4 为准。
             message:
               type: string
@@ -5755,6 +5839,148 @@ components:
         probe_hint:
           type: string
           description: 提示本地发起体检（`/api/v1/node/upstream/probe`），不在服务端探。
+
+    NodeChannelPollRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        wait_s:
+          type: number
+          minimum: 1
+          maximum: 30
+          default: 25
+          description: 长轮询最长等待秒数（1–30，默认 25）；到点无任务返回 `204`。
+        capabilities:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            maxLength: 64
+          description: 本节点可承接的能力标识（可选）；未知值**忽略不报错**，只按双方交集派单。
+
+    NodeChannelJob:
+      type: object
+      additionalProperties: true
+      required: [job_id, kind, request_id, request, lease_expires_at]
+      description: |
+        通道派发的单个任务。**不含任何凭据 / 上游端点**（H1 口径不变）；
+        `request` 是待转发的请求正文，只在内存与响应体过一手，不进库 / 不进日志 / 不进事件。
+        **`model` / `messages` 不在 job 顶层**，统一放在 `request` 内（与客户端 `parse_job` 对齐）。
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [chat.completions]
+        request_id:
+          type: string
+          description: 平台请求标识（贯穿网关 / 调度 / 收据）。
+        request:
+          type: object
+          additionalProperties: true
+          required: [model, messages]
+          properties:
+            model:
+              type: string
+            messages:
+              type: array
+              minItems: 1
+              items:
+                type: object
+                additionalProperties: true
+                required: [role, content]
+                properties:
+                  role:
+                    type: string
+                    enum: [system, user, assistant]
+                  content:
+                    type: string
+            max_tokens:
+              type: integer
+              minimum: 1
+            temperature:
+              type: number
+              minimum: 0
+              maximum: 2
+            stop:
+              type: array
+              items:
+                type: string
+        timeout_s:
+          type: number
+          minimum: 1
+          description: 平台侧请求总超时（秒，可选）；缺省由客户端按自身策略。
+        lease_expires_at:
+          type: string
+          format: date-time
+          description: 租约到期时刻；到期未回传由通道层重派（≤2 次）。
+
+    NodeChannelPollResponse:
+      type: object
+      additionalProperties: true
+      required: [job, server_time]
+      properties:
+        job:
+          $ref: '#/components/schemas/NodeChannelJob'
+        server_time:
+          type: string
+          format: date-time
+
+    NodeChannelResultRequest:
+      type: object
+      additionalProperties: true
+      required: [job_id, status]
+      description: |
+        结果回传。`status=failed` 时必须给 `error_code` 或 `error_class`（否则 `400` + `40001`）。
+        服务端只保留 usage / 元数据与请求摘要，**不落正文**。
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [completed, failed]
+        content:
+          type: string
+          description: 模型输出正文（`completed` 时有意义；不落库、不进日志）。
+        finish_reason:
+          type: string
+        tokens_in:
+          type: integer
+          minimum: 0
+        tokens_out:
+          type: integer
+          minimum: 0
+        usage_source:
+          type: string
+          enum: [actual, estimated, dual]
+          description: |
+            usage 来源：`actual` 上游返回 / `estimated` 本地估算 / `dual` 两者都有
+            （取用优先级 actual > estimated）。可空（`null` = 未上报）。
+        latency_ms:
+          type: integer
+          minimum: 0
+        first_byte_ms:
+          type: integer
+          minimum: 0
+        error_code:
+          type: string
+        error_class:
+          type: string
+        upstream_request_id:
+          type: string
+
+    NodeChannelResultAck:
+      type: object
+      additionalProperties: true
+      required: [accepted, duplicate]
+      properties:
+        accepted:
+          type: boolean
+        duplicate:
+          type: boolean
+          description: 取值为 `true` 时表示同一 `job_id` 的重复提交被幂等去重（通道未再次受理）。
 
     ReceiptInput:
       type: object
