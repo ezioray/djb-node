@@ -17,7 +17,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.9
+  version: 1.2.10
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面（127 路径 / 145 操作；覆盖 M01–M14、M16；1.2.9 增 C10 节点通道）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
@@ -2004,6 +2004,141 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+
+  # ----------------------------------------------------------------------
+  # M17 待分润冻结（C14，spec 1.2.10）
+  # 只冻结「待分润」：不写账本、不改余额；S2 全开 I0–I4（罚没留 S3）
+  # ----------------------------------------------------------------------
+  /api/v1/admin/supply/integrity/holds:
+    get:
+      tags: [admin]
+      summary: 待分润冻结列表（active/all + 节点/模型/等级过滤 + 游标）
+      operationId: listIntegrityHolds
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [active, all, released, expired], default: active }
+        - name: node_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: model
+          in: query
+          required: false
+          schema: { type: string }
+        - name: level
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/IntegrityLevel' }
+      responses:
+        '200':
+          description: 冻结列表
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IntegrityHoldList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      summary: 创建 / 升级冻结（I0 只留事件；已有 active 只升不降）
+      operationId: createIntegrityHold
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IntegrityHoldCreateRequest' }
+      responses:
+        '201':
+          description: 已创建（I0 为 200 noted，hold=null）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IntegrityHoldMutation' }
+        '200':
+          description: 已升级 / I0 已记录（action=escalated|noted）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IntegrityHoldMutation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/admin/supply/integrity/holds/{id}:
+    get:
+      tags: [admin]
+      summary: 冻结详情（含事件流水）
+      operationId: getIntegrityHold
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 冻结详情
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IntegrityHoldDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin/supply/integrity/holds/{id}/release:
+    post:
+      tags: [admin]
+      summary: 解除冻结（I0/I1 一人；I2 双人；I3/I4 双人 + 高权限 scope）
+      operationId: releaseIntegrityHold
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IntegrityHoldReleaseRequest' }
+      responses:
+        '200':
+          description: 已解除（幂等：重复 release 回同一结果）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IntegrityHoldMutation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   # ----------------------------------------------------------------------
   # 调度与定价（M04；spec 1.2.0 补登记：M04 CR-2）
@@ -7159,6 +7294,113 @@ components:
         policy_version:
           type: string
           description: 准入通过后生成的策略版本（客户端据此拉取策略）。
+
+
+    # ------------------------------------------------------------ M17 冻结（C14，spec 1.2.10）
+    IntegrityLevel:
+      type: string
+      enum: [I0, I1, I2, I3, I4]
+      description: 作弊等级；冻结比例 I0=0 / I1=50% / I2=80% / I3=I4=100%。
+
+    IntegrityHold:
+      type: object
+      additionalProperties: true
+      required: [id, node_id, model, level, ratio_bp, base_amount_micro,
+                 frozen_amount_micro, state, reason, created_at, version]
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string }
+        upstream_id: { type: [string, 'null'] }
+        model: { type: string }
+        level: { $ref: '#/components/schemas/IntegrityLevel' }
+        ratio_bp: { type: integer, minimum: 0, maximum: 10000 }
+        base_amount_micro: { type: integer, minimum: 0 }
+        frozen_amount_micro: { type: integer, minimum: 0 }
+        state: { type: string, enum: [active, released, expired] }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+        released_at: { type: [string, 'null'], format: date-time }
+        release_reason: { type: [string, 'null'] }
+        reviewer_a: { type: [string, 'null'] }
+        reviewer_b: { type: [string, 'null'] }
+        version: { type: integer, minimum: 1 }
+        updated_at: { type: [string, 'null'], format: date-time }
+
+    IntegrityHoldEvent:
+      type: object
+      additionalProperties: true
+      required: [event_id, node_id, model, event, actor, created_at]
+      properties:
+        event_id: { type: string, format: uuid }
+        hold_id: { type: [string, 'null'], format: uuid }
+        node_id: { type: string }
+        model: { type: string }
+        event: { type: string, enum: [created, escalated, released, expired] }
+        from_level: { type: [string, 'null'] }
+        to_level: { type: [string, 'null'] }
+        detail: { type: object, additionalProperties: true }
+        actor: { type: string }
+        created_at: { type: string, format: date-time }
+
+    IntegrityHoldList:
+      type: object
+      additionalProperties: true
+      required: [items, has_more, state]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/IntegrityHold' }
+        has_more: { type: boolean }
+        next_cursor: { type: [string, 'null'] }
+        state: { type: string }
+
+    IntegrityHoldCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [node_id, model, level, base_amount_micro, reason]
+      properties:
+        node_id: { type: string }
+        upstream_id: { type: [string, 'null'] }
+        model: { type: string }
+        level: { $ref: '#/components/schemas/IntegrityLevel' }
+        base_amount_micro:
+          type: integer
+          minimum: 0
+          description: 待分润基数（由调用方从 M05 快照取；本接口不读账本）。
+        reason: { type: string }
+        evidence_ref: { type: string }
+
+    IntegrityHoldReleaseRequest:
+      type: object
+      additionalProperties: true
+      required: [reason]
+      properties:
+        reviewers:
+          type: array
+          items: { type: string }
+          description: I2 需 2 个不同 reviewer；I3/I4 另需操作者 integrity:release:high。
+        reason: { type: string }
+
+    IntegrityHoldMutation:
+      type: object
+      additionalProperties: true
+      required: [action]
+      properties:
+        action: { type: string, enum: [created, escalated, noted, released] }
+        hold: { oneOf: [{ $ref: '#/components/schemas/IntegrityHold' }, { type: 'null' }] }
+        event: { oneOf: [{ $ref: '#/components/schemas/IntegrityHoldEvent' }, { type: 'null' }] }
+
+    IntegrityHoldDetail:
+      type: object
+      additionalProperties: true
+      required: [hold, events]
+      properties:
+        hold: { $ref: '#/components/schemas/IntegrityHold' }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/IntegrityHoldEvent' }
 
     # ------------------------------------------------------------ 调度与定价（M04，spec 1.2.0）
     RouteRequest:

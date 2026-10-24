@@ -3,6 +3,32 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.10 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 3 条管理面路径 / 4 个操作 / 8 个 schema；不改既有路径语义）
+**计数**：127 → 130 路径、145 → 149 操作、225 → 233 schema
+
+**变更**
+1. 新增 `GET|POST /api/v1/admin/supply/integrity/holds`、`GET /holds/{id}`、
+   `POST /holds/{id}/release`（M17 C14 待分润冻结）。
+2. `IntegrityLevel` = I0–I4；冻结比例固定 **I0=0 / I1=50% / I2=80% / I3=I4=100%**（决策人 2026-10-24）。
+3. 冻结只作用于「待分润」：**不写账本、不改余额**；`frozen_amount_micro = base_amount_micro * ratio_bp // 10000`。
+4. 解除：I0/I1 一人；I2 需 2 名不同 reviewer；I3/I4 另需 `integrity:release:high`；
+   幂等重放回同一结果。
+5. `supply.freeze.enabled` 关闭时写接口 `503 + 50001 (feature_disabled)`；读接口只读可用。
+
+**影响面**
+- M14 后台：新增冻结列表/详情/创建/解除页面数据源。
+- M17/M11：冻结与案件联动；**不改变账本/结算金额**。
+- M04/M08：可读 `is_frozen` / `frozen_total`（接线由 Lead 排期）。
+- 旧客户端：不涉及公开 `/v1`；tolerant reader 无影响。
+
+**兼容矩阵**
+- v1 未发布 → N/N-1/N-2 不适用；无破坏性变更。
+- 与 1.2.9 的关系：纯新增（管理面）。
+
+**复核人**：lead（C14 实现 / 规格登记；证据 `DEV-C14-FREEZE-20261024T120857Z.txt`）
+
 ## 1.2.9 · 2026-10-24 · MINOR
 
 **类型**：MINOR（新增 2 条节点面路径 + 5 个 schema + **首次使用 `204`**；无删除、无类型更改、
