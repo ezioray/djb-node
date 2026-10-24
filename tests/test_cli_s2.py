@@ -48,11 +48,11 @@ def test_token_count_messages_includes_template_overhead(ready, capsys):
 def test_flags_list_defaults_all_off(ready, capsys):
     assert main(["flags", "--json"]) == 0
     payload = _json_out(capsys)
-    assert payload["count"] == 6
+    assert payload["count"] == 7
     assert {item["name"] for item in payload["flags"]} >= {
         "client.probe.periodic.enabled", "client.token.compare.enabled",
         "client.relay.enabled", "supply.attestation.enabled", "client.channel.enabled",
-        "client.model_sync.enabled"}
+        "client.model_sync.enabled", "client.notifications.enabled"}
     assert all(item["enabled"] is False for item in payload["flags"])
     assert all(item["owner"] and item["expire_at"] and item["rollback_rule"]
                for item in payload["flags"])
