@@ -1,0 +1,22 @@
+name: Bug 报告
+description: 客户端/协议/文档问题（不要贴凭据或用户正文）
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "安全漏洞请勿公开提 issue，按 SECURITY.md 私下报告。"
+  - type: input
+    id: version
+    attributes: { label: 版本 / commit, placeholder: "djb --version 或 commit sha" }
+    validations: { required: true }
+  - type: dropdown
+    id: os
+    attributes: { label: 平台, options: ["Linux", "Windows", "macOS", "机房/容器", "文档/其他"] }
+    validations: { required: true }
+  - type: textarea
+    id: steps
+    attributes: { label: 复现步骤, placeholder: "命令 + 期望 + 实际；日志请先脱敏" }
+    validations: { required: true }
+  - type: textarea
+    id: evidence
+    attributes: { label: 诊断信息, description: "djb diagnose 生成的脱敏包摘要；不要贴 key/token/正文" }

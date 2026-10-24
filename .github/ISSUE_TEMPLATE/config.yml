@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（私下报告）
+    url: https://github.com/ezioray/djb-node/security/advisories/new
+    about: 不要公开提 issue；见 SECURITY.md
