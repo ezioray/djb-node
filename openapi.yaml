@@ -17,7 +17,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.7
+  version: 1.2.8
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面（125 路径 / 143 操作；覆盖 M01–M14、M16）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
@@ -5352,6 +5352,30 @@ components:
           description: |
             价格快照版本（M04 model_catalog.price_version / M10 同族），用于三处同源校验。
             公开侧（未登录文档站 / 降级镜像）可缺省为 null；客户端不得据此推断结算价。
+        available:
+          type: boolean
+          description: |
+            当前是否可服务（C9，1.2.8）。服务端按「容量公告 + 已验证上游（state=verified）
+            且 verified_at 在新鲜窗口内」判定；字段缺省表示未计算/降级镜像，客户端不得推断为可用。
+        probe:
+          type: object
+          additionalProperties: false
+          description: |
+            可用性依据（C9，1.2.8）；只在服务端能给出时返回。reason 为 no_capacity / unverified /
+            stale，available=true 时为 null。
+          properties:
+            level:
+              type: [string, 'null']
+              description: 服务端已知的证明等级；S2 仅回传可用性，暂不宣称 L3+。
+            verified_at:
+              type: [string, 'null']
+              format: date-time
+            fresh:
+              type: boolean
+              description: verified_at 是否在服务端新鲜窗口内（默认 900s）。
+            reason:
+              type: [string, 'null']
+              enum: [no_capacity, unverified, stale, null]
 
     ModelList:
       type: object
