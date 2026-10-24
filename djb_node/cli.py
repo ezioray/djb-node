@@ -21,7 +21,8 @@ from typing import Any, Callable
 
 from . import __version__, facts
 from .api import NodeApi
-from .config import (ClientConfig, Paths, load_config, resolve_home, save_config)
+from .attest import AttestationManager
+from .config import (ClientConfig, Paths, feature_flag, load_config, resolve_home, save_config)
 from .daemon import ControlClient, Daemon, control_socket_file
 from .diagnose import DiagnoseBuilder, DiagnoseError
 from .envcheck import EnvChecker
@@ -33,9 +34,11 @@ from .limits import (Limiter, YieldDetector, in_schedule, parse_schedule_windows
 from .logging_setup import get_logger, prune_old_logs, setup_logging
 from .outbox import ReceiptFactory, validate_receipt
 from .policy import summary as policy_summary
+from .relay import RelayError, RelayManager
 from .secure import CredentialStore
 from .state import StateMachine, Snapshot
 from .store import ProfileRecord, Store, UpstreamRecord
+from . import tokens as tokens_mod
 from .update import UpdateManager
 from .upstream import (UpstreamManager, a2_prompt, parse_models, probe_upstream,
                        validate_access_type, validate_base_url, validate_min_price)
@@ -579,8 +582,22 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         secret = getattr(args, "secret", None)
         if getattr(args, "secret_stdin", False):
             secret = sys.stdin.readline().strip()
+        relay_profile = None
+        if getattr(args, "kind", None) == facts.RELAY_KIND:
+            relay_mgr = RelayManager(store, credentials, config=config)
+            if not relay_mgr.enabled():
+                raise UsageError("relay 接入开关关闭（默认关闭）：先 djb flags --enable "
+                                 + facts.RELAY_FLAG + " 再添加（本次未创建上游）")
         record = manager.add(access_type=args.access, base_url=args.base_url,
                              models=args.models, secret=secret, protocol=args.protocol)
+        if getattr(args, "kind", None) == facts.RELAY_KIND:
+            relay_mgr = RelayManager(store, credentials, config=config)
+            relay_profile = relay_mgr.add(
+                base_url=args.base_url, upstream_id=record.id,
+                auth_scheme=getattr(args, "auth", "bearer") or "bearer",
+                header_name=getattr(args, "auth_header", None),
+                auth_prefix=getattr(args, "auth_prefix", None),
+                tls_pin=getattr(args, "tls_pin", None), secret=secret)
         declared: dict[str, Any] = {"declared": False, "reason": "daemon 未运行（稍后 djb upstream declare --id）"}
         try:
             api = NodeApi(config.gateway_url, client_key=credentials.client_key(),
@@ -591,6 +608,7 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         except DjbError as exc:
             declared = {"declared": False, "reason": exc.message}
         payload = {"upstream": manager.store.upstream(record.id).to_dict(),
+                   "relay": relay_profile.to_dict() if relay_profile else None,
                    "declare": declared,
                    "credential_stored": bool(secret),
                    "credential_note": "凭据只在 0600 本机文件；申报只上行 credential_handle"}
@@ -613,7 +631,8 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         return 0
     if action == "probe":
         record = store.upstream(args.id)
-        result = manager.probe(record.id)
+        result = manager.probe(record.id, level=getattr(args, "level", None))
+        details = manager.probe_details(record.id)
         try:
             api = NodeApi(config.gateway_url, client_key=credentials.client_key(),
                           http=HttpClient(timeout=15.0))
@@ -624,12 +643,67 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         except DjbError as exc:
             result["reported"] = False
             result["report_error"] = exc.message
-        _emit(result, as_json=_json_flag(args),
+        payload = {**result, "local_details": details}
+        _emit(payload, as_json=_json_flag(args),
               text=lambda value: ("探测 " + str(value["upstream_id"]) + "："
                                   + ("可达" if value["reachable"] else "不可达")
                                   + " · " + str(value["latency_ms"]) + " ms"
                                   + (" · " + str(value["error_class"])
-                                     if value.get("error_class") else "")))
+                                     if value.get("error_class") else "")
+                                  + " · 通过 " + str(sum(1 for item in value["model_checks"]
+                                                          if item.get("ok"))) + "/"
+                                  + str(len(value["model_checks"])) + " 模型（L2/L3）"))
+        return 0
+
+    if action == "discover":
+        relay_mgr = RelayManager(store, credentials, config=config)
+        if not relay_mgr.enabled():
+            raise UsageError("relay 接入开关关闭（默认关闭）：先 djb flags --enable "
+                             + facts.RELAY_FLAG)
+        registry = None
+        if getattr(args, "registry", None):
+            registry = [item.strip() for item in str(args.registry).split(",") if item.strip()]
+        result = relay_mgr.discover(args.id, registry=registry)
+        payload = {"upstream_id": args.id, "discovered": result.to_dict(),
+                   "aliases": relay_mgr.load(args.id).aliases if relay_mgr.load(args.id) else {}}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: ("发现 " + str(len(value["discovered"].get("models") or []))
+                                  + " 个模型；已映射 "
+                                  + str(len(value["aliases"] or {}))
+                                  + " 个。未映射模型不公告，用 djb upstream map 绑定"))
+        return 0
+
+    if action == "map":
+        relay_mgr = RelayManager(store, credentials, config=config)
+        if not relay_mgr.enabled():
+            raise UsageError("relay 接入开关关闭（默认关闭）：先 djb flags --enable "
+                             + facts.RELAY_FLAG)
+        profile = relay_mgr.map(args.id, args.from_model, args.to_model,
+                                replace=bool(getattr(args, "replace", False)))
+        _emit({"upstream_id": args.id, "aliases": profile.aliases},
+              as_json=_json_flag(args),
+              text=lambda value: "已映射：" + str(args.from_model) + " → " + str(args.to_model))
+        return 0
+
+    if action == "unmap":
+        relay_mgr = RelayManager(store, credentials, config=config)
+        if not relay_mgr.enabled():
+            raise UsageError("relay 接入开关关闭（默认关闭）：先 djb flags --enable "
+                             + facts.RELAY_FLAG)
+        profile = relay_mgr.unmap(args.id, args.from_model)
+        _emit({"upstream_id": args.id, "aliases": profile.aliases},
+              as_json=_json_flag(args),
+              text=lambda value: "已取消映射：" + str(args.from_model))
+        return 0
+
+    if action == "relay":
+        relay_mgr = RelayManager(store, credentials, config=config)
+        profiles = [item.to_dict() for item in relay_mgr.list()]
+        payload = {"enabled": relay_mgr.enabled(), "profiles": profiles,
+                   "count": len(profiles)}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: ("relay " + ("已启用" if value["enabled"] else "关闭（只读）")
+                                  + "；" + str(value["count"]) + " 个配置"))
         return 0
     if action in ("enable", "disable"):
         record = manager.set_model_enabled(args.id, args.model, action == "enable")
@@ -677,6 +751,116 @@ def cmd_upstream(args: argparse.Namespace) -> int:
               text=lambda value: "已申报：" + json.dumps(value, ensure_ascii=False))
         return 0
     raise UsageError("未知 upstream 子命令：" + action)
+
+
+# ─────────────────────────────────────────────────────────── token / flags / attest
+def cmd_token(args: argparse.Namespace) -> int:
+    """本地 token 计数（C8）：零网络、零落盘正文；估算值显式标 estimated。"""
+    paths = _paths(args)
+    action = getattr(args, "token_action", "count") or "count"
+    if action != "count":
+        raise UsageError("未知 token 子命令：" + action)
+    model = str(getattr(args, "model", "") or "").strip()
+    if not model:
+        raise UsageError("缺少 --model")
+    messages = None
+    tools = None
+    if getattr(args, "messages", None):
+        try:
+            messages = json.loads(args.messages)
+        except json.JSONDecodeError as exc:
+            raise UsageError("--messages 不是合法 JSON：" + str(exc)) from exc
+    if getattr(args, "tools", None):
+        try:
+            tools = json.loads(args.tools)
+        except json.JSONDecodeError as exc:
+            raise UsageError("--tools 不是合法 JSON：" + str(exc)) from exc
+    if messages is not None:
+        result = tokens_mod.count_messages(model, messages, tools)
+        source = "messages"
+    else:
+        text = getattr(args, "text", None)
+        if getattr(args, "file", None):
+            try:
+                with open(args.file, "r", encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError as exc:
+                raise UsageError("读取 --file 失败：" + str(exc)) from exc
+        if text is None and not sys.stdin.isatty():
+            text = sys.stdin.read()
+        result = tokens_mod.count_for_model(model, text or "")
+        source = "text"
+    payload = {"model": model, "source": source, **result.as_dict()}
+    _emit(payload, as_json=_json_flag(args),
+          text=lambda value: (str(value["tokens"]) + " tokens · " + str(value["tokenizer_id"])
+                              + ("（估算）" if value["estimated"] else "（精确）")))
+    return 0
+
+
+def cmd_flags(args: argparse.Namespace) -> int:
+    """查看 / 设置本机特性开关（默认关闭；只允许登记过的开关）。"""
+    paths, config, store = _context(args)
+    enable = getattr(args, "enable", None)
+    disable = getattr(args, "disable", None)
+    changed = None
+    if enable and disable:
+        raise UsageError("--enable 与 --disable 只能二选一")
+    name = enable or disable
+    if name:
+        if name not in facts.FEATURE_FLAGS:
+            raise UsageError("未登记的开关：" + name + "（登记表见 facts.FEATURE_FLAGS）")
+        extra = dict(config.extra or {})
+        current = extra.get("feature_flags")
+        flags = dict(current) if isinstance(current, dict) else {}
+        flags[name] = bool(enable)
+        extra["feature_flags"] = flags
+        config.extra = extra
+        save_config(paths, config)
+        changed = {"name": name, "value": bool(enable)}
+    rows = []
+    for flag_name, spec in facts.FEATURE_FLAGS.items():
+        rows.append({"name": flag_name,
+                     "enabled": feature_flag(config, flag_name),
+                     "default": bool(spec.get("default", False)),
+                     "owner": spec.get("owner"),
+                     "expire_at": spec.get("expire_at"),
+                     "rollback_rule": spec.get("rollback_rule"),
+                     "description": spec.get("description")})
+    payload = {"flags": rows, "changed": changed, "count": len(rows)}
+    _emit(payload, as_json=_json_flag(args),
+          text=lambda value: "\n".join(
+              ("✅ " if item["enabled"] else "⛔ ") + item["name"]
+              + "  owner=" + str(item["owner"]) + "  expire=" + str(item["expire_at"])
+              for item in value["flags"]) + (
+              "\n（默认关闭；开启需 owner/expire_at/rollback_rule 齐全，到期强制关）"
+              if not value["changed"] else
+              "\n已" + ("开启 " if value["changed"]["value"] else "关闭 ")
+              + value["changed"]["name"] + "（重启 daemon 生效）"))
+    return 0
+
+
+def cmd_attest(args: argparse.Namespace) -> int:
+    """查看本地模型身份证明记录（客户端证据只作线索，不自我宣称 verified）。"""
+    paths, config, store = _context(args)
+    manager = AttestationManager(store, config=config)
+    upstream_id = getattr(args, "id", None)
+    model = getattr(args, "model", None)
+    if upstream_id and model:
+        payload = {"attestation": manager.status(upstream_id, model)}
+    else:
+        rows = manager.list()
+        if upstream_id:
+            rows = [item for item in rows if item.get("upstream_id") == upstream_id]
+        payload = {"enabled": manager.enabled(), "records": rows, "count": len(rows)}
+    _emit(payload, as_json=_json_flag(args),
+          text=lambda value: ("证明开关：" + ("开" if value.get("enabled") else "关")
+                              + ("；" + str(value.get("count", 1)) + " 条记录"
+                                 if "records" in value else ""))
+          + ("\n" + "\n".join(str(item.get("model")) + " · L" + str(item.get("level"))
+                                + " · " + str(item.get("state"))
+                                for item in (value.get("records") or []))
+             if value.get("records") else ""))
+    return 0
 
 
 # ─────────────────────────────────────────────────────────── announce
@@ -977,13 +1161,13 @@ def _residual_hits(paths: Paths, *, keep_logs: bool) -> list[str]:
 # ─────────────────────────────────────────────────────────── parser
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog=PROG, description="DJB 联脑 · 共享节点客户端（M15 / S1 Linux CLI + daemon）",
+        prog=PROG, description="DJB 联脑 · 共享节点客户端（M15 / S2 P1 Linux CLI + daemon）",
         epilog="退出码：" + "；".join(str(code) + "=" + text for code, text
                                      in sorted(facts.EXIT_CODE_HELP.items())))
     parser.add_argument("--home", help="本机数据目录（默认 $DJB_HOME 或 ~/.djb）")
     parser.add_argument("--json", action="store_true", help="输出 JSON（便于脚本 / 托盘）")
     parser.add_argument("--version", action="version",
-                        version=PROG + " " + __version__ + " (M15 client-runtime)")
+                        version=PROG + " " + __version__ + " (M15 client-runtime / S2 P1)")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     def add_common(handler: Callable[[argparse.Namespace], int], name: str,
@@ -1072,12 +1256,33 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--access", required=True, choices=facts.ACCESS_TYPES)
     add.add_argument("--base-url", required=True)
     add.add_argument("--models", required=True, help="逗号分隔的模型 id")
+    add.add_argument("--kind", choices=facts.UPSTREAM_KINDS,
+                     help="可选 upstream_kind（第三方中转站选 " + facts.RELAY_KIND + "）")
+    add.add_argument("--auth", choices=facts.RELAY_AUTH_SCHEMES,
+                     help="relay 认证方式（默认 bearer）")
+    add.add_argument("--auth-header", help="custom 认证的 header 名")
+    add.add_argument("--auth-prefix", help="认证值前缀（默认 Bearer ）")
+    add.add_argument("--tls-pin", help="自签 relay 的证书 SPKI SHA-256 pin（显式确认）")
     add.add_argument("--secret", help="上游密钥（建议 --secret-stdin，避免进 shell 历史）")
     add.add_argument("--secret-stdin", action="store_true", help="从 stdin 读密钥")
     add.add_argument("--protocol", default=facts.DEFAULT_UPSTREAM_PROTOCOL)
     upstream_sub.add_parser("list", help="列出本机上游")
     probe = upstream_sub.add_parser("probe", help="本地探测上游并把结论上报（服务端不探测）")
     probe.add_argument("--id", required=True)
+    probe.add_argument("--level", choices=facts.PROBE_LEVELS,
+                       help="探针级别（默认 L3；流式失败回退 L2）")
+    discover = upstream_sub.add_parser("discover", help="relay 模型自动发现（未映射不公告）")
+    discover.add_argument("--id", required=True)
+    discover.add_argument("--registry", help="可选 canonical 模型清单（逗号分隔）")
+    mapping = upstream_sub.add_parser("map", help="relay 模型别名映射")
+    mapping.add_argument("--id", required=True)
+    mapping.add_argument("--from", dest="from_model", required=True)
+    mapping.add_argument("--to", dest="to_model", required=True)
+    mapping.add_argument("--replace", action="store_true", help="覆盖已有映射")
+    unmap = upstream_sub.add_parser("unmap", help="取消 relay 模型映射")
+    unmap.add_argument("--id", required=True)
+    unmap.add_argument("--from", dest="from_model", required=True)
+    upstream_sub.add_parser("relay", help="查看 relay 配置（开关关闭时只读）")
     for action, help_text in (("enable", "启用模型"), ("disable", "停用模型")):
         item = upstream_sub.add_parser(action, help=help_text)
         item.add_argument("--id", required=True)
@@ -1097,6 +1302,25 @@ def build_parser() -> argparse.ArgumentParser:
     declare.add_argument("--id", required=True)
     for child in upstream_sub.choices.values():
         _sub_flags(child)
+
+    token = add_common(cmd_token, "token", "本地 token 计数（不联网；估算值显式标记）")
+    token_sub = token.add_subparsers(dest="token_action", metavar="<action>")
+    token_count = token_sub.add_parser("count", help="计数文本或 messages 的 token")
+    token_count.add_argument("--model", required=True)
+    token_count.add_argument("--text", help="直接给文本（不落盘）")
+    token_count.add_argument("--file", help="从文件读文本（只读）")
+    token_count.add_argument("--messages", help="JSON messages 数组（含 chat template 开销）")
+    token_count.add_argument("--tools", help="JSON tools 数组")
+    for child in token_sub.choices.values():
+        _sub_flags(child)
+
+    flags = add_common(cmd_flags, "flags", "查看 / 设置本机特性开关（默认关闭）")
+    flags.add_argument("--enable", metavar="NAME")
+    flags.add_argument("--disable", metavar="NAME")
+
+    attest_cmd = add_common(cmd_attest, "attest", "查看本地模型身份证明记录（客户端线索）")
+    attest_cmd.add_argument("--id", help="上游 id")
+    attest_cmd.add_argument("--model", help="模型 id（与 --id 同用时看单条）")
 
     announce = add_common(cmd_announce, "announce", "手动公告容量（带模型 / 价格 / QPS）")
     announce.add_argument("--dry-run", action="store_true", help="只打印公告内容")

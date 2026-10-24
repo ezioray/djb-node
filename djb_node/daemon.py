@@ -219,7 +219,8 @@ class Daemon:
                                     channel=self.config.update_channel,
                                     client_version=facts.CLIENT_VERSION, http=self.http,
                                     now=now)
-        self.server = LocalApiServer(self, token=self.token, port=self.port, http=self.http)
+        self.server = LocalApiServer(self, token=self.token, port=self.port, http=self.http,
+                                        settings=self.config.extra)
         self._stop_event = threading.Event()
         self._control: ControlServer | None = None
         self._started = False

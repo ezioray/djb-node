@@ -1,8 +1,13 @@
-# DJB 联脑 · 节点客户端（M15 client-runtime，S1 / Linux CLI + daemon）
+# DJB 联脑 · 节点客户端（M15 client-runtime，S1 + S2 P1 / Linux CLI + daemon）
 
 本仓库的 openapi.yaml 是协议契约；本文件只描述客户端（repos/djb-node 的 djb_node/ 包）。
 S1 范围：Linux CLI + daemon、本机回环镜像端点、M02 注册/心跳/策略/上游、M05 双签收据上报、
-环境检测、L1–L3 限额、容量公告、更新骨架。**无 GUI、无组网、不做内存/存储共享、不装驱动、不静默提权。**
+环境检测、L1–L3 限额、容量公告、更新骨架。
+
+S2 P1 增量（2026-10-24，默认开关关闭）：平台抽象层（Windows/macOS/Linux 目录、服务描述、凭据后端探测）、
+模型探针 L1→L2/L3 + 周期复探 + 公告门控、本地 token 计数与 usage 差异检测、第三方中转站接入、
+模型身份证明客户端侧核心（L0–L5 线索采集）。**仍无托盘 / GUI、无真实出站长连接（C10）、
+无服务端证明定级（C12 服务端侧）；不做内存/存储共享、不装驱动、不静默提权。**
 
 ## 1. 安装与首次运行
 
@@ -31,7 +36,10 @@ S1 范围：Linux CLI + daemon、本机回环镜像端点、M02 注册/心跳/�
 | djb status | 状态与诊断摘要 | --json --show-token（读取本次进程令牌） |
 | djb pause / resume | 用户暂停 / 恢复（重启后保留） | — |
 | djb limits | 查看 / 设置并发、日周月配额、资源上限、时段、让路 | --preset --daily-tokens --weekly-tokens --monthly-tokens --concurrent --cpu/--gpu/--mem --yield/--no-yield --schedule --schedule-json --clear-schedule |
-| djb upstream | A1/A2/B 上游、模型开关与最低价、探测、A2 prompt | add / list / probe / enable / disable / price / remove / a2-prompt / declare |
+| djb upstream | A1/A2/B 上游、模型开关与最低价、探测、relay、A2 prompt | add / list / probe / discover / map / unmap / relay / enable / disable / price / remove / a2-prompt / declare |
+| djb token count | 本地 token 计数（不联网；估算值标 estimated） | --model --text --file --messages --tools |
+| djb flags | 查看 / 设置本机特性开关（登记表 4 条，默认关闭） | --enable NAME / --disable NAME |
+| djb attest | 查看本地模型身份证明记录（客户端线索，不自我宣称 verified） | --id --model |
 | djb announce | 手动公告容量（模型 / 价格 / QPS） | --dry-run |
 | djb update | 更新骨架：检查 / 安装 / 回滚 / 状态 | --check --apply --rollback --status --source --channel |
 | djb logs | 查看脱敏日志（7 天保留） | --tail N --follow --level info\|debug\|warning\|error |
@@ -40,6 +48,23 @@ S1 范围：Linux CLI + daemon、本机回环镜像端点、M02 注册/心跳/�
 
 退出码语义：0 成功；1 未分类；2 用法；3 未初始化；4 daemon 未运行；5 凭据缺失/无效；
 6 网络或上游不可达；7 签名/哈希/策略校验失败；8 状态冲突（端口占用、非法迁移等）。
+
+### 2.1 S2 P1 能力与开关（默认关闭）
+
+| 能力 | 命令 / 行为 | 开关 | 回滚 |
+| --- | --- | --- | --- |
+| 周期复探 | `djb upstream probe --id [--level L2\|L3]`；启动先做一轮 L1–L3，之后按开关周期复探（10 min 起，按模型数退避、失败指数退避） | `client.probe.periodic.enabled` | 关闭 → 只保留手动 probe；公告按已存 `last_probe_at` 判新鲜 |
+| 公告门控 | 只有 `verified` + 15 min 内新鲜 + 启用的模型拿正 QPS；未验证/过期模型 `max_qps=0` | 无（随探针） | — |
+| token 计数 | `djb token count --model M --text ...`；返回 tokens / tokenizer / estimated；无 tiktoken 时启发式（中文 ≈1 token/字） | `client.token.compare.enabled`（差异检测） | 关闭 → 只记录上游 usage，不比较 |
+| 第三方中转站 | `djb upstream add --kind third_party_relay --auth bearer --secret-stdin` → `discover` → `map`；未映射不公告 | `client.relay.enabled` | 关闭 → 隐藏写路径；已有配置只读、不删除 |
+| 模型身份证明 | 客户端产出 L0–L5 证据线索，`djb attest` 查看；本地不宣称 verified | `supply.attestation.enabled` | 关闭 → 回退 L2 可达性；已存证明只读 |
+| 平台抽象层 | `platform.paths` / `service` / `credentials`；Linux 路径与 S1 逐字一致，macOS/Windows 默认目录按系统约定 | 无 | — |
+
+开关三字段（owner / expire_at / rollback_rule）登记在 `djb_node/facts.py`；`djb flags` 只能改登记过的开关，
+到期强制关。开关改动写 `config.json` 的 `extra.feature_flags`，**重启 daemon 生效**。
+
+**尚未接线**：`LocalApiServer(settings=...)` 已由 daemon 注入用于 token 差异检测；relay 发现结果进入容量公告、
+服务端 L3+ 定级、真实出站长连接（C10）、托盘消息中心（C15/C16）在 P2。
 
 ## 3. 本机回环端点（本机端点、非开放契约）
 
@@ -63,8 +88,8 @@ S1 范围：Linux CLI + daemon、本机回环镜像端点、M02 注册/心跳/�
 默认目录 ~/.djb（DJB_HOME 或 --home 可改；目录 0700）：
 
     state.db          安装 / Profile / 策略快照 / 公告 / 收据缓冲 / 用量窗口（SQLite，PRAGMA user_version 只前进）
-    config.json       非敏感配置（镜像端口、服务端地址、更新频道、日志级别）
-    credentials/      节点 client_key 与上游密钥（**0600 文件，S1 允许并显式标注 storage=file-0600**）
+    config.json       非敏感配置（镜像端口、服务端地址、更新频道、日志级别、extra.feature_flags）
+    credentials/      节点 client_key 与上游密钥（**0600 文件；S1 显式降级，S2 接 OS 安全存储**）
     keys/             收据缓冲密钥 / 供方签名密钥 / 更新 mock 密钥（0600）
     logs/             djb.log（JSON 行，轮转 5 MiB，保留 7 天，自动脱敏）
     runtime/          daemon.sock（0600 控制套接字）、daemon.out

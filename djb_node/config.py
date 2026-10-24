@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import facts
+from .platform.paths import default_home as _platform_default_home
 from .util import clamp, ensure_dir, file_mode, read_json, write_json
 
 
@@ -28,11 +29,12 @@ GATEWAY_PLACEHOLDER = "https://api.example.invalid"
 
 
 def resolve_home(explicit: str | None = None) -> str:
-    """优先级：--home > DJB_HOME > ~/.djb（绝对路径）。"""
-    candidate = explicit or os.environ.get("DJB_HOME") or ""
-    if candidate:
-        return os.path.abspath(os.path.expanduser(candidate))
-    return os.path.abspath(os.path.join(os.path.expanduser("~"), DEFAULT_HOME_DIRNAME))
+    """优先级：--home > DJB_HOME > 平台默认（C2）。
+
+    Linux 与 S1 逐字一致（~/.djb）；macOS / Windows 的默认目录由
+    `platform.paths.default_home()` 决定（S2 托盘安装包使用）。
+    """
+    return _platform_default_home(explicit)
 
 
 @dataclass

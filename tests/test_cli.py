@@ -10,7 +10,8 @@ from djb_node.cli import build_parser, main
 
 
 COMMANDS = ["init", "env", "auth", "start", "stop", "status", "pause", "resume",
-            "limits", "upstream", "announce", "update", "logs", "diagnose", "uninstall"]
+            "limits", "upstream", "token", "flags", "attest", "announce", "update",
+            "logs", "diagnose", "uninstall"]
 
 
 def test_every_command_has_help(capsys):
