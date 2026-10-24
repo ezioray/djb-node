@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+{{- /*
+C5 机房版 · 持久卷声明（可选）
+
+默认 persistence.enabled=false（用 emptyDir）；打开本文件后：
+  * existingClaim 非空 -> 直接用运维建好的 PVC（本 Chart 不建）；
+  * 否则建一个 PVC，名字与 Deployment 里引用的一致；
+  * helm.sh/resource-policy: keep —— 卸载 release 时**不删**卷（节点状态/收据缓冲留着，
+    重装后能接着用；真正的清理必须人工确认后删 PVC）。
+*/}}
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) (eq .Values.mode "deployment") }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "djb-node.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "djb-node.labels" . | nindent 4 }}
+  annotations:
+    # 卸载不删卷：数据（state.db / 收据缓冲 / 日志）比 Pod 值钱
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- with .Values.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+{{- end }}

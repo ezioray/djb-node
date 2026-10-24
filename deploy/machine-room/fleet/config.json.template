@@ -1,0 +1,14 @@
+{
+  "gateway_url": "${gateway}",
+  "mirror_port": ${port},
+  "update_channel": "${update_channel}",
+  "update_source": "${update_source}",
+  "log_level": "${log_level}",
+  "yield_enabled": ${yield_enabled},
+  "extra": {
+    "node_id": "${node_id}",
+    "preset": "${preset}",
+    "labels": ${labels_json},
+    "feature_flags": {}
+  }
+}

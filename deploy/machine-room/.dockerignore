@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# C5 机房版镜像忽略清单（context = 仓库根，`docker build -f deploy/machine-room/Dockerfile .`）。
+# 采用「黑名单」而不是白名单：白名单一旦写错会让构建直接失败，黑名单最坏只是多传几 KB。
+# 镜像实际内容由 Dockerfile 的 COPY 决定（只有 pyproject.toml / README-CLIENT.md / djb_node/）。
+
+# ── VCS 与 CI
+.git
+.gitignore
+.gitattributes
+.github
+ci
+
+# ── 测试与文档（镜像不需要；测试会 import 大量 fixture，体积也不小）
+tests
+docs
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+
+# ── 构建产物
+build
+dist
+*.egg-info
+deploy/machine-room/offline/dist
+deploy/machine-room/fleet/out
+
+# ── 凭据 / 密钥 / 本地状态：永不进构建上下文（纵深防御，COPY 也不会碰它们）
+*.key
+*.pem
+*.p12
+*.pfx
+*.sig
+credentials.json
+.env
+.env.*
+.djb-home
+*.db
+**/state.db
+**/state.db-wal
+**/state.db-shm
+logs
+diagnostics
+
+# ── 协议契约（365 KB，运行时不读；离线包/Chart 各自带自己的版本）
+openapi.yaml
+CHANGELOG-协议.md

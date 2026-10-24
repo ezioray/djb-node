@@ -1,0 +1,46 @@
+{{- /*
+SPDX-License-Identifier: Apache-2.0
+C5 机房版 · 安装后提示（helm install/upgrade 结束时会打印）
+*/ -}}
+{{- $workload := ternary "deploy" "ds" (eq .Values.mode "deployment") -}}
+{{ .Chart.Name }} {{ .Chart.Version }}（app {{ .Chart.AppVersion }}）已渲染到 namespace {{ .Release.Namespace }}，release 名 {{ .Release.Name }}。
+
+形态：{{ .Values.mode }}{{ if eq .Values.mode "deployment" }}（replicas={{ int .Values.replicaCount }}）{{ end }}
+镜像：{{ include "djb-node.image" . }}
+入站端口：**没有**。daemon 只绑容器内 127.0.0.1:{{ int .Values.node.mirrorPort }}/v1（M15 INV-03），
+          因此本 Chart 不建 Service / Ingress，集群外部也无从访问。请勿自己补一个 Service 指到 1717。
+
+1) 看实例是否健康（探针只打容器内回环，kubelet 的 httpGet 打 Pod IP 会失败，故用 exec）
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+   kubectl -n {{ .Release.Namespace }} exec {{ $workload }}/{{ include "djb-node.fullname" . }} -- djb status --json
+
+2) 首次接单前要绑定节点密钥（凭据**不**进 values / ConfigMap）
+{{- if .Values.auth.existingSecret }}
+   已配置 auth.existingSecret={{ .Values.auth.existingSecret }}：bootstrap 会在首次启动时
+   从只读挂载导入 client key（落 /data/credentials/credentials.json，0600，不回显）。
+{{- else }}
+   目前未配置 auth.existingSecret：节点以「未绑定」态启动（只做离线自测）。
+   二选一：
+     a) 交互补密钥（不回显）：kubectl -n {{ .Release.Namespace }} exec -it {{ $workload }}/{{ include "djb-node.fullname" . }} -- djb auth --set-key -
+     b) 用 Secret 注入（推荐）：先 kubectl create secret generic <name> --from-literal=client-key=...，
+        再 --set auth.existingSecret=<name> 升级（Chart 只引用，不渲染密钥内容）。
+{{- end }}
+   检查绑定：kubectl -n {{ .Release.Namespace }} exec {{ $workload }}/{{ include "djb-node.fullname" . }} -- djb auth --status
+
+3) 本机自检（在容器内）：curl 不可用也没关系，镜像只用标准库
+   kubectl -n {{ .Release.Namespace }} exec {{ $workload }}/{{ include "djb-node.fullname" . }} -- \
+     python -c "import json,urllib.request;print(json.dumps(json.load(urllib.request.urlopen('http://127.0.0.1:{{ int .Values.node.mirrorPort }}/v1/health')),ensure_ascii=False,indent=2))"
+
+4) 升级 / 回滚（只在批准窗口内由 release-manager 执行）
+   helm -n {{ .Release.Namespace }} upgrade {{ .Release.Name }} <chart> --version <new> -f <values>
+   helm -n {{ .Release.Namespace }} rollback {{ .Release.Name }}      # 回到上一修订
+   helm -n {{ .Release.Namespace }} history {{ .Release.Name }}
+   ⚠️ state.db 的 PRAGMA user_version 只前进：客户端拒绝降级，回滚请同时复位 /data 卷的镜像版本。
+
+5) 卸载
+   helm -n {{ .Release.Namespace }} uninstall {{ .Release.Name }}
+   PVC 带 helm.sh/resource-policy: keep（persistence.enabled=true 时），卷不会被删；
+   需要彻底清理时人工删 PVC 与对应 Secret（本 Chart 从不创建 Secret，不删别人的东西）。
+
+6) 开关纪律：node.featureFlags 默认全关；开启必须带 owner / expire_at / rollback_rule，
+   否则模板会直接 fail（M17 §9）。运行时生效需重启 Pod。

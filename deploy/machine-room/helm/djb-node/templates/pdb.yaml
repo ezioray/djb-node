@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+{{- /*
+C5 机房版 · PodDisruptionBudget（仅 deployment 模式）
+
+节点是「可中断」的供给单元：驱逐时允许一个实例先走（它的在途任务会由平台重新调度），
+但要保证同名 release 至少留一个实例在跑，避免节点池突然整体消失造成供给抖动。
+DaemonSet 模式不建 PDB（每台机器一个实例，PDB 的语义不适用）。
+*/}}
+{{- if and .Values.pdb.enabled (eq .Values.mode "deployment") }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "djb-node.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "djb-node.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ int .Values.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "djb-node.selectorLabels" . | nindent 6 }}
+{{- end }}

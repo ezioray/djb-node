@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+{{- /*
+C5 机房版 · 节点配置 ConfigMap（/config/config.json 的只读种子）
+
+为什么是 ConfigMap 而不是 Secret：config.json 是**非敏感**配置（网关地址、镜像端口、
+预设、日志级别、开关）。凭据本体永不出现在这里，也不出现在任何 values 默认值里。
+
+形状与 djb_node/config.py 的 ClientConfig 一致：
+  gateway_url / mirror_port / update_channel / update_source / log_level / yield_enabled / extra
+
+特性开关（M17 §9）：默认全关；每个开启的开关必须三字段齐全（owner / expire_at /
+rollback_rule），否则模板直接 fail —— 让「开关没有负责人和到期日」在部署前就报错，
+而不是上线几个月后没人敢关。
+*/}}
+
+{{- /* ── 入参校验：在部署前把明显错误打回去 ───────────────────────────── */}}
+{{- if not (has .Values.mode (list "deployment" "daemonset")) -}}
+{{- fail (printf "values.mode 必须是 deployment 或 daemonset（收到 %q）" .Values.mode) -}}
+{{- end -}}
+{{- $port := int .Values.node.mirrorPort -}}
+{{- if or (lt $port 1024) (gt $port 65535) -}}
+{{- fail (printf "node.mirrorPort 必须在 1024-65535（收到 %d）" $port) -}}
+{{- end -}}
+{{- if lt (int .Values.replicaCount) 0 -}}
+{{- fail "replicaCount 不能为负" -}}
+{{- end -}}
+
+{{- /* ── 特性开关三字段校验 ───────────────────────────────────────────── */}}
+{{- $flags := dict -}}
+{{- range $name, $spec := .Values.node.featureFlags -}}
+{{- if not (kindIs "map" $spec) -}}
+{{- fail (printf "node.featureFlags.%s 必须是对象（enabled/owner/expire_at/rollback_rule）" $name) -}}
+{{- end -}}
+{{- if $spec.enabled -}}
+{{- if not (and $spec.owner $spec.expire_at $spec.rollback_rule) -}}
+{{- fail (printf "node.featureFlags.%s 缺少 owner/expire_at/rollback_rule（M17 §9 三字段强制）" $name) -}}
+{{- end -}}
+{{- $_ := set $flags $name true -}}
+{{- else -}}
+{{- $_ := set $flags $name false -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* ── 组装 config.json（用 dict + toJson，保证一定是合法 JSON）───── */}}
+{{- $extra := deepCopy (default (dict) .Values.node.extra) -}}
+{{- if gt (len $flags) 0 -}}
+{{- $_ := set $extra "feature_flags" $flags -}}
+{{- end -}}
+{{- $cfg := dict
+      "gateway_url" (toString .Values.node.gatewayUrl)
+      "mirror_port" $port
+      "update_channel" (toString .Values.node.updateChannel)
+      "update_source" (toString (default "" .Values.node.updateSource))
+      "log_level" (toString .Values.node.logLevel)
+      "yield_enabled" (ternary true false .Values.node.yieldEnabled) -}}
+{{- if gt (len $extra) 0 }}
+{{- $_ := set $cfg "extra" $extra }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "djb-node.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "djb-node.labels" . | nindent 4 }}
+  annotations:
+    # 非敏感配置（无凭据、无 token）：明文可读是设计选择
+    djb.io/description: "djb-node 非敏感运行配置（/config/config.json 种子）"
+data:
+  config.json: |-
+    {{- $cfg | toJson | nindent 4 }}

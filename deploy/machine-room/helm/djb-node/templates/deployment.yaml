@@ -1,0 +1,246 @@
+# SPDX-License-Identifier: Apache-2.0
+{{- /*
+C5 机房版 · djb-node Deployment（values.mode=deployment 时渲染）
+
+安全基线（每条都有测试断言，见 tests/test_machine_room.py）：
+  * 非 root：runAsNonRoot + runAsUser/runAsGroup 10001（镜像里同名 UID/GID）；
+  * 只读根文件系统：readOnlyRootFilesystem=true，可写点只有 /data、/config、/tmp；
+  * 不提权：allowPrivilegeEscalation=false、privileged=false、capabilities.drop=[ALL]；
+  * 无入站：hostNetwork=false、没有 Service/Ingress、容器不声明 ports（daemon 只绑 127.0.0.1）；
+  * 无特权/无宿主命名空间：不写 hostPID/hostIPC/hostPath（daemonset 模式的 hostPath 另见其文件）；
+  * 凭据：只引用 existingSecret，绝不把 client key 渲染进 ConfigMap / env / values；
+  * 资源：requests + limits 必填（默认值见 values.yaml），避免机房内一个节点拖垮整台机器。
+*/}}
+{{- if eq .Values.mode "deployment" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "djb-node.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "djb-node.labels" . | nindent 4 }}
+spec:
+  replicas: {{ int .Values.replicaCount }}
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 先起新 Pod 再停旧 Pod：节点退出接单是「软停」，滚动不会丢在途任务
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "djb-node.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # 配置变化 -> Pod 模板变化 -> 触发滚动（比手工重启可靠）
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "djb-node.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "djb-node.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # 硬值：节点客户端不参与集群网络暴露，也不复用宿主网络命名空间
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      dnsPolicy: {{ .Values.dnsPolicy }}
+      terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- if .Values.bootstrap.enabled }}
+      initContainers:
+        # 引导容器：把「首次部署要人工做的三件事」做成幂等步骤
+        #   1) /config/config.json（ConfigMap 只读）-> /data/config.json（只补空缺，不覆盖运维改动）
+        #   2) djb init --no-env（幂等：建目录 / state.db / 预设 / 限额）
+        #   3) 可选：从 existingSecret 只读挂载导入 client key（仍然落 /data 的 0600 文件，不回显）
+        - name: bootstrap
+          image: {{ include "djb-node.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -eu
+              if [ ! -s /data/config.json ] && [ -s /config/config.json ]; then
+                cp /config/config.json /data/config.json
+                echo "djb-bootstrap: seeded /data/config.json from /config"
+              fi
+              djb init --no-env \
+                --preset "$DJB_PRESET" \
+                --daily-tokens "$DJB_DAILY_TOKENS" \
+                --weekly-tokens "$DJB_WEEKLY_TOKENS" \
+                --monthly-tokens "$DJB_MONTHLY_TOKENS" \
+                --concurrent "$DJB_CONCURRENT" \
+                --cpu "$DJB_CPU_PCT" \
+                --gpu "$DJB_GPU_PCT" \
+                --mem "$DJB_MEM_PCT" >/dev/null
+              if [ -n "${DJB_CREDENTIAL_SEED_FILE:-}" ] \
+                 && [ -s "${DJB_CREDENTIAL_SEED_FILE}" ] \
+                 && [ ! -s /data/credentials/credentials.json ]; then
+                # 密钥只在内存与 /data 的 0600 文件中；不写日志、不进公告
+                tr -d '\r\n' < "${DJB_CREDENTIAL_SEED_FILE}" | djb auth --set-key -
+                echo "djb-bootstrap: client key imported from Secret"
+              fi
+          env:
+            - name: DJB_HOME
+              value: /data
+            - name: DJB_PRESET
+              value: {{ .Values.node.preset | quote }}
+            - name: DJB_DAILY_TOKENS
+              value: {{ int .Values.node.limits.dailyTokens | quote }}
+            - name: DJB_WEEKLY_TOKENS
+              value: {{ int .Values.node.limits.weeklyTokens | quote }}
+            - name: DJB_MONTHLY_TOKENS
+              value: {{ int .Values.node.limits.monthlyTokens | quote }}
+            - name: DJB_CONCURRENT
+              value: {{ int .Values.node.limits.concurrent | quote }}
+            - name: DJB_CPU_PCT
+              value: {{ int .Values.node.limits.cpuPct | quote }}
+            - name: DJB_GPU_PCT
+              value: {{ int .Values.node.limits.gpuPct | quote }}
+            - name: DJB_MEM_PCT
+              value: {{ int .Values.node.limits.memPct | quote }}
+            {{- if .Values.auth.existingSecret }}
+            - name: DJB_CREDENTIAL_SEED_FILE
+              value: /secrets/client-key
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+              readOnly: true
+            {{- if .Values.auth.existingSecret }}
+            - name: client-key
+              mountPath: /secrets
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- end }}
+      containers:
+        - name: djb-node
+          image: {{ include "djb-node.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # 显式给命令，不依赖镜像 ENTRYPOINT 被 Helm 覆盖；前台跑 = 容器 PID 1 + SIGTERM 优雅停止
+          command: ["djb"]
+          args: ["start", "--foreground"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: DJB_HOME
+              value: /data
+            # 镜像 HEALTHCHECK 与本探针共用这个端口；改 node.mirrorPort 时两者一起变
+            - name: DJB_MIRROR_PORT
+              value: {{ int .Values.node.mirrorPort | quote }}
+          # 不声明 ports：daemon 只绑 127.0.0.1，集群不应有任何入站路径
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # 探针只走容器内 127.0.0.1（免令牌 /v1/health）：
+          # kubelet 的 httpGet 会连 Pod IP，而回环监听在 Pod IP 上不可达，所以用 exec。
+          startupProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,sys,urllib.request as u;
+                  p=os.environ.get('DJB_MIRROR_PORT','1717');
+                  r=u.urlopen('http://127.0.0.1:'+p+'/v1/health', timeout=3);
+                  sys.exit(0 if r.status == 200 else 1)
+            periodSeconds: {{ int .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.startup.failureThreshold }}
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,sys,urllib.request as u;
+                  p=os.environ.get('DJB_MIRROR_PORT','1717');
+                  r=u.urlopen('http://127.0.0.1:'+p+'/v1/health', timeout=3);
+                  sys.exit(0 if r.status == 200 else 1)
+            periodSeconds: {{ int .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,sys,urllib.request as u;
+                  p=os.environ.get('DJB_MIRROR_PORT','1717');
+                  r=u.urlopen('http://127.0.0.1:'+p+'/v1/health', timeout=3);
+                  sys.exit(0 if r.status == 200 else 1)
+            periodSeconds: {{ int .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.probes.readiness.failureThreshold }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | quote }}
+          {{- else if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "djb-node.fullname" . }}
+          {{- else }}
+          # 默认 emptyDir：本地状态可重建（收据缓冲 ≤24h、重新注册即可），部署最简单
+          emptyDir:
+            sizeLimit: 1Gi
+          {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "djb-node.fullname" . }}
+            # optional：ConfigMap 缺失也允许启动（运维可能自带 /data/config.json）
+            optional: true
+        - name: tmp
+          # 只读根文件系统下 /tmp 必须显式给一个可写卷（SQLite/临时文件用）
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.auth.existingSecret }}
+        - name: client-key
+          secret:
+            secretName: {{ .Values.auth.existingSecret | quote }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.auth.clientKeyField | quote }}
+                path: client-key
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
