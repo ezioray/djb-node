@@ -205,3 +205,40 @@ DIAGNOSE_SCAN_PATTERNS: tuple[str, ...] = (
     r"hmac-sha256:[0-9a-f]{64}",
     r"Bearer\s+[A-Za-z0-9._\-]{16,}",
 )
+
+# ─────────────────────────────────────────────────────────── 客户端模型探针（M17 §4.5 / C7）
+PROBE_LEVELS: tuple[str, ...] = ("L1", "L2", "L3")
+"""L1 = GET /models（upstream.probe_upstream）；L2 = 非流式 chat；L3 = 流式 chat + usage。"""
+PROBE_DEFAULT_LEVEL = "L3"
+"""默认做 L3（流式）；流式失败仍保留 L2 结论（降级不丢验证）。"""
+PROBE_VERSION = "c7.1"
+"""探针版本（本地字段；spec 1.2.7 未定义 probe_version，不上行）。"""
+PROBE_PROMPT = "djb-probe"
+"""合成 prompt：编译期常量，**不含任何用户正文**（M17 §10 / T9）。"""
+PROBE_MAX_TOKENS = 1
+PROBE_TIMEOUT_S = 5.0
+PROBE_FRESH_S = 15 * 60
+"""last_probe_at 新鲜窗口：超过即不进容量公告（默认 15 min）。"""
+PROBE_PERIODIC_DEFAULT_S = 10 * 60
+PROBE_PERIODIC_MAX_S = 6 * 3600
+PROBE_MODELS_PER_STEP = 8
+"""模型数退避：每多 8 个模型，周期复探间隔再加一档。"""
+PROBE_MAX_BACKOFF_SHIFT = 5
+"""失败指数退避上限：2**5 = 32 倍（再乘上限截断）。"""
+PROBE_PASS_BUDGET_S = 10
+"""单轮探针预算（秒）：启动校验与周期复探共用，超出即把剩余模型留到下一轮。"""
+PROBE_NOT_PROBED = "not_probed"
+"""预算内没来得及探的模型：不算失败，但不进容量公告。"""
+
+FEATURE_FLAGS: dict[str, dict] = {
+    "client.probe.periodic.enabled": {
+        "default": False,
+        "owner": "client-seat",
+        "expire_at": "2026-12-31",
+        "rollback_rule": "关闭后只保留手动 probe（djb upstream probe）；"
+                         "公告按已存 last_probe_at 判新鲜",
+        "description": "客户端周期复探（L2/L3），默认关闭",
+    },
+}
+"""特性开关（M17 §9：三字段齐全 + 默认关闭；值取本地 config.json 的 extra）。"""
+PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"

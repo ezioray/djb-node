@@ -20,15 +20,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
-from . import facts
+from . import facts, probe as probe_mod
 from .errors import UsageError
 from .httpclient import HttpClient, join_url
 from .secure import CredentialStore
 from .store import Store, UpstreamRecord
-from .util import iso, new_request_id, utcnow
+from .util import iso, new_request_id, parse_iso, utcnow
 
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._:/@+\-]{1,128}$")
 PRICE_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
@@ -41,12 +41,30 @@ class ModelEntry:
     enabled: bool = True
     min_price: str | None = None
     min_price_unit: str = facts.DEFAULT_MIN_PRICE_UNIT
+    # C7 探针结论（**可选 / 本地**）：spec 1.2.7 的 NodeProbeReport 没有这些字段，
+    # 它们只写 model JSON、只用于本地公告门控，不上行。
+    inference_ok: bool | None = None
+    stream_ok: bool | None = None
+    usage_ok: bool | None = None
+    probe_version: str | None = None
+    last_probe_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"id": self.id, "enabled": bool(self.enabled)}
         if self.min_price is not None:
             payload["min_price"] = self.min_price
             payload["min_price_unit"] = self.min_price_unit
+        # 只加不改：探针字段有值才落，旧库 / 旧配置的 JSON 形状保持不变。
+        if self.inference_ok is not None:
+            payload["inference_ok"] = bool(self.inference_ok)
+        if self.stream_ok is not None:
+            payload["stream_ok"] = bool(self.stream_ok)
+        if self.usage_ok is not None:
+            payload["usage_ok"] = bool(self.usage_ok)
+        if self.probe_version is not None:
+            payload["probe_version"] = self.probe_version
+        if self.last_probe_at is not None:
+            payload["last_probe_at"] = self.last_probe_at
         return payload
 
     @classmethod
@@ -56,7 +74,41 @@ class ModelEntry:
                    enabled=bool(raw.get("enabled", True)),
                    min_price=str(price) if price is not None else None,
                    min_price_unit=str(raw.get("min_price_unit")
-                                      or facts.DEFAULT_MIN_PRICE_UNIT))
+                                      or facts.DEFAULT_MIN_PRICE_UNIT),
+                   inference_ok=_optional_bool(raw.get("inference_ok")),
+                   stream_ok=_optional_bool(raw.get("stream_ok")),
+                   usage_ok=_optional_bool(raw.get("usage_ok")),
+                   probe_version=_optional_str(raw.get("probe_version")),
+                   last_probe_at=_optional_str(raw.get("last_probe_at")))
+
+    # ── 公告门控（C7）
+    def verified(self) -> bool:
+        """L2 通过（`inference_ok`）才算验证；缺省 = 从未验证。"""
+        return self.inference_ok is True
+
+    def probe_age_s(self, now: Any) -> float | None:
+        stamp = parse_iso(self.last_probe_at)
+        if stamp is None:
+            return None
+        return (now - stamp).total_seconds()
+
+    def fresh(self, now: Any, *, ttl: int = facts.PROBE_FRESH_S) -> bool:
+        """`last_probe_at` 是否新鲜；未来时间（时钟漂移）按新鲜处理。"""
+        age = self.probe_age_s(now)
+        if age is None:
+            return False
+        return age <= ttl
+
+    def announceable(self, now: Any) -> bool:
+        return self.enabled and self.verified() and self.fresh(now)
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return bool(value) if isinstance(value, bool) else None
+
+
+def _optional_str(value: Any) -> str | None:
+    return str(value) if isinstance(value, str) and value else None
 
 
 def parse_models(raw: str | Iterable[str] | None) -> list[ModelEntry]:
@@ -277,47 +329,167 @@ class UpstreamManager:
         self.credentials.delete_upstream_secret(upstream_id)
         return self.store.delete_upstream(upstream_id)
 
-    def probe(self, upstream_id: str, *, timeout: float = 5.0) -> dict[str, Any]:
+    def probe(self, upstream_id: str, *, timeout: float | None = None,
+              level: str | None = None, now: Any = None,
+              deadline: Any = None, clock: Callable[[], Any] | None = None
+              ) -> dict[str, Any]:
+        """L1（/models）+ 逐模型 L2/L3，结论写回本地模型 JSON。
+
+        返回值**只含 spec 1.2.7 `NodeProbeReport` 已定义的字段**
+        （upstream_id / reachable / latency_ms / error_class /
+        model_checks[model, ok, error_class] / checked_at），可直接上报。
+        L2/L3 细节（inference_ok / stream_ok / usage_ok / token_usage /
+        probe_version / last_probe_at）只落本地：`probe_details()` 可读。
+        """
+        moment = now or utcnow()
+        seconds = float(timeout if timeout is not None else facts.PROBE_TIMEOUT_S)
         record = self.store.upstream(upstream_id)
         secret = self.credentials.upstream_secret(upstream_id)
         result = probe_upstream(record.base_url, record.model_ids(),
-                                credential=secret, http=self.http, timeout=timeout)
-        state = "verified" if result.reachable else "rejected"
-        self.store.update_upstream(upstream_id, state=state,
-                                   last_probe_at=iso(utcnow()))
-        payload = result.to_dict()
-        payload.update({"upstream_id": upstream_id, "checked_at": iso(utcnow())})
+                                credential=secret, http=self.http, timeout=seconds)
+        checks: list[dict[str, Any]] = [dict(item) for item in result.model_checks]
+        outcomes: dict[str, probe_mod.ProbeOutcome] = {}
+        if result.reachable:
+            listed = [str(item.get("model")) for item in checks if item.get("ok")]
+            outcomes = probe_mod.probe_models(
+                record.base_url, listed, credential=secret,
+                level=level or facts.PROBE_DEFAULT_LEVEL, timeout=seconds,
+                http=self.http, deadline=deadline, clock=clock)
+        # 逐模型合并：L2/L3 结论优先；未在清单 / 预算内没探到 -> 不 ok。
+        for item in checks:
+            model_id = str(item.get("model"))
+            outcome = outcomes.get(model_id)
+            if outcome is None:
+                if item.get("ok"):
+                    item["ok"] = False
+                    item["error_class"] = facts.PROBE_NOT_PROBED
+                continue
+            item["ok"] = bool(outcome.inference_ok)
+            if outcome.error_class:
+                item["error_class"] = outcome.error_class
+            else:
+                item.pop("error_class", None)
+        verified = [model_id for model_id, outcome in outcomes.items()
+                    if outcome.inference_ok]
+        state = "verified" if (result.reachable and verified) else "rejected"
+        stamp = iso(moment)
+        self.store.update_upstream(upstream_id, models=self._probe_models_payload(
+            record, outcomes, stamp), state=state, last_probe_at=stamp)
+        payload = {"upstream_id": upstream_id, "reachable": result.reachable,
+                   "latency_ms": result.latency_ms,
+                   "error_class": result.error_class,
+                   "model_checks": checks, "checked_at": stamp}
         return payload
 
+    @staticmethod
+    def _probe_models_payload(record: UpstreamRecord,
+                              outcomes: dict[str, probe_mod.ProbeOutcome],
+                              stamp: str) -> list[dict[str, Any]]:
+        """把探针结论写回模型 JSON 的五个可选字段（只加不改）。
+
+        网络失败（没有 outcome）**不覆盖**上一次成功结论：凭证/新鲜度由
+        `last_probe_at` 与上游 `state` 共同门控，避免抖动把最后一次好结果抹掉。
+        """
+        models: list[dict[str, Any]] = []
+        for raw in record.models:
+            item = dict(raw)
+            outcome = outcomes.get(str(item.get("id")))
+            if outcome is not None:
+                item["inference_ok"] = bool(outcome.inference_ok)
+                if outcome.stream_ok is not None:
+                    item["stream_ok"] = bool(outcome.stream_ok)
+                item["usage_ok"] = bool(outcome.usage_present)
+                item["probe_version"] = facts.PROBE_VERSION
+                item["last_probe_at"] = stamp
+            models.append(item)
+        return models
+
+    def probe_details(self, upstream_id: str, *, now: Any = None) -> list[dict[str, Any]]:
+        """本地 L2/L3 细节视图（**不上行**；spec 无这些字段）。"""
+        record = self.store.upstream(upstream_id)
+        moment = now or utcnow()
+        details: list[dict[str, Any]] = []
+        for raw in record.models:
+            entry = ModelEntry.from_dict(raw)
+            details.append({"model": entry.id, "enabled": entry.enabled,
+                            "inference_ok": entry.inference_ok,
+                            "stream_ok": entry.stream_ok,
+                            "usage_ok": entry.usage_ok,
+                            "probe_version": entry.probe_version,
+                            "last_probe_at": entry.last_probe_at,
+                            "fresh": entry.fresh(moment),
+                            "announceable": entry.announceable(moment)})
+        return details
+
     # ── 公告 / 目录 / 路由
-    def announce_capacity(self, profile: Any) -> list[dict[str, Any]]:
-        entries: list[dict[str, Any]] = []
-        enabled_models = [(record, item) for record in self.list() if record.enabled
-                          for item in record.models if item.get("enabled", True)]
+    def announceable_models(self, now: Any = None) -> list[tuple[UpstreamRecord, ModelEntry]]:
+        """可**真正**进容量的模型（>0 QPS）：模型级 L2 证据 + 新鲜 + 启用。
+
+        门控口径（C7）：
+
+        * 模型级：`inference_ok is True`（L2 通过）且 `last_probe_at` 在
+          `facts.PROBE_FRESH_S`（默认 15 min）内；从未探过 / 过期 / L2 失败一律不算；
+        * 上游级：`state=rejected` 一票否决；`declared` / `probing` / `verified`
+          的差别只在聚合标签上（`djb upstream declare` 会把 state 写回 declared，
+          所以判定以**模型级证据**为准，避免申报一次就把体检结论抹掉）；
+        * `enabled=false` 的上游 / 模型不进容量。
+        """
+        moment = now or utcnow()
+        out: list[tuple[UpstreamRecord, ModelEntry]] = []
+        for record in self.list():
+            if not record.enabled or record.state == "rejected":
+                continue
+            for raw in record.models:
+                entry = ModelEntry.from_dict(raw)
+                if entry.announceable(moment):
+                    out.append((record, entry))
+        return out
+
+    def announce_capacity(self, profile: Any, *, now: Any = None) -> list[dict[str, Any]]:
+        """容量公告（spec CapacityAnnouncement，`max_qps` 最小 0）。
+
+        未验证 / 过期 / 被拒的模型仍以**同形状**条目出现，但 `max_qps=0`
+        （= 不进容量，服务端调度拿不到吞吐）；只有 verified + 新鲜 + 启用的模型
+        按并发分摊到正的 `max_qps`。这样旧调用方（`djb announce`）的清单结构与
+        行序不变，只在数值上体现门控。
+        """
+        moment = now or utcnow()
+        live = {(record.id, entry.id) for record, entry in self.announceable_models(moment)}
+        rows: list[tuple[UpstreamRecord, ModelEntry]] = []
+        for record in self.list():
+            if not record.enabled:
+                continue
+            for raw in record.models:
+                entry = ModelEntry.from_dict(raw)
+                if entry.enabled:
+                    rows.append((record, entry))
         per_model_qps = max(0.1, round(max(1, int(profile.concurrent))
-                                       / max(1, len(enabled_models)), 2))
-        for record, item in enabled_models:
+                                       / max(1, len(live)), 2))
+        entries: list[dict[str, Any]] = []
+        for record, entry in rows:
             entries.append({
                 "kind": facts.TOKEN_RELAY_KIND,
                 "access": record.access_type,
-                "model": str(item.get("id")),
-                "max_qps": per_model_qps,
-                "ask_price": str(item.get("min_price") or "0"),
-                "unit": str(item.get("min_price_unit") or facts.DEFAULT_MIN_PRICE_UNIT),
+                "model": entry.id,
+                "max_qps": per_model_qps if (record.id, entry.id) in live else 0.0,
+                "ask_price": str(entry.min_price or "0"),
+                "unit": entry.min_price_unit,
                 "resource_level": str(profile.preset),
             })
         return entries
 
-    def catalog(self, *, price_version: str = "local") -> list[dict[str, Any]]:
+    def catalog(self, *, price_version: str = "local", now: Any = None) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
+        moment = now or utcnow()
         for record in self.list():
             if not record.enabled:
                 continue
-            for item in record.models:
-                enabled = bool(item.get("enabled", True))
-                price = item.get("min_price")
+            for raw in record.models:
+                entry = ModelEntry.from_dict(raw)
+                enabled = entry.enabled
+                price = entry.min_price
                 entries.append({
-                    "id": str(item.get("id")),
+                    "id": entry.id,
                     "object": "model",
                     "created": 0,
                     "owned_by": "djb-node",
@@ -327,9 +499,16 @@ class UpstreamManager:
                     "available": enabled and record.state in ("declared", "probing", "verified"),
                     "price_version": price_version,
                     "price": ({"amount": str(price),
-                               "unit": str(item.get("min_price_unit")
-                                           or facts.DEFAULT_MIN_PRICE_UNIT)}
+                               "unit": entry.min_price_unit}
                               if price is not None else None),
+                    # 只加不改：本地探针可见性（spec Model 无这些字段，本机 API 仅自用）
+                    "probe": {"inference_ok": entry.inference_ok,
+                              "stream_ok": entry.stream_ok,
+                              "usage_ok": entry.usage_ok,
+                              "probe_version": entry.probe_version,
+                              "last_probe_at": entry.last_probe_at,
+                              "fresh": entry.fresh(moment),
+                              "announceable": entry.announceable(moment)},
                 })
         return entries
 
