@@ -36,6 +36,7 @@ from .errors import (AuthError, DjbError, ForbiddenError, NetworkError, NotInsta
 from .httpclient import HttpClient
 from .limits import Decision, Limiter, YieldDetector, YieldResult
 from .logging_setup import event, setup_logging
+from .model_sync import ModelSyncClient, model_sync_enabled
 from .outbox import ReceiptFactory, SealedReceiptBuffer
 from .probe import periodic_interval_s
 from .secure import CredentialStore
@@ -229,6 +230,10 @@ class Daemon:
         self._channel: ChannelClient | None = None
         self._channel_thread: threading.Thread | None = None
         self._channel_stop: threading.Event | None = None
+        # M18b 模型/tokenizer 同步（默认关闭：关闭时不拉取、不建线程）
+        self._model_sync: ModelSyncClient | None = None
+        self._model_sync_thread: threading.Thread | None = None
+        self._model_sync_stop: threading.Event | None = None
         # 运行态
         self._user_paused = bool(self.store.get_kv("user_paused", False))
         self._consecutive_failures = 0
@@ -310,6 +315,7 @@ class Daemon:
               protocol_version=facts.PROTOCOL_VERSION)
         self._bootstrap()
         self._start_channel()
+        self._start_model_sync()
         if self._user_paused:
             self._transition_pause("user_paused")
         return self.status()
@@ -416,6 +422,7 @@ class Daemon:
         event("daemon.stopping")
         self._stop_event.set()
         self._stop_channel()
+        self._stop_model_sync()
         try:
             self.server.shutdown()
         except Exception:                                  # pragma: no cover - 防御
@@ -493,6 +500,60 @@ class Daemon:
                 "jobs_failed": int(snapshot.get("jobs_failed", 0)),
                 "last_job_id": snapshot.get("last_job_id"),
                 "last_error": snapshot.get("last_error")}
+
+    # ── M18b 模型 / tokenizer 同步（默认关闭）
+    def _start_model_sync(self) -> None:
+        """开关 ``client.model_sync.enabled`` 打开时起同步线程；关闭时不拉取、不建线程。"""
+        if not model_sync_enabled(self.config):
+            return
+        if self._model_sync_thread is not None and self._model_sync_thread.is_alive():
+            return
+        api = self._api_factory(self.config.gateway_url, self.credentials.client_key())
+        self._model_sync_stop = threading.Event()
+        self._model_sync = ModelSyncClient(self.paths, self.config, self.credentials,
+                                           http=self.http, api=api, now=self._now)
+        self._model_sync_thread = threading.Thread(target=self._model_sync_runner,
+                                                   name="djb-model-sync", daemon=True)
+        self._model_sync_thread.start()
+        event("model_sync.thread_started_by_daemon",
+              interval_s=facts.MODEL_SYNC_INTERVAL_S)
+
+    def _model_sync_runner(self) -> None:
+        """线程体：异常只记事件，不影响 daemon 主循环（M18 §5：同步失败不停接单）。"""
+        client, stop = self._model_sync, self._model_sync_stop
+        if client is None or stop is None:                  # pragma: no cover - 防御
+            return
+        try:
+            client.run_periodic(stop)
+        except Exception as exc:                            # pragma: no cover - 防御
+            event("model_sync.thread_crashed", level="warning",
+                  error=type(exc).__name__)
+
+    def _stop_model_sync(self) -> None:
+        """置停止位并 join ≤ facts.MODEL_SYNC_STOP_JOIN_S；已应用版本与本地文件保留。"""
+        if self._model_sync_stop is not None:
+            self._model_sync_stop.set()
+        thread = self._model_sync_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=facts.MODEL_SYNC_STOP_JOIN_S)
+        if thread is not None:
+            event("model_sync.thread_joined", alive=thread.is_alive())
+        self._model_sync_thread = None
+
+    def _model_sync_status(self) -> dict[str, Any]:
+        """status / 诊断用（只有版本号与计数，无正文、无凭据）。"""
+        enabled = model_sync_enabled(self.config)
+        running = bool(self._model_sync_thread is not None
+                       and self._model_sync_thread.is_alive())
+        if self._model_sync is not None:
+            snapshot = self._model_sync.status()
+        else:
+            snapshot = {"current_version": 0, "applied_at": None, "models": 0,
+                        "unsupported": [], "drift": [], "last_error": None,
+                        "verified": False, "next_at": None}
+        snapshot.update({"enabled": enabled, "running": running,
+                         "interval_s": facts.MODEL_SYNC_INTERVAL_S})
+        return snapshot
 
     # ── tick
     def _seconds_until_next_due(self) -> float:
@@ -1026,6 +1087,8 @@ class Daemon:
                                      item.id, now=self._now())]},
             # C10c 出站长轮询通道（默认关闭；关闭时 running 恒为 False）
             "channel": self._channel_status(),
+            # M18b 模型/tokenizer 同步（默认关闭；关闭时 running 恒为 False）
+            "model_sync": self._model_sync_status(),
             "flags": {name: {"enabled": feature_flag(self.config, name), **spec}
                       for name, spec in facts.FEATURE_FLAGS.items()},
             "update": self.update.status(),

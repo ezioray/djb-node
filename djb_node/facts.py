@@ -458,3 +458,42 @@ CHANNEL_BODY_FIELDS: tuple[str, ...] = ("model", "messages", "max_tokens", "temp
 CHANNEL_STOP_JOIN_S = 5
 """daemon 停止时等待通道线程的秒数。"""
 CHANNEL_STATUS_KINDS: tuple[str, ...] = ("idle", "polling", "executing", "stopping")
+
+# ─────────────────────────────────────────────────────────── M18b 客户端模型 / tokenizer 同步
+# 口径：客户端拉取服务端**签名 bundle**（版本 + payload_hash + TTL），校验后热应用本地
+# 模型元数据；无法本地支持的 tokenizer → unsupported，**不伪造精确 tokenizer、不装依赖**。
+# 失败一律保留旧版（M18 §5「签名失败/回退版本 → 保留旧版并上报 sync_rejected」）。
+FEATURE_FLAGS["client.model_sync.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "关闭后停拉取、保留已应用版本（本地 model_sync.json 只读不删）",
+    "description": "客户端模型/tokenizer 同步（M18b）：拉签名 bundle、校验后热应用，默认关闭",
+}
+MODEL_SYNC_FLAG = "client.model_sync.enabled"
+MODEL_CATALOG_PATH = "/api/v1/node/model-catalog"
+MODEL_SYNC_STATE_PATH = "/api/v1/node/model-sync/state"
+MODEL_SYNC_FILE = "model_sync.json"
+"""本地已应用 bundle（原子写、0600；只存元数据，不存正文/凭据）。"""
+MODEL_SYNC_SCHEMA = 1
+MODEL_SYNC_INTERVAL_S = 15 * 60
+"""周期拉取间隔（M18 §5：启动 + 每 15 min）。"""
+MODEL_SYNC_BACKOFF_S: tuple[int, ...] = (60, 300, 900, 1800)
+"""拉取失败退避（秒）：用尽停在最后一档，不退出、不影响接单。"""
+MODEL_SYNC_TIMEOUT_S = 20
+MODEL_SYNC_STATE_TIMEOUT_S = 15
+MODEL_SYNC_STOP_JOIN_S = 5
+MODEL_SYNC_FIELDS: tuple[str, ...] = ("vendor", "canonical", "aliases", "context_window",
+                                      "tokenizer_family", "tokenizer_version",
+                                      "tokenizer_hash", "effective_at")
+"""bundle 里每个模型必须携带的字段（缺 canonical 的条目整条丢弃）。"""
+MODEL_SYNC_KNOWN_TOKENIZERS: tuple[str, ...] = ("tiktoken", "openai", "cl100k_base",
+                                               "o200k_base", "heuristic")
+"""本地**有实现**的 tokenizer family（其余一律 unsupported，计数标 estimated）。"""
+MODEL_SYNC_ERROR_CLASSES: tuple[str, ...] = (
+    "version_invalid", "version_regression", "hash_mismatch", "expired",
+    "signature_invalid", "payload_invalid", "not_modified", "fetch_failed",
+)
+MODEL_SYNC_DRIFT_FIELDS: tuple[str, ...] = ("tokenizer_family", "tokenizer_version",
+                                            "tokenizer_hash", "context_window")
+"""漂移只比这几项（其余字段变化不算漂移，避免噪声）。"""
