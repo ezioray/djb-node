@@ -13,6 +13,9 @@ CLIENT_KEY = "ck_" + "test_mock_client_key_0123456789abcdef"
 NEW_CLIENT_KEY = "ck_" + "test_rotated_key_0123456789abcdef"
 NODE_ID = "node-mock-1"
 POLICY_VERSION = "policy-1"
+# 固定测试纪元：daemon 用假时钟（2026-10-24T00:00Z），mock 不得用真实时间生成 issued_at，
+# 否则每天 UTC 00:05 之后「issued_at 在未来」会假失败（时间炸弹）。
+TEST_EPOCH = "2026-10-24T00:00:00Z"
 
 
 def _iso_now() -> str:
@@ -24,7 +27,7 @@ def policy_payload(*, policy_version: str = POLICY_VERSION, quotas=None,
     return {
         "policy_version": policy_version,
         "protocol_version": PROTOCOL_VERSION,
-        "issued_at": issued_at or _iso_now(),
+        "issued_at": issued_at or TEST_EPOCH,
         "effective_at": "2026-10-24T00:00:00Z",
         "digest": "b" * 64,
         "quotas": quotas or [],
