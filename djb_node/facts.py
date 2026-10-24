@@ -205,3 +205,70 @@ DIAGNOSE_SCAN_PATTERNS: tuple[str, ...] = (
     r"hmac-sha256:[0-9a-f]{64}",
     r"Bearer\s+[A-Za-z0-9._\-]{16,}",
 )
+
+# ─────────────────────────────────────────────────────────── token 计数（C8；PROBE §2）
+# 现状：客户端只读上游 usage，缺失时平台 len//4 估算——中文低估约 4 倍
+# （ops/audit/reports/PROBE-TOKEN-AUDIT-20261024T0017Z.md §2.2）。
+# 本组常量是 tokens.py 的唯一来源；业务代码不得再写字面量。
+TOKENIZER_HEURISTIC_ID = "heuristic:v1"
+"""没有可用分词器时的启发式估算器标识（estimated=True）。"""
+TOKENIZER_TIKTOKEN_PREFIX = "tiktoken:"
+"""已安装 tiktoken（optional extra `tokens`）时的 tokenizer_id 前缀：prefix + encoding 名。"""
+TOKEN_CHAT_MESSAGE_OVERHEAD = 4
+"""chat template 粗略开销：每条消息固定 +4（role / 分隔控制符）。"""
+TOKEN_CHAT_REPLY_PRIMING = 3
+"""回复预备开销：assistant 起手控制符 +3（最后一次 template 收尾）。"""
+TOKEN_IMAGE_PART_OVERHEAD = 85
+"""多模态 image_url 片段按「低清图 85 token」估算（无本地解码能力，不猜测尺寸）。"""
+TOKEN_HEURISTIC_ASCII_CHARS_PER_TOKEN = 4
+"""启发式：ASCII 字母 / 数字 / 空白 ≈ 4 字符 1 token（英文经验值）。"""
+TOKEN_HEURISTIC_ASCII_SYMBOL_CHARS_PER_TOKEN = 2
+"""启发式：ASCII 标点 / 符号 ≈ 2 字符 1 token（BPE 对符号压缩差）。"""
+TOKEN_HEURISTIC_CJK_TOKENS_PER_CHAR = 1
+"""启发式：CJK（中日韩 + 全角）≈ 1 token / 字；校准依据 PROBE §2.2 的 4 倍低估。"""
+TOKEN_HEURISTIC_OTHER_TOKENS_PER_CHAR = 1
+"""启发式：其它非 ASCII（西里尔 / 重音拉丁 / emoji）≈ 1 token / 字（宁高不低）。"""
+TOKEN_COMPARE_THRESHOLD_PCT = 1.0
+"""本地 token 计数 vs 上游 usage 的告警阈值（%）：严格大于才记（对齐 LIMIT_DIFF_ALERT_PCT）。"""
+TOKEN_OPENAI_MODEL_PREFIXES: tuple[str, ...] = (
+    "gpt-", "chatgpt-", "o1", "o3", "o4", "text-embedding-", "davinci", "curie", "babbage",
+)
+"""视为 OpenAI 分词族（tiktoken 有意义的模型族）的模型名前缀。"""
+TOKEN_TIKTOKEN_ENCODINGS: dict[str, str] = {
+    # 顺序有意义：长前缀在前（gpt-4o 先于 gpt-4）
+    "gpt-4o": "o200k_base",
+    "gpt-4.1": "o200k_base",
+    "gpt-4.5": "o200k_base",
+    "chatgpt-4o": "o200k_base",
+    "gpt-5": "o200k_base",
+    "o1": "o200k_base",
+    "o3": "o200k_base",
+    "o4": "o200k_base",
+    "text-embedding-3": "cl100k_base",
+    "text-embedding-ada": "cl100k_base",
+    "gpt-4": "cl100k_base",
+    "gpt-3.5": "cl100k_base",
+    "gpt-35": "cl100k_base",
+    "davinci": "cl100k_base",
+    "curie": "cl100k_base",
+    "babbage": "cl100k_base",
+}
+"""模型名前缀 → tiktoken encoding 名（只覆盖已确认映射；未命中走 tiktoken 自带查表）。"""
+
+# ─────────────────────────────────────────────────────────── 特性开关（默认关闭 + 三字段）
+# 口径（Lead 集成）：FEATURE_FLAGS 是共享登记表；本卡只追加 client.token.compare.enabled。
+# 条目形状统一为 default / owner / expire_at / rollback_rule / description。
+# 求值逻辑唯一实现在 config.feature_flag（C7）；facts 这里只存元数据，不做解析。
+TOKEN_COMPARE_FLAG = "client.token.compare.enabled"
+"""真实请求路径「本地计数 vs 上游 usage」差异检测开关（默认关闭，见 FEATURE_FLAGS）。"""
+TOKEN_COMPARE_FLAG_META: dict[str, object] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "关闭后只记录上游 usage、不做本地比较",
+    "description": "真实请求路径做本地 token 计数与上游 usage 的差异检测（>1% 记 token_mismatch）",
+}
+FEATURE_FLAGS: dict[str, dict[str, object]] = {}
+"""特性开关登记表：每个开关必须带 default（默认关闭）/ owner / expire_at / rollback_rule /
+description。C7 也向本表追加条目，合并时由 Lead 统一为一个 dict。"""
+FEATURE_FLAGS[TOKEN_COMPARE_FLAG] = TOKEN_COMPARE_FLAG_META
