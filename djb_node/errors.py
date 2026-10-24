@@ -167,6 +167,21 @@ class BudgetExceededError(DjbError):
     exit_code = facts.EXIT_ERROR
 
 
+class FeatureDisabled(UsageError):
+    """特性开关关闭（M17 §9：默认关闭；关闭后已有配置/记录只读，不删除）。"""
+
+    def __init__(self, name: str, *, rollback_rule: str | None = None) -> None:
+        rule = rollback_rule
+        if rule is None:
+            spec = facts.FEATURE_FLAGS.get(str(name)) or {}
+            rule = spec.get("rollback_rule")
+        super().__init__(
+            "特性开关 " + str(name) + " 处于关闭状态（默认关闭）："
+            + (str(rule) if rule else "先按 M17 §9 演练后再开启"),
+            reason="feature_disabled")
+        self.flag = str(name)
+
+
 TYPE_FOR_STATUS: dict[int, str] = {
     400: "invalid_request_error",
     401: "authentication_error",
