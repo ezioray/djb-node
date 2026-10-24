@@ -1,0 +1,228 @@
+# SPDX-License-Identifier: Apache-2.0
+{{- /*
+C5 机房版 · djb-node DaemonSet（values.mode=daemonset 时渲染）
+
+什么时候用：每台物理机固定一个节点客户端，且状态（SQLite）必须留在**节点本地盘**上。
+安全基线跟 Deployment 一模一样（非 root / 只读根 / 不提权 / 无入站 / 无 hostNetwork），
+唯一差别是数据卷：DaemonSet 里 Pod 是「一机一实例」，用 PVC 反而会漂移，
+所以这里支持 nodeLocalData.hostPath（默认关闭）或 emptyDir。
+
+⚠️ hostPath 会写宿主机目录：打开前请确认目录已预建、属主 10001:10001、且不在 /etc、
+   /usr、/var/lib/kubelet 等系统路径下；这是本 Chart 唯一会碰宿主文件系统的开关。
+*/}}
+{{- if eq .Values.mode "daemonset" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "djb-node.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "djb-node.labels" . | nindent 4 }}
+spec:
+  revisionHistoryLimit: 3
+  updateStrategy:
+    type: {{ .Values.daemonsetUpdateStrategy.type }}
+    {{- if eq .Values.daemonsetUpdateStrategy.type "RollingUpdate" }}
+    rollingUpdate:
+      maxUnavailable: {{ .Values.daemonsetUpdateStrategy.rollingUpdate.maxUnavailable }}
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "djb-node.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "djb-node.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "djb-node.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      dnsPolicy: {{ .Values.dnsPolicy }}
+      terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- if .Values.bootstrap.enabled }}
+      initContainers:
+        - name: bootstrap
+          image: {{ include "djb-node.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -eu
+              if [ ! -s /data/config.json ] && [ -s /config/config.json ]; then
+                cp /config/config.json /data/config.json
+                echo "djb-bootstrap: seeded /data/config.json from /config"
+              fi
+              djb init --no-env \
+                --preset "$DJB_PRESET" \
+                --daily-tokens "$DJB_DAILY_TOKENS" \
+                --weekly-tokens "$DJB_WEEKLY_TOKENS" \
+                --monthly-tokens "$DJB_MONTHLY_TOKENS" \
+                --concurrent "$DJB_CONCURRENT" \
+                --cpu "$DJB_CPU_PCT" \
+                --gpu "$DJB_GPU_PCT" \
+                --mem "$DJB_MEM_PCT" >/dev/null
+              if [ -n "${DJB_CREDENTIAL_SEED_FILE:-}" ] \
+                 && [ -s "${DJB_CREDENTIAL_SEED_FILE}" ] \
+                 && [ ! -s /data/credentials/credentials.json ]; then
+                tr -d '\r\n' < "${DJB_CREDENTIAL_SEED_FILE}" | djb auth --set-key -
+                echo "djb-bootstrap: client key imported from Secret"
+              fi
+          env:
+            - name: DJB_HOME
+              value: /data
+            - name: DJB_PRESET
+              value: {{ .Values.node.preset | quote }}
+            - name: DJB_DAILY_TOKENS
+              value: {{ int .Values.node.limits.dailyTokens | quote }}
+            - name: DJB_WEEKLY_TOKENS
+              value: {{ int .Values.node.limits.weeklyTokens | quote }}
+            - name: DJB_MONTHLY_TOKENS
+              value: {{ int .Values.node.limits.monthlyTokens | quote }}
+            - name: DJB_CONCURRENT
+              value: {{ int .Values.node.limits.concurrent | quote }}
+            - name: DJB_CPU_PCT
+              value: {{ int .Values.node.limits.cpuPct | quote }}
+            - name: DJB_GPU_PCT
+              value: {{ int .Values.node.limits.gpuPct | quote }}
+            - name: DJB_MEM_PCT
+              value: {{ int .Values.node.limits.memPct | quote }}
+            {{- if .Values.auth.existingSecret }}
+            - name: DJB_CREDENTIAL_SEED_FILE
+              value: /secrets/client-key
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+              readOnly: true
+            {{- if .Values.auth.existingSecret }}
+            - name: client-key
+              mountPath: /secrets
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- end }}
+      containers:
+        - name: djb-node
+          image: {{ include "djb-node.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["djb"]
+          args: ["start", "--foreground"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: DJB_HOME
+              value: /data
+            - name: DJB_MIRROR_PORT
+              value: {{ int .Values.node.mirrorPort | quote }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          startupProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,sys,urllib.request as u;
+                  p=os.environ.get('DJB_MIRROR_PORT','1717');
+                  r=u.urlopen('http://127.0.0.1:'+p+'/v1/health', timeout=3);
+                  sys.exit(0 if r.status == 200 else 1)
+            periodSeconds: {{ int .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.startup.failureThreshold }}
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,sys,urllib.request as u;
+                  p=os.environ.get('DJB_MIRROR_PORT','1717');
+                  r=u.urlopen('http://127.0.0.1:'+p+'/v1/health', timeout=3);
+                  sys.exit(0 if r.status == 200 else 1)
+            periodSeconds: {{ int .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,sys,urllib.request as u;
+                  p=os.environ.get('DJB_MIRROR_PORT','1717');
+                  r=u.urlopen('http://127.0.0.1:'+p+'/v1/health', timeout=3);
+                  sys.exit(0 if r.status == 200 else 1)
+            periodSeconds: {{ int .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.probes.readiness.failureThreshold }}
+      volumes:
+        - name: data
+          {{- if .Values.nodeLocalData.enabled }}
+          hostPath:
+            path: {{ .Values.nodeLocalData.hostPath | quote }}
+            type: {{ .Values.nodeLocalData.type | quote }}
+          {{- else }}
+          # 默认 emptyDir：Pod 重建即丢本地状态（会重新注册），但绝不写宿主机目录
+          emptyDir:
+            sizeLimit: 1Gi
+          {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "djb-node.fullname" . }}
+            optional: true
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.auth.existingSecret }}
+        - name: client-key
+          secret:
+            secretName: {{ .Values.auth.existingSecret | quote }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.auth.clientKeyField | quote }}
+                path: client-key
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: Apache-2.0
+# C5 机房版 · djb-node 默认值
+#
+# 默认值纪律：
+#   1) 默认 = 最安全的「能跑起来」；安全相关的开关默认取最保守值；
+#   2) **任何凭据 / token / 生产域名 / 密钥都不得出现在本文件**（测试会扫）；
+#   3) 镜像 tag 禁止 latest；网关地址默认是不可解析的占位域名，必须由运维替换。
+
+# ── 镜像 ────────────────────────────────────────────────────────────────────
+image:
+  # 占位仓库：换成机房的私有 registry（不要写生产域名进仓库）
+  repository: registry.example.invalid/djb-node
+  # tag 留空 -> 用 .Chart.AppVersion（0.2.0）。镜像本身用固定补丁版本的基础镜像。
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# ── 形态 ────────────────────────────────────────────────────────────────────
+# deployment：默认。100 节点机房里用 replicaCount 把实例铺到不同节点（配合反亲和）。
+# daemonset ：每台物理机固定一个实例、状态必须落在节点本地盘时用（见 templates/daemonset.yaml）。
+mode: deployment
+
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ── ServiceAccount ──────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # 节点客户端不调用 Kubernetes API：默认不注入 ServiceAccount token（最小权限）
+  automountServiceAccountToken: false
+
+# ── Pod 级安全上下文（容器内再叠一层容器级 securityContext）────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  # 只读根文件系统：可写点只有 /data、/config、/tmp（对应 volumeMounts）
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop: ["ALL"]
+
+# ── 网络 ────────────────────────────────────────────────────────────────────
+# daemon 只绑 127.0.0.1:1717（M15 INV-03），集群侧**没有** Service / Ingress / 入站端口。
+# 因此 hostNetwork 必须保持 false（模板里不是开关，是硬值；这里留字段只做显式声明）。
+hostNetwork: false
+dnsPolicy: ClusterFirst
+
+# ── 资源 ────────────────────────────────────────────────────────────────────
+# 节点是「让路型」负载：请求小、上限明确；业务侧的 L2 资源上限（CPU 40%）是另一层约束。
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# ── 探针（只打容器内回环）──────────────────────────────────────────────────
+# kubelet 的 httpGet 探针连的是 **Pod IP**，而 daemon 只绑 127.0.0.1 -> httpGet 必然失败，
+# 所以这里用 exec + 本机回环 HTTP（免令牌 /v1/health），既不走外网也不需要额外工具。
+probes:
+  startup:
+    periodSeconds: 5
+    failureThreshold: 24      # 最多等 120s（首次 init 后 daemon 起得很快）
+  liveness:
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# ── 节点配置（渲染成 /config/config.json，再由 initContainer 复制到 /data/config.json）
+node:
+  # 占位网关：api.example.invalid 不可解析（RFC 6761 保留域），必须由运维替换成真实地址。
+  # 禁止把生产域名写进仓库 / values 默认值（安全审计项）。
+  gatewayUrl: "https://api.example.invalid"
+  # 预设：省心 / 均衡 / 全力以赴（djb init --preset）
+  preset: "省心"
+  updateChannel: stable
+  updateSource: ""
+  logLevel: info
+  yieldEnabled: true
+  # 本机回环镜像端口（config.json 的 mirror_port；改这里同时改容器 ENV DJB_MIRROR_PORT）
+  mirrorPort: 1717
+  # 限额（写进 state.db，由 initContainer 的 djb init 落地；0 表示 weekly/monthly 不额外限制）
+  limits:
+    dailyTokens: 500000
+    weeklyTokens: 0
+    monthlyTokens: 0
+    concurrent: 3
+    cpuPct: 40
+    gpuPct: 70
+    memPct: 70
+  # config.json 的非敏感扩展字段（原样进 extra）
+  extra: {}
+  # 特性开关：默认**空 = 全关**。开启必须三字段齐全，否则模板直接 fail：
+  #   featureFlags:
+  #     client.probe.periodic.enabled:
+  #       enabled: true
+  #       owner: client-seat
+  #       expire_at: "2026-12-31"
+  #       rollback_rule: "关闭后只保留手动 probe；公告按已存 last_probe_at 判新鲜"
+  featureFlags: {}
+
+# ── 凭据 ────────────────────────────────────────────────────────────────────
+# 只**引用**已存在的 Secret：本 Chart 不创建 Secret、不渲染任何密钥内容。
+# 运维侧创建（示例，值不要进 git / values）：
+#   kubectl -n <ns> create secret generic djb-node-client --from-literal=client-key="$DJB_CLIENT_KEY"
+# 留空则不注入：节点以「未绑定」态启动，用 kubectl exec ... djb auth --set-key - 交互补。
+auth:
+  existingSecret: ""
+  clientKeyField: client-key
+
+# ── 持久化 ──────────────────────────────────────────────────────────────────
+persistence:
+  # 默认 emptyDir：state.db / 收据缓冲是本地状态，Pod 重建会重新注册；最省事、最不容易出错。
+  # 生产建议：给 existingClaim（由存储团队创建）或 enabled=true（本 Chart 建 PVC，带 keep 注解）。
+  enabled: false
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+
+# ── daemonset 模式的节点本地目录 ────────────────────────────────────────────
+# hostPath 会写宿主机目录，默认关闭；打开前请确认节点目录已预建且属主为 10001。
+nodeLocalData:
+  enabled: false
+  hostPath: /var/lib/djb-node
+  type: DirectoryOrCreate
+
+# ── 启动引导（initContainer）───────────────────────────────────────────────
+bootstrap:
+  # 复制种子 config.json -> djb init --no-env（幂等）-> 可选导入客户端密钥（只读挂载的 Secret）
+  enabled: true
+
+# ── 调度 ────────────────────────────────────────────────────────────────────
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# ── PDB（仅 deployment 模式）────────────────────────────────────────────────
+pdb:
+  enabled: true
+  minAvailable: 1
+
+# ── 其它 ────────────────────────────────────────────────────────────────────
+podAnnotations: {}
+podLabels: {}
+# 优雅停止：daemon 收到 SIGTERM 会停接单、落盘、退出（≤60s 足够）
+terminationGracePeriodSeconds: 60
+# DaemonSet 滚动更新策略
+daemonsetUpdateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 10%

@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# C5 机房版 · djb-node Helm Chart 元数据
+#
+# 发布纪律：本 Chart 的 version 只在**合并后**由 release-manager 递增并在批准窗口内发布；
+# 开发分支只改内容、不发布（见 deploy/machine-room/README.md §7）。
+apiVersion: v2
+name: djb-node
+description: |
+  DJB 联脑 · 机房版节点客户端（M15 client-runtime）。无 GUI、无入站端口、非 root、
+  只读根文件系统；状态落持久卷；凭据只引用已存在的 Secret。
+type: application
+# Chart 版本：模板/默认值变化时递增（SemVer）
+version: 0.1.0
+# 应用版本：与 djb-node 的 pyproject.toml [project].version 保持一致（测试会断言）
+appVersion: "0.2.0"
+# 依赖：只用 Deployment / DaemonSet / ConfigMap / SA / PDB 这些 1.25+ 稳定 API
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - djb
+  - node
+  - client-runtime
+  - machine-room
+home: https://example.invalid/djb-node
+sources:
+  - https://example.invalid/djb-node
+maintainers:
+  - name: DJB machine-room
+    email: machine-room@example.invalid
+annotations:
+  # 三字段纪律（与特性开关同一口径）：owner / expire_at / rollback_rule
+  djb.io/owner: machine-room-seat
+  djb.io/expire-at: "2026-12-31"
+  djb.io/rollback-rule: |
+    helm uninstall <release> 回滚到上一版 Chart；/data 卷保留即可续跑（state.db 版本只前进，
+    降级安装会被客户端拒绝）。详见 deploy/machine-room/README.md §4。
