@@ -30,6 +30,12 @@ JOB = {"job_id": "job-1", "node_id": "node-1", "timeout_s": 30,
        "requests": {"model": "mock-model", "messages": MESSAGES,
                     "max_tokens": 16, "temperature": 0.3, "stop": ["\n\n"]}}
 
+# spec 1.2.9 NodeChannelResultRequest：客户端只发这些键（多余会被丢弃/40001）
+WIRE_COMPLETED = {"job_id", "status", "content", "finish_reason", "tokens_in",
+                  "tokens_out", "usage_source", "latency_ms"}
+WIRE_FAILED = {"job_id", "status", "error_code", "error_class", "latency_ms"}
+LEGACY_FIELDS = {"succeeded", "node_id", "usage", "duration_ms", "completed_at"}
+
 
 # ─────────────────────────────────────────────────────────── 夹具 / 替身
 class Capture(logging.Handler):
@@ -200,7 +206,7 @@ def test_poll_errors_backoff_1_5_30(paths, credentials, events):
 
 
 # ─────────────────────────────────────────────────────────── job 执行 / 映射
-def test_job_success_maps_content_finish_reason_usage(paths, credentials, clock, events):
+def test_job_success_maps_contract_fields(paths, credentials, clock, events):
     api = FakeApi([JOB])
     chat = FakeChat()
     client = _client(paths, credentials, api=api, chat_call=chat, clock=clock)
@@ -213,16 +219,17 @@ def test_job_success_maps_content_finish_reason_usage(paths, credentials, clock,
     assert body["stop"] == ["\n\n"] and body["stream"] is False
     assert len(api.submits) == 1
     result = api.submits[0]
-    assert result["job_id"] == "job-1" and result["node_id"] == "node-1"
-    assert result["status"] == "succeeded"
+    # 契约口径：status=completed + tokens_in/out + usage_source，无 succeeded/node_id/usage 嵌套
+    assert result["job_id"] == "job-1"
+    assert result["status"] == "completed"
     assert result["content"] == "你好"
     assert result["finish_reason"] == "stop"
-    assert result["usage"] == {"prompt_tokens": 7, "completion_tokens": 2,
-                              "total_tokens": 9}
-    assert isinstance(result["duration_ms"], int) and result["duration_ms"] >= 0
-    assert result["completed_at"] == "2026-10-24T00:00:00Z"
+    assert result["tokens_in"] == 7 and result["tokens_out"] == 2
+    assert result["usage_source"] == "actual"
+    assert isinstance(result["latency_ms"], int) and result["latency_ms"] >= 0
+    assert set(result) == WIRE_COMPLETED
+    assert not (set(result) & LEGACY_FIELDS)
     assert client.snapshot()["jobs_done"] == 1
-
 
 def test_job_body_only_whitelisted_fields(paths, credentials):
     job = json.loads(json.dumps(JOB))
@@ -245,10 +252,11 @@ def test_local_4xx_maps_to_failed_with_error_code(paths, credentials):
     _run(client, api, stop_after=1)
     result = api.submits[0]
     assert result["status"] == "failed"
-    assert result["error_code"] == facts.LOCAL_ERROR_CODES["quota_exceeded"]
+    assert result["error_code"] == "40201"          # 字符串，不是整数
     assert result["error_class"] == "quota_exceeded"
+    assert set(result) == WIRE_FAILED
+    assert not (set(result) & LEGACY_FIELDS)
     assert "content" not in result
-
 
 def test_local_5xx_maps_to_upstream_error(paths, credentials):
     api = FakeApi([JOB])
@@ -256,9 +264,8 @@ def test_local_5xx_maps_to_upstream_error(paths, credentials):
     _run(client, api, stop_after=1)
     result = api.submits[0]
     assert result["status"] == "failed"
-    assert result["error_code"] == facts.LOCAL_ERROR_CODES["upstream_error"]
+    assert result["error_code"] == "50903"
     assert result["error_class"] == "upstream_error"
-
 
 def test_local_timeout_maps_to_504(paths, credentials):
     api = FakeApi([JOB])
@@ -268,20 +275,19 @@ def test_local_timeout_maps_to_504(paths, credentials):
     _run(client, api, stop_after=1)
     result = api.submits[0]
     assert result["status"] == "failed"
-    assert result["error_code"] == facts.LOCAL_ERROR_CODES["upstream_timeout"]
+    assert result["error_code"] == "50902"
     assert result["error_class"] == "upstream_timeout"
 
-
 def test_invalid_job_submits_failed_without_chat(paths, credentials):
-    api = FakeApi([{"job_id": "job-bad"}])          # 缺 requests
+    api = FakeApi([{"job_id": "job-bad"}])          # 缺 request/requests
     chat = FakeChat()
     client = _client(paths, credentials, api=api, chat_call=chat)
     _run(client, api, stop_after=1)
     assert chat.calls == []
     assert api.submits[0]["job_id"] == "job-bad"
     assert api.submits[0]["status"] == "failed"
+    assert api.submits[0]["error_code"] == "40001"
     assert api.submits[0]["error_class"] == "invalid_job"
-
 
 def test_job_timeout_clamped_to_upper_and_lower_bounds(paths, credentials):
     huge = json.loads(json.dumps(JOB))
@@ -384,7 +390,7 @@ def test_api_submit_channel_result_uses_job_id_as_idempotency_key():
     body = json.dumps({"accepted": ["job-1"], "duplicate": False}).encode()
     http = FakeHttp(HttpResponse(status=200, headers={}, body=body, url="", elapsed_ms=1))
     api = NodeApi("https://gateway.test", client_key="ck_test", http=http)
-    result = api.submit_channel_result({"job_id": "job-1", "status": "succeeded"})
+    result = api.submit_channel_result({"job_id": "job-1", "status": "completed"})
     assert result["accepted"] == ["job-1"]
     from djb_node import protocol
     call = http.calls[0]
@@ -414,8 +420,11 @@ def test_integration_poll_job_local_chat_and_submit(paths, credentials, channel_
     thread.join(5)
     assert channel_mock.results, "结果没有回传到平台端点"
     result = channel_mock.results[0]
-    assert result["job_id"] == "job-1" and result["status"] == "succeeded"
+    assert result["job_id"] == "job-1" and result["status"] == "completed"
     assert result["content"] == "你好"
+    assert result["tokens_in"] == 7 and result["tokens_out"] == 2
+    assert result["usage_source"] == "actual"
+    assert set(result) <= WIRE_COMPLETED
     # 本机镜像调用带 Bearer 一次性令牌，body 里没有平台注入字段
     assert channel_mock.chat_auth[0] == "Bearer " + LOCAL_TOKEN
     assert channel_mock.chat_requests[0]["stream"] is False
@@ -522,3 +531,62 @@ def test_daemon_status_exposes_channel_wait_and_state(daemon_env, monkeypatch):
         assert channel["last_job_id"] is None
     finally:
         daemon.stop()
+
+
+# ─────────────────────────────────────────────────────────── wire 契约（C10a 1.2.9）
+def _completed_result(paths, credentials, chat) -> dict:
+    api = FakeApi([JOB])
+    client = _client(paths, credentials, api=api, chat_call=chat)
+    _run(client, api, stop_after=1)
+    return api.submits[0]
+
+
+def test_wire_completed_payload_is_json_and_matches_contract(paths, credentials):
+    result = _completed_result(paths, credentials, FakeChat())
+    wire = json.loads(json.dumps(result, ensure_ascii=False))   # 真发出去的样子
+    assert set(wire) == WIRE_COMPLETED
+    assert wire["status"] == "completed"
+    assert wire["usage_source"] in ("actual", "estimated")
+    assert isinstance(wire["tokens_in"], int) and isinstance(wire["tokens_out"], int)
+    assert not (set(wire) & LEGACY_FIELDS)
+
+
+def test_wire_failed_payload_matches_contract(paths, credentials):
+    api = FakeApi([JOB])
+    client = _client(paths, credentials, api=api, chat_call=FakeChat(status=429))
+    _run(client, api, stop_after=1)
+    wire = json.loads(json.dumps(api.submits[0], ensure_ascii=False))
+    assert set(wire) == WIRE_FAILED
+    assert wire["status"] == "failed"
+    assert wire["error_code"] == "42901" and isinstance(wire["error_code"], str)
+    assert not (set(wire) & LEGACY_FIELDS)
+    assert "content" not in wire
+
+
+def test_usage_absent_marks_estimated_without_null_tokens(paths, credentials):
+    chat = FakeChat({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    result = _completed_result(paths, credentials, chat)
+    assert result["usage_source"] == "estimated"
+    # spec 里 tokens_in/out 是 integer：缺失时**不发**（发 null 会破坏类型），平台取到空值
+    assert "tokens_in" not in result and "tokens_out" not in result
+    assert set(result) == WIRE_COMPLETED - {"tokens_in", "tokens_out"}
+
+
+def test_parse_job_accepts_envelope_request_and_flat_shapes():
+    request_job = {"job": {"job_id": "j1", "kind": "chat.completions",
+                           "request_id": "req-1", "lease_expires_at": "2026-10-24T00:05:00Z",
+                           "request": {"model": "m1", "messages": MESSAGES,
+                                       "max_tokens": 8, "timeout_s": 42}},
+                   "server_time": "2026-10-24T00:00:00Z"}
+    parsed = parse_job(request_job)
+    assert parsed.job_id == "j1" and parsed.model == "m1"
+    assert parsed.messages == MESSAGES and parsed.max_tokens == 8
+    assert parsed.timeout_s == 42                        # request 内的 timeout_s 也认
+    legacy = parse_job({"job_id": "j2", "requests": {"model": "m2", "messages": MESSAGES}})
+    assert legacy.job_id == "j2" and legacy.model == "m2"
+    flat = parse_job({"job_id": "j3", "kind": "chat.completions", "model": "m3",
+                      "messages": MESSAGES, "timeout_s": 5,
+                      "lease_expires_at": "2026-10-24T00:05:00Z"})
+    assert flat is not None and flat.job_id == "j3" and flat.model == "m3"
+    assert flat.timeout_s == 5
+    assert not hasattr(flat, "lease_expires_at")          # 租约只属平台侧，客户端忽略
