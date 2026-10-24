@@ -17,7 +17,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.2.11
+  version: 1.2.14
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面（127 路径 / 145 操作；覆盖 M01–M14、M16；1.2.9 增 C10 节点通道）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
@@ -2006,6 +2006,535 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
 
+
+
+
+
+  # ----------------------------------------------------------------------
+  # M17 可验证随机抽检（C14b，spec 1.2.14）
+  # commit-reveal + 贡献量加权；seed 只在 open 响应出现一次
+  # ----------------------------------------------------------------------
+  /api/v1/admin/supply/integrity/sampling/epochs:
+    post:
+      tags: [admin]
+      summary: 开启抽检轮次（先承诺 seed，seed 仅此一次返回）
+      operationId: openSamplingEpoch
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SamplingEpochOpenRequest' }
+      responses:
+        '201':
+          description: 已承诺（seed 只返回一次，库内只有 sha256）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SamplingEpochOpenResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    get:
+      tags: [admin]
+      summary: 抽检轮次列表
+      operationId: listSamplingEpochs
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [committed, revealed, expired] }
+      responses:
+        '200':
+          description: 轮次列表
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SamplingEpochList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/supply/integrity/sampling/epochs/{id}:
+    get:
+      tags: [admin]
+      summary: 轮次详情（含 draws）
+      operationId: getSamplingEpoch
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 轮次详情
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SamplingEpochDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin/supply/integrity/sampling/epochs/{id}/reveal:
+    post:
+      tags: [admin]
+      summary: 揭晓 seed 并生成 draws（幂等重放）
+      operationId: revealSamplingEpoch
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SamplingRevealRequest' }
+      responses:
+        '200':
+          description: 已揭晓并抽签
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SamplingRevealResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/admin/supply/integrity/sampling/draws/{id}/result:
+    post:
+      tags: [admin]
+      summary: 回填抽检结果（复用 C12 证据；L3→passed）
+      operationId: recordSamplingResult
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SamplingResultRequest' }
+      responses:
+        '200':
+          description: 已回填
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SamplingResultResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/admin/supply/integrity/sampling/verify:
+    post:
+      tags: [admin]
+      summary: 复算轮次（同 seed 重算一致）
+      operationId: verifySamplingEpoch
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SamplingVerifyRequest' }
+      responses:
+        '200':
+          description: 复算结果
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SamplingVerifyResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ----------------------------------------------------------------------
+  # M12a 节点通知（C15，spec 1.2.13）
+  # 离线可拉取；ack/read 幂等；不分发正文/凭据
+  # ----------------------------------------------------------------------
+  /api/v1/node/notifications:
+    get:
+      tags: [node]
+      summary: 拉取本节点通知（离线补拉）
+      operationId: pullNodeNotifications
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+        - name: since
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: category
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: 未读/未过期通知
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeNotificationList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/node/notifications/unread_count:
+    get:
+      tags: [node]
+      summary: 未读角标数量
+      operationId: getNodeNotificationUnreadCount
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 未读数
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeNotificationUnread' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/node/notifications/{id}/ack:
+    post:
+      tags: [node]
+      summary: 确认收到（幂等）
+      operationId: ackNodeNotification
+      security:
+        - nodeClientKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已确认
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeNotificationAck' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/node/notifications/{id}/read:
+    post:
+      tags: [node]
+      summary: 标记已读（隐含 ack；幂等）
+      operationId: readNodeNotification
+      security:
+        - nodeClientKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已读
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeNotificationAck' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin/notifications/node:
+    post:
+      tags: [admin]
+      summary: 入队一条节点通知（运营/测试）
+      operationId: enqueueNodeNotification
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeNotificationEnqueueRequest' }
+      responses:
+        '201':
+          description: 已入队（dedupe 命中返回已有）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeNotificationAdmin' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    get:
+      tags: [admin]
+      summary: 节点通知列表/投递状态（排障）
+      operationId: listNodeNotificationsAdmin
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+        - name: node_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: state
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: 通知列表
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeNotificationAdminList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ----------------------------------------------------------------------
+  # M18 模型/tokenizer 同步（C17，spec 1.2.12）
+  # 只分发元数据/指纹，不分发厂商 tokenizer 权重
+  # ----------------------------------------------------------------------
+  /api/v1/node/model-catalog:
+    get:
+      tags: [node]
+      summary: 拉取模型/tokenizer 签名 bundle（since 版本之后）
+      operationId: getNodeModelCatalog
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+        - name: since
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: 当前 bundle；`not_modified=true` 表示 since 已是最新
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeModelCatalog' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/node/model-sync/state:
+    post:
+      tags: [node]
+      summary: 上报客户端已应用版本/漂移/错误类（不含正文）
+      operationId: reportNodeModelSyncState
+      security:
+        - nodeClientKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeModelSyncStateRequest' }
+      responses:
+        '200':
+          description: 已记录
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeModelSyncStateAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/admin/model-sync/bundles:
+    get:
+      tags: [admin]
+      summary: 模型同步 bundle 列表（含 draft/published/rolled_back）
+      operationId: listModelSyncBundles
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [draft, published, revoked, rolled_back] }
+      responses:
+        '200':
+          description: bundle 列表
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelSyncBundleList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      summary: 从注册表生成 draft bundle
+      operationId: createModelSyncBundle
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelSyncBundleCreateRequest' }
+      responses:
+        '201':
+          description: draft 已生成（版本只增）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelSyncBundleCreateResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/admin/model-sync/bundles/{id}/publish:
+    post:
+      tags: [admin]
+      summary: 发布 bundle（HMAC 签名；需 model_sync.write）
+      operationId: publishModelSyncBundle
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已发布
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelSyncBundleResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/admin/model-sync/bundles/{id}/rollback:
+    post:
+      tags: [admin]
+      summary: 回滚到上一 published（发布副本，不改历史）
+      operationId: rollbackModelSyncBundle
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 回滚副本已发布
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelSyncBundleResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/admin/model-sync/state:
+    get:
+      tags: [admin]
+      summary: 节点模型同步状态（版本/漂移/错误类）
+      operationId: listNodeModelSyncState
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+        - name: node_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: 节点状态列表
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeModelSyncStateList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   # ----------------------------------------------------------------------
   # M17 模型身份证明（C12，spec 1.2.11）
@@ -5677,6 +6206,12 @@ components:
           description: |
             价格快照版本（M04 model_catalog.price_version / M10 同族），用于三处同源校验。
             公开侧（未登录文档站 / 降级镜像）可缺省为 null；客户端不得据此推断结算价。
+        tokenizer_version:
+          type: [string, 'null']
+          description: 服务端已知的 tokenizer 版本（C17/M18）；缺省表示未同步/未知。
+        model_sync_version:
+          type: [integer, 'null']
+          description: 该行来源的模型同步 bundle 版本（C17/M18）；缺省表示未同步。
         available:
           type: boolean
           description: |
@@ -7402,6 +7937,359 @@ components:
           description: 准入通过后生成的策略版本（客户端据此拉取策略）。
 
 
+
+
+
+
+    # ------------------------------------------------------------ M17 抽检（C14b，spec 1.2.14）
+    SamplingContribution:
+      type: object
+      additionalProperties: false
+      required: [node_id, model, weight]
+      properties:
+        node_id: { type: string }
+        model: { type: string }
+        weight: { type: integer, minimum: 0 }
+
+    SamplingEpoch:
+      type: object
+      additionalProperties: true
+      required: [id, epoch_no, seed_commit, contributions, state, draw_count, committed_at]
+      properties:
+        id: { type: string, format: uuid }
+        epoch_no: { type: integer, minimum: 1 }
+        seed_commit: { type: string }
+        seed_reveal: { type: [string, 'null'] }
+        contributions:
+          type: array
+          items: { $ref: '#/components/schemas/SamplingContribution' }
+        state: { type: string, enum: [committed, revealed, expired] }
+        draw_count: { type: integer, minimum: 0 }
+        committed_at: { type: string, format: date-time }
+        revealed_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    SamplingDraw:
+      type: object
+      additionalProperties: true
+      required: [id, epoch_id, node_id, model, weight, rank, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        epoch_id: { type: string, format: uuid }
+        node_id: { type: string }
+        model: { type: string }
+        weight: { type: integer, minimum: 0 }
+        rank: { type: integer, minimum: 1 }
+        challenge_id: { type: [string, 'null'], format: uuid }
+        status: { type: string, enum: [pending, passed, failed, missed] }
+        level: { type: [string, 'null'] }
+        detail: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: [string, 'null'], format: date-time }
+
+    SamplingEpochOpenRequest:
+      type: object
+      additionalProperties: true
+      required: [epoch_no, contributions, draw_count]
+      properties:
+        epoch_no: { type: integer, minimum: 1 }
+        contributions:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/SamplingContribution' }
+        draw_count: { type: integer, minimum: 0 }
+
+    SamplingEpochOpenResponse:
+      type: object
+      additionalProperties: true
+      required: [epoch, seed]
+      properties:
+        epoch: { $ref: '#/components/schemas/SamplingEpoch' }
+        seed:
+          type: string
+          description: 32B seed 的 hex；**只在本次响应出现一次**，库内只存 sha256。
+
+    SamplingRevealRequest:
+      type: object
+      additionalProperties: true
+      required: [seed]
+      properties:
+        seed: { type: string }
+
+    SamplingRevealResponse:
+      type: object
+      additionalProperties: true
+      required: [epoch, draws, idempotent]
+      properties:
+        epoch: { $ref: '#/components/schemas/SamplingEpoch' }
+        draws:
+          type: array
+          items: { $ref: '#/components/schemas/SamplingDraw' }
+        idempotent: { type: boolean }
+
+    SamplingEpochList:
+      type: object
+      additionalProperties: true
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/SamplingEpoch' }
+        has_more: { type: boolean }
+        next_cursor: { type: [string, 'null'] }
+
+    SamplingEpochDetail:
+      type: object
+      additionalProperties: true
+      required: [epoch, draws]
+      properties:
+        epoch: { $ref: '#/components/schemas/SamplingEpoch' }
+        draws:
+          type: array
+          items: { $ref: '#/components/schemas/SamplingDraw' }
+
+    SamplingResultRequest:
+      type: object
+      additionalProperties: true
+      required: [evidence]
+      properties:
+        evidence: { $ref: '#/components/schemas/AttestationEvidenceRequest' }
+
+    SamplingResultResponse:
+      type: object
+      additionalProperties: true
+      required: [draw, attestation]
+      properties:
+        draw: { $ref: '#/components/schemas/SamplingDraw' }
+        attestation: { $ref: '#/components/schemas/ModelAttestation' }
+
+    SamplingVerifyRequest:
+      type: object
+      additionalProperties: true
+      required: [epoch_id]
+      properties:
+        epoch_id: { type: string, format: uuid }
+
+    SamplingVerifyResponse:
+      type: object
+      additionalProperties: true
+      required: [epoch_id, consistent, commit_ok]
+      properties:
+        epoch_id: { type: string, format: uuid }
+        consistent: { type: boolean }
+        commit_ok: { type: boolean }
+        draw_count: { type: integer, minimum: 0 }
+        expected: { type: array, items: { type: object, additionalProperties: true } }
+        actual: { type: array, items: { type: object, additionalProperties: true } }
+
+    # ------------------------------------------------------------ M12a 节点通知（C15，spec 1.2.13）
+    NodeNotification:
+      type: object
+      additionalProperties: true
+      required: [id, severity, category, template_key, payload, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        severity: { type: string, enum: [P0, P1, P2] }
+        category: { type: string }
+        template_key: { type: string }
+        payload: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+        read_at: { type: [string, 'null'], format: date-time }
+
+    NodeNotificationList:
+      type: object
+      additionalProperties: true
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/NodeNotification' }
+        has_more: { type: boolean }
+        next_cursor: { type: [string, 'null'] }
+
+    NodeNotificationUnread:
+      type: object
+      additionalProperties: true
+      required: [unread]
+      properties:
+        unread: { type: integer, minimum: 0 }
+
+    NodeNotificationAck:
+      type: object
+      additionalProperties: true
+      required: [accepted, state]
+      properties:
+        accepted: { type: boolean }
+        state: { type: string, enum: [queued, delivered, read, expired] }
+
+    NodeNotificationEnqueueRequest:
+      type: object
+      additionalProperties: true
+      required: [node_id, severity, category, template_key]
+      properties:
+        node_id: { type: string }
+        severity: { type: string, enum: [P0, P1, P2] }
+        category: { type: string }
+        template_key: { type: string }
+        payload: { type: object, additionalProperties: true }
+        dedupe_key: { type: [string, 'null'] }
+        expires_at: { type: [string, 'null'], format: date-time }
+
+    NodeNotificationAdmin:
+      type: object
+      additionalProperties: true
+      required: [id, node_id, severity, category, state]
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string }
+        severity: { type: string, enum: [P0, P1, P2] }
+        category: { type: string }
+        template_key: { type: string }
+        payload: { type: object, additionalProperties: true }
+        state: { type: string }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+        delivered_at: { type: [string, 'null'], format: date-time }
+        read_at: { type: [string, 'null'], format: date-time }
+        dedupe_key: { type: [string, 'null'] }
+        delivery_count: { type: [integer, 'null'] }
+
+    NodeNotificationAdminList:
+      type: object
+      additionalProperties: true
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/NodeNotificationAdmin' }
+        has_more: { type: boolean }
+        next_cursor: { type: [string, 'null'] }
+
+    # ------------------------------------------------------------ M18 模型同步（C17，spec 1.2.12）
+    VendorModel:
+      type: object
+      additionalProperties: true
+      required: [vendor, canonical, tokenizer_family, tokenizer_version]
+      properties:
+        vendor: { type: string }
+        canonical: { type: string }
+        aliases:
+          type: array
+          items: { type: string }
+        context_window: { type: [integer, 'null'], minimum: 1 }
+        tokenizer_family: { type: string }
+        tokenizer_version: { type: string }
+        tokenizer_hash: { type: [string, 'null'] }
+        effective_at: { type: [string, 'null'], format: date-time }
+
+    NodeModelCatalog:
+      type: object
+      additionalProperties: true
+      required: [version, not_modified, models]
+      properties:
+        version: { type: integer, minimum: 0 }
+        not_modified: { type: boolean }
+        payload_hash: { type: [string, 'null'] }
+        signature: { type: [string, 'null'] }
+        expires_at: { type: [string, 'null'], format: date-time }
+        models:
+          type: array
+          items: { $ref: '#/components/schemas/VendorModel' }
+
+    NodeModelSyncStateRequest:
+      type: object
+      additionalProperties: true
+      required: [applied_version]
+      properties:
+        applied_version: { type: integer, minimum: 0 }
+        drift:
+          type: array
+          items: { type: string }
+        error_class: { type: [string, 'null'] }
+
+    NodeModelSyncStateAck:
+      type: object
+      additionalProperties: true
+      required: [accepted, server_version]
+      properties:
+        accepted: { type: boolean }
+        server_version: { type: integer, minimum: 0 }
+
+    ModelSyncBundle:
+      type: object
+      additionalProperties: true
+      required: [bundle_id, version, state, models_count]
+      properties:
+        bundle_id: { type: string, format: uuid }
+        version: { type: integer, minimum: 1 }
+        state: { type: string, enum: [draft, published, revoked, rolled_back] }
+        source: { type: string }
+        payload_hash: { type: [string, 'null'] }
+        signature: { type: [string, 'null'] }
+        models_count: { type: integer, minimum: 0 }
+        published_at: { type: [string, 'null'], format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    ModelSyncBundleResponse:
+      type: object
+      additionalProperties: true
+      required: [bundle]
+      properties:
+        bundle: { $ref: '#/components/schemas/ModelSyncBundle' }
+
+    ModelSyncBundleCreateResponse:
+      type: object
+      additionalProperties: true
+      required: [bundle, auto_published]
+      properties:
+        bundle: { $ref: '#/components/schemas/ModelSyncBundle' }
+        auto_published: { type: boolean }
+
+    ModelSyncBundleList:
+      type: object
+      additionalProperties: true
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ModelSyncBundle' }
+        has_more: { type: boolean }
+        next_cursor: { type: [string, 'null'] }
+
+    ModelSyncBundleCreateRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        source: { type: string }
+        note: { type: [string, 'null'] }
+
+    NodeModelSyncState:
+      type: object
+      additionalProperties: true
+      required: [node_id, applied_version, updated_at, in_sync]
+      properties:
+        node_id: { type: string }
+        applied_version: { type: integer, minimum: 0 }
+        applied_at: { type: [string, 'null'], format: date-time }
+        updated_at: { type: string, format: date-time }
+        in_sync: { type: boolean }
+        drift:
+          type: object
+          additionalProperties: true
+        error_class: { type: [string, 'null'] }
+
+    NodeModelSyncStateList:
+      type: object
+      additionalProperties: true
+      required: [items, has_more, server_version]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/NodeModelSyncState' }
+        server_version: { type: integer, minimum: 0 }
+        has_more: { type: boolean }
 
     # ------------------------------------------------------------ M17 证明（C12，spec 1.2.11）
     AttestationLevel:

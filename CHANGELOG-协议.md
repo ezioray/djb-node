@@ -3,6 +3,64 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.13 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 5 条节点/管理面路径、6 个操作、7 个 schema）
+**计数**：139 → 144 路径、159 → 165 操作、252 → 259 schema
+
+**变更**
+1. `GET /api/v1/node/notifications`：节点离线补拉（本节点、未过期、分类、keyset 游标）。
+2. `POST .../{id}/ack`、`.../{id}/read`（read 隐含 ack，幂等）。
+3. `GET .../unread_count`：未读角标。
+4. 管理面 `POST|GET /api/v1/admin/notifications/node`：入队/列表（运营/排障）。
+5. payload 白名单 + PII/正文/凭据键拒绝；P0 必带过期；180 天保留。
+6. 开关 `notify.node_push.enabled` 默认关；`DJB_NODE_PUSH=1` S2 激活。
+
+**影响面**
+- C15/C16：服务端队列 + 客户端消息中心；C10 `notify.push` 帧后续复用 pull/ack。
+- 不碰账本；不写正文。
+
+**复核人**：lead（C15 实现 / 规格登记；证据 `DEV-C15-PUSH-20261024T200821Z.txt`）
+
+## 1.2.14 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 5 条管理面路径、6 个操作、13 个 schema）
+**计数**：144 → 149 路径、165 → 171 操作、259 → 272 schema
+
+**变更**
+1. M17 可验证随机抽检：`POST/GET /api/v1/admin/supply/integrity/sampling/epochs`、`GET /{id}`、
+   `POST /{id}/reveal`、`POST /draws/{id}/result`、`POST /verify`。
+2. commit-reveal：open 只存 `sha256(seed)`，seed 仅在 open 响应出现一次；reveal 校验承诺后
+   HMAC 排序 + 贡献权重无放回抽签；同 seed 可复算。
+3. 结果复用 C12 证据：L3→passed、L2/L1→failed、过期→missed；escalate 只给 I0/I1/I2 建议。
+4. 开关 `supply.sampling.enabled` 默认关；`DJB_SAMPLING=1` S2 激活。
+5. 不写账本；seed 不落库；抽检不下发正文。
+
+**复核人**：lead（C14b 实现 / 规格登记；证据 `DEV-C14-SAMPLING-20261024T195903Z.txt`）
+
+## 1.2.12 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 6 条节点/管理面路径、7 个操作、11 个 schema；不改既有路径语义）
+**计数**：133 → 139 路径、152 → 159 操作、241 → 252 schema
+
+**变更**
+1. `GET /api/v1/node/model-catalog?since=`：拉取模型/tokenizer 签名 bundle；`since` 已最新 → `not_modified=true`。
+2. `POST /api/v1/node/model-sync/state`：上报已应用版本/漂移/错误类。
+3. 管理面：bundle 列表/创建/发布/回滚 + 节点同步状态（5 条）。
+4. `payload_hash` = canonical JSON `{version, expires_at, models}` 的 sha256；`signature` = `hmac-sha256:` + HMAC(payload_hash)。
+5. 只分发元数据/指纹（vendor/canonical/aliases/context/tokenizer family/version/hash/effective_at），**不分发厂商 tokenizer 权重**。
+6. 开关 `model.sync.enabled` 默认关；`DJB_MODEL_SYNC=1` S2 激活；`model.sync.auto_publish` 默认关。
+
+**影响面**
+- M18/C17：服务端注册表 + bundle；客户端 M18b 已实现同口径校验。
+- M03/M13：后续 `/v1/models` 增加 tokenizer 版本、门户展示（1.2.13）。
+- M17：版本不一致时降为 unknown/不冻结（后续接线）。
+
+**兼容矩阵**
+- 只加不改；无破坏性变更。
+
+**复核人**：lead（C17 实现 / 规格登记；证据 `DEV-M18-SERVER-20261024T194914Z.txt`）
+
 ## 1.2.11 · 2026-10-24 · MINOR
 
 **类型**：MINOR（新增 3 条节点/管理面路径、3 个操作、8 个 schema；不改既有路径语义）
