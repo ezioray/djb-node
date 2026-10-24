@@ -29,7 +29,7 @@ tokens = ["tiktoken>=0.7"]
 djb = "djb_node.cli:main"
 
 [tool.setuptools]
-packages = ["djb_node", "djb_node.platform"]
+packages = ["djb_node", "djb_node.platform", "djb_node.tray"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
