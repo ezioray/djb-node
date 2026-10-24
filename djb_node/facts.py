@@ -205,3 +205,123 @@ DIAGNOSE_SCAN_PATTERNS: tuple[str, ...] = (
     r"hmac-sha256:[0-9a-f]{64}",
     r"Bearer\s+[A-Za-z0-9._\-]{16,}",
 )
+
+# ─────────────────────────────────────────────────────────── M17 · supply-integrity（C11 relay / C12 attest）
+# 口径来源：product/v4/modules/M17-supply-integrity.md §4（relay）、§5.1–5.3（L0–L5 / tokenizer）、
+# §8（接口只加不改）、§9（开关三字段）。只加不改：本段不修改任何既有常量。
+UPSTREAM_KINDS: tuple[str, ...] = (
+    "official_api", "local_agent", "enterprise_gateway", "third_party_relay")
+"""M17 §4.1：可选 upstream_kind（老服务端忽略未知值）。"""
+RELAY_KIND = "third_party_relay"
+
+RELAY_AUTH_SCHEMES: tuple[str, ...] = ("bearer", "x-api-key", "api-key", "custom")
+"""M17 §4.3：auth_scheme；custom 必须显式给 header_name。"""
+RELAY_AUTH_HEADER: dict[str, str] = {
+    "bearer": "Authorization", "x-api-key": "X-Api-Key", "api-key": "Api-Key"}
+RELAY_AUTH_PREFIX: dict[str, str] = {"bearer": "Bearer ", "x-api-key": "", "api-key": ""}
+RELAY_FORBIDDEN_HEADERS: tuple[str, ...] = (
+    "host", "authorization", "content-length", "transfer-encoding", "connection",
+    "cookie", "set-cookie", "proxy-authorization", "proxy-authenticate", "upgrade",
+    "te", "trailer")
+"""extra_headers 永不可覆盖的传输/认证头（Host / Authorization 冲突一律拒绝）。"""
+RELAY_EXTRA_HEADER_ALLOWLIST: tuple[str, ...] = (
+    "x-title", "x-app", "x-app-name", "x-client", "x-client-name", "x-request-id",
+    "x-api-version", "anthropic-version", "anthropic-beta", "openai-beta",
+    "x-stainless-lang", "x-stainless-package-version")
+"""M17 §4.3：extra_headers 白名单（小写比较，未列入即拒绝）。"""
+RELAY_SECRET_QUERY_PARAMS: tuple[str, ...] = (
+    "key", "api_key", "apikey", "api-key", "token", "access_token", "auth", "secret",
+    "sig", "signature", "password", "passwd", "credential")
+"""URL query 里出现这些参数名即视为「key 进 URL」→ 拒绝（M17 §4.3）。"""
+RELAY_LOCAL_HOSTS: tuple[str, ...] = ("127.0.0.1", "::1", "localhost")
+"""只对回环允许 http://；其余 relay 端点必须 https://。"""
+RELAY_TIMEOUT_DEFAULTS: dict[str, float] = {"connect": 5.0, "first_byte": 30.0, "total": 120.0}
+RELAY_TIMEOUT_MAX_S = 600.0
+RELAY_MAX_EXTRA_HEADERS = 16
+RELAY_HEADER_VALUE_MAX_LEN = 256
+RELAY_PROFILE_KEY_PREFIX = "relay:"
+RELAY_INDEX_KEY = "relay:index"
+RELAY_PROFILE_SCHEMA = 1
+RELAY_MODEL_STATES: tuple[str, ...] = ("mapped", "unmapped", "rejected")
+"""unmapped = 未映射：不公告、不接单（M17 §4.4）。"""
+
+RELAY_VENDOR_HINTS: dict[str, str] = {
+    # 模型 id 前缀 → canonical vendor（最长前缀优先）。只用于「能归一就自动映射」。
+    "gpt": "openai", "o1": "openai", "o3": "openai", "o4": "openai",
+    "chatgpt": "openai", "text-embedding": "openai", "dall-e": "openai",
+    "claude": "anthropic", "gemini": "google", "gemma": "google",
+    "deepseek": "deepseek", "qwen": "qwen", "qwq": "qwen",
+    "glm": "zhipu", "chatglm": "zhipu", "kimi": "moonshot", "moonshot": "moonshot",
+    "llama": "meta", "mistral": "mistral", "mixtral": "mistral", "grok": "xai",
+}
+RELAY_CANONICAL_CANDIDATE_LIMIT = 5
+
+# ── C12 attestation（§5.1–5.3）
+ATTEST_LEVELS: tuple[str, ...] = ("L0", "L1", "L2", "L3", "L4", "L5")
+ATTEST_LEVEL_NAMES: dict[str, str] = {
+    "L0": "declared", "L1": "reachable", "L2": "inference",
+    "L3": "tokenizer", "L4": "behavioral", "L5": "provider"}
+ATTEST_LEVEL_METHOD: dict[str, str] = {
+    "L1": "l1_models", "L2": "l2_inference", "L3": "l3_tokenizer",
+    "L4": "behavioral", "L5": "provider"}
+"""等级 → 证据方法（§4.5 / §5.2）。"""
+ATTEST_LEVEL_TTL_S: dict[str, int] = {
+    "L0": 0, "L1": 24 * 3600, "L2": 24 * 3600, "L3": 7 * 86400,
+    "L4": 30 * 86400, "L5": 90 * 86400}
+"""M17 §5.7：L1/L2 24h、L3 7d、L4 30d、L5 90d（可配，不硬编码在业务里）。"""
+ATTEST_STATES: tuple[str, ...] = (
+    "declared", "reachable", "inference", "tokenizer", "behavioral", "provider",
+    "failed", "expired", "suspended")
+ATTEST_BLOCKING_STATES: tuple[str, ...] = ("failed", "expired", "suspended")
+"""这些状态下一律不公告、不接单（与等级无关）。"""
+ATTEST_MIN_SERVICE_LEVEL = "L3"
+"""§5.1：容量公告与调度只认 L3+；S2 付费流量最低门槛。"""
+ATTEST_TRUST = "client_side_clue"
+"""§1 / §11：客户端证据只作线索，不得自我宣称 verified。"""
+ATTEST_TOKENIZER_TOLERANCE_PCT = 1.0
+ATTEST_TOKENIZER_TOLERANCE_TOKENS = 1
+"""§5.1 / §5.3：容差 ±1 token 或 1%，取较大者（整数化 = ceil）。"""
+ATTEST_TOKENIZER_RESULTS: tuple[str, ...] = ("match", "mismatch", "unknown")
+ATTEST_EVIDENCE_RESULTS: tuple[str, ...] = ("ok", "match", "mismatch", "unknown", "error")
+ATTEST_EVIDENCE_MAX_KEPT = 20
+ATTEST_NONCE_TTL_S = 24 * 3600
+ATTEST_NONCE_MAX_ENTRIES = 4096
+ATTEST_KEY_PREFIX = "attest:"
+ATTEST_INDEX_KEY = "attest:index"
+ATTEST_NONCE_KEY = "attest:nonces"
+ATTEST_RECORD_SCHEMA = 1
+ATTEST_TOKENIZER_HINTS: dict[str, str] = {
+    # 本地已知 tokenizer 家族指纹（最长前缀优先）；拿不到就 unknown，不猜。
+    "gpt-4o": "openai:o200k", "gpt-4.1": "openai:o200k", "o1": "openai:o200k",
+    "o3": "openai:o200k", "o4": "openai:o200k",
+    "gpt-4": "openai:cl100k", "gpt-3.5": "openai:cl100k",
+    "claude": "anthropic:claude", "gemini": "google:sentencepiece",
+    "deepseek": "deepseek:bbpe", "qwen": "qwen:bbpe", "glm": "zhipu:bbpe",
+    "kimi": "moonshot:bbpe", "llama": "meta:llama3", "mistral": "mistral:tekken",
+}
+ATTEST_COUNTER_CANDIDATES: tuple[str, ...] = ("count_prompt_tokens", "count_tokens")
+"""惰性 import djb_node.tokens（C8 写域）时尝试的函数名；缺失即降级 unknown。"""
+
+# ── §9 特性开关（三字段齐全 + default，默认关闭；客户端侧只用这两条）
+# Lead 集成口径：开关只登记在 facts.FEATURE_FLAGS，取值统一走 config.feature_flag()。
+# C7（client.probe.periodic.enabled）与 C8 的条目由 Lead 合并本段，不要在这里重定义他人开关。
+FEATURE_FLAGS: dict[str, dict] = {
+    "client.relay.enabled": {
+        "owner": "client-seat",
+        "expire_at": "2026-12-31",
+        "rollback_rule": "关闭 → 隐藏 relay 接入；已有配置只读、不删除",
+        "default": False,
+        "description": "第三方中转站接入（M17 §4 / C11），默认关闭",
+    },
+    "supply.attestation.enabled": {
+        "owner": "lead",
+        "expire_at": "2026-12-31",
+        "rollback_rule": "关闭 → 回退 L2 可达性判定；已有路由/账本不变；已存证明保留只读",
+        "default": False,
+        "description": "模型身份证明（M17 §5 / C12 客户端侧线索采集），默认关闭",
+    },
+}
+"""特性开关（M17 §9：owner / expire_at / rollback_rule / default，默认关闭）。"""
+RELAY_FLAG = "client.relay.enabled"
+ATTEST_FLAG = "supply.attestation.enabled"
+FLAG_REQUIRED_FIELDS: tuple[str, ...] = ("owner", "expire_at", "rollback_rule", "default")

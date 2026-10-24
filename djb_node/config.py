@@ -192,6 +192,40 @@ def load_config(paths: Paths) -> ClientConfig:
     return ClientConfig.from_dict(raw)
 
 
+_TRUE_TEXT = ("1", "true", "on", "yes", "y", "enabled")
+
+
+def feature_flag(config: ClientConfig, name: str) -> bool:
+    """特性开关求值（**默认关闭**；未知开关一律按默认值）。
+
+    M17 §9：开关必须三字段齐全（owner / expire_at / rollback_rule）且默认关闭，
+    定义在 `facts.FEATURE_FLAGS`。本机取值只读 config.json 的非敏感 `extra`
+    （`feature_flags` 子字典优先，其次同名平铺键），不覆盖服务端 policy。
+    """
+    spec = facts.FEATURE_FLAGS.get(str(name)) or {}
+    default = bool(spec.get("default", False))
+    extra = config.extra if isinstance(config.extra, dict) else {}
+    nested = extra.get("feature_flags")
+    value: Any = None
+    if isinstance(nested, dict) and name in nested:
+        value = nested[name]
+    elif name in extra:
+        value = extra[name]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUE_TEXT
+    if isinstance(value, int) and not isinstance(value, bool):
+        return bool(value)
+    return default
+
+
+def flag_spec(name: str) -> dict[str, Any]:
+    """开关定义（三字段 + 默认值），用于 status / 诊断展示。"""
+    spec = facts.FEATURE_FLAGS.get(str(name)) or {}
+    return dict(spec)
+
+
 def save_config(paths: Paths, config: ClientConfig) -> None:
     config.validate()
     paths.prepare()
