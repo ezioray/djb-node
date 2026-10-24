@@ -21,6 +21,9 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+# C8：真分词器只是 optional extra，**不是**运行时依赖（缺失时 djb_node.tokens 走启发式
+# 估算并标 estimated=True）。装法：pip install "djb-node[tokens]"
+tokens = ["tiktoken>=0.7"]
 
 [project.scripts]
 djb = "djb_node.cli:main"

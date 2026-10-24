@@ -14,6 +14,9 @@
   Authorization: Bearer <token>，常量时间比较；缺失/错误 -> 401 + 40101。
 * 错误信封与 spec Error 一致（type / code / message / request_id）。
 * **不落正文**：请求/响应 body 不写日志、不写数据库；只记元数据（模型、状态、tokens、耗时）。
+* C8：开关 ``client.token.compare.enabled``（默认关闭）打开时，额外做「本地 token 计数 vs
+  上游 usage」差异检测，>1% 记 ``token_mismatch``（只有数字与来源，不含正文）。
+  **不改写上游 usage、不改收据金额**；开关关闭时行为和以前完全一致。
 """
 from __future__ import annotations
 
@@ -26,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any, Protocol
 
-from . import facts, protocol
+from . import facts, protocol, tokens
 from .errors import PortInUseError, UsageError
 from .httpclient import HttpClient, InputStream, join_url
 from .logging_setup import event
@@ -106,7 +109,8 @@ class _Server(ThreadingHTTPServer):
 
 class LocalApiServer:
     def __init__(self, runtime: Runtime, *, token: str, host: str = facts.MIRROR_HOST,
-                 port: int = facts.MIRROR_PORT, http: HttpClient | None = None) -> None:
+                 port: int = facts.MIRROR_PORT, http: HttpClient | None = None,
+                 settings: dict[str, Any] | None = None) -> None:
         if not token or len(token) < facts.LOCAL_TOKEN_MIN_BYTES:
             raise UsageError("local_token 长度不足（至少 " + str(facts.LOCAL_TOKEN_MIN_BYTES)
                              + " 字节）")
@@ -115,6 +119,8 @@ class LocalApiServer:
         self.host = validate_bind_host(host)
         self.port = int(port)
         self.http = http or HttpClient(timeout=UPSTREAM_TIMEOUT_S)
+        # C8：开关宿主（client.* 配置树 / extra）；缺省 None = 按 facts 默认（关闭）
+        self.settings = dict(settings or {})
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -179,6 +185,11 @@ class LocalApiServer:
     def token_fingerprint(self) -> str:
         from .util import sha256_hex
         return sha256_hex("djb-local-token:" + self.token)[:12]
+
+    # ── C8：本地 token 计数 vs 上游 usage（开关默认关闭）
+    def token_compare_enabled(self) -> bool:
+        """开关 ``client.token.compare.enabled``（默认关闭 = 只记录上游 usage）。"""
+        return tokens.compare_enabled(self.settings)
 
 
 # ─────────────────────────────────────────────────────────── HTTP handler
@@ -387,6 +398,8 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                 server.runtime.observe(model=model, prompt_tokens=usage[0],
                                        completion_tokens=usage[1], total_tokens=usage[2],
                                        request_id=request_id)
+                self._compare_tokens(model, payload, usage, stream=False,
+                                     request_id=request_id)
             self.send_response(response.status)
             self.send_header("Content-Type", response.headers.get(
                 "content-type", "application/json; charset=utf-8"))
@@ -410,6 +423,36 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                 return
             event("local_api.upstream_status", level="warning", model=model,
                   status=status, request_id=request_id)
+
+        def _compare_tokens(self, model: str, payload: dict[str, Any],
+                            usage: tuple[int, int, int], *, stream: bool,
+                            request_id: str) -> None:
+            """C8 差异检测：本地估算 vs 上游 prompt tokens，>1% 记一条事件。
+
+            * 开关关闭（默认）→ 直接返回，行为与接入前一致；
+            * **只读**：不改 `usage`、不改转发 body、不动 `observe()` 入参、不碰收据金额；
+            * 事件只含 model / 本地 / 上游 / 差值 / 来源 / tokenizer_id，**不含正文**；
+            * 计数异常不得影响转发（捕获后只记一条 warning）。
+            """
+            if not server.token_compare_enabled():
+                return
+            try:
+                local = tokens.count_messages(model, payload.get("messages"),
+                                              tools=payload.get("tools"))
+                mismatch = tokens.compare_counts(local.tokens, usage[0])
+                if mismatch is None:
+                    return
+                event("token_mismatch", level="warning", model=model,
+                      source=("stream" if stream else "json"),
+                      local_tokens=mismatch.local_tokens,
+                      upstream_tokens=mismatch.upstream_tokens,
+                      delta_tokens=mismatch.delta_tokens,
+                      delta_pct=mismatch.delta_pct,
+                      tokenizer_id=local.tokenizer_id, estimated=local.estimated,
+                      request_id=request_id)
+            except Exception as exc:                           # 计数失败不阻断转发
+                event("local_api.token_compare_failed", level="warning", model=model,
+                      error=type(exc).__name__, request_id=request_id)
 
         # ── 转发：SSE
         def _forward_stream(self, url: str, payload: dict[str, Any],
@@ -466,6 +509,8 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                     server.runtime.observe(model=model, prompt_tokens=usage[0],
                                            completion_tokens=usage[1], total_tokens=usage[2],
                                            request_id=request_id)
+                    self._compare_tokens(model, payload, usage, stream=True,
+                                         request_id=request_id)
                 event("local_api.chat_stream", model=model, status=200,
                       access=target.access, tokens=(usage[2] if usage else None),
                       request_id=request_id)
