@@ -24,21 +24,26 @@
 * **开关默认关闭**：``client.channel.enabled``（见 ``facts.FEATURE_FLAGS``）；关闭时
   daemon 不创建本客户端，行为与无通道版本完全一致（回滚：已取 job 尽力回传后停止）。
 
-job（平台 → 节点，字段按需，缺省有兜底）::
+job（平台 → 节点；spec 1.2.9 ``NodeChannelPollResponse.job``）::
 
-    {"job_id": "job-1", "node_id": "node-1", "timeout_s": 120,
-     "requests": {"model": "gpt-4o-mini", "messages": [...],
-                  "max_tokens": 512, "temperature": 0.7, "stop": ["\\n\\n"]}}
+    {"job": {"job_id": "job-1", "kind": "chat.completions", "request_id": "req-1",
+             "model": "gpt-4o-mini", "messages": [...], "max_tokens": 512,
+             "temperature": 0.7, "stop": ["\\n\\n"], "timeout_s": 120,
+             "lease_expires_at": "2026-10-24T00:05:00Z"},
+     "server_time": "2026-10-24T00:00:00Z"}
 
-结果（节点 → 平台）::
+``parse_job`` 同时兼容请求体嵌套在 ``request`` / ``requests`` 或扁平形状。
 
-    {"job_id": "job-1", "node_id": "node-1", "status": "succeeded",
-     "content": "...", "finish_reason": "stop",
-     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-     "duration_ms": 123, "completed_at": "2026-10-24T00:00:00Z"}
-    {"job_id": "job-1", "node_id": "node-1", "status": "failed",
-     "error_code": 50903, "error_class": "upstream_error", "duration_ms": 42,
-     "completed_at": "..."}
+结果（节点 → 平台；字段严格按 ``NodeChannelResultRequest``，多余都会被丢弃）::
+
+    {"job_id": "job-1", "status": "completed", "content": "...",
+     "finish_reason": "stop", "tokens_in": 7, "tokens_out": 2,
+     "usage_source": "actual", "latency_ms": 123}
+    {"job_id": "job-1", "status": "failed", "error_code": "50903",
+     "error_class": "upstream_error", "latency_ms": 42}
+
+``status`` 只有 ``completed`` / ``failed``；**不发** ``node_id`` / ``usage`` 嵌套 /
+``duration_ms`` / ``completed_at``（C10a 契约里没有这些字段）。
 """
 from __future__ import annotations
 
@@ -94,8 +99,11 @@ class ChannelJob:
         return body
 
 
-def _timeout_of(raw: Mapping[str, Any]) -> float:
-    value = raw.get("timeout_s")
+def _timeout_of(payload: Mapping[str, Any], request: Mapping[str, Any]) -> float:
+    """timeout_s：job 顶层优先，其次 request 内（C10a/C10b 两种形状都认）。"""
+    value = payload.get("timeout_s")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        value = request.get("timeout_s")
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return float(facts.CHANNEL_JOB_TIMEOUT_DEFAULT_S)
     seconds = float(value)
@@ -103,22 +111,51 @@ def _timeout_of(raw: Mapping[str, Any]) -> float:
                min(seconds, float(facts.CHANNEL_JOB_TIMEOUT_MAX_S)))
 
 
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _request_of(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """取「请求体」这一段：``request``（C10a）→ ``requests``（历史）→ 顶层（spec 扁平形状）。"""
+    for key in ("request", "requests"):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return payload
+
+
 def parse_job(payload: Any) -> ChannelJob | None:
-    """平台 job → ChannelJob；缺 job_id / 请求体不合法返回 None（调用方回 failed）。"""
+    """平台 job → ChannelJob；缺 job_id / 请求体不合法返回 None（调用方回 failed）。
+
+    兼容三种形状（只加不改）：
+
+    * 派发信封 ``{"job": {...}, "server_time": ...}``（spec NodeChannelPollResponse）；
+    * 请求体嵌套在 ``request``（C10a）或 ``requests``（C10c 早期）里；
+    * spec 的扁平 ``NodeChannelJob``（model / messages 与 job_id 同级）。
+
+    ``lease_expires_at`` 只用于平台侧重派，客户端忽略（本地执行按 timeout_s 截断）。
+    """
     if not isinstance(payload, Mapping):
         return None
-    job_id = str(payload.get("job_id") or "").strip()
-    request = payload.get("requests")
-    if not isinstance(request, Mapping):
-        request = payload.get("request")
-    if not job_id or not isinstance(request, Mapping):
+    envelope = payload.get("job")
+    if isinstance(envelope, Mapping):
+        payload = envelope
+    request = _request_of(payload)
+    job_id = str(payload.get("job_id") or request.get("job_id") or "").strip()
+    if not job_id:
         return None
     model = str(request.get("model") or "").strip()
     messages = request.get("messages")
     if not model or not isinstance(messages, list) or not messages:
         return None
-    max_tokens = request.get("max_tokens")
-    temperature = request.get("temperature")
     stop = request.get("stop")
     node_id = payload.get("node_id")
     return ChannelJob(
@@ -126,16 +163,22 @@ def parse_job(payload: Any) -> ChannelJob | None:
         node_id=str(node_id) if isinstance(node_id, str) and node_id else None,
         model=model,
         messages=messages,
-        max_tokens=int(max_tokens) if isinstance(max_tokens, int) and not isinstance(
-            max_tokens, bool) else None,
-        temperature=float(temperature) if isinstance(temperature, (int, float)) and not
-        isinstance(temperature, bool) else None,
+        max_tokens=_int_or_none(request.get("max_tokens")),
+        temperature=_float_or_none(request.get("temperature")),
         stop=[str(item) for item in stop] if isinstance(stop, list) else None,
-        timeout_s=_timeout_of(payload),
+        timeout_s=_timeout_of(payload, request),
     )
 
 
-# ─────────────────────────────────────────────────────────── 错误映射
+# ─────────────────────────────────────────────────────────── 结果（wire 契约）
+#: spec 1.2.9 ``NodeChannelResultRequest`` 字段（只发这些；多余的会被 M02 丢弃或 40001）
+WIRE_FIELDS: tuple[str, ...] = ("job_id", "status", "content", "finish_reason",
+                                "tokens_in", "tokens_out", "usage_source", "latency_ms",
+                                "error_code", "error_class", "upstream_request_id")
+#: ``usage_source`` 取值：C10b ``facts.USAGE_SOURCES`` = (estimated, actual, dual)
+USAGE_SOURCE_ACTUAL = "actual"
+USAGE_SOURCE_ESTIMATED = "estimated"
+
 _LOCAL_ERROR_BY_STATUS: dict[int, tuple[int, str]] = {
     400: (facts.LOCAL_ERROR_CODES["invalid_request"], "invalid_request"),
     401: (facts.LOCAL_ERROR_CODES["unauthorized"], "unauthorized"),
@@ -146,21 +189,27 @@ _LOCAL_ERROR_BY_STATUS: dict[int, tuple[int, str]] = {
 }
 
 
-def result_for_error(job_id: str, status: int, *, node_id: str | None = None,
-                     duration_ms: int = 0, error_class: str | None = None) -> dict[str, Any]:
-    """本机 4xx/5xx / 网络失败 → failed 结果（只带错误码与错误类，不带上游正文）。"""
+def result_for_error(job_id: str, status: int, *, error_class: str | None = None,
+                     latency_ms: int | None = None) -> dict[str, Any]:
+    """本机 4xx/5xx / 网络失败 → ``status=failed`` 结果（wire 字段见 ``WIRE_FIELDS``）。
+
+    * ``error_code`` 按 spec 发**字符串**（``"50903"``），不发整数；
+    * 不发 ``node_id`` / ``duration_ms`` / ``completed_at``（契约无此字段）；
+    * 不带上游正文（错误只按类别粗粒度描述）。
+    """
     code, klass = _LOCAL_ERROR_BY_STATUS.get(int(status),
                                              (facts.LOCAL_ERROR_CODES["upstream_error"],
                                               "upstream_error"))
-    if status >= 500 and int(status) not in _LOCAL_ERROR_BY_STATUS:
+    if int(status) >= 500 and int(status) not in _LOCAL_ERROR_BY_STATUS:
         klass = "upstream_error"
     payload: dict[str, Any] = {
-        "job_id": job_id, "status": "failed", "error_code": code,
-        "error_class": error_class or klass, "duration_ms": int(duration_ms),
-        "completed_at": iso(utcnow()),
+        "job_id": job_id,
+        "status": "failed",
+        "error_code": str(code),
+        "error_class": error_class or klass,
     }
-    if node_id:
-        payload["node_id"] = node_id
+    if latency_ms is not None:
+        payload["latency_ms"] = max(0, int(latency_ms))
     return payload
 
 
@@ -191,6 +240,7 @@ class ChannelClient:
         self._jobs_failed = 0
         self._last_error: str | None = None
         self._last_job_id: str | None = None
+        self._last_job_at: str | None = None
         self._lock = threading.Lock()
 
     # ── 观察面（status / 诊断；不含正文与令牌）
@@ -202,6 +252,7 @@ class ChannelClient:
                     "jobs_done": self._jobs_done,
                     "jobs_failed": self._jobs_failed,
                     "last_job_id": self._last_job_id,
+                    "last_job_at": self._last_job_at,
                     "last_error": self._last_error,
                     "wait_s": facts.CHANNEL_POLL_WAIT_S}
 
@@ -281,12 +332,11 @@ class ChannelClient:
               model=job.model, timeout_s=job.timeout_s)
         result = self._execute(job)
         duration_ms = int((time.monotonic() - started) * 1000)
-        result["duration_ms"] = duration_ms
-        result["completed_at"] = iso(self._now())    # 注入时钟（测试可控）
+        self._last_job_at = iso(self._now())        # 只进 status / 诊断，不上 wire
         self._submit(result)
-        if result.get("status") == "succeeded":
+        if result.get("status") == "completed":
             self._jobs_done += 1
-            event("channel.job_done", job_id=job.job_id, status="succeeded",
+            event("channel.job_done", job_id=job.job_id, status="completed",
                   duration_ms=duration_ms)
         else:
             self._jobs_failed += 1
@@ -296,23 +346,37 @@ class ChannelClient:
             self._set_state("polling")
 
     def _execute(self, job: ChannelJob) -> dict[str, Any]:
-        """调本机镜像端点；成功映射 content/finish_reason/usage，失败映射 error_code。"""
+        """调本机镜像端点；成功映射 content/finish_reason/tokens_*，失败映射 error_code。"""
         body = job.body()
+        started = time.monotonic()
         try:
             response = self.chat_call(body, job.timeout_s)
         except (TimeoutError, OSError):            # 注入替身直接抛原生超时/连接错误
-            return result_for_error(job.job_id, 504, node_id=job.node_id,
-                                    error_class="upstream_timeout")
+            return result_for_error(job.job_id, 504, error_class="upstream_timeout",
+                                    latency_ms=self._elapsed_ms(started))
         except DjbError as exc:
             status = 504 if getattr(exc, "reason", None) == "timeout" else 502
-            return result_for_error(job.job_id, status, node_id=job.node_id)
+            return result_for_error(job.job_id, status,
+                                    latency_ms=self._elapsed_ms(started))
+        latency_ms = self._elapsed_ms(started)
         status = int(getattr(response, "status", 0) or 0)
         payload = response.json() if callable(getattr(response, "json", None)) else None
         if not (200 <= status < 300) or not isinstance(payload, dict):
-            return result_for_error(job.job_id, status or 502, node_id=job.node_id)
-        return self._result_from_chat(job, payload)
+            return result_for_error(job.job_id, status or 502, latency_ms=latency_ms)
+        return self._result_from_chat(job, payload, latency_ms=latency_ms)
 
-    def _result_from_chat(self, job: ChannelJob, payload: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _elapsed_ms(started: float) -> int:
+        return max(0, int((time.monotonic() - started) * 1000))
+
+    def _result_from_chat(self, job: ChannelJob, payload: dict[str, Any], *,
+                          latency_ms: int | None = None) -> dict[str, Any]:
+        """本机 200 响应 → ``status=completed`` 契约结果（tokens_in/out + usage_source）。
+
+        * 上游给了 usage → ``tokens_in/tokens_out`` 为整数，``usage_source="actual"``；
+        * 上游没给 usage → **不发** tokens_in/tokens_out（spec 里是 integer，发 null 会破坏
+          类型），``usage_source="estimated"``；平台侧 ``int_or_none`` 取到的同样是空值。
+        """
         choices = payload.get("choices")
         choice = choices[0] if isinstance(choices, list) and choices else {}
         if not isinstance(choice, Mapping):
@@ -320,20 +384,29 @@ class ChannelClient:
         message = choice.get("message")
         content = message.get("content") if isinstance(message, Mapping) else None
         usage = payload.get("usage")
-        clean_usage: dict[str, int] = {}
+        tokens_in = tokens_out = None
         if isinstance(usage, Mapping):
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                value = usage.get(key)
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    clean_usage[key] = value
-        return {
+            candidate_in = _int_or_none(usage.get("prompt_tokens"))
+            candidate_out = _int_or_none(usage.get("completion_tokens"))
+            if candidate_in is not None:
+                tokens_in = max(0, candidate_in)
+            if candidate_out is not None:
+                tokens_out = max(0, candidate_out)
+        result: dict[str, Any] = {
             "job_id": job.job_id,
-            "node_id": job.node_id,
-            "status": "succeeded",
+            "status": "completed",
             "content": content if isinstance(content, str) else "",
             "finish_reason": choice.get("finish_reason"),
-            "usage": clean_usage,
+            "usage_source": (USAGE_SOURCE_ACTUAL if tokens_in is not None
+                             or tokens_out is not None else USAGE_SOURCE_ESTIMATED),
         }
+        if tokens_in is not None:
+            result["tokens_in"] = tokens_in
+        if tokens_out is not None:
+            result["tokens_out"] = tokens_out
+        if latency_ms is not None:
+            result["latency_ms"] = max(0, int(latency_ms))
+        return result
 
     # ── 结果回传（幂等键 = job_id；网络类失败重试一次）
     def _submit(self, payload: dict[str, Any]) -> None:
