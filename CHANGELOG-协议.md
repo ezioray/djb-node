@@ -3,6 +3,33 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.2.11 · 2026-10-24 · MINOR
+
+**类型**：MINOR（新增 3 条节点/管理面路径、3 个操作、8 个 schema；不改既有路径语义）
+**计数**：130 → 133 路径、149 → 152 操作、233 → 241 schema
+
+**变更**
+1. 新增 `POST /api/v1/node/upstream/attest/challenge`：签发 L1–L3 合成探针（5 min TTL、一次性）；
+2. 新增 `POST /api/v1/node/upstream/attest`：回传证据；**服务端自己用 tokenizer 计数比对**
+   （容差 `max(1, ceil(expected*1%))`），match→L3，超容差→L2 + `tokenizer_mismatch`（不判作弊），
+   无 usage→L2/L1，failed→L0；只升不降；挑战重放/跨 node/model 100% 拒绝。
+3. 新增 `GET /api/v1/admin/supply/integrity/attestations`：证明列表（node/model/level）。
+4. `ModelAttestation`：id/node_id/upstream_id/model/level/state/source/tokenizer_version/evidence_ref/verified_at/expires_at；
+   TTL L1/L2 24h、L3 7d（L4 30d / L5 90d 预留给 C13）。
+5. 开关 `supply.attestation.enabled` 默认关；S2 测试网 `DJB_ATTEST=1` 显式激活。
+
+**影响面**
+- M17 证明段：服务端 L3+ 可定级；M04/M02 可按 `is_attested` 门控（接线由 Lead 排期）。
+- 客户端：后续 `djb attest` 接 challenge/report（当前仍本地线索）。
+- M05/M06：无影响；证明不写账本。
+- 旧客户端：不涉及公开 `/v1`。
+
+**兼容矩阵**
+- v1 未发布 → 不适用；无破坏性变更。
+- 与 1.2.10 的关系：纯新增。
+
+**复核人**：lead（C12 实现 / 规格登记；证据 `DEV-C12-ATTEST-20261024T191751Z.txt`）
+
 ## 1.2.10 · 2026-10-24 · MINOR
 
 **类型**：MINOR（新增 3 条管理面路径 / 4 个操作 / 8 个 schema；不改既有路径语义）
