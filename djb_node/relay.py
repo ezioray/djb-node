@@ -49,7 +49,7 @@ from .errors import DjbError, FeatureDisabled, UsageError, VerifyError
 from .httpclient import HttpClient, HttpResponse
 from .secure import CredentialStore
 from .store import Store
-from .util import iso, utcnow
+from .util import iso, parse_iso, utcnow
 
 HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]{1,64}$")
 PIN_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -734,6 +734,58 @@ def announceable_models(profile: RelayProfile) -> list[str]:
 def is_serviceable(profile: RelayProfile, canonical: str) -> bool:
     """未映射 / 已关闭的模型不接单（§4.4.3）。"""
     return str(canonical) in announceable_models(profile)
+
+
+# ─────────────────────────────────────────────────────────── C9 容量接线
+def discovery_age_s(profile: RelayProfile, now: Any = None) -> float | None:
+    """距最近一次成功发现的秒数；从未发现返回 None。"""
+    stamp = parse_iso(profile.discovered_at)
+    if stamp is None:
+        return None
+    moment = now or utcnow()
+    return (moment - stamp).total_seconds()
+
+
+def discovery_fresh(profile: RelayProfile, now: Any = None, *,
+                    ttl: int = facts.RELAY_FRESH_S) -> bool:
+    """发现结论是否新鲜（未来时间按新鲜处理，容忍时钟漂移）。"""
+    age = discovery_age_s(profile, now)
+    if age is None:
+        return False
+    return age <= ttl
+
+
+def capacity_targets(profiles: Iterable[RelayProfile], *, now: Any = None
+                     ) -> dict[str, list[dict[str, Any]]]:
+    """relay 发现结果 → 容量公告目标（按 ``upstream_id`` 分组）。
+
+    C9 口径（与上游探针门控同形）：
+
+    * 只输出 ``state=mapped`` 且 ``enabled`` 的模型 —— **未映射不公告**；
+    * ``fresh`` = 最近一次成功发现在 ``RELAY_FRESH_S`` 内；过期仍出行但调用方必须置
+      ``max_qps=0``（保留条目，便于审计「报了多少 / 认了多少」）；
+    * ``model`` 用上游模型 id（服务端的 ``(access, model)`` 门控按申报 id 匹配），
+      ``canonical`` 只作为附加字段（平台侧别名，供门户/日志对照）。
+
+    读路径永远可用（开关关闭时调用方不传本结果即可，不删除任何配置）。
+    """
+    moment = now or utcnow()
+    out: dict[str, list[dict[str, Any]]] = {}
+    for profile in profiles:
+        fresh = discovery_fresh(profile, moment)
+        rows: list[dict[str, Any]] = []
+        for item in profile.models:
+            if item.get("state") != "mapped" or not item.get("enabled", True):
+                continue
+            model_id = str(item.get("id") or "").strip()
+            canonical = item.get("canonical")
+            if not model_id or not canonical:
+                continue
+            rows.append({"model": model_id, "canonical": str(canonical), "fresh": fresh})
+        # 即使是空列表也要登记：调用方据此把该上游从「行级公告」切到 relay 语义
+        # （否则未映射的 relay 上游会退回 legacy 行级条目，等价于绕开门控）。
+        out[str(profile.upstream_id)] = rows
+    return out
 
 
 def set_model_enabled(profile: RelayProfile, upstream_model_id: Any, enabled: bool

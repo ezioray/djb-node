@@ -36,7 +36,7 @@ from .model_sync import ModelSyncClient, bundle_file, model_sync_enabled
 from .notifications import NotificationStore, notifications_enabled
 from .outbox import ReceiptFactory, validate_receipt
 from .policy import summary as policy_summary
-from .relay import RelayError, RelayManager
+from .relay import RelayError, RelayManager, capacity_targets
 from .secure import CredentialStore
 from .state import StateMachine, Snapshot
 from .store import ProfileRecord, Store, UpstreamRecord
@@ -981,7 +981,9 @@ def cmd_announce(args: argparse.Namespace) -> int:
     credentials = CredentialStore(paths)
     profile = store.profile()
     manager = UpstreamManager(store, credentials)
-    entries = manager.announce_capacity(profile)
+    relay_mgr = RelayManager(store, credentials, config=config)
+    relay_targets = capacity_targets(relay_mgr.list()) if relay_mgr.enabled() else {}
+    entries = manager.announce_capacity(profile, relay=relay_targets)
     if not entries:
         raise UsageError("没有可公告的模型：先 djb upstream add / enable")
     if getattr(args, "dry_run", False):

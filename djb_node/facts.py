@@ -263,6 +263,13 @@ UPSTREAM_KINDS: tuple[str, ...] = (
 """M17 §4.1：可选 upstream_kind（老服务端忽略未知值）。"""
 RELAY_KIND = "third_party_relay"
 
+RELAY_FRESH_S = 900
+"""C9 接线：relay 发现结论的新鲜度窗口（秒），与服务端 ``PROBE_FRESH_S=900`` 同口径。
+
+口径来源：`app/supply/facts.py` 的「容量公告只认 ≥ now-900s 的 verified」；
+relay 以「最近一次成功发现」代替 L2 探针，过期即 ``max_qps=0``（保留条目，便于审计）。
+"""
+
 RELAY_AUTH_SCHEMES: tuple[str, ...] = ("bearer", "x-api-key", "api-key", "custom")
 """M17 §4.3：auth_scheme；custom 必须显式给 header_name。"""
 RELAY_AUTH_HEADER: dict[str, str] = {

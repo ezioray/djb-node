@@ -445,37 +445,68 @@ class UpstreamManager:
                     out.append((record, entry))
         return out
 
-    def announce_capacity(self, profile: Any, *, now: Any = None) -> list[dict[str, Any]]:
+    def announce_capacity(self, profile: Any, *, now: Any = None,
+                          relay: dict[str, list[dict[str, Any]]] | None = None
+                          ) -> list[dict[str, Any]]:
         """容量公告（spec CapacityAnnouncement，`max_qps` 最小 0）。
 
         未验证 / 过期 / 被拒的模型仍以**同形状**条目出现，但 `max_qps=0`
         （= 不进容量，服务端调度拿不到吞吐）；只有 verified + 新鲜 + 启用的模型
         按并发分摊到正的 `max_qps`。这样旧调用方（`djb announce`）的清单结构与
         行序不变，只在数值上体现门控。
+
+        ``relay``（C9 接线，可选）：``{upstream_id: [{"model", "canonical", "fresh"}]}``。
+        由 :func:`djb_node.relay.capacity_targets` 生成，**只含已映射模型**：
+
+        * 命中 relay 的上游不再出行级条目，改出映射后的模型条目（未映射不公告）；
+        * ``fresh=False``（发现过期）仍出行，但 ``max_qps=0``（同 C7/C9 口径）；
+        * 正的 QPS 在「探针 verified 模型 + relay 新鲜映射模型」之间统一分摊；
+        * 附加 ``canonical`` 字段（spec ``additionalProperties: true``，只加不改）。
         """
         moment = now or utcnow()
+        relay_targets = dict(relay or {})
         live = {(record.id, entry.id) for record, entry in self.announceable_models(moment)}
-        rows: list[tuple[UpstreamRecord, ModelEntry]] = []
+        live_relay = {(upstream_id, str(row.get("model")))
+                      for upstream_id, rows in relay_targets.items()
+                      for row in rows if row.get("fresh")}
+        per_model_qps = max(0.1, round(max(1, int(profile.concurrent))
+                                       / max(1, len(live) + len(live_relay)), 2))
+        entries: list[dict[str, Any]] = []
         for record in self.list():
             if not record.enabled:
                 continue
+            if record.id in relay_targets:
+                targets = {str(row.get("model")): row for row in relay_targets[record.id]}
+                for raw in record.models:
+                    entry = ModelEntry.from_dict(raw)
+                    target = targets.get(entry.id)
+                    if not entry.enabled or target is None:
+                        continue
+                    entries.append({
+                        "kind": facts.TOKEN_RELAY_KIND,
+                        "access": record.access_type,
+                        "model": entry.id,
+                        "max_qps": (per_model_qps
+                                    if (record.id, entry.id) in live_relay else 0.0),
+                        "ask_price": str(entry.min_price or "0"),
+                        "unit": entry.min_price_unit,
+                        "resource_level": str(profile.preset),
+                        "canonical": str(target.get("canonical") or ""),
+                    })
+                continue
             for raw in record.models:
                 entry = ModelEntry.from_dict(raw)
-                if entry.enabled:
-                    rows.append((record, entry))
-        per_model_qps = max(0.1, round(max(1, int(profile.concurrent))
-                                       / max(1, len(live)), 2))
-        entries: list[dict[str, Any]] = []
-        for record, entry in rows:
-            entries.append({
-                "kind": facts.TOKEN_RELAY_KIND,
-                "access": record.access_type,
-                "model": entry.id,
-                "max_qps": per_model_qps if (record.id, entry.id) in live else 0.0,
-                "ask_price": str(entry.min_price or "0"),
-                "unit": entry.min_price_unit,
-                "resource_level": str(profile.preset),
-            })
+                if not entry.enabled:
+                    continue
+                entries.append({
+                    "kind": facts.TOKEN_RELAY_KIND,
+                    "access": record.access_type,
+                    "model": entry.id,
+                    "max_qps": per_model_qps if (record.id, entry.id) in live else 0.0,
+                    "ask_price": str(entry.min_price or "0"),
+                    "unit": entry.min_price_unit,
+                    "resource_level": str(profile.preset),
+                })
         return entries
 
     def catalog(self, *, price_version: str = "local", now: Any = None) -> list[dict[str, Any]]:

@@ -40,6 +40,7 @@ from .model_sync import ModelSyncClient, model_sync_enabled, verifier_from_env
 from .notifications import NotificationStore, notifications_enabled
 from .outbox import ReceiptFactory, SealedReceiptBuffer
 from .probe import periodic_interval_s
+from .relay import RelayManager, capacity_targets
 from .secure import CredentialStore
 from .server import Admission, LocalApiServer, RouteTarget
 from .state import StateMachine, Snapshot, reason_label
@@ -663,6 +664,14 @@ class Daemon:
                 "receipts": self.buffer.count(), "inflight": self._inflight}
 
     # ── 心跳
+    def _relay_capacity_targets(self, now: datetime) -> dict[str, list[dict[str, Any]]]:
+        """C9 接线：relay 发现结果 → 容量目标（开关关闭时返回空 dict，行为不变）。"""
+        manager = RelayManager(self.store, self.credentials, config=self.config,
+                               now=lambda: now)
+        if not manager.enabled():
+            return {}
+        return capacity_targets(manager.list(), now=now)
+
     def _heartbeat(self, now: datetime, *, initial: bool = False) -> None:
         if self.api is None:
             self._next_heartbeat_at = now + timedelta(seconds=self._heartbeat_interval_s)
@@ -678,7 +687,8 @@ class Daemon:
             "protocol_version": facts.PROTOCOL_VERSION,
             "policy_version": current_policy.policy_version if current_policy else "",
             "runtime_state": snapshot.runtime_state(),
-            "capacity": self.upstreams.announce_capacity(profile, now=now),
+            "capacity": self.upstreams.announce_capacity(
+                profile, now=now, relay=self._relay_capacity_targets(now)),
             "load": {"inflight": self._inflight, "queue_seconds": 0.0},
         }
         try:
