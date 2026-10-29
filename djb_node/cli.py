@@ -1273,6 +1273,16 @@ def _residual_hits(paths: Paths, *, keep_logs: bool) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────── parser
+def cmd_tray(args: argparse.Namespace) -> int:
+    """启动托盘壳（C3/C4）；无图形会话时 tray.main 返回 3，不抛 traceback。"""
+    from .tray.app import main as tray_main
+    argv = ["--interval-ms", str(getattr(args, "interval_ms", 5000))]
+    title = getattr(args, "title", None)
+    if title:
+        argv += ["--title", str(title)]
+    return tray_main(argv)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG, description="DJB 联脑 · 共享节点客户端（M15 / S2 P1 Linux CLI + daemon）",
@@ -1483,6 +1493,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     diagnose = add_common(cmd_diagnose, "diagnose", "生成脱敏诊断包（无凭据 / 无正文）")
     diagnose.add_argument("--output", help="输出路径（默认 diagnostics/）")
+
+    tray = add_common(cmd_tray, "tray",
+                      "启动托盘壳（Windows/macOS；只发动作建议，不执行命令）")
+    tray.add_argument("--interval-ms", type=int, default=5000,
+                      help="刷新间隔（毫秒，默认 5000）")
+    tray.add_argument("--title", default="DJB 联脑", help="窗口 / 菜单栏标题前缀")
 
     uninstall = add_common(cmd_uninstall, "uninstall", "卸载：清除服务 / 配置 / 凭据 / 缓存并自检残留")
     uninstall.add_argument("--yes", action="store_true", help="确认卸载")

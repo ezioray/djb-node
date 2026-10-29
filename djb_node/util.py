@@ -203,7 +203,9 @@ def atomic_write(path: str, data: bytes | str, mode: int = 0o600) -> None:
     ensure_dir(directory, 0o700)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=directory)
     try:
-        os.fchmod(fd, mode)
+        # Windows 没有 fchmod（NTFS ACL 也不吃 POSIX 位）；退化为路径级 chmod，不阻断写入
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
