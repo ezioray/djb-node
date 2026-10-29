@@ -34,7 +34,7 @@ def test_m17_flags_registered_with_expected_owners():
     assert facts.RELAY_FLAG == "client.relay.enabled"
     assert facts.ATTEST_FLAG == "supply.attestation.enabled"
     assert relay["owner"] == "client-seat"
-    assert attest["owner"] == "lead"
+    assert attest["owner"] == "platform"
     assert "只读" in relay["rollback_rule"] and "只读" in attest["rollback_rule"]
 
 

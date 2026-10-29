@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """C8 · tokenizer 注册表 + 本地 token 计数 + 上游 usage 差异判定。
 
-背景（ops/audit/reports/PROBE-TOKEN-AUDIT-20261024T0017Z.md §2）：
+背景见内部审计记录（不随公开仓发布）：
 
 * 客户端此前**没有分词器**，只读上游 `usage`；缺失时平台用 ``len//4`` 估算，
   中文低估约 4 倍（100 汉字 → 估 25，实际约 100）。

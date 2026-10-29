@@ -208,7 +208,7 @@ DIAGNOSE_SCAN_PATTERNS: tuple[str, ...] = (
 
 # ─────────────────────────────────────────────────────────── token 计数（C8；PROBE §2）
 # 现状：客户端只读上游 usage，缺失时平台 len//4 估算——中文低估约 4 倍
-# （ops/audit/reports/PROBE-TOKEN-AUDIT-20261024T0017Z.md §2.2）。
+# （内部审计记录 §2.2，不随公开仓发布）。
 # 本组常量是 tokens.py 的唯一来源；业务代码不得再写字面量。
 TOKENIZER_HEURISTIC_ID = "heuristic:v1"
 """没有可用分词器时的启发式估算器标识（estimated=True）。"""
@@ -409,7 +409,7 @@ FEATURE_FLAGS["client.relay.enabled"] = {
     "description": "第三方中转站接入（M17 §4 / C11），默认关闭",
 }
 FEATURE_FLAGS["supply.attestation.enabled"] = {
-    "owner": "lead",
+    "owner": "platform",
     "expire_at": "2026-12-31",
     "rollback_rule": "关闭 → 回退 L2 可达性判定；已有路由/账本不变；已存证明保留只读",
     "default": False,

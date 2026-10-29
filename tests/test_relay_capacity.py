@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""C9 接线 · relay 发现结果进入容量公告（task-4）。
+"""C9 接线 · relay 发现结果进入容量公告（task）。
 
 口径：
 * 只公告 ``state=mapped`` + ``enabled`` 的模型（**未映射不公告**）；

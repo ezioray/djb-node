@@ -145,7 +145,7 @@ def test_daemon_service_spec_rejects_empty_home():
 
 @pytest.mark.parametrize("kwargs", [
     {"name": "bad name", "argv": ("x",)},
-    {"name": "-lead", "argv": ("x",)},
+    {"name": "-owner", "argv": ("x",)},
     {"name": "", "argv": ("x",)},
     {"name": "d" * 70, "argv": ("x",)},
     {"name": "djb", "argv": ()},
