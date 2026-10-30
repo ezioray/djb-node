@@ -110,6 +110,14 @@ class ShareWindowTests(unittest.TestCase):
         window.toggle_advanced()
         self.assertTrue(backend.views[-1].advanced)
 
+    def test_both_tiers_off_does_not_crash_gui(self) -> None:
+        backend = FakeBackend(ShareSettings(realtime=False, batch=False))
+        window = ShareWindow(backend, backend.settings, save_sink=lambda _s: None,
+                             network_ok=True, upload_mbps=120)
+        view = window.view()
+        self.assertFalse(view.save_enabled)
+        self.assertIn("至少开启", view.warnings[0])
+
     def test_save_local_atomic_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "nested" / "share.json"

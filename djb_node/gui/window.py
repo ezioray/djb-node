@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Protocol, Sequence, runtime_checkable
 
@@ -49,7 +50,6 @@ class ShareWindow:
                  network_ok: bool, upload_mbps: float,
                  min_upload_mbps: float = 50.0,
                  estimates: dict[str, str] | None = None) -> None:
-        settings.validate()
         self._backend = backend
         self._settings = settings
         self._save_sink = save_sink
@@ -74,10 +74,16 @@ class ShareWindow:
         self.refresh()
 
     def view(self) -> ShareView:
-        return build_share_view(
+        view = build_share_view(
             self._settings, network_ok=self._network_ok,
             upload_mbps=self._upload_mbps, min_upload_mbps=self._min_upload_mbps,
             estimates=self._estimates, advanced=self._advanced)
+        try:
+            self._settings.validate()
+        except ValueError as exc:
+            return replace(view, warnings=(str(exc),) + view.warnings,
+                           save_enabled=False)
+        return view
 
     def refresh(self) -> None:
         self._backend.render(self.view())

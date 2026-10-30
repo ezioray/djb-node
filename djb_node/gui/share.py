@@ -70,8 +70,11 @@ def build_share_view(settings: ShareSettings, *,
                      min_upload_mbps: float = 50.0,
                      estimates: Mapping[str, str] | None = None,
                      advanced: bool = False) -> ShareView:
-    """把设置 + 网络事实投影成可渲染视图；缺预估显示「—」，不编造金额。"""
-    settings.validate()
+    """把设置 + 网络事实投影成可渲染视图；缺预估显示「—」，不编造金额。
+
+    允许传入「尚未通过校验」的设置（例如用户把两档都关掉），由窗口层补警告并禁用保存；
+    这里只做类型/数值边界检查，避免 GUI 在编辑过程中崩掉。
+    """
     if upload_mbps < 0:
         raise ValueError("upload_mbps 必须 >= 0")
     options = tuple(
