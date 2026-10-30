@@ -1283,6 +1283,23 @@ def cmd_tray(args: argparse.Namespace) -> int:
     return tray_main(argv)
 
 
+def cmd_proxy(args: argparse.Namespace) -> int:
+    """打印 S4 代理偏好口径；不联网、不改 daemon。"""
+    from .proxy import ProxyPreferences
+
+    prefs = ProxyPreferences(
+        effort=getattr(args, "effort", None),
+        composition=getattr(args, "composition", "single"),
+        proxy_mode=getattr(args, "proxy_mode", None),
+    )
+    payload = {"fields": prefs.fields(), "effective": prefs.describe()}
+    _emit(payload, as_json=_json_flag(args),
+          text=lambda item: "\n".join(
+              ["请求字段: " + (", ".join(item["fields"]) or "（无，走服务端缺省）"),
+               "生效口径: " + ", ".join(f"{k}={v}" for k, v in item["effective"].items())]))
+    return 0
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     """启动 S3 共享设置窗口；无图形会话时 gui.main 返回 3，不抛 traceback。"""
     from .gui.window import main as gui_main
@@ -1513,6 +1530,15 @@ def build_parser() -> argparse.ArgumentParser:
     tray.add_argument("--interval-ms", type=int, default=5000,
                       help="刷新间隔（毫秒，默认 5000）")
     tray.add_argument("--title", default="DJB 联脑", help="窗口 / 菜单栏标题前缀")
+
+    proxy = add_common(cmd_proxy, "proxy",
+                       "显示 S4 代理偏好（composition / effort / proxy_mode；只打印不联网）")
+    proxy.add_argument("--composition", choices=("single", "mono_pair", "hetero_pair"),
+                       default="single", help="组合形态（客户端当前只支持 single）")
+    proxy.add_argument("--effort", choices=("minimal", "low", "medium", "high", "auto"),
+                       help="推理强度；auto 仅 single 可用")
+    proxy.add_argument("--proxy-mode", choices=("fidelity", "balanced", "max_save"),
+                       help="代理档位；缺省 fidelity")
 
     gui = add_common(cmd_gui, "gui", "打开 S3 共享设置窗口（预设 / 三档 / 组网）")
     gui.add_argument("--preset", choices=("saver", "balanced", "full"), default="balanced")
