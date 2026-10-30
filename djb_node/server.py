@@ -297,7 +297,7 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
             try:
                 payload = server.runtime.health()
             except Exception as exc:                           # pragma: no cover - 防御
-                self._error(500, 50001, "健康检查失败", request_id)
+                self._error(503, 50001, "健康检查失败", request_id)
                 event("local_api.health_failed", level="error", error=type(exc).__name__)
                 return
             payload = dict(payload)
@@ -309,7 +309,7 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
             try:
                 payload = server.runtime.models()
             except Exception as exc:                           # pragma: no cover - 防御
-                self._error(500, 50001, "模型目录不可用", request_id)
+                self._error(503, 50001, "模型目录不可用", request_id)
                 event("local_api.models_failed", level="error", error=type(exc).__name__)
                 return
             self._send_json(200, payload, request_id)

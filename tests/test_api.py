@@ -121,7 +121,7 @@ def test_raise_for_response_mapping():
     assert isinstance(raise_for_response(response(500, 50001), what="x"), NetworkError)
     assert isinstance(raise_for_response(response(400, 40001), what="x"), UsageError)
     generic = raise_for_response(response(418), what="x")
-    assert generic.code == 50001
+    assert generic.code == 50000
 
 
 def test_protocol_compatibility():

@@ -137,7 +137,7 @@ class ControlServer(threading.Thread):
             response = {"ok": False, "error": {"code": exc.code, "message": exc.message,
                                                "type": exc.error_type}}
         except Exception as exc:                            # pragma: no cover - 防御
-            response = {"ok": False, "error": {"code": 50001,
+            response = {"ok": False, "error": {"code": 50000,
                                                "message": "内部错误：" + type(exc).__name__,
                                                "type": "server_error"}}
         try:

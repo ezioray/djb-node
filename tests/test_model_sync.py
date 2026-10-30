@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 import os
 import threading
 
@@ -76,9 +77,17 @@ class FakeApi:
         return {"accepted": True, "server_version": 9}
 
 
-def bundle(version=1, *, models=None, expires_at="2026-10-26T00:00:00Z",
+def bundle(version=1, *, models=None, expires_at=None,
            signature="sig-v1", tamper_hash=False) -> dict:
-    """构造一个 hash 自洽的 bundle。"""
+    """构造一个 hash 自洽的 bundle。
+
+    ``expires_at`` 缺省为「真实当前时间 + 1 天」：此前的写死值 2026-10-26 已过期，
+    导致所有不注入 clock 的用例被 ``expired`` 拒收（2026-10-30 审计发现）。
+    专门验证过期的用例仍显式传入过去时间 + 注入固定 clock。
+    """
+    if expires_at is None:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
     payload = {
         "version": version,
         "expires_at": expires_at,

@@ -115,7 +115,7 @@ class NodeApi:
         response = self._call("POST", protocol.PATHS["register"], json_body=payload, timeout=20)
         body = response.json()
         if not isinstance(body, dict) or not body.get("node_id"):
-            raise NetworkError("注册响应缺少 node_id（契约不匹配）", code=45001)
+            raise NetworkError("注册响应缺少 node_id（契约不匹配）", code=50001)
         return body
 
     def pair_key(self, node_id: str, *, rotate: bool = False,
@@ -125,7 +125,7 @@ class NodeApi:
         response = self._call("POST", protocol.PATHS["pair"], json_body=payload, timeout=20)
         body = response.json()
         if not isinstance(body, dict) or not body.get("client_key"):
-            raise NetworkError("密钥轮换响应缺少 client_key（契约不匹配）", code=45001)
+            raise NetworkError("密钥轮换响应缺少 client_key（契约不匹配）", code=50001)
         return body
 
     def binding(self, node_id: str) -> dict[str, Any]:
@@ -152,7 +152,7 @@ class NodeApi:
                               timeout=15)
         body = response.json()
         if not isinstance(body, dict):
-            raise NetworkError("心跳响应不是 JSON 对象（契约不匹配）", code=45001)
+            raise NetworkError("心跳响应不是 JSON 对象（契约不匹配）", code=50001)
         return body
 
     # ─────────────────────────────────────────────────────── 上游
@@ -220,7 +220,7 @@ class NodeApi:
                               timeout=facts.CHANNEL_RESULT_TIMEOUT_S)
         body = response.json()
         if not isinstance(body, dict) or "accepted" not in body:
-            raise NetworkError("通道结果响应缺少 accepted（契约不匹配）", code=45001)
+            raise NetworkError("通道结果响应缺少 accepted（契约不匹配）", code=50001)
         return body
 
     # ─────────────────────────────────────────────────────── 模型同步（M18b）
@@ -244,7 +244,7 @@ class NodeApi:
             raise raise_for_response(response, what=facts.MODEL_CATALOG_PATH)
         payload = response.json()
         if not isinstance(payload, dict):
-            raise NetworkError("模型目录响应不是 JSON 对象（契约不匹配）", code=45001)
+            raise NetworkError("模型目录响应不是 JSON 对象（契约不匹配）", code=50001)
         return payload
 
     def submit_model_sync_state(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -256,7 +256,7 @@ class NodeApi:
                               timeout=facts.MODEL_SYNC_STATE_TIMEOUT_S)
         body = response.json()
         if not isinstance(body, dict) or "accepted" not in body:
-            raise NetworkError("模型同步状态响应缺少 accepted（契约不匹配）", code=45001)
+            raise NetworkError("模型同步状态响应缺少 accepted（契约不匹配）", code=50001)
         return body
 
     # ─────────────────────────────────────────────────────── 站内信（C16）
@@ -313,7 +313,7 @@ class NodeApi:
                               idempotency_key=idempotency_key, timeout=25)
         body = response.json()
         if not isinstance(body, dict) or "accepted" not in body:
-            raise NetworkError("收据批量响应缺少 accepted（契约不匹配）", code=45001)
+            raise NetworkError("收据批量响应缺少 accepted（契约不匹配）", code=50001)
         return body
 
 
@@ -336,9 +336,12 @@ def raise_for_response(response: HttpResponse, *, what: str) -> DjbError:
             retry_after = int(retry_after_header)
         except ValueError:
             retry_after = None
+    # 未映射状态的兜底：5xx 按「内部错误(500) / 依赖不可用(502-504)」分流，
+    # 不再一律 50001（那会把内部错误误报成「依赖不可用」）
     default_codes = {400: 40001, 401: 40101, 403: 40305, 404: 40401,
-                     409: 40919, 413: 40013, 426: 42601, 429: 42901}
-    code = code if code not in (None, 0) else default_codes.get(status, 50001)
+                     409: 40919, 413: 40013, 426: 42601, 429: 42901,
+                     500: 50000, 502: 50001, 503: 50001, 504: 50001}
+    code = code if code not in (None, 0) else default_codes.get(status, 50000)
     details = {"status": status, "what": what}
     if status == 401:
         return AuthError(message, code=code, details=details, reason=reason)

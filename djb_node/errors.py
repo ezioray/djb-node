@@ -25,7 +25,7 @@ class DjbError(Exception):
     http_status: int = 500
     exit_code: int = facts.EXIT_ERROR
 
-    def __init__(self, message: str, *, code: int = 50001,
+    def __init__(self, message: str, *, code: int = 50000,
                  details: dict[str, Any] | None = None,
                  retry_after: int | None = None,
                  reason: str | None = None) -> None:
