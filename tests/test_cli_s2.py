@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from djb_node import facts
 from djb_node.cli import main
 from djb_node.config import Paths, feature_flag, load_config
 from djb_node.store import Store
@@ -48,7 +49,10 @@ def test_token_count_messages_includes_template_overhead(ready, capsys):
 def test_flags_list_defaults_all_off(ready, capsys):
     assert main(["flags", "--json"]) == 0
     payload = _json_out(capsys)
-    assert payload["count"] == 7
+    # 计数与名单都以登记表为唯一来源（U1：原硬编码 count == 7 在新增开关后陈旧失败）
+    assert payload["count"] == len(facts.FEATURE_FLAGS)
+    assert {item["name"] for item in payload["flags"]} == set(facts.FEATURE_FLAGS)
+    # M17/P1 核心开关必须在列（名字本身的断言留在 test_feature_flags.py）
     assert {item["name"] for item in payload["flags"]} >= {
         "client.probe.periodic.enabled", "client.token.compare.enabled",
         "client.relay.enabled", "supply.attestation.enabled", "client.channel.enabled",

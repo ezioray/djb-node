@@ -6,10 +6,17 @@ Lead 集成口径：开关只登记在 ``facts.FEATURE_FLAGS``，取值统一走
 """
 from __future__ import annotations
 
+from datetime import date
+
+import pytest
+
 from djb_node import facts
 from djb_node.attest import attestation_enabled
-from djb_node.config import ClientConfig, feature_flag, flag_spec
+from djb_node.config import ClientConfig, feature_flag, flag_expired, flag_spec
 from djb_node.relay import relay_enabled
+
+EXPIRE_DAY = date(2026, 12, 31)   # facts.FEATURE_FLAGS 全表统一的到期日
+AFTER_EXPIRE = date(2027, 1, 1)
 
 
 def make_config(**extra) -> ClientConfig:
@@ -67,3 +74,74 @@ def test_relay_and_attest_readers_delegate_to_feature_flag():
     assert relay_enabled(on) is True and attestation_enabled(on) is True
     mixed = make_config(feature_flags={facts.RELAY_FLAG: True})
     assert relay_enabled(mixed) is True and attestation_enabled(mixed) is False
+
+
+# ── 到期强制关（task-1）：expire_at 当日仍有效，次日起 fail-closed ──────────────
+
+
+def test_expire_at_day_is_inclusive_then_forces_off():
+    on = make_config(feature_flags={facts.RELAY_FLAG: True})
+    assert feature_flag(on, facts.RELAY_FLAG, today=EXPIRE_DAY) is True
+    assert flag_expired(facts.RELAY_FLAG, today=EXPIRE_DAY) is False
+    assert feature_flag(on, facts.RELAY_FLAG, today=AFTER_EXPIRE) is False
+    assert flag_expired(facts.RELAY_FLAG, today=AFTER_EXPIRE) is True
+    # 到期后即使显式写 true 也不能开（否则到期机制形同虚设）
+    assert feature_flag(on, facts.RELAY_FLAG, today=date(2031, 6, 1)) is False
+
+
+def test_default_off_flag_stays_false_after_expiry():
+    assert feature_flag(ClientConfig(), facts.ATTEST_FLAG, today=AFTER_EXPIRE) is False
+
+
+def test_every_registered_flag_is_forced_off_after_expiry():
+    all_on = make_config(feature_flags={name: True for name in facts.FEATURE_FLAGS})
+    far_future = date(2031, 1, 1)
+    for name in facts.FEATURE_FLAGS:
+        assert flag_expired(name, today=far_future) is True, name
+        assert feature_flag(all_on, name, today=far_future) is False, name
+        # 到期前一天仍按登记表判定（不被提前关）
+        assert flag_expired(name, today=date(2026, 12, 30)) is False, name
+
+
+@pytest.mark.parametrize("bad_expire", ["", "   ", None, "not-a-date", "2026-13-01", 20271231])
+def test_malformed_expire_at_fails_closed(monkeypatch, bad_expire):
+    name = "test.flag.malformed-expire"
+    monkeypatch.setitem(facts.FEATURE_FLAGS, name, {
+        "default": False,
+        "owner": "test-seat",
+        "expire_at": bad_expire,
+        "rollback_rule": "关闭即回退",
+        "description": "到期字段非法的登记项必须 fail-closed",
+    })
+    on = make_config(feature_flags={name: True})
+    assert flag_expired(name) is True
+    assert feature_flag(on, name) is False
+
+
+def test_expire_at_accepts_date_object(monkeypatch):
+    name = "test.flag.date-object"
+    monkeypatch.setitem(facts.FEATURE_FLAGS, name, {
+        "default": False,
+        "owner": "test-seat",
+        "expire_at": EXPIRE_DAY,
+        "rollback_rule": "关闭即回退",
+        "description": "expire_at 允许 date 对象（登记表用字符串，防御性兼容）",
+    })
+    on = make_config(feature_flags={name: True})
+    assert feature_flag(on, name, today=EXPIRE_DAY) is True
+    assert feature_flag(on, name, today=AFTER_EXPIRE) is False
+
+
+def test_unregistered_flag_keeps_c7_semantics_without_expiry():
+    # 未登记开关没有到期元数据：不额外收紧（C7 既有语义），也不报"已到期"
+    assert flag_expired("nope") is False
+    assert feature_flag(make_config(feature_flags={"nope": True}), "nope") is True
+
+
+def test_flag_readers_inherit_expiry(monkeypatch):
+    # relay/attest 等 reader 都走 feature_flag，到期后应自动跟随为 False
+    on = make_config(feature_flags={facts.RELAY_FLAG: True, facts.ATTEST_FLAG: True})
+    assert relay_enabled(on) is True and attestation_enabled(on) is True
+    monkeypatch.setattr("djb_node.config._utc_today", lambda: date(2031, 1, 1))
+    assert relay_enabled(on) is False
+    assert attestation_enabled(on) is False

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from typing import Any
 
 from . import facts
@@ -210,16 +211,69 @@ def _extra_of(config: Any) -> dict[str, Any]:
     return {}
 
 
-def feature_flag(config: Any, name: str) -> bool:
-    """特性开关求值（**默认关闭**；未知开关一律按定义默认值）。
+def _utc_today() -> date:
+    """求值当天（UTC）：与 tray/actions、ipc_windows 的到期口径一致。"""
+    return datetime.now(timezone.utc).date()
+
+
+def _parse_expire_at(value: Any) -> date | None:
+    """把 `expire_at` 解析成日期；缺失/非法返回 None（调用方 fail-closed 处理）。
+
+    只接受 ISO 日期字符串或 date/datetime 对象：登记表用字符串，数字等其它类型
+    一律视为非法（避免 `20271231` 这类整数被 ISO basic 格式静默解析成日期）。
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def flag_expired(name: str, *, today: date | None = None) -> bool:
+    """开关是否已到期（`expire_at` 当日仍有效，次日起强制关）。
+
+    - 已登记开关（`facts.FEATURE_FLAGS`）缺失/非法 `expire_at` → **返回 True（fail-closed）**，
+      宁可不启用也不让开关永久开着；
+    - 未登记开关没有到期元数据 → 返回 False，语义仍由 `feature_flag` 的 C7 口径处理，
+      本函数不改变未登记开关的既有行为。
+
+    `today` 只供测试注入；非日期时回落 UTC 今天（生产路径的默认行为）。
+    """
+    spec = facts.FEATURE_FLAGS.get(str(name))
+    if not isinstance(spec, Mapping):
+        return False
+    expires = _parse_expire_at(spec.get("expire_at"))
+    if expires is None:
+        return True
+    ref = today if isinstance(today, date) and not isinstance(today, datetime) else _utc_today()
+    return ref > expires
+
+
+def feature_flag(config: Any, name: str, *, today: date | None = None) -> bool:
+    """特性开关求值（**默认关闭**；未知开关一律按定义默认值；到期强制关）。
 
     M17 §9：开关必须三字段齐全（owner / expire_at / rollback_rule）且默认关闭，
     定义在 `facts.FEATURE_FLAGS`。本机取值只读 config.json 的非敏感 `extra`
     （`feature_flags` 子字典优先，其次同名平铺键），不覆盖服务端 policy。
 
+    `expire_at` 由本入口统一强制（与 tray/actions、ipc_windows 同一口径：**UTC 日期，
+    到期日当天仍有效，次日起为 False**）；已登记但 `expire_at` 缺失/非法按 fail-closed
+    处理。未登记开关没有到期元数据，保持 C7 既有语义不额外收紧。
+
     这是全队唯一的开关求值入口：`config` 接受 `ClientConfig`，也接受形状等价的
     mapping（即 `config.extra` 本身，或含 `extra` 键的 dict），便于其他模块复用。
+    `today` 是仅测试注入的只加参数（线上调用不传）。
     """
+    if flag_expired(name, today=today):
+        return False
     spec = facts.FEATURE_FLAGS.get(str(name)) or {}
     default = bool(spec.get("default", False))
     extra = _extra_of(config)
