@@ -36,7 +36,7 @@ PATHS = {
     "earnings": "/api/v1/node/earnings",
     "profile": "/api/v1/node/profile",
     "receipt": "/api/v1/node/receipts/",       # 单条：+ receipt_id
-    "balance": "/api/v1/user/balance",         # 用方余额：需要用户凭据（Bearer），节点密钥读不了
+    "node_balance": "/api/v1/node/balance",    # 节点绑定账户的可用余额（节点钥可读）
 }
 
 #: 一页最多取多少条（服务端可下调，客户端不硬要）
@@ -294,16 +294,23 @@ class NodeCloudClient:
         payload = self._request_json("receipt", PATHS["receipt"] + quote(ident, safe=""))
         return dict(payload)
 
-    def balance(self, user_key: str) -> dict[str, Any]:
-        """用方「可用余额」（micro-USD）。**需要用户凭据**（Bearer），节点密钥无权读取。"""
-        key = str(user_key or "").strip()
-        if not key:
-            raise ProviderError("没有用户凭据（节点密钥不能读账户余额）",
-                                hint="在账单页登录后查看")
-        payload = self._request_json("balance", PATHS["balance"],
-                                     headers=build_headers(extra={"Authorization": "Bearer " + key}))
-        return {"balance_minor": payload.get("available_minor"),
-                "balance": micro_text(payload.get("available_minor")),
+    def node_balance(self) -> dict[str, Any]:
+        """节点绑定账户的可用余额（micro-USD）。三态严格区分，不互相冒充。
+
+        * 有余额/账单为 0 → ``balance`` 文本（0 是事实，账本明说没充过值）；
+        * 未绑定账户 → ``ProviderError("节点未绑定账户…")``（**不是 0**）；
+        * 取不到 → ``ProviderError(原因)``。
+        """
+        payload = self._request_json("node_balance", PATHS["node_balance"])
+        minor = payload.get("available_minor")
+        if minor is None:
+            reason = str(payload.get("unavailable_reason") or "")
+            if reason == "node_not_bound":
+                raise ProviderError("节点未绑定账户",
+                                    hint="在服务端把节点绑定到账户后可见")
+            raise ProviderError(reason_text(reason) if reason else "云端没有给出可用余额",
+                                hint="稍后刷新")
+        return {"balance_minor": int(minor), "balance": micro_text(minor),
                 "as_of": payload.get("as_of"),
                 "note": reason_text(payload.get("note")) if payload.get("note") else ""}
 

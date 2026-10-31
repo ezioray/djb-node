@@ -373,7 +373,6 @@ class LocalDataSource:
     """
 
     def __init__(self, home: str | os.PathLike | None = None, *,
-                 user_key: str | None = None,
                  runner: Callable[[Sequence[str]], Mapping[str, Any]] | None = None,
                  cloud: Any | None = None,
                  which: Callable[[str], str | None] = shutil.which,
@@ -387,7 +386,6 @@ class LocalDataSource:
         self._home = Path(home or resolve_home(None))
         self._runner = runner or self._cli_runner
         self._cloud = cloud
-        self._user_key = (user_key or "").strip() or None
         self._offline_reason = ""          # 本轮刷新已确认的「连不上」原因（跨域复用）
         self._which = which
         self._facts = facts
@@ -491,14 +489,22 @@ class LocalDataSource:
             from ..util import utcnow
             now = utcnow()
             paths = Paths(str(self._home))
-            for probe in (check_system, lambda: check_hardware(now),
+            # 三个探针签名都是 (now, ...)：少传参会在界面上变成「检测失败（TypeError）」
+            for probe in (lambda: check_system(now), lambda: check_hardware(now),
                           lambda: check_runtime(now, paths)):
                 try:
                     check = probe()
-                    checks.append({"id": getattr(check, "identifier", ""),
-                                   "level": getattr(check, "level", ""),
-                                   "summary": getattr(check, "message", ""),
-                                   "next_step": getattr(check, "next_step", "")})
+                    # Check 的字段是 id/title/status/conclusion/next_step（status: ok/warn/fail/na）
+                    data = check.to_dict() if hasattr(check, "to_dict") else {}
+                    status = str(data.get("status") or "")
+                    checks.append({
+                        "id": str(data.get("id") or ""),
+                        "level": {"ok": "ok", "fail": "error"}.get(status, "warn"),
+                        "status": status,
+                        "summary": (str(data.get("title") or "") + "："
+                                    + str(data.get("conclusion") or "")).strip("："),
+                        "next_step": str(data.get("next_step") or ""),
+                    })
                 except Exception as exc:             # 单项失败不影响其余
                     checks.append({"id": "probe", "level": "warn",
                                    "summary": "检测失败（" + type(exc).__name__ + "）",
@@ -678,16 +684,13 @@ class LocalDataSource:
                     "online": False, "note": "结算明细暂不可用：" + exc.reason}
         rows = payload if isinstance(payload, Mapping) else {}
         balance_text, balance_note = None, ""
-        if self._user_key:
-            try:
-                balance = self._cloud_call("balance", self._user_key)
-            except ProviderError as exc:
-                balance_note = exc.reason
-            else:
-                balance_text = (balance or {}).get("balance")
-                balance_note = str((balance or {}).get("note") or "")
+        try:
+            balance = self._cloud_call("node_balance")
+        except ProviderError as exc:
+            balance_note = exc.reason            # 未绑定/取不到都如实说，不写 0
         else:
-            balance_note = "需要用户凭据（节点密钥不能读账户余额）"
+            balance_text = (balance or {}).get("balance")
+            balance_note = str((balance or {}).get("note") or "")
         # 客户端已把 *_minor（micro-USD）归一化成「至少 2 位、最多 6 位」文本；
         # 这里只补「本地 status 有、云端没有」的字段（例如余额额度），不反向覆盖云端值。
         def pick(key: str, fallback: Any) -> Any:

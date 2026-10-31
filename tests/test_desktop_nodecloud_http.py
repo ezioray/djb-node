@@ -60,10 +60,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"receipt_id": parsed.path.rsplit("/", 1)[-1],
                                     "state": "accepted",
                                     "received_at": "2026-11-01T10:00:00Z"})
-        if parsed.path == "/api/v1/user/balance":
-            Handler.seen[-1]["auth"] = self.headers.get("Authorization")
+        if parsed.path == "/api/v1/node/balance":
+            Handler.seen[-1]["auth"] = self.headers.get("X-Client-Key")
             return self._send(200, {"available_minor": 1_234_567, "unit": "micro-USD",
-                                    "as_of": "2026-11-01T10:00:00Z"})
+                                    "account": "2101", "as_of": "2026-11-01T10:00:00Z"})
         kind = parsed.path.rsplit("/", 1)[-1]
         if kind == "earnings":
             return self._send(200, {"currency": "USDT", "settled_minor": 1_500_000,
@@ -114,8 +114,11 @@ def server():
         thread.join(timeout=5)
 
 
+TEST_KEY = "ck-test"
+
+
 def make_client(base: str) -> NodeCloudClient:
-    return NodeCloudClient(base, "ck-test", timeout=5.0)
+    return NodeCloudClient(base, TEST_KEY, timeout=5.0)
 
 
 def test_real_http_pagination_end_to_end(server):
@@ -168,22 +171,15 @@ def test_real_http_connection_refused_is_readable():
     assert "云端连不上" in info.value.reason
 
 
-def test_real_http_single_receipt_and_balance(server):
+def test_real_http_single_receipt_and_node_balance(server):
     client = make_client(server)
     receipt = client.receipt("r-1")
     assert receipt["receipt_id"] == "r-1" and receipt["state"] == "accepted"
     assert Handler.seen[-1]["path"] == "/api/v1/node/receipts/r-1"
 
-    balance = client.balance("user-key-abc")
+    balance = client.node_balance()
     assert balance["balance"] == "1.234567" and balance["balance_minor"] == 1_234_567
     call = Handler.seen[-1]
-    assert call["path"] == "/api/v1/user/balance"
-    assert call["auth"] == "Bearer user-key-abc"          # 用户凭据只在头里
-    assert "user-key-abc" not in json.dumps(call["query"])
-
-
-def test_real_http_balance_without_user_key_is_refused_locally(server):
-    with pytest.raises(ProviderError) as info:
-        make_client(server).balance("")
-    assert "没有用户凭据" in info.value.reason
-    assert Handler.seen == []                              # 根本没发请求
+    assert call["path"] == "/api/v1/node/balance"
+    assert call["auth"] == TEST_KEY                        # 节点钥在头里
+    assert TEST_KEY not in json.dumps(call["query"])       # 绝不进 query

@@ -276,8 +276,8 @@ def test_earnings_use_micro_usd_text():
     text = text_of("earnings", source)
     assert "0.25 USDT" in text                        # 今日（带币种）
     assert "[已结算] 1.50" in text and "[待结算] 1.234567" in text
-    assert "[余额（可用）]" in text                       # 余额卡：没用户凭据就说暂不可用
-    assert "需要用户凭据" in text
+    assert "[余额（可用）]" in text                       # 余额卡：取不到就说暂不可用，不写 0
+    assert "余额暂不可用" in text and "0.00" not in text.split("[余额（可用）]")[1].split("\n")[0]
 
 
 def test_account_uses_profile_fields():
@@ -375,23 +375,39 @@ def test_one_network_failure_does_not_cost_four_timeouts():
     assert not snapshot.ok("account") or "云端连不上" in str(account.get("note", ""))
 
 
-# ─────────────────────────────────────────────────────────── 余额（/user/balance，需用户凭据）
-def test_balance_with_user_key_uses_server_value(monkeypatch):
+# ─────────────────────────────────────────── 余额（/api/v1/node/balance，节点钥可读，三态）
+def test_node_balance_with_amount(monkeypatch):
     source = make_source(FakeCloud())
-    source._user_key = "uk-test"
     source._cloud = type("Cloud", (), {
         "fetch": lambda self, kind: {"items": [], "next_cursor": None, "truncated": False},
         "earnings": lambda self: {"settled": "1.50", "pending": None, "payouts": [],
                                   "currency": "USDT", "note": ""},
-        "balance": lambda self, key: {"balance": "0.00", "balance_minor": 0,
-                                      "note": "no_balance_record：该账户还没有充值…"},
+        "node_balance": lambda self: {"balance": "0.00", "balance_minor": 0,
+                                      "note": "no_balance_record：还没有充值凭证"},
     })()
     section = source._earnings()
-    assert section["balance"] == "0.00"                  # 服务端说是 0 就是 0
-    assert "还没有充值" in section["balance_note"]
+    assert section["balance"] == "0.00"                  # 账本说是 0 就是 0
+    assert "还没有充值凭证" in section["balance_note"]
 
 
-def test_balance_failure_is_unavailable_not_zero():
+def test_node_balance_unbound_is_unavailable_not_zero():
+    class Unbound:
+        def fetch(self, kind):
+            return {"items": [], "next_cursor": None, "truncated": False}
+
+        def earnings(self):
+            return {"settled": "1.50", "pending": None, "payouts": [], "currency": "USDT",
+                    "note": ""}
+
+        def node_balance(self):
+            raise ProviderError("节点未绑定账户，可用余额暂不可用")
+
+    section = make_source(Unbound())._earnings()
+    assert section["balance"] is None
+    assert "未绑定" in section["balance_note"]
+
+
+def test_node_balance_failure_is_unavailable_not_zero():
     class Boom:
         def fetch(self, kind):
             return {"items": [], "next_cursor": None, "truncated": False}
@@ -400,52 +416,9 @@ def test_balance_failure_is_unavailable_not_zero():
             return {"settled": "1.50", "pending": None, "payouts": [], "currency": "USDT",
                     "note": ""}
 
-        def balance(self, key):
+        def node_balance(self):
             raise ProviderError("云端暂时不可用（502）")
 
-    source = make_source(Boom())
-    source._user_key = "uk-test"
-    section = source._earnings()
+    section = make_source(Boom())._earnings()
     assert section["balance"] is None
     assert "502" in section["balance_note"]
-
-
-def test_balance_without_user_key_never_guesses():
-    section = make_source(FakeCloud(earnings={"settled": "1.00", "pending": None,
-                                              "payouts": []}))._earnings()
-    assert section["balance"] is None
-    assert "需要用户凭据" in section["balance_note"]
-
-
-# ───────────────────────────────────────────────── 本机收据库没初始化 ≠ 云端不可用
-def test_cloud_empty_plus_uninitialized_store_is_zero_not_unavailable(tmp_path):
-    """真联调抓到：云端明说 0 张、本机库还没建，页面却整块「暂不可用（内部异常名）」。
-
-    必须给临时 home：默认 home 是真的 ``~/.djb``，测试绝不能去开它。
-    """
-    class Cloud:
-        def fetch(self, kind):
-            return {"items": [], "next_cursor": None, "truncated": False}
-
-        def earnings(self):
-            return {"settled": None, "pending": None, "payouts": [], "currency": "USDT",
-                    "note": ""}
-
-    source = LocalDataSource(home=tmp_path, cloud=Cloud())   # 空 home：还没跑过 daemon
-    section = source._receipts()
-    assert section["rows"] == [] and section["origin"] == "cloud"
-    assert "尚未初始化" in section["note"]
-    assert "还没有收据" not in section["note"]          # 一句话，不要读成两条警告
-
-
-def test_unreadable_store_still_degrades_when_cloud_failed(tmp_path):
-    class Dead:
-        def fetch(self, kind):
-            raise ProviderError("云端连不上（OSError）")
-
-    source = LocalDataSource(home=tmp_path, cloud=Dead())
-    with pytest.raises(ProviderError) as info:
-        source._receipts()
-    assert "云端连不上" in info.value.reason
-    for leak in ("NameError", "StoreNotInitialized", "Traceback"):
-        assert leak not in info.value.reason

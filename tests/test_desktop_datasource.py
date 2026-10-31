@@ -329,3 +329,25 @@ def test_snapshot_is_always_sections_or_unavailable(tmp_path):
         assert isinstance(value, (dict, ds.Unavailable)), name
         if isinstance(value, dict):
             assert value, name                        # 空 dict 会被当成「有数据但全空」
+
+
+# ───────────────────────────────────────────── 环境检测行：字段名与状态词都要真的映射上
+def test_bench_checks_come_from_envcheck_with_real_fields(tmp_path):
+    """真联调抓到：探针签名/字段名猜错，界面上三行全是「—」和「检测失败（TypeError）」。"""
+    section = ds.LocalDataSource(home=tmp_path)._bench_section()
+    checks = section.get("checks") or []
+    assert len(checks) == 3
+    assert [row["id"] for row in checks] == ["system", "hardware", "runtime"]
+    for row in checks:
+        assert row["level"] in ("ok", "warn", "error")
+        assert row["summary"] and "：" in row["summary"]      # 标题 + 结论，不是空串
+        assert row["status"] in ("ok", "warn", "fail", "na")
+        assert "TypeError" not in row["summary"]
+
+
+def test_bench_view_shows_probe_conclusions(tmp_path):
+    from djb_node.desktop.views import build_view
+
+    text = build_view("bench", ds.LocalDataSource(home=tmp_path).snapshot()).plain_text()
+    assert "系统与架构" in text or "硬件" in text
+    assert "检测失败" not in text

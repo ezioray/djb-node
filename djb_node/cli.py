@@ -286,6 +286,11 @@ def cmd_auth(args: argparse.Namespace) -> int:
     return 0
 
 
+#: ``djb start`` 认为「已经可以停下等待」的状态：online 是成功，其余是明确的终态
+_START_ACCEPT_STATES = ("online",)
+_START_SETTLED_STATES = ("online", "paused", "error", "updating", "stopped")
+
+
 # ─────────────────────────────────────────────────────────── start / stop
 def cmd_start(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
@@ -302,27 +307,54 @@ def cmd_start(args: argparse.Namespace) -> int:
     _spawn_daemon(paths, config, token)
     deadline = time.monotonic() + float(getattr(args, "timeout", 20) or 20)
     last_error = ""
+    pid: Any = None
     while time.monotonic() < deadline:
         try:
             response = ControlClient(paths).call({"cmd": "ping"}, timeout=1.0)
             if response.get("ok"):
-                payload = {"started": True, "pid": response.get("pid"),
-                           "local_api": "http://" + facts.MIRROR_HOST + ":"
-                                        + str(config.mirror_port) + "/v1",
-                           "local_token": token,
-                           "token_note": "令牌只在本次进程存活期间有效；不落盘，可用 djb status --show-token 再次读取",
-                           "next_step": "export DJB_LOCAL_TOKEN=<token>; 之后用 Bearer 调用本机 /v1"}
-                _emit(payload, as_json=_json_flag(args),
-                      text=lambda value: "daemon 已启动（pid " + str(value["pid"]) + "）\n"
-                      + "本机镜像：" + str(value["local_api"]) + "（仅 127.0.0.1）\n"
-                      + "local_token=" + str(value["local_token"]) + "\n"
-                      + "令牌只在本次进程存活期间有效，不落盘；需要时 djb status --show-token")
-                return 0
+                pid = response.get("pid")
+                break
         except NotRunningError as exc:
             last_error = exc.message
         time.sleep(0.25)
-    print("djb: daemon 启动超时（" + last_error + "）；查看 djb logs --tail 50", file=sys.stderr)
-    return facts.EXIT_NOT_RUNNING
+    else:
+        print("djb: daemon 启动超时（" + last_error + "）；查看 djb logs --tail 50", file=sys.stderr)
+        return facts.EXIT_NOT_RUNNING
+    # 控制口起来 ≠ 已经接单：等状态机真的走到 online（或走到 paused/error 这类终态）。
+    # 否则用户看到「已启动」，实际还在 starting、一单也不接。
+    state, reason = "", ""
+    while time.monotonic() < deadline:
+        try:
+            status = ControlClient(paths).call({"cmd": "status"}, timeout=2.0).get("status") or {}
+        except NotRunningError as exc:
+            last_error = exc.message
+            break
+        state = str(status.get("state") or "")
+        reason = str(status.get("reason") or "")
+        if state in _START_SETTLED_STATES:
+            break
+        time.sleep(0.25)
+    if state not in _START_ACCEPT_STATES:
+        detail = last_error or ("daemon 已启动但状态是 " + (state or "未知")
+                                + ("（" + reason + "）" if reason else "")
+                                + "，没有进入接单状态；查看 djb status / djb logs --tail 50")
+        print("djb: " + detail, file=sys.stderr)
+        return facts.EXIT_NOT_RUNNING
+    payload = {"started": True, "pid": pid, "state": state,
+               "local_api": "http://" + facts.MIRROR_HOST + ":"
+                            + str(config.mirror_port) + "/v1",
+               "local_token": token,
+               "token_note": "令牌只在本次进程存活期间有效；不落盘，可用 djb status --show-token 再次读取",
+               "next_step": "export DJB_LOCAL_TOKEN=<token>; 之后用 Bearer 调用本机 /v1"}
+    if reason:
+        payload["reason"] = reason
+    _emit(payload, as_json=_json_flag(args),
+          text=lambda value: "daemon 已启动（pid " + str(value["pid"]) + "），状态 "
+          + str(value.get("state") or "—") + "\n"
+          + "本机镜像：" + str(value["local_api"]) + "（仅 127.0.0.1）\n"
+          + "local_token=" + str(value["local_token"]) + "\n"
+          + "令牌只在本次进程存活期间有效，不落盘；需要时 djb status --show-token")
+    return 0
 
 
 def _spawn_daemon(paths: Paths, config: ClientConfig, token: str) -> None:
