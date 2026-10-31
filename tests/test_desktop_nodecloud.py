@@ -342,3 +342,33 @@ def test_profile_payload_maps_node_identity():
     assert profile["node_id"] == "node-7c31" and profile["bound"] is True
     assert profile["capabilities"] == ["A1:mock-small"]
     assert profile["email"] is None                  # 节点接口没有邮箱，不编
+
+
+def test_one_network_failure_does_not_cost_four_timeouts():
+    """一轮刷新里网络挂了一次，剩下的域直接沿用同一原因（不各等一次 6s 超时）。"""
+
+    class DeadCloud:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch(self, kind):
+            self.calls += 1
+            raise ProviderError("云端连不上（OSError）")
+
+        def earnings(self):
+            self.calls += 1
+            raise ProviderError("云端连不上（OSError）")
+
+        def profile(self):
+            self.calls += 1
+            raise ProviderError("云端连不上（OSError）")
+
+    cloud = DeadCloud()
+    snapshot = make_source(cloud).snapshot()
+    assert cloud.calls == 1                      # 只有第一个域真的去撞网络
+    for name in ("tasks", "receipts", "earnings"):
+        assert not snapshot.ok(name)
+        assert "云端连不上" in str(snapshot.sections[name].reason)
+    # 账户域即使云端取不到也还能显示本机凭据，但必须把原因写进 note
+    account = snapshot.sections["account"]
+    assert not snapshot.ok("account") or "云端连不上" in str(account.get("note", ""))

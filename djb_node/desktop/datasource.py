@@ -385,6 +385,7 @@ class LocalDataSource:
         self._home = Path(home or resolve_home(None))
         self._runner = runner or self._cli_runner
         self._cloud = cloud
+        self._offline_reason = ""          # 本轮刷新已确认的「连不上」原因（跨域复用）
         self._which = which
         self._facts = facts
         self._bench = bench
@@ -461,6 +462,7 @@ class LocalDataSource:
             "yield": self._yield, "account": self._account, "logs": self._logs_section,
         }
         collected: dict[str, Any] = {}
+        self._offline_reason = ""
         for name in wanted:
             collected[name] = self._safe(name, loader[name])
         return Snapshot(sections=collected,
@@ -511,21 +513,33 @@ class LocalDataSource:
     def _cloud_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self._cloud is None:
             raise ProviderError("云端未接通（未登录节点）", hint="完成配对后重试")
+        # 本轮刷新里若已经确认「连不上云端」，剩下的域直接沿用同一个原因（不再各等一次超时）
+        if self._offline_reason:
+            raise ProviderError(self._offline_reason, hint="网络恢复后点「刷新」重试")
         handler = getattr(self._cloud, method, None)
         if handler is None:
             raise ProviderError("云端接口未接线（" + method + "）", hint="等待平台提供该接口")
         try:
             return handler(*args, **kwargs)
-        except ProviderError:
+        except ProviderError as exc:
+            if exc.reason.startswith("云端连不上"):
+                self._offline_reason = exc.reason      # 网络层失败：本轮不再逐域重试
             raise                       # 已经带可读原因（401 / 服务端降级 / 未上线）
         except Exception as exc:
             raise ProviderError("云端请求失败（" + type(exc).__name__ + "）") from None
 
     def _cloud_pages(self, kind: str, method: str) -> dict[str, Any]:
         """按 ``page.next_cursor`` 取全量（客户端负责翻页上限）；无 ``fetch`` 的桩只取单页。"""
+        if self._offline_reason:
+            raise ProviderError(self._offline_reason, hint="网络恢复后点「刷新」重试")
         fetch = getattr(self._cloud, "fetch", None) if self._cloud is not None else None
         if callable(fetch):
-            payload = fetch(kind)
+            try:
+                payload = fetch(kind)
+            except ProviderError as exc:
+                if exc.reason.startswith("云端连不上"):
+                    self._offline_reason = exc.reason
+                raise
             rows = payload.get("items") if isinstance(payload, Mapping) else payload
             return {"rows": [row for row in (rows or []) if isinstance(row, Mapping)],
                     "next_cursor": payload.get("next_cursor") if isinstance(payload, Mapping) else None,
@@ -591,9 +605,11 @@ class LocalDataSource:
         origin = "local"
         note = ""
         next_cursor = None
+        cloud_error: ProviderError | None = None
         try:
             pages = self._cloud_pages("receipts", "list_receipts")
         except ProviderError as exc:
+            cloud_error = exc
             note = "云端收据暂不可用：" + exc.reason
         else:
             rows, origin, next_cursor = pages["rows"], "cloud", pages["next_cursor"]
@@ -613,6 +629,9 @@ class LocalDataSource:
         if not rows and not local_ok:
             # 两边都读不到：不能说「0 张」，那是把缺数据说成零
             raise ProviderError(note, hint="daemon 起来后再刷新；云端收据需要登录节点")
+        if not rows and cloud_error is not None:
+            # 云端取不到、本地也没有：如实说「暂不可用（原因）」，不是「还没有收据」
+            raise ProviderError(cloud_error.reason, hint=cloud_error.hint)
         if not rows and not note:
             note = "还没有收据"
         return {"rows": rows, "origin": origin, "note": note, "next_cursor": next_cursor}
