@@ -119,7 +119,7 @@ COLORS: dict[str, str] = {
 #: 字体族优先级（Windows / macOS / Linux 回退；不引第三方字体依赖）
 FONT_FAMILIES: tuple[str, ...] = (
     "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC",
-    "Noto Sans SC", "Inter", "Source Han Sans SC", "DejaVu Sans",
+    "Noto Sans SC", "Inter", "Source Han Sans SC", "DejaVu Sans", "system-ui",
 )
 #: 等宽族（哈希 / seq / 命令）
 MONO_FAMILIES: tuple[str, ...] = (
