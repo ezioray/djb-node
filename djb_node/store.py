@@ -21,10 +21,63 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from . import facts
-from .errors import StoreDowngradeError, StoreNotInitializedError
-from .util import iso, new_install_id, parse_iso, sha256_hex, utcnow
+from .errors import StoreDowngradeError, StoreNotInitializedError, UsageError
+from . import plan_router
+from .util import iso, new_install_id, new_request_id, parse_iso, sha256_hex, utcnow
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+_PLAN_SCHEMA_SQL: tuple[str, ...] = (
+    # v4：多 plan 组 + 组级共享预算（日/月 minor 上限，NULL = 不限）。
+    # 金额一律 minor（USD x 100 整数，不用浮点）；unknown_usage_count 记录「上游没回
+    # usage」的成功请求数（这类请求不记金额、不记 token，只计数，便于事后核对）。
+    # spent_tokens_* / unknown_usage_count 是**给定列之外的纯增量列**（都有默认值）。
+    """
+    CREATE TABLE IF NOT EXISTS plan_groups (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        budget_usd_minor_day INTEGER,
+        budget_usd_minor_month INTEGER,
+        spent_usd_minor_day INTEGER NOT NULL DEFAULT 0,
+        spent_usd_minor_month INTEGER NOT NULL DEFAULT 0,
+        day_key TEXT,
+        month_key TEXT,
+        priority INTEGER NOT NULL DEFAULT 100,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        spent_tokens_day INTEGER NOT NULL DEFAULT 0,
+        spent_tokens_month INTEGER NOT NULL DEFAULT 0,
+        unknown_usage_count INTEGER NOT NULL DEFAULT 0,
+        allow_model_downgrade INTEGER NOT NULL DEFAULT 0,
+        model_fallbacks TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS plan_group_members (
+        group_id TEXT NOT NULL,
+        upstream_id TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 100,
+        weight INTEGER NOT NULL DEFAULT 1,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (group_id, upstream_id)
+    )
+    """,
+)
+
+_UNSET: Any = object()
+#: 公开别名：调用方（CLI）用 ``store.UNSET`` 表示「这个参数不改」
+UNSET: Any = _UNSET
+"""区分「参数没传」与「显式传 None（= 不限）」（预算设置用）。"""
+
+#: v4 的纯增量列（老库缺列时补；已存在则跳过 —— 迁移幂等）
+_PLAN_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("plan_groups", "spent_tokens_day", "INTEGER NOT NULL DEFAULT 0"),
+    ("plan_groups", "spent_tokens_month", "INTEGER NOT NULL DEFAULT 0"),
+    ("plan_groups", "unknown_usage_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("plan_groups", "allow_model_downgrade", "INTEGER NOT NULL DEFAULT 0"),
+    ("plan_groups", "model_fallbacks", "TEXT NOT NULL DEFAULT ''"),
+)
 
 _SCHEMA_SQL: tuple[str, ...] = (
     """
@@ -146,7 +199,7 @@ _SCHEMA_SQL: tuple[str, ...] = (
         value TEXT NOT NULL
     )
     """,
-)
+) + _PLAN_SCHEMA_SQL
 
 
 @dataclass
@@ -331,6 +384,10 @@ class Store:
                     # v2：收据增加 stale 标记（超 24 h 不丢弃，标 stale + 停接单，Lead 裁决 CR-2）
                     connection.execute("ALTER TABLE receipts ADD COLUMN stale INTEGER"
                                        " NOT NULL DEFAULT 0")
+                if version < 4:
+                    # v4：多 plan 组（组内自动切换 + 组级共享预算）。只建新表 / 补增量列，
+                    # 不动任何老表、不回填老数据 —— 老库自动升，升完老数据照旧可用。
+                    _migrate_plan_schema(connection)
                 connection.execute("PRAGMA user_version=" + str(SCHEMA_VERSION))
         self._connection = connection
         return connection
@@ -380,6 +437,8 @@ class Store:
                                                            "stale"):
                     connection.execute("ALTER TABLE receipts ADD COLUMN stale INTEGER"
                                        " NOT NULL DEFAULT 0")
+                if version_before < 4:
+                    _migrate_plan_schema(connection)
                 connection.execute("PRAGMA user_version=" + str(SCHEMA_VERSION))
                 exists = connection.execute(
                     "SELECT COUNT(*) FROM install").fetchone()[0]
@@ -562,6 +621,184 @@ class Store:
             from .errors import UsageError
             raise UsageError("模型不在该上游的清单里：" + model_id)
         return self.update_upstream(upstream_id, models=models)
+
+    # ─────────────────────────────────────────────────────── plan 组（schema v4）
+    def plan_groups(self) -> list[dict[str, Any]]:
+        """全部组（按 priority, name 升序）+ 组内成员（按 priority, upstream_id 升序）。
+
+        形状直接就是 ``plan_router.pick_target`` 的入参；``spent_*`` / ``day_key`` /
+        ``month_key`` 是**库里原样**的值：跨窗口的归零由路由侧 ``_window_spent``
+        归一化、由 ``add_plan_spend`` 在写入侧落库。成员的 ``models`` 取所属上游当前
+        启用的模型（逗号串，原样透传）。
+        """
+        connection = self.connect()
+        rows = connection.execute(
+            "SELECT * FROM plan_groups ORDER BY priority, name").fetchall()
+        models = _upstream_models_map(connection)
+        members: dict[str, list[dict[str, Any]]] = {}
+        for row in connection.execute(
+                "SELECT * FROM plan_group_members ORDER BY priority, upstream_id"):
+            members.setdefault(str(row["group_id"]), []).append(
+                _row_to_plan_member(row, models.get(str(row["upstream_id"]), "")))
+        return [_row_to_plan_group(row, members.get(str(row["id"]), [])) for row in rows]
+
+    def plan_group(self, name_or_id: str) -> dict[str, Any]:
+        """按**名字或 id** 取组（CLI 的 --group 两种都接受）；不存在抛 UsageError。"""
+        key = str(name_or_id or "").strip()
+        if not key:
+            raise UsageError("组名不能为空")
+        connection = self.connect()
+        row = connection.execute(
+            "SELECT * FROM plan_groups WHERE name = ? OR id = ?", (key, key)).fetchone()
+        if row is None:
+            raise UsageError("plan 组不存在：" + key)
+        models = _upstream_models_map(connection)
+        members = [_row_to_plan_member(item, models.get(str(item["upstream_id"]), ""))
+                   for item in connection.execute(
+                       "SELECT * FROM plan_group_members WHERE group_id = ?"
+                       " ORDER BY priority, upstream_id", (str(row["id"]),))]
+        return _row_to_plan_group(row, members)
+
+    def add_plan_group(self, *, name: str, budget_day_minor: int | None = None,
+                       budget_month_minor: int | None = None,
+                       priority: int = 100, enabled: bool = True,
+                       allow_model_downgrade: bool = False,
+                       model_fallbacks: Any = (),
+                       now: datetime | None = None) -> dict[str, Any]:
+        """建组（名字唯一）；金额一律 minor（整数），``None`` = 不限。"""
+        moment = iso(now or self._now())
+        clean = _validate_plan_name(name)
+        identifier = "pg_" + new_request_id()
+        with self._conn() as connection:
+            try:
+                connection.execute(
+                    "INSERT INTO plan_groups (id, name, budget_usd_minor_day,"
+                    " budget_usd_minor_month, spent_usd_minor_day, spent_usd_minor_month,"
+                    " day_key, month_key, priority, enabled, created_at, updated_at,"
+                    " allow_model_downgrade, model_fallbacks)"
+                    " VALUES (?,?,?,?,0,0,NULL,NULL,?,?,?,?,?,?)",
+                    (identifier, clean, _validate_optional_minor(budget_day_minor),
+                     _validate_optional_minor(budget_month_minor),
+                     _validate_priority(priority), 1 if enabled else 0, moment, moment,
+                     1 if allow_model_downgrade else 0,
+                     ",".join(_validate_model_list(model_fallbacks))))
+            except sqlite3.IntegrityError:
+                raise UsageError("plan 组已存在：" + clean)
+        return self.plan_group(identifier)
+
+    def set_plan_budget(self, name_or_id: str, *, day_minor: Any = _UNSET,
+                        month_minor: Any = _UNSET,
+                        allow_model_downgrade: Any = _UNSET,
+                        model_fallbacks: Any = _UNSET,
+                        now: datetime | None = None) -> dict[str, Any]:
+        """设置日/月预算；不传的字段保持原值，显式传 ``None`` = 取消上限。"""
+        group = self.plan_group(name_or_id)
+        pairs: dict[str, Any] = {}
+        if day_minor is not _UNSET:
+            pairs["budget_usd_minor_day"] = _validate_optional_minor(day_minor)
+        if month_minor is not _UNSET:
+            pairs["budget_usd_minor_month"] = _validate_optional_minor(month_minor)
+        if allow_model_downgrade is not _UNSET:
+            pairs["allow_model_downgrade"] = 1 if allow_model_downgrade else 0
+        if model_fallbacks is not _UNSET:
+            pairs["model_fallbacks"] = ",".join(_validate_model_list(model_fallbacks))
+        if not pairs:
+            return group
+        pairs["updated_at"] = iso(now or self._now())
+        assignments = ", ".join(key + " = ?" for key in pairs)
+        with self._conn() as connection:
+            connection.execute("UPDATE plan_groups SET " + assignments + " WHERE id = ?",
+                               tuple(pairs.values()) + (group["id"],))
+        return self.plan_group(group["id"])
+
+    def set_plan_group_enabled(self, name_or_id: str, enabled: bool, *,
+                               now: datetime | None = None) -> dict[str, Any]:
+        group = self.plan_group(name_or_id)
+        with self._conn() as connection:
+            connection.execute(
+                "UPDATE plan_groups SET enabled = ?, updated_at = ? WHERE id = ?",
+                (1 if enabled else 0, iso(now or self._now()), group["id"]))
+        return self.plan_group(group["id"])
+
+    def add_plan_group_member(self, name_or_id: str, *, upstream_id: str,
+                              priority: int = 100, weight: int = 1,
+                              enabled: bool = True,
+                              now: datetime | None = None) -> dict[str, Any]:
+        """加成员（同组同上游幂等 upsert：改 priority/weight/enabled）。"""
+        group = self.plan_group(name_or_id)
+        upstream = str(upstream_id or "").strip()
+        if not upstream:
+            raise UsageError("上游 id 不能为空")
+        self.upstream(upstream)                        # 不存在直接抛 UsageError
+        with self._conn() as connection:
+            connection.execute(
+                "INSERT INTO plan_group_members (group_id, upstream_id, priority, weight,"
+                " enabled) VALUES (?,?,?,?,?) ON CONFLICT(group_id, upstream_id) DO UPDATE SET"
+                " priority=excluded.priority, weight=excluded.weight,"
+                " enabled=excluded.enabled",
+                (group["id"], upstream, _validate_priority(priority),
+                 _validate_weight(weight), 1 if enabled else 0))
+            connection.execute("UPDATE plan_groups SET updated_at = ? WHERE id = ?",
+                               (iso(now or self._now()), group["id"]))
+        return self.plan_group(group["id"])
+
+    def remove_plan_group_member(self, name_or_id: str, upstream_id: str, *,
+                                 now: datetime | None = None) -> bool:
+        group = self.plan_group(name_or_id)
+        with self._conn() as connection:
+            cursor = connection.execute(
+                "DELETE FROM plan_group_members WHERE group_id = ? AND upstream_id = ?",
+                (group["id"], str(upstream_id or "").strip()))
+            connection.execute("UPDATE plan_groups SET updated_at = ? WHERE id = ?",
+                               (iso(now or self._now()), group["id"]))
+        return bool(cursor.rowcount)
+
+    def remove_plan_group(self, name_or_id: str) -> bool:
+        """删组（连同成员）；**不碰** upstreams / 凭据 / 用量窗口。"""
+        group = self.plan_group(name_or_id)
+        with self._conn() as connection:
+            connection.execute("DELETE FROM plan_group_members WHERE group_id = ?",
+                               (group["id"],))
+            cursor = connection.execute("DELETE FROM plan_groups WHERE id = ?",
+                                        (group["id"],))
+        return bool(cursor.rowcount)
+
+    def add_plan_spend(self, name_or_id: str, *, tokens: int | None,
+                       cost_minor: int | None = None,
+                       now: datetime | None = None) -> dict[str, Any]:
+        """把一次**成功**请求的用量记到组预算上（单条 UPDATE，原子）。
+
+        * ``tokens`` 为 ``None``：上游没回 usage → 只把 ``unknown_usage_count`` +1，
+          不记金额、不记 token（任务单 C 的口径）；
+        * ``cost_minor`` 为 ``None``：拿不到单价 → 只记 token，不记金额；
+        * ``day_key`` / ``month_key`` 变了 → 对应窗口的 ``spent_*`` 先归零再累加
+          （在同一句 SQL 里用 CASE 完成，不存在读-改-写竞态窗口）。
+        """
+        group = self.plan_group(name_or_id)
+        moment = now or self._now()
+        today = plan_router.day_key(moment)
+        this_month = plan_router.month_key(moment)
+        token_value = 0 if tokens is None else max(0, int(tokens))
+        cost_value = 0 if cost_minor is None else max(0, int(cost_minor))
+        unknown = 1 if tokens is None else 0
+        with self._conn() as connection:
+            connection.execute(
+                "UPDATE plan_groups SET"
+                " spent_usd_minor_day = (CASE WHEN day_key = :today"
+                "   THEN spent_usd_minor_day ELSE 0 END) + :cost,"
+                " spent_usd_minor_month = (CASE WHEN month_key = :month"
+                "   THEN spent_usd_minor_month ELSE 0 END) + :cost,"
+                " spent_tokens_day = (CASE WHEN day_key = :today"
+                "   THEN spent_tokens_day ELSE 0 END) + :tokens,"
+                " spent_tokens_month = (CASE WHEN month_key = :month"
+                "   THEN spent_tokens_month ELSE 0 END) + :tokens,"
+                " unknown_usage_count = unknown_usage_count + :unknown,"
+                " day_key = :today, month_key = :month, updated_at = :now"
+                " WHERE id = :id",
+                {"today": today, "month": this_month, "cost": cost_value,
+                 "tokens": token_value, "unknown": unknown,
+                 "now": iso(moment), "id": group["id"]})
+        return self.plan_group(group["id"])
 
     # ─────────────────────────────────────────────────────── policy
     def save_policy(self, record: PolicyRecord) -> PolicyRecord:
@@ -816,12 +1053,124 @@ class Store:
         }
 
 
+def _validate_plan_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise UsageError("plan 组名不能为空")
+    if len(text) > 64:
+        raise UsageError("plan 组名太长（上限 64 字符）")
+    if any(ch in text for ch in "\r\n\t\x00"):
+        raise UsageError("plan 组名不能含控制字符")
+    return text
+
+
+def _validate_optional_minor(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise UsageError("预算金额必须是整数 minor（USD x 100）")
+    if value < 0:
+        raise UsageError("预算金额不能为负")
+    return int(value)
+
+
+def _validate_model_list(value: Any) -> list[str]:
+    """降级链：逗号串或序列；去空、去重、保序。"""
+    if value is None:
+        return []
+    items = value.split(",") if isinstance(value, str) else list(value)
+    ordered: dict[str, None] = {}
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        if len(text) > 200 or any(ch in text for ch in "\r\n\t\x00"):
+            raise UsageError("模型名不合法：" + text[:32])
+        ordered.setdefault(text, None)
+    return list(ordered)
+
+
+def _upstream_models_map(connection: sqlite3.Connection) -> dict[str, str]:
+    """``upstream_id -> "m1,m2"``（只取启用的模型；解析失败按空处理）。"""
+    mapping: dict[str, str] = {}
+    for row in connection.execute("SELECT id, models FROM upstreams"):
+        try:
+            entries = json.loads(row["models"] or "[]")
+        except (TypeError, ValueError):                       # pragma: no cover - 防御
+            continue
+        ids = [str(item.get("id")) for item in entries
+               if isinstance(item, dict) and item.get("id")
+               and item.get("enabled", True)]
+        mapping[str(row["id"])] = ",".join(ids)
+    return mapping
+
+
+def _validate_priority(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise UsageError("priority 必须是整数")
+    if value < 0 or value > 100000:
+        raise UsageError("priority 超出范围（0–100000）")
+    return int(value)
+
+
+def _validate_weight(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise UsageError("weight 必须是整数")
+    if value < 1 or value > 1000:
+        raise UsageError("weight 超出范围（1–1000）")
+    return int(value)
+
+
+def _row_to_plan_member(row: sqlite3.Row, models: str = "") -> dict[str, Any]:
+    """成员 -> ``plan_router`` 认的形状（``models`` 是逗号串，``""`` = 不支持任何模型）。"""
+    return {"upstream_id": str(row["upstream_id"]), "models": models,
+            "priority": int(row["priority"]), "weight": int(row["weight"]),
+            "enabled": bool(row["enabled"])}
+
+
+def _row_to_plan_group(row: sqlite3.Row, members: list[dict[str, Any]]) -> dict[str, Any]:
+    """组 -> ``plan_router`` 认的 dict（比路由用到的字段多几个，供 CLI 显示）。"""
+    keys = row.keys()
+
+    def _column(name: str, fallback: Any) -> Any:
+        return row[name] if name in keys else fallback
+
+    fallbacks = str(_column("model_fallbacks", "") or "")
+    return {
+        "id": str(row["id"]), "name": str(row["name"]),
+        "enabled": bool(row["enabled"]), "priority": int(row["priority"]),
+        "budget_usd_minor_day": _column("budget_usd_minor_day", None),
+        "budget_usd_minor_month": _column("budget_usd_minor_month", None),
+        "spent_usd_minor_day": int(_column("spent_usd_minor_day", 0) or 0),
+        "spent_usd_minor_month": int(_column("spent_usd_minor_month", 0) or 0),
+        "day_key": _column("day_key", None), "month_key": _column("month_key", None),
+        "spent_tokens_day": int(_column("spent_tokens_day", 0) or 0),
+        "spent_tokens_month": int(_column("spent_tokens_month", 0) or 0),
+        "unknown_usage_count": int(_column("unknown_usage_count", 0) or 0),
+        "allow_model_downgrade": bool(_column("allow_model_downgrade", 0)),
+        "model_fallbacks": [item.strip() for item in fallbacks.split(",") if item.strip()],
+        "members": members,
+    }
+
+
 def _has_column(connection: sqlite3.Connection, table: str, column: str) -> bool:
     try:
         rows = connection.execute("PRAGMA table_info(" + table + ")").fetchall()
     except sqlite3.Error:                                  # pragma: no cover - 防御
         return False
     return any(str(row[1]) == column for row in rows)
+
+
+def _migrate_plan_schema(connection: sqlite3.Connection) -> None:
+    """v3 → v4 迁移：只建 plan 组两张新表 + 补纯增量列（幂等，可重复执行）。
+
+    不动任何老表结构、不回填、不删除：老库自动升，升完老数据照旧可读可用。
+    """
+    for statement in _PLAN_SCHEMA_SQL:
+        connection.execute(statement)
+    for table, column, ddl in _PLAN_ADDED_COLUMNS:
+        if not _has_column(connection, table, column):
+            connection.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + ddl)
 
 
 def bucket_for(install_id: str) -> int:

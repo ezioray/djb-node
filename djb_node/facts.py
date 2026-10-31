@@ -556,3 +556,22 @@ FEATURE_FLAGS["client.ipc.windows.enabled"] = {
     "rollback_rule": "关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好",
     "description": "Windows同SID/session/integrity安全命名管道；不解禁GUI托盘控制",
 }
+
+# ─────────────────────────────────────────────────────────── 多 plan 组（组内自动切换 + 组级预算）
+# 口径：一条上游 = 一个 plan。多个 plan 先分组（组级共享预算，日/月上限，NULL=不限），
+# 组按 priority 升序，组内按成员 priority 升序（同档按 weight 加权随机）依次尝试；
+# 组预算耗尽 / 全部失败 → 用下一组。**默认关闭**；关闭时 /v1/chat/completions 走原来的
+# 单上游 route() 路径，行为与接入前一致（plan_router 都不会被调用）。
+FEATURE_FLAGS["plan.groups"] = {
+    "default": False,
+    "owner": "plan-groups",
+    "expire_at": "2027-06-30",
+    "rollback_rule": "关闭（默认即关）→ /v1/chat/completions 退回单上游 route() 路径，"
+                     "plan_router 不被调用、不记账；plan_groups / plan_group_members 表与"
+                     " spent_* / unknown_usage_count 数据只读保留，不删除、不改写；"
+                     "本地库版本只前进（v4），回退安装旧客户端会被拒绝，故回滚动作只关开关",
+    "description": "多 plan 组：组内按 priority 自动切换、组级共享日/月预算，默认关闭",
+}
+PLAN_GROUPS_FLAG = "plan.groups"
+# 注意：尝试次数上限与冷却秒数只在 djb_node/plan_router.py 里定义一份
+# （MAX_ATTEMPTS / AUTH_COOLDOWN_S），这里不再复制，避免两处漂移。

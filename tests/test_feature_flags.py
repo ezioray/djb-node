@@ -25,13 +25,17 @@ def make_config(**extra) -> ClientConfig:
     return config
 
 
+#: 各开关自己的到期日（默认 2026-12-31；plan.groups 按任务单到 2027-06-30）
+EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30"}
+
+
 def test_every_flag_has_three_fields_and_default_off():
     assert facts.FEATURE_FLAGS, "客户端至少要登记 M17 的两条开关"
     for name, spec in facts.FEATURE_FLAGS.items():
         for field_name in ("owner", "expire_at", "rollback_rule", "default", "description"):
             assert str(spec.get(field_name, "")).strip(), name + " 缺少 " + field_name
         assert spec["default"] is False, name + " 必须默认关闭"
-        assert spec["expire_at"] == "2026-12-31"
+        assert spec["expire_at"] == EXPIRE_OVERRIDES.get(name, "2026-12-31")
         assert "desc" not in spec, name + " 不要用 desc 字段（统一 description）"
 
 

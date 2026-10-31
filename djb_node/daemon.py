@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from . import facts, policy as policy_mod, protocol
+from . import facts, plan_router, policy as policy_mod, protocol
 from .api import NodeApi, PolicyFetch
 from .channel import ChannelClient, channel_enabled
 from .config import ClientConfig, Paths, feature_flag, load_config
@@ -1169,6 +1169,67 @@ class Daemon:
                            access=record.access_type, upstream_id=record.id,
                            credential=secret,
                            protocol=getattr(record, "protocol", None) or "openai-chat")
+
+    # ── plan 组（开关 plan.groups；默认关闭时下列方法不会被调用）
+    def plan_groups(self) -> list[dict[str, Any]]:
+        """plan 组快照（组 + 成员 + 已花预算），形状即 ``plan_router.pick_target`` 的入参。"""
+        return self.store.plan_groups()
+
+    def plan_route(self, upstream_id: str, model: str) -> RouteTarget | None:
+        """把组内成员解析成 RouteTarget；该上游不服务此模型 / 已禁用 -> ``None``。
+
+        凭据只从本机 0600 存储读出放进 ``RouteTarget.credential``，**不进日志**。
+        """
+        try:
+            record = self.store.upstream(str(upstream_id))
+        except UsageError:                              # 上游不存在 = 该成员不可用
+            return None
+        if not record.enabled:
+            return None
+        entry = next((item for item in record.models
+                      if str(item.get("id")) == model and item.get("enabled", True)), None)
+        if entry is None:
+            return None
+        return RouteTarget(base_url=record.base_url, model=str(entry.get("id")),
+                           access=record.access_type, upstream_id=record.id,
+                           credential=self.credentials.upstream_secret(record.id),
+                           protocol=getattr(record, "protocol", None) or "openai-chat")
+
+    def plan_charge(self, target: Any, model: str,
+                    usage: tuple[int, int, int] | None) -> dict[str, Any]:
+        """把一次**成功**请求记到组预算（C 段口径）。
+
+        ``target`` 是 ``plan_router.PlanTarget``（``.group`` 是组名、``.model`` 是实际模型）。
+
+        * 有 usage → 按「单价 × token」算金额（minor）；单价缺失 / 单位不认识 → 只记 token；
+        * 没有 usage → 只把 ``unknown_usage_count`` +1（不记金额、不记 token）；
+        * 记账是单条 SQL UPDATE，跨天 / 跨月窗口在同一句里归零。
+        """
+        group_key = str(getattr(target, "group", "") or "")      # 组名（PlanTarget.group）
+        if not group_key:
+            return {}
+        tokens = None if usage is None else max(0, int(usage[2]))
+        price: Any = None
+        unit: str | None = None
+        try:
+            record = self.store.upstream(str(getattr(target, "upstream_id", "") or ""))
+        except UsageError:                              # 上游已删：拿不到单价，只记 token
+            record = None
+        if record is not None:
+            for item in record.models:
+                if str(item.get("id")) == model:
+                    price = item.get("min_price")
+                    unit = item.get("min_price_unit")
+                    break
+        cost_minor = plan_router.estimate_cost_minor(tokens=tokens, price=price, unit=unit)
+        group = self.store.add_plan_spend(group_key, tokens=tokens, cost_minor=cost_minor,
+                                          now=self._now())
+        return {"group": group["name"], "group_id": group["id"],
+                "cost_minor": cost_minor, "tokens": tokens,
+                "price_known": cost_minor is not None,
+                "spent_usd_minor_day": group["spent_usd_minor_day"],
+                "spent_usd_minor_month": group["spent_usd_minor_month"],
+                "unknown_usage_count": group["unknown_usage_count"]}
 
     def begin_task(self) -> None:
         with self._inflight_lock:
