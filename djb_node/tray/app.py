@@ -125,7 +125,8 @@ class TrayApp:
                  status_provider: Callable[[], Mapping[str, Any] | None],
                  notifications_provider: Callable[[], Sequence[Mapping[str, Any]] | None],
                  intent_sink: Callable[[TrayIntent], None], *,
-                 interval_ms: int = DEFAULT_INTERVAL_MS) -> None:
+                 interval_ms: int = DEFAULT_INTERVAL_MS,
+                 bus: Any | None = None) -> None:
         if isinstance(interval_ms, bool) or not isinstance(interval_ms, int) or interval_ms <= 0:
             raise UsageError("interval_ms 必须是正整数（毫秒）")
         self._backend = backend
@@ -138,6 +139,12 @@ class TrayApp:
         self._model: TrayModel | None = None
         self._timer: Any = None
         self._closed = False
+        #: 与主窗口共享的暂停/让路状态总线（可选；None = 只做托盘自己的刷新）
+        self._bus = bus
+        self._refreshing = False
+        self._unsubscribe: Callable[[], None] | None = None
+        if bus is not None:
+            self._unsubscribe = bus.subscribe(self._on_external_state)
         backend.set_activate_handler(self.activate)
 
     # ─────────────────────────────────────────────────── 状态查询
@@ -172,7 +179,30 @@ class TrayApp:
         self._backend.set_title(model.status_line())
         self._backend.set_menu_items(model.items)
         self._backend.set_badge(self._badge_of(model))
+        self._publish_state(status)
         return model
+
+    def _publish_state(self, status: Any) -> None:
+        """把本次回读结果广播给主窗口（暂停/让路一致性）；失败只记事件，不拖垮托盘。"""
+        bus = self._bus
+        if bus is None or not isinstance(status, Mapping):
+            return
+        self._refreshing = True
+        try:
+            bus.publish_status(status, source="tray")
+        except Exception as exc:
+            event("tray.bus_publish_failed", level="warning", error=type(exc).__name__)
+        finally:
+            self._refreshing = False
+
+    def _on_external_state(self, _snapshot: Any) -> None:
+        """别的界面（主窗口）回读到新状态：立即重画菜单，不再等下一个 5s 周期。"""
+        if self._closed or self._refreshing:
+            return
+        try:
+            self.refresh()
+        except Exception as exc:                       # 托盘是旁路，刷新失败不能崩
+            event("tray.bus_refresh_failed", level="warning", error=type(exc).__name__)
 
     def _collect(self, provider: Callable[[], Any], default: Any) -> Any:
         """旁路采集：provider 抛异常时降级为 ``default``（托盘不因 status / 消息库异常停）。"""
@@ -227,6 +257,12 @@ class TrayApp:
             return
         self._closed = True
         self._timer = None
+        if self._unsubscribe is not None:
+            try:
+                self._unsubscribe()
+            except Exception:
+                pass
+            self._unsubscribe = None
         self._backend.stop()
 
     def _schedule(self) -> None:
@@ -414,9 +450,9 @@ class TkBackend:
         """16×16 纯色图标（不下载图片资源；窗口管理器不支持时静默省略）。"""
         icon = self._tk.PhotoImage(width=16, height=16)
         icon.put(COLORS["bg"], to=(0, 0, 16, 16))
-        icon.put(COLORS["cyan"], to=(2, 4, 5, 14))
-        icon.put(COLORS["cyan"], to=(5, 11, 12, 14))
-        icon.put(COLORS["violet"], to=(10, 2, 14, 10))
+        icon.put(COLORS["mint"], to=(2, 4, 5, 14))
+        icon.put(COLORS["mint2"], to=(5, 11, 12, 14))
+        icon.put(COLORS["text"], to=(10, 2, 14, 10))
         try:
             self._root.iconphoto(True, icon)
         except Exception:                              # 部分 WM 不支持 iconphoto：省略图标

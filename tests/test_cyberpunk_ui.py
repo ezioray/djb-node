@@ -172,13 +172,37 @@ def _luminance(color):
     return sum(a * b for a, b in zip(linear, (0.2126, 0.7152, 0.0722)))
 
 
+def _contrast(first, second):
+    """WCAG 2.x 对比度（亮者作分子，与前景/背景顺序无关）。
+
+    2026-11-01 UI-BASELINE 把主题从暗色翻成浅色（Daylight Signal），旧写法
+    ``(前景+0.05)/(背景+0.05)`` 只在「深底浅字」时等于 WCAG 值；浅底深字会算出
+    0.2 这样的假失败。这里改成标准对称公式，阈值 4.5 / 3.0 一律不放宽。
+    """
+    high, low = sorted((_luminance(first), _luminance(second)), reverse=True)
+    return (high + .05) / (low + .05)
+
+
 @pytest.mark.parametrize("color", ["text", "muted", "cyan", "violet", "wait", "danger"])
 def test_theme_text_contrast(color):
-    assert (_luminance(COLORS[color]) + .05) / (_luminance(COLORS["panel"]) + .05) >= 4.5
+    assert _contrast(COLORS[color], COLORS["panel"]) >= 4.5
+
+
+def test_theme_text_variants_meet_contrast_on_page_and_card():
+    """文字色在页底与卡片上都必须达标（浅色主题最容易被背景色拉低的地方）。"""
+    for name in ("text", "text2", "muted", "cyan", "danger", "ok"):
+        assert _contrast(COLORS[name], COLORS["bg"]) >= 4.5, name
+        assert _contrast(COLORS[name], COLORS["panel"]) >= 4.5, name
+
+
+def test_theme_contrast_helper_is_order_independent():
+    assert _contrast("#FFFFFF", "#0D2925") == pytest.approx(_contrast("#0D2925", "#FFFFFF"))
+    assert _contrast("#FFFFFF", "#FFFFFF") == pytest.approx(1.0)
+    assert _contrast("#FFFFFF", "#0D2925") > 14
 
 
 def test_theme_control_boundary_contrast():
-    assert (_luminance(COLORS["border"]) + .05) / (_luminance(COLORS["input"]) + .05) >= 3
+    assert _contrast(COLORS["border"], COLORS["input"]) >= 3
 
 
 def test_control_flag_canonical_default_and_expiry():
