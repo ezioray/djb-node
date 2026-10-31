@@ -15,7 +15,8 @@ from pathlib import Path
 
 import pytest
 
-CLOUD = Path(__file__).resolve().parents[2] / "djb-cloud" / "app" / "metering" / "node_console.py"
+NODE = Path(__file__).resolve().parents[1]
+CLOUD = NODE.parent / "djb-cloud" / "app" / "metering" / "node_console.py"
 
 pytestmark = pytest.mark.skipif(not CLOUD.exists(),
                                 reason="同仓外的 djb-cloud 不在预期路径，跳过跨仓契约检查")
@@ -64,8 +65,16 @@ def test_pagination_keys_unchanged():
     assert {"data", "page", "next_cursor", "has_more"} <= keys
 
 
-def test_receipt_states_are_the_ones_client_maps():
-    """客户端把 accepted→verified、rejected/expired→failed；词表变了要一起改。"""
+def test_receipt_states_are_the_ones_client_shows_verbatim():
+    """客户端**原样显示**云端状态词（accepted/rejected/expired），只另给中文。
+
+    真数据联调时发现旧实现把 accepted 翻成 verified——本机一次校验都没做却说「已验证」。
+    现在词表变了也要一起改：这里挂一句话，改的时候能看到。
+    """
     source = CLOUD.read_text(encoding="utf-8")
     for word in ("accepted", "rejected", "expired"):
         assert word in source, "收据状态词表里没有 " + word
+    client = NODE / "djb_node" / "desktop" / "nodecloud.py"
+    text = client.read_text(encoding="utf-8")
+    for word in ("accepted", "rejected", "expired"):
+        assert word in text, "客户端的中文状态表没覆盖 " + word

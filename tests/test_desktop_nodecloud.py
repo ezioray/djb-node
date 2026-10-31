@@ -305,14 +305,17 @@ def test_task_rows_get_tokens_elapsed_and_state_mapping():
          "finished_at": "2026-11-01T10:01:00Z", "amount_micro": 500_000},
     ]))))
     rows = client.fetch("tasks")["items"]
-    assert rows[0]["id"] == "t-1" and rows[0]["state"] == "inflight"
+    # 云端原词保留（recorded/settled），在途与否另由 inflight 表达；两者不再互相顶替
+    assert rows[0]["id"] == "t-1" and rows[0]["state"] == "recorded"
+    assert rows[0]["state_text"] == "已记录" and rows[0]["inflight"] is True
     assert rows[0]["tokens"] == 42 and rows[0]["elapsed_s"] == 9
     assert rows[0]["amount"] == "1.25"
-    assert rows[1]["id"] == "req-2" and rows[1]["state"] == "done"
+    assert rows[1]["id"] == "req-2" and rows[1]["state"] == "settled"
+    assert rows[1]["state_text"] == "已结算" and rows[1]["inflight"] is False
     assert rows[1]["elapsed_s"] == 60 and rows[1]["amount"] == "0.50"
 
 
-def test_receipt_rows_map_accepted_to_verified():
+def test_receipt_rows_keep_state_words_and_do_not_claim_verified():
     client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(200, page([
         {"receipt_id": "r-1", "state": "accepted", "tokens": 40, "revenue_minor": 2_000_000,
          "issued_at": "2026-11-01T10:00:00Z", "hash": "deadbeef…"},
@@ -320,18 +323,27 @@ def test_receipt_rows_map_accepted_to_verified():
          "issued_at": "2026-11-01T10:05:00Z", "reject_reason": "bad signature"},
     ]))))
     rows = client.fetch("receipts")["items"]
-    assert rows[0]["status"] == "verified" and rows[0]["state_raw"] == "accepted"
+    # accepted 是「云端受理」，不是「本机校验通过」——原词保留，中文另给
+    assert rows[0]["state"] == "accepted" and rows[0]["state_text"] == "已受理"
+    assert "status" not in rows[0] or rows[0].get("status") != "verified"
     assert rows[0]["created_at"] == "2026-11-01T10:00:00Z" and rows[0]["amount"] == "2.00"
-    assert rows[1]["status"] == "failed" and rows[1]["amount"] is None
+    assert rows[1]["state"] == "rejected" and rows[1]["amount"] is None
 
 
-def test_receipt_view_renders_accepted_as_verified_not_failed():
+def test_receipt_view_shows_cloud_state_and_local_check_separately():
+    """真数据口径：云端 accepted/rejected/expired 原样说，本机有没有副本另说。"""
     cloud = FakeCloud(receipts={"items": [
-        {"receipt_id": "r-1", "status": "verified", "created_at": "2026-11-01T10:00:00Z",
-         "tokens": 40}], "next_cursor": None, "truncated": False})
+        {"receipt_id": "r-1", "state": "accepted", "state_text": "已受理",
+         "created_at": "2026-11-01T10:00:00Z", "tokens": 40, "local_check": "no_local"},
+        {"receipt_id": "r-2", "state": "rejected", "state_text": "已拒绝",
+         "rejected_code": 46001, "reject_reason": "provider_signature_mismatch",
+         "created_at": "2026-11-01T10:01:00Z", "tokens": None, "local_check": "no_local"},
+    ], "next_cursor": None, "truncated": False})
     text = text_of("receipts", make_source(cloud))
-    assert "✓ verified" in text
-    assert "✕" not in text.split("收据")[-1]
+    assert "✓ 已受理" in text
+    assert "已拒绝（46001 收据签名不匹配" in text
+    assert "本机无副本" in text
+    assert "已验证" not in text.replace("本机已验证", "").replace("本机无副本", "")
 
 
 def test_profile_payload_maps_node_identity():
@@ -422,3 +434,46 @@ def test_node_balance_failure_is_unavailable_not_zero():
     section = make_source(Boom())._earnings()
     assert section["balance"] is None
     assert "502" in section["balance_note"]
+
+
+# ───────────────────────────────────────────── 第二页被拒：拿到的照显，但要标 truncated
+def test_second_page_rejection_keeps_first_page_and_flags_truncated():
+    """真联调：receipts 的 next_cursor 回传云端 400，客户端不能把已拿到的 2 条也丢掉。"""
+    answers = [
+        {"data": [{"receipt_id": "r1", "state": "accepted"}],
+         "page": {"cursor": "", "has_more": True, "next_cursor": "broken"}},
+    ]
+
+    class FlakyHttp:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, method, url, headers=None, timeout=None):   # noqa: ARG002
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResponse(200, answers[0])
+            return FakeResponse(400, {"error": {"code": 40001, "message": "cursor 非法"}})
+
+    client = NodeCloudClient("http://cloud.test", "ck", http=FlakyHttp())
+    result = client.fetch("receipts")
+    assert [row["receipt_id"] for row in result["items"]] == ["r1"]
+    assert result["truncated"] is True
+    assert "400" in result["page_error"] and result["pages"] == 1
+
+
+def test_first_page_failure_still_fails_the_whole_domain():
+    class Dead:
+        def request(self, method, url, headers=None, timeout=None):   # noqa: ARG002
+            return FakeResponse(400, {"error": {"code": 40001}})
+
+    with pytest.raises(ProviderError):
+        NodeCloudClient("http://cloud.test", "ck", http=Dead()).fetch("receipts")
+
+
+def test_truncated_note_names_the_cursor_rejection_not_a_generic_more():
+    section = {"rows": [{"receipt_id": "r1"}], "truncated": True,
+               "next_cursor": "broken", "page_error": "请求被拒绝（400）"}
+    from djb_node.desktop.datasource import _more_note
+
+    note = _more_note(section)
+    assert "云端拒绝了翻页游标" in note and "已显示前 1 条" in note

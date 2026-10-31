@@ -125,7 +125,8 @@ def test_real_http_pagination_end_to_end(server):
     client = make_client(server)
     result = client.fetch("tasks")
     assert [row["id"] for row in result["items"]] == ["t1", "t2", "t3"]
-    assert [row["state"] for row in result["items"]] == ["inflight", "done", "inflight"]
+    assert [row["state"] for row in result["items"]] == ["recorded", "settled", "recorded"]
+    assert [row["inflight"] for row in result["items"]] == [True, False, True]
     assert result["pages"] == 3 and result["truncated"] is False
     assert [call["query"].get("cursor", [None])[0] for call in Handler.seen] == [None, "c2", "c3"]
     assert all(call["path"] == "/api/v1/node/tasks" for call in Handler.seen)

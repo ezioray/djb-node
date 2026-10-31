@@ -86,6 +86,19 @@ def _seconds(start: Any, end: Any) -> int | None:
     return max(0, int((second - first).total_seconds()))
 
 
+#: 云端状态原词 → 中文（只翻译，不改写；未知词一律原样显示并标「未知」）
+STATE_TEXT = {
+    "recorded": "已记录", "settled": "已结算", "corrected": "已更正",
+    "accepted": "已受理", "rejected": "已拒绝", "expired": "已过期",
+    "failed": "失败", "error": "错误", "running": "进行中", "done": "已完成",
+}
+
+
+def state_text(state: str) -> str:
+    """状态原词的中文说法；没登记的词返回空串（调用方负责如实显示原词）。"""
+    return STATE_TEXT.get(str(state or ""), "")
+
+
 def _task_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """任务行：补 tokens 合计与耗时（视图直接用），其余字段原样保留。"""
     tokens_in, tokens_out = row.get("tokens_in"), row.get("tokens_out")
@@ -95,21 +108,26 @@ def _task_row(row: Mapping[str, Any]) -> dict[str, Any]:
     state = str(row.get("state") or "")
     return {**row,
             "id": row.get("task_id") or row.get("request_id") or row.get("id"),
-            # recorded=已记录未结算，按「在途」展示；settled/corrected=已结算
-            "state": ("inflight" if row.get("inflight") else
-                      "done" if state in ("settled", "corrected") else state),
-            "state_raw": state,
+            # 云端状态原样保留（recorded/settled/…），在途与否由 inflight 单独表达——
+            # 用 inflight 顶替 state 会把「已记录」这个原词吞掉。
+            "state": state,
+            "state_text": state_text(state),
+            "inflight": bool(row.get("inflight")),
             "tokens": total,
             "elapsed_s": _seconds(row.get("started_at"), row.get("finished_at")),
             "amount": micro_text(row.get("amount_micro"))}
 
 
 def _receipt_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    """收据行：服务端 state=accepted/rejected/expired，映射成视图的 verified/failed。"""
+    """收据行：``state=accepted/rejected/expired`` 是**受理结果**，不是本机校验结论。
+
+    以前把 accepted 翻成 verified：本机一次校验都没做，却在界面上写「已验证」——
+    所以现在原词保留（``state``），中文另给（``state_text``），校验结论只由本机比对得出。
+    """
     state = str(row.get("state") or "")
-    status = ("verified" if state == "accepted"
-              else "failed" if state in ("rejected", "expired") else state)
-    return {**row, "status": status, "state_raw": state,
+    return {**row, "state": state, "state_text": state_text(state),
+            "rejected_code": row.get("rejected_code"),
+            "reject_reason": row.get("reject_reason"),
             "created_at": row.get("issued_at"),
             "amount": micro_text(row.get("revenue_minor"))}
 
@@ -222,8 +240,17 @@ class NodeCloudClient:
         items: list[dict[str, Any]] = []
         cursor: str | None = None
         pages = 0
+        page_error = ""
         while pages < self.max_pages:
-            payload = self._get(kind, cursor=cursor, limit=self.page_limit)
+            try:
+                payload = self._get(kind, cursor=cursor, limit=self.page_limit)
+            except ProviderError as exc:
+                if pages == 0:
+                    raise                     # 第一页就失败：整个域不可用，如实上报
+                # 后面的页被拒（云端游标坏 / 400 / 422）：已拿到的照常显示，
+                # 但要标成 truncated 并给出原因——不能假装「就这么多」。
+                page_error = exc.reason
+                break
             pages += 1
             mapper = _ROW_MAPPERS.get(kind)
             rows = _items(payload)
@@ -232,7 +259,8 @@ class NodeCloudClient:
             if not cursor:
                 break
         return {"items": items, "next_cursor": cursor, "pages": pages,
-                "truncated": bool(cursor)}
+                "truncated": bool(cursor) or bool(page_error),
+                "page_error": page_error}
 
     def list_tasks(self, *, cursor: str | None = None,
                    limit: int | None = None) -> dict[str, Any]:
@@ -254,10 +282,19 @@ class NodeCloudClient:
         否则照常展示并把原因降级成 note。
         """
         payload = self._get("earnings")
-        settled_minor = payload.get("settled_minor")
-        pending_minor = payload.get("pending_minor")
-        today_minor = payload.get("today_minor")
-        balance_minor = payload.get("balance_minor")
+        # features 把「名为 _minor、实为 micro-USD」的字段改成 *_micro（旧的标 deprecated）：
+        # 先认新名，旧名兜底，避免过渡期读空。数值一律按 micro-USD 解释，绝不当「分」。
+        def amount(*names: str) -> Any:
+            for name in names:
+                if name in payload:
+                    return payload.get(name)
+            return None
+
+        settled_minor = amount("settled_micro", "settled_minor")
+        pending_minor = amount("pending_micro", "pending_minor")
+        corrected_minor = amount("corrected_micro", "corrected_minor")
+        today_minor = amount("today_micro", "today_minor", "settled_today_micro")
+        balance_minor = amount("balance_micro", "balance_minor")
         rows = [row for row in (payload.get("rows") or []) if isinstance(row, Mapping)]
         reason = reason_text(payload.get("unavailable_reason"))
         if settled_minor is None and pending_minor is None and not rows:
@@ -268,17 +305,22 @@ class NodeCloudClient:
             "task_id": row.get("task_id"),
             "amount": micro_text(row.get("amount_micro")),
             "currency": str(payload.get("currency") or "USDT"),
-            "status": str(row.get("state") or "—"),
+            "state": str(row.get("state") or ""),
+            # 中文 + 原词一起给：原词是契约里的状态词，翻译只是方便读
+            "status": ((state_text(str(row.get("state") or "")) + "（"
+                        + str(row.get("state")) + "）")
+                       if state_text(str(row.get("state") or ""))
+                       else str(row.get("state") or "—")),
             "created_at": row.get("recorded_at") or row.get("settled_at") or "—",
         } for row in rows]
         return {
             "currency": str(payload.get("currency") or "USDT"),
             "settled_minor": settled_minor, "pending_minor": pending_minor,
-            "corrected_minor": payload.get("corrected_minor"),
+            "corrected_minor": corrected_minor,
             "today_minor": today_minor, "balance_minor": balance_minor,
             "settled": micro_text(settled_minor),
             "pending": micro_text(pending_minor),
-            "corrected": micro_text(payload.get("corrected_minor")),
+            "corrected": micro_text(corrected_minor),
             "today": micro_text(today_minor),
             "balance": micro_text(balance_minor),
             "next_settlement_at": payload.get("next_settlement_at"),

@@ -507,9 +507,10 @@ def _receipt_differences(local: Mapping[str, Any], cloud_row: Mapping[str, Any],
     compare("task_id", local.get("task_id"), cloud_row.get("task_id"))
 
     mine_hash = _local_hash(local)
-    cloud_hash = str(cloud_row.get("hash") or "").rstrip("…").strip()
-    if mine_hash and cloud_hash and not cloud_hash.startswith(mine_hash):
-        differences.append(("hash", mine_hash + "…", cloud_hash + "…"))
+    # 云端 ``hash`` 只给前 8 位 + …（脱敏，完整签名不出库），所以只能拿它去比本机的前缀
+    cloud_hash = str(cloud_row.get("hash") or "").rstrip("…").strip().lower()
+    if mine_hash and cloud_hash and not mine_hash.lower().startswith(cloud_hash):
+        differences.append(("hash", mine_hash[:len(cloud_hash)] + "…", cloud_hash + "…"))
 
     price = local.get("price") if isinstance(local.get("price"), Mapping) else {}
     mine_amount = _amount_text(price.get("amount"))

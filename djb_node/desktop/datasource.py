@@ -569,7 +569,9 @@ class LocalDataSource:
             rows = payload.get("items") if isinstance(payload, Mapping) else payload
             return {"rows": [row for row in (rows or []) if isinstance(row, Mapping)],
                     "next_cursor": payload.get("next_cursor") if isinstance(payload, Mapping) else None,
-                    "truncated": bool(payload.get("truncated")) if isinstance(payload, Mapping) else False}
+                    "truncated": bool(payload.get("truncated")) if isinstance(payload, Mapping) else False,
+                    "page_error": str((payload.get("page_error") if isinstance(payload, Mapping)
+                                       else "") or "")}
         payload = self._cloud_call(method)
         rows = _as_rows(payload)
         cursor = None
@@ -640,21 +642,23 @@ class LocalDataSource:
         else:
             rows, origin, next_cursor = pages["rows"], "cloud", pages["next_cursor"]
             note = _more_note(pages)
-        local_ok = True
-        local_note = ""
+        local_rows, local_note, local_ok = self._local_receipts()
         if not rows:
-            try:
-                store = self._store()
-                for row in store.receipts(limit=200):
-                    record = row.to_dict() if hasattr(row, "to_dict") else dict(row)
-                    rows.append(record)
-            except StoreNotInitializedError:
-                # 本机还没跑过 daemon：这是「本机没有收据」，不是错误；
-                # 也不能因此把云端明说的 0 张说成不可用。
-                local_note = "本机收据库尚未初始化（daemon 未启动过）"
-            except Exception as exc:
-                local_ok = False
-                local_note = "本地收据不可读（" + type(exc).__name__ + "）"
+            if origin == "local":
+                rows = local_rows
+            elif local_rows:
+                rows = local_rows
+                origin = "local"
+        if rows and origin == "cloud":
+            # 云端受理结果 ≠ 本机校验结论：逐条看本机有没有副本、对不对得上
+            own = {str(row.get("receipt_id") or ""): row for row in local_rows}
+            for row in rows:
+                row.setdefault("local_check", _receipt_local_check(
+                    row, own.get(str(row.get("receipt_id") or ""))))
+        elif rows:
+            # 行本来就来自本机：它们就是本机数据，「有没有副本」这问题不成立
+            for row in rows:
+                row["local_check"] = "match" if origin == "local" else "no_local"
         if not rows and not local_ok:
             # 两边都读不到：不能说「0 张」，那是把缺数据说成零
             raise ProviderError("；".join(filter(None, (note, local_note))),
@@ -664,10 +668,34 @@ class LocalDataSource:
             raise ProviderError(cloud_error.reason, hint=cloud_error.hint)
         if not rows and not note:
             note = "还没有收据"
-        if local_note:
+        if local_note and not rows:
             # 「还没有收据」+「本机库没初始化」不是两件事，别读成两条警告
             note = local_note if note == "还没有收据" else "；".join((note, local_note))
         return {"rows": rows, "origin": origin, "note": note, "next_cursor": next_cursor}
+
+    def _local_receipts(self) -> tuple[list[dict[str, Any]], str, bool]:
+        """本机密封收据（解密后的明文行）；返回 ``(rows, 提示, 是否可读)``。"""
+        try:
+            store = self._store()
+        except StoreNotInitializedError:
+            # 本机还没跑过 daemon：这是「本机没有收据」，不是错误
+            return [], "本机收据库尚未初始化（daemon 未启动过）", True
+        except Exception as exc:
+            return [], "本地收据不可读（" + type(exc).__name__ + "）", False
+        try:
+            from ..config import Paths
+            from ..outbox import SealedReceiptBuffer
+            from ..secure import CredentialStore
+
+            buffer = SealedReceiptBuffer(store, CredentialStore(Paths(str(self._home))).buffer_key())
+            rows: list[dict[str, Any]] = []
+            for item in store.receipts(limit=200):
+                record = item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                decoded = buffer.get(str(record.get("receipt_id") or ""))
+                rows.append(dict(decoded) if isinstance(decoded, Mapping) else record)
+            return rows, "", True
+        except Exception as exc:
+            return [], "本地收据不可读（" + type(exc).__name__ + "）", False
 
     def _earnings(self) -> Mapping[str, Any]:
         status = self._safe("status", self._status)
@@ -780,10 +808,33 @@ class LocalDataSource:
                 "levels": list(LOG_LEVELS), "note": ""}
 
 
+def _hash_prefix(value: Any, size: int = 8) -> str:
+    """云端 ``hash`` 是掩码过的（前 8 位 + …）；本机是全量，比较只能比前缀。"""
+    text = str(value or "").strip().rstrip("…").strip().lower()
+    return text[:size]
+
+
+def _receipt_local_check(cloud: Mapping[str, Any], local: Mapping[str, Any] | None) -> str:
+    """本机副本 vs 云端受理行：``match`` / ``mismatch`` / ``no_local``。"""
+    if not local:
+        return "no_local"
+    mine_hash = _hash_prefix(local.get("hash") or local.get("payload_hash"))
+    theirs_hash = _hash_prefix(cloud.get("hash"))
+    if mine_hash and theirs_hash and mine_hash != theirs_hash:
+        return "mismatch"
+    if str(local.get("task_id") or "") and str(cloud.get("task_id") or ""):
+        if str(local.get("task_id")) != str(cloud.get("task_id")):
+            return "mismatch"
+    return "match"
+
+
 def _more_note(pages: Mapping[str, Any]) -> str:
-    """翻到上限还有游标就如实说「还有更多、本轮没拉全」，不当场承诺刷新就能续上。"""
+    """翻页没拉全就如实说：到上限、或云端直接拒了游标（两种原因别混成一句）。"""
+    count = len(pages.get("rows") or [])
+    if pages.get("page_error"):
+        return ("已显示前 " + str(count) + " 条：云端拒绝了翻页游标（"
+                + str(pages.get("page_error")) + "），后面的暂时拉不到")
     if pages.get("truncated") and pages.get("next_cursor"):
-        count = len(pages.get("rows") or [])
         return "已显示前 " + str(count) + " 条，还有更多（本轮未全部拉取）"
     return ""
 

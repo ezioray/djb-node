@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from .datasource import Snapshot, UNAVAILABLE, Unavailable
+from .nodecloud import STATE_TEXT
 
 __all__ = [
     "Action", "Card", "Field", "Mark", "Row", "Table", "VIEWS", "VIEW_KEYS", "View",
@@ -228,8 +229,14 @@ def _overview(snapshot: Snapshot) -> View:
     status, earnings = _section(snapshot, "status"), _section(snapshot, "earnings")
     receipts = _section(snapshot, "receipts")
     yield_state = _section(snapshot, "yield")
-    inflight = status.get("inflight")
-    task_text = (str(len(inflight)) + " 个在途") if isinstance(inflight, list) else "—"
+    tasks = _section(snapshot, "tasks")
+    task_rows = [row for row in (tasks.get("rows") or []) if isinstance(row, Mapping)]
+    if tasks and task_rows:
+        count = sum(1 for row in task_rows if row.get("inflight"))
+        task_text = str(count) + " 个在途"
+    else:
+        inflight = status.get("inflight")
+        task_text = (str(len(inflight)) + " 个在途") if isinstance(inflight, list) else "—"
     reason = status.get("reason_label") or status.get("reason")
     state_map = {"online": (MARK_DONE + " 运行中", "mint"), "starting": (MARK_WAIT + " 启动中", "amber"),
                  "paused": (MARK_WAIT + " 已暂停", "amber"), "updating": (MARK_WAIT + " 更新中", "amber"),
@@ -237,10 +244,15 @@ def _overview(snapshot: Snapshot) -> View:
     state_text, tone = state_map.get(str(status.get("state")), (MARK_UNKNOWN + " 状态未知", "muted"))
     cards = (
         Card("今日贡献", _num(earnings.get("today") or status.get("today_earnings")) + " USDT",
-             "服务端下发值，本机不换算", "mint"),
+             ("服务端下发值，本机不换算" if (earnings.get("today") or status.get("today_earnings"))
+              else "服务端未下发今日字段；不拿总计冒充今日"), "mint"),
         Card("当前任务", task_text, "在途任务", "default"),
-        Card("余额（额度）", _num(earnings.get("balance") or status.get("balance")),
-             "额度不可提现，仅抵扣推理", "default"),
+        Card("余额（可用）",
+             ("暂不可用" if earnings.get("balance_note") and earnings.get("balance") is None
+              else _num(earnings.get("balance") or status.get("balance"))),
+             ("账户预付款 · 不可提现" if earnings.get("balance") is not None
+              else str(earnings.get("balance_note") or "额度不可提现，仅抵扣推理")),
+             "default"),
         Card("接单状态", state_text, str(reason or "无让路原因"), tone),
         Card("资源", _bytes(_section(snapshot, "bench").get("mem_available_bytes")) + " 可用内存",
              "CPU " + str(_section(snapshot, "bench").get("cpu_count") or "—") + " 核", "default"),
@@ -252,12 +264,49 @@ def _overview(snapshot: Snapshot) -> View:
         key="overview", title="总览",
         subtitle="今日贡献 · 当前任务 · 资源 · 让路 · 收据",
         cards=cards,
-        table=Table(("收据号", "时间", "Tokens", "状态"), tuple(rows[:5]),
+        table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(rows[:5]),
                     note=str(receipts.get("note") or ""),
                     empty="还没有收据（完成后自动生成）"),
         unavailable=_missing(snapshot, ("status", "earnings")),
         notes=("数值全部原样展示服务端字段；无数据显示「—」，不显示 0。",),
     )
+
+
+#: 计量收据拒收码 → 中文解释（源：cloud ``app/metering/errors.py`` 的错误码表）
+REJECT_TEXT = {
+    "40001": "请求不合法",
+    "40013": "请求体超上限",
+    "40101": "未认证",
+    "40303": "无权代表该节点",
+    "40401": "收据不存在",
+    "46001": "收据签名不匹配",
+    "50001": "服务端未就绪",
+}
+
+
+def _reject_text(code: Any, reason: Any, state: Any) -> str:
+    """``rejected``/``expired`` 行必须说清为什么被拒；码没登记就如实说「未知拒绝码」。"""
+    text = str(state or "")
+    code_text = str(code).strip() if code not in (None, "") else ""
+    if not code_text:
+        return text
+    meaning = REJECT_TEXT.get(code_text, "未知拒绝码")
+    extra = ("；" + str(reason)) if reason else ""
+    return text + "（" + code_text + " " + meaning + extra + "）"
+
+
+def _local_check_text(row: Mapping[str, Any]) -> str:
+    """本机校验结论：没有本机副本就如实说没有，绝不把云端受理当成「已验证」。"""
+    check = str(row.get("local_check") or "")
+    if check == "match":
+        return MARK_DONE + " 一致"
+    if check == "mismatch":
+        return MARK_FAIL + " 不一致"
+    if check == "no_local":
+        return MARK_IDLE + " 本机无副本"
+    if check == "unreadable":
+        return MARK_WAIT + " 本机不可读"
+    return MARK_IDLE + " 未校验"
 
 
 def _receipt_rows(rows: Any) -> list[Row]:
@@ -266,13 +315,24 @@ def _receipt_rows(rows: Any) -> list[Row]:
         if not isinstance(row, Mapping):
             continue
         identifier = str(row.get("receipt_id") or row.get("id") or "")
-        status = str(row.get("status") or "")
-        mark = (MARK_DONE if status in ("verified", "ok", "done")
-                else MARK_WAIT if status in ("pending", "buffered", "")
-                else MARK_FAIL)
+        state = str(row.get("state") or row.get("status") or "")
+        chinese = str(row.get("state_text") or STATE_TEXT.get(state, ""))
+        mark = (MARK_DONE if state in ("accepted", "verified", "ok", "done")
+                else MARK_WAIT if state in ("pending", "buffered")
+                else MARK_FAIL if state in ("rejected", "expired", "failed", "error")
+                else MARK_UNKNOWN)
+        if state in ("rejected", "expired"):
+            label = _reject_text(row.get("rejected_code"), row.get("reject_reason"), chinese or state)
+        elif chinese:
+            label = chinese
+        elif state:
+            label = state + "（未知状态）"          # 没登记的词原样显示，不猜
+        else:
+            label = "待回执"
         result.append(Row((identifier or "—", str(row.get("created_at") or row.get("ts") or "—"),
                            _num(row.get("tokens") or row.get("tokens_total")),
-                           mark + " " + (status or "待回执")), key=identifier))
+                           mark + " " + label,
+                           _local_check_text(row)), key=identifier))
     return result
 
 
@@ -381,15 +441,24 @@ def _tasks(snapshot: Snapshot) -> View:
     for row in tasks.get("rows") if isinstance(tasks.get("rows"), list) else []:
         if not isinstance(row, Mapping):
             continue
-        status = str(row.get("state") or row.get("status") or "unknown")
-        mark = (MARK_DONE if status in ("done", "completed", "ok")
-                else MARK_WAIT if status in ("running", "inflight", "queued", "pending")
-                else MARK_FAIL if status in ("failed", "error") else MARK_UNKNOWN)
-        tone = ("mint" if status in ("done", "completed", "ok")
-                else "amber" if status in ("running", "inflight", "queued", "pending")
-                else "red" if status in ("failed", "error") else "muted")
-        rows.append(Row((str(row.get("id") or row.get("task_id") or "—"), mark + " " + status,
-                         str(row.get("elapsed_s") or row.get("duration_s") or "—"),
+        status = str(row.get("state") or row.get("status") or "")
+        chinese = str(row.get("state_text") or STATE_TEXT.get(status, ""))
+        # 状态列：中文 + 原词（原词是契约里的词，别只给翻译）；没登记的词原样 + 「未知状态」
+        label = (chinese + "（" + status + "）") if chinese else (
+            status + "（未知状态）" if status else "—")
+        # 「在途」是独立的布尔字段，不能拿来顶替 state
+        if row.get("inflight"):
+            label += " · 进行中"
+        mark = (MARK_DONE if status in ("settled", "corrected", "done", "completed", "ok")
+                else MARK_WAIT if (row.get("inflight") or status in
+                                   ("running", "queued", "pending"))
+                else MARK_FAIL if status in ("failed", "error", "rejected", "expired")
+                else MARK_UNKNOWN)
+        tone = ("mint" if mark == MARK_DONE else "amber" if mark == MARK_WAIT
+                else "red" if mark == MARK_FAIL else "muted")
+        elapsed = str(row.get("elapsed_s") or row.get("duration_s") or "")
+        rows.append(Row((str(row.get("id") or row.get("task_id") or "—"), mark + " " + label,
+                         elapsed or ("进行中" if row.get("inflight") else "—"),
                          _num(row.get("tokens") or row.get("tokens_total")),
                          str(row.get("receipt_id") or "—")),
                         key=str(row.get("id") or row.get("task_id") or ""), tone=tone))
@@ -403,28 +472,40 @@ def _tasks(snapshot: Snapshot) -> View:
                     empty=_empty_text(snapshot, "tasks", "当前没有任务")),
         actions=(Action("tasks.refresh", "刷新"),),
         unavailable=_missing(snapshot, ("tasks",)),
-        notes=("点行看详情：状态三态、耗时、tokens、收据号。",),
+        notes=("状态列给云端原词（recorded/settled/…）+ 中文；「进行中」来自 inflight 字段。",
+               "点行看详情：状态三态、耗时、tokens、收据号。"),
     )
 
 
 def _receipts(snapshot: Snapshot) -> View:
     receipts = _section(snapshot, "receipts")
     rows = _receipt_rows(receipts.get("rows"))
-    verified = sum(1 for row in rows if row.cells[3].startswith(MARK_DONE))
+    raw_rows = [row for row in (receipts.get("rows") or []) if isinstance(row, Mapping)]
+    verified = sum(1 for row in raw_rows if str(row.get("local_check") or "") == "match")
+    mismatch = sum(1 for row in raw_rows if str(row.get("local_check") or "") == "mismatch")
+    no_local = sum(1 for row in raw_rows if str(row.get("local_check") or "") == "no_local")
+    if not raw_rows:
+        verify_meta = "没有收据可校验"
+    elif no_local == len(raw_rows):
+        verify_meta = "本机无副本：云端受理 ≠ 本机校验过"
+    else:
+        verify_meta = "本机无副本 " + str(no_local) + " 张" + (
+            "；不一致 " + str(mismatch) + " 张" if mismatch else "")
     return View(
         key="receipts", title="收据",
         subtitle="双签字段 · Merkle 路径 · 本地校验",
         cards=(Card("收据总数", _count(snapshot, "receipts", str(len(rows)) + " 张"),
                     "来源：" + str(receipts.get("origin") or "local"), "default"),
-               Card("已验证", _count(snapshot, "receipts", str(verified) + " 张"),
-                    "其余等待回执", "mint")),
-        table=Table(("收据号", "时间", "Tokens", "状态"), tuple(rows),
+               Card("本机已验证", _count(snapshot, "receipts", str(verified) + " 张"),
+                    verify_meta, "mint" if verified else "muted")),
+        table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(rows),
                     note=str(receipts.get("note") or ""),
                     empty=_empty_text(snapshot, "receipts", "还没有收据")),
         actions=(Action("receipts.verify", "校验选中收据", enabled=bool(rows),
                         reason="没有可校验的收据"),),
         unavailable=_missing(snapshot, ("receipts",)),
-        notes=("哈希 / seq 用等宽字体 + 弱化颜色；证据常驻但不发光。",),
+        notes=("状态列是云端受理结果（accepted/rejected/expired）；「本机校验」列才是本机比对结论。",
+               "哈希 / seq 用等宽字体 + 弱化颜色；证据常驻但不发光。"),
     )
 
 

@@ -621,3 +621,66 @@ def test_logout_disabled_reason_tells_which_side_is_missing():
     nothing = {"account": {"profile": {}, "security": {}, "note": ""}}
     text = build_view("account", ds.FakeDataSource(nothing).snapshot()).plain_text()
     assert "尚未登录" in text
+
+
+# ───────────────────────────────────────────── 收据状态词 / 拒绝码 / 本机校验
+def _receipts_text(tmp_path, rows):
+    class Cloud:
+        def fetch(self, kind):
+            return {"items": rows, "next_cursor": None, "truncated": False}
+
+        def earnings(self):
+            return {"settled": None, "pending": None, "payouts": [], "currency": "USDT",
+                    "note": ""}
+
+    return vw.build_view("receipts", ds.LocalDataSource(home=tmp_path, cloud=Cloud()).snapshot()).plain_text()
+
+
+def test_receipt_states_are_shown_verbatim_plus_chinese(tmp_path):
+    text = _receipts_text(tmp_path, [
+        {"receipt_id": "r1", "state": "accepted", "state_text": "已受理", "tokens": 10,
+         "created_at": "2026-11-01T00:00:00Z", "local_check": "no_local"},
+        {"receipt_id": "r2", "state": "expired", "state_text": "已过期", "rejected_code": 40001,
+         "reject_reason": "receipt_window_exceeded", "tokens": None,
+         "created_at": "2026-11-01T00:01:00Z", "local_check": "no_local"},
+    ])
+    assert "✓ 已受理" in text                     # accepted 不许再被翻成「已验证」
+    assert "已过期（40001 请求不合法；receipt_window_exceeded）" in text
+    assert "本机无副本" in text
+
+
+def test_unknown_reject_code_is_named_as_unknown(tmp_path):
+    text = _receipts_text(tmp_path, [
+        {"receipt_id": "r3", "state": "rejected", "state_text": "已拒绝",
+         "rejected_code": 99999, "reject_reason": None, "tokens": None,
+         "created_at": "2026-11-01T00:02:00Z", "local_check": "no_local"},
+    ])
+    assert "99999 未知拒绝码" in text              # 没登记的码如实说未知，不编解释
+
+
+def test_receipt_view_counts_only_locally_matched_as_verified(tmp_path):
+    text = _receipts_text(tmp_path, [
+        {"receipt_id": "r1", "state": "accepted", "state_text": "已受理", "tokens": 10,
+         "created_at": "2026-11-01T00:00:00Z", "local_check": "match"},
+        {"receipt_id": "r2", "state": "accepted", "state_text": "已受理", "tokens": 20,
+         "created_at": "2026-11-01T00:01:00Z", "local_check": "mismatch"},
+        {"receipt_id": "r3", "state": "accepted", "state_text": "已受理", "tokens": 30,
+         "created_at": "2026-11-01T00:02:00Z", "local_check": "no_local"},
+    ])
+    assert "[本机已验证] 1 张" in text
+    assert "不一致 1 张" in text and "本机无副本 1 张" in text
+
+
+def test_receipt_verify_compares_masked_cloud_hash_as_prefix():
+    """云端 hash 是「前 8 位 + …」的掩码，只能比前缀；方向写反会把一致判成不一致。"""
+    from djb_node.desktop.controller import _receipt_differences
+
+    local = {"receipt_id": "r1", "task_id": "t1", "sig_provider": "hmac-sha256:15e80bafdeadbeef",
+             "price": {"amount": "1.25"}}
+    cloud = {"receipt_id": "r1", "task_id": "t1", "hash": "15e80baf…", "revenue_minor": 1_250_000}
+    assert _receipt_differences(local, cloud, {"state": "accepted"}) == []
+
+    cloud_bad = {"receipt_id": "r1", "task_id": "t1", "hash": "deadbeef…",
+                 "revenue_minor": 1_250_000}
+    diffs = _receipt_differences(local, cloud_bad, {"state": "accepted"})
+    assert [field for field, _mine, _theirs in diffs] == ["hash"]
