@@ -89,6 +89,8 @@ class DesktopApp:
         apply_theme(self._root, ttk)
         self._build_shell()
         self._bind_keys()
+        self._root.bind("<Configure>",
+                        lambda event: self._apply_layout(getattr(event, "width", None)), add="+")
         if self._bus is not None:
             self._unsubscribe = self._bus.subscribe(self._on_bus)
         self.show_view(controller.view)
@@ -113,7 +115,16 @@ class DesktopApp:
         self._state_pill = ttk.Label(top, text="状态未知", style="PillMuted.TLabel")
         self._state_pill.grid(row=0, column=3, sticky="e", padx=(0, 12))
         ttk.Button(top, text="刷新 / F5", command=self.refresh).grid(row=0, column=4, sticky="e")
+        # 窄窗（<760）时侧栏放不下：导航改成一个下拉，仍然一个都不少
+        self._nav_combo = ttk.Combobox(top, state="readonly", takefocus=True,
+                                       values=[str(i) + " · " + VIEW_TITLES[key]
+                                               for i, key in enumerate(VIEW_KEYS, start=1)])
+        self._nav_combo.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        self._nav_combo.grid_remove()
+        self._nav_combo.bind("<<ComboboxSelected>>", self._on_nav_combo)
+        self._top = top
         side = ttk.Frame(self._root, style="Sidebar.TFrame", padding=(10, 12))
+        self._side = side
         side.grid(row=1, column=0, sticky="nsew")
         ttk.Label(side, text="导航", style="Meta.TLabel").pack(anchor="w", padx=6, pady=(0, 8))
         for index, key in enumerate(VIEW_KEYS, start=1):
@@ -181,9 +192,86 @@ class DesktopApp:
         self._update_status()
         return view
 
+    #: 窄窗阈值：低于这个宽度侧栏让位给内容（E10 口径 390 也算“能看全”）
+    NARROW_WIDTH = 760
+
+    def _is_narrow(self) -> bool:
+        """窄不窄以窗口真实宽度为准（不依赖 _apply_layout 的先后顺序）。"""
+        try:
+            return int(self._root.winfo_width()) < self.NARROW_WIDTH
+        except Exception:                            # pragma: no cover - 无窗口
+            return False
+
+    def _apply_layout(self, width: int | None = None) -> None:
+        """窗口窄了就把侧栏收成下拉：内容区拿到整宽，表格列才不会被挤没。
+
+        只看**根窗口**的宽度，且只在宽度真的变化时才动布局——
+        子控件的 ``<Configure>`` 也会冒到这里，按事件里的 width 判断会让侧栏反复收起/展开。
+        """
+        try:
+            current = int(self._root.winfo_width())
+        except Exception:                                  # pragma: no cover - 无窗口
+            return
+        if current <= 1:                                   # 还没 map：没有可用宽度
+            return
+        if current == getattr(self, "_layout_width", None):
+            return
+        self._layout_width = current
+        narrow = current < self.NARROW_WIDTH
+        if narrow == getattr(self, "_narrow", None):
+            return
+        self._narrow = narrow
+        if narrow:
+            self._side.grid_remove()
+            self._nav_combo.grid()
+            self._view_title.grid_remove()
+        else:
+            self._side.grid()
+            self._nav_combo.grid_remove()
+            self._view_title.grid()
+        self._sync_nav(self._controller.view)
+        tree = getattr(self, "_tree", None)
+        if tree is not None:
+            self._apply_narrow_cells(narrow)         # 行文案跟着窄/宽切换
+            self._fit_columns(tree)                  # 让位/回位后重排一次列宽
+
+    def _apply_narrow_cells(self, narrow: bool) -> None:
+        """窄窗用行级紧凑文案，回宽恢复完整文案（数据两份都在视图里，不丢字段）。"""
+        table = getattr(self, "_table", None)
+        tree = getattr(self, "_tree", None)
+        if table is None or tree is None:
+            return
+        for row in getattr(table, "rows", ()) or ():
+            iid = row.key or ""
+            if not iid:
+                continue
+            compact = getattr(row, "narrow", ())
+            values = (compact if narrow and compact and len(compact) == len(row.cells)
+                      else row.cells)
+            try:
+                tree.item(iid, values=values)
+            except Exception:                        # pragma: no cover - 行已被重建
+                pass
+
+    def _on_nav_combo(self, _event=None) -> None:
+        value = str(self._nav_combo.get() or "")
+        if "·" in value:
+            index = value.split("·", 1)[0].strip()
+            for position, key in enumerate(VIEW_KEYS, start=1):
+                if str(position) == index:
+                    self.show_view(key)
+                    return
+
     def _sync_nav(self, key: str) -> None:
         for name, button in self._nav_buttons.items():
             button.configure(style="NavOn.TButton" if name == key else "Nav.TButton")
+        combo = getattr(self, "_nav_combo", None)
+        if combo is not None:
+            try:
+                index = VIEW_KEYS.index(key) + 1
+                combo.set(str(index) + " · " + VIEW_TITLES[key])
+            except (ValueError, Exception):                # pragma: no cover - 视图名变了
+                pass
 
     def _update_status(self) -> None:
         self._status.configure(text=self._controller.status_line())
@@ -275,6 +363,8 @@ class DesktopApp:
                 side="left", padx=(0, 12))
 
     def _render_table(self, table: Table) -> None:
+        self._table = table
+        narrow = self._is_narrow()
         tk, ttk = self._tk, self._ttk
         frame = ttk.Frame(self._content, style="Card.TFrame", padding=(1, 1))
         frame.pack(fill="both", expand=True, pady=(0, 10))
@@ -282,8 +372,7 @@ class DesktopApp:
                             height=min(12, max(3, len(table.rows) + 1)), selectmode="browse")
         for column in table.columns:
             tree.heading(column, text=column, anchor="w")
-            tree.column(column, anchor="w", width=max(90, 620 // max(1, len(table.columns))),
-                        stretch=True)
+            tree.column(column, anchor="w", width=120, stretch=True)
         from ..gui.theme import MUTED_TEXT, TOKENS, MINT_TEXT, AMBER_TEXT, RED_TEXT
         tree.tag_configure("disabled", foreground=MUTED_TEXT)
         tag_colors = {"mint": MINT_TEXT, "amber": AMBER_TEXT, "red": RED_TEXT,
@@ -291,15 +380,24 @@ class DesktopApp:
         for name, color in tag_colors.items():
             tree.tag_configure("tone-" + name, foreground=color)
         self._row_notes = {}
+        self._row_cells = {}
         for row in table.rows:
             tags = ["tone-" + (row.tone or "default")]
             if row.disabled:
                 tags.append("disabled")          # 标灰优先于语义色
             iid = row.key or ""
-            tree.insert("", "end", iid=iid or None, values=row.cells, tags=tuple(tags))
+            values = row.cells
+            if narrow and getattr(row, "narrow", ()) and len(row.narrow) == len(row.cells):
+                values = row.narrow              # 窄窗用紧凑文案，详情抽屉仍看完整字段
+            tree.insert("", "end", iid=iid or None, values=values, tags=tuple(tags))
+            self._row_cells[iid or str(len(self._row_cells))] = row.cells
             if row.note:
                 self._row_notes[iid] = row.note
         tree.pack(fill="both", expand=True)
+        # 列宽跟着可视宽度走：窄窗（E10 口径 390）下列不会被挤出可视区，
+        # 也不会因为「固定 124px × N」而溢出到看不见的地方（Treeview 没有横向滚动条）。
+        self._fit_columns(tree)
+        tree.bind("<Configure>", lambda _event, view=tree: self._fit_columns(view), add="+")
         if not table.rows:
             ttk.Label(frame, text=table.empty, style="CardMuted.TLabel",
                       padding=(12, 16)).pack(anchor="w")
@@ -314,6 +412,74 @@ class DesktopApp:
         if table.note:
             ttk.Label(self._content, text=table.note, style="Meta.TLabel").pack(anchor="w")
 
+    def _fit_columns(self, tree: Any) -> None:
+        """列宽按可视宽度分配，保证所有可见列都在首屏内（Treeview 没有横向滚动条）。
+
+        权重取「表头长度」与「该列最长单元格（截到 24 字）」的较大者：
+        「状态」这种装长文案的列拿到更宽的份额，短列不浪费。
+        窄窗下先按 ``Table.narrow_hide`` 让位几列（数据仍在详情抽屉里）。
+        """
+        table = getattr(self, "_table", None)
+        all_columns = list(tree["columns"])
+        narrow = self._is_narrow()
+        hidden = tuple(getattr(table, "narrow_hide", ())) if narrow else ()
+        shown = [column for column in all_columns if column not in hidden]
+        if not shown:
+            return
+        tree.configure(displaycolumns=shown)
+        try:
+            available = int(tree.winfo_width())
+        except Exception:                            # pragma: no cover - 未映射窗口
+            return
+        if available <= 1:                           # 还没布局：用请求宽度兜底
+            available = int(tree.winfo_reqwidth())
+        rows = getattr(table, "rows", ()) or ()
+        weights: list[float] = []
+        for column in shown:
+            # 单元格按「原始列序」取，别用 shown 的下标（隐藏列会让下标错位）
+            source_index = all_columns.index(column)
+            longest = len(column) + 1
+            for row in rows:
+                if source_index < len(row.cells):
+                    longest = max(longest, min(24, len(str(row.cells[source_index]))))
+            weights.append(float(max(4, longest)))
+        total = sum(weights) or 1.0
+        floor = 40
+        remaining = available
+        headers = dict(getattr(table, "narrow_headers", ()) or ())
+        for column in shown:
+            text = headers.get(column, column) if narrow else column
+            tree.heading(column, text=text, anchor="w")
+        widths: list[int] = []
+        for index, column in enumerate(shown):
+            share = max(floor, int(available * weights[index] / total))
+            if index == len(shown) - 1:
+                share = max(floor, remaining)
+            widths.append(share)
+            remaining -= share
+        # 短列也要放得下表头 + 典型值（「校验」列被压到 43px 时只剩「无副」两个字）
+        for index, column in enumerate(shown):
+            header = headers.get(column, column) if narrow else column
+            source_index = all_columns.index(column)
+            chars = len(header)
+            for row in rows:
+                cells = (getattr(row, "narrow", ()) if narrow and
+                         len(getattr(row, "narrow", ())) == len(row.cells) else row.cells)
+                if source_index < len(cells):
+                    chars = max(chars, min(7, len(str(cells[source_index]))))
+            need = max(floor, chars * 13 + 12)
+            if widths[index] < need:
+                gap = need - widths[index]
+                donor = max(range(len(widths)), key=lambda i: widths[i])
+                if donor != index and widths[donor] - gap >= floor:
+                    widths[donor] -= gap
+                    widths[index] = need
+        for column, width in zip(shown, widths):
+            tree.column(column, width=width, stretch=True)
+        self._column_widths = tuple(int(tree.column(column, "width")) for column in shown)
+        self._column_viewport = available
+        self._hidden_columns = tuple(hidden)
+
     def _on_row_select(self, _event=None) -> None:
         tree = getattr(self, "_tree", None)
         detail = getattr(self, "_detail", None)
@@ -325,7 +491,9 @@ class DesktopApp:
         if not selection:
             detail.pack_forget()
             return
-        values = tree.item(selection[0], "values")
+        # 详情抽屉永远用**完整**单元格（窄窗表格里可能是紧凑文案）
+        full = getattr(self, "_row_cells", {}) or {}
+        values = full.get(str(selection[0])) or tree.item(selection[0], "values")
         try:
             self._controller.select_row(self._controller.view, values[0] if values else "")
         except Exception:

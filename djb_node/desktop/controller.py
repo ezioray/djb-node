@@ -514,8 +514,12 @@ def _receipt_differences(local: Mapping[str, Any], cloud_row: Mapping[str, Any],
 
     price = local.get("price") if isinstance(local.get("price"), Mapping) else {}
     mine_amount = _amount_text(price.get("amount"))
-    theirs_amount = _amount_text((int(cloud_row["revenue_minor"]) / 1_000_000)
-                                 if isinstance(cloud_row.get("revenue_minor"), int) else "")
+    # 正式字段 revenue_micro；缺了回落 revenue_minor（同值同列，允许的回落）
+    cloud_revenue = cloud_row.get("revenue_micro")
+    if not isinstance(cloud_revenue, int):
+        cloud_revenue = cloud_row.get("revenue_minor")
+    theirs_amount = (_amount_text(int(cloud_revenue) / 1_000_000)
+                     if isinstance(cloud_revenue, int) else "")
     if mine_amount and theirs_amount and mine_amount != theirs_amount:
         differences.append(("金额", mine_amount, theirs_amount))
     return differences

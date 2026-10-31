@@ -105,3 +105,67 @@ def test_demo_mode_is_labelled_on_screen(tmp_path):
     real = desktop_app.make_controller(home=tmp_path, demo=False)
     assert real.snapshot.source != "demo"
     assert not real.status_line().startswith("【演示数据】")
+
+
+# ───────────────────────────────────────────── 窄窗（E10 口径 390）布局
+def _window_app(tmp_path, width: int):
+    """真窗口 + 指定宽度；没有 DISPLAY 就跳过（CI 里靠 xvfb 跑）。"""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                              # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    from djb_node.desktop.app import DesktopApp, _DEMO_SECTIONS
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    # 用真数据形状（state / rejected_code / local_check），演示数据的旧 status 形状测不到拒绝码
+    sections = dict(_DEMO_SECTIONS)
+    sections["receipts"] = {"origin": "cloud", "note": "", "rows": [
+        {"receipt_id": "rcpt_uat_rj_0001", "created_at": "2026-11-01T03:12:00Z", "tokens": None,
+         "state": "rejected", "rejected_code": 46001,
+         "reject_reason": "provider_signature_mismatch", "local_check": "no_local"},
+        {"receipt_id": "rcpt_uat_0001", "created_at": "2026-11-01T03:10:00Z", "tokens": 1500,
+         "state": "accepted", "local_check": "no_local"},
+    ]}
+    controller = DesktopController(FakeDataSource(sections, source="test"))
+    app = DesktopApp(controller, root=root)
+    root.minsize(1, 1)
+    root.geometry(str(width) + "x780")
+    app.show_view("receipts")
+    root.update_idletasks()
+    root.update()
+    return app, root
+
+
+def test_narrow_window_shows_every_receipt_column_without_horizontal_scroll(tmp_path):
+    """390 宽：5 列里的「本机校验」不许被挤出可视区（Treeview 没有横向滚动条）。"""
+    app, root = _window_app(tmp_path, 390)
+    try:
+        tree = app._tree                             # noqa: SLF001 - 断言用
+        shown = list(tree["displaycolumns"])
+        assert "本机校验" in shown
+        widths = [int(tree.column(column, "width")) for column in shown]
+        assert sum(widths) <= int(tree.winfo_width())
+        assert "时间" not in shown and "Tokens" not in shown   # 让位的列在详情抽屉里仍有
+    finally:
+        root.destroy()
+
+
+def test_narrow_rows_are_compact_but_detail_keeps_full_text(tmp_path):
+    """窄窗状态列只留拒绝码，详情抽屉仍是完整解释——信息不丢，只是换地方。"""
+    app, root = _window_app(tmp_path, 390)
+    try:
+        tree = app._tree                             # noqa: SLF001 - 断言用
+        first = tree.get_children()[0]
+        compact = tree.item(first, "values")
+        assert "46001" in compact[3] and "收据签名不匹配" not in compact[3]
+        full = app._row_cells[first]                 # noqa: SLF001 - 断言用
+        assert "收据签名不匹配" in full[3]
+        tree.selection_set(first)
+        root.update()
+        texts = [w.cget("text") for frame in app._detail.winfo_children()  # noqa: SLF001
+                 for w in frame.winfo_children()]
+        assert any("收据签名不匹配" in text for text in texts)
+    finally:
+        root.destroy()

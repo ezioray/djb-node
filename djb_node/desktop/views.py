@@ -82,6 +82,8 @@ class Row:
     note: str = ""
     #: 行级语义色（default/mint/amber/red/muted）：给日志级别这类整行状态用
     tone: str = "default"
+    #: 窄窗下的紧凑单元格（同长度、更短文案）；详情抽屉仍用完整 ``cells``
+    narrow: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,10 @@ class Table:
     rows: tuple[Row, ...] = ()
     note: str = ""
     empty: str = "暂无数据"
+    #: 窄窗（E10 口径 390）下先让位的列；数据不丢，详情抽屉里仍是全字段
+    narrow_hide: tuple[str, ...] = ()
+    #: 窄窗下的表头短名（只改表头，不改数据）
+    narrow_headers: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -265,6 +271,8 @@ def _overview(snapshot: Snapshot) -> View:
         subtitle="今日贡献 · 当前任务 · 资源 · 让路 · 收据",
         cards=cards,
         table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(rows[:5]),
+                    narrow_hide=("时间", "Tokens"),
+                    narrow_headers=(("本机校验", "校验"),),
                     note=str(receipts.get("note") or ""),
                     empty="还没有收据（完成后自动生成）"),
         unavailable=_missing(snapshot, ("status", "earnings")),
@@ -293,6 +301,17 @@ def _reject_text(code: Any, reason: Any, state: Any) -> str:
     meaning = REJECT_TEXT.get(code_text, "未知拒绝码")
     extra = ("；" + str(reason)) if reason else ""
     return text + "（" + code_text + " " + meaning + extra + "）"
+
+
+def _short_id(value: Any, keep: int = 8) -> str:
+    """窄窗里的主键：太长就留尾段（``…rj_0001``），完整值在详情抽屉里。"""
+    text = str(value or "")
+    return text if len(text) <= keep + 2 else "…" + text[-keep:]
+
+
+#: 窄窗下的校验结论短名（4 个字以内，免得被列宽截断成「无副」）
+_LOCAL_CHECK_SHORT = {"match": "一致", "mismatch": "不一致",
+                      "no_local": "无副本", "unreadable": "不可读"}
 
 
 def _local_check_text(row: Mapping[str, Any]) -> str:
@@ -329,10 +348,20 @@ def _receipt_rows(rows: Any) -> list[Row]:
             label = state + "（未知状态）"          # 没登记的词原样显示，不猜
         else:
             label = "待回执"
+        check_text = _local_check_text(row)
+        code = str(row.get("rejected_code") or "").strip()
+        short = (mark + " " + (chinese or state) + ((" " + code) if code else "")).strip()
         result.append(Row((identifier or "—", str(row.get("created_at") or row.get("ts") or "—"),
                            _num(row.get("tokens") or row.get("tokens_total")),
-                           mark + " " + label,
-                           _local_check_text(row)), key=identifier))
+                           mark + " " + label, check_text),
+                          key=identifier,
+                          # 窄窗只留码，中文解释在详情抽屉/备注里，不丢信息也不挤爆列
+                          narrow=((_short_id(identifier) or "—"),
+                                  str(row.get("created_at") or row.get("ts") or "—"),
+                                  _num(row.get("tokens") or row.get("tokens_total")),
+                                  short,
+                                  _LOCAL_CHECK_SHORT.get(
+                                      str(row.get("local_check") or ""), check_text))))
     return result
 
 
@@ -468,6 +497,7 @@ def _tasks(snapshot: Snapshot) -> View:
         cards=(Card("队列", _count(snapshot, "tasks", str(len(rows)) + " 条"),
                     ("来源：" + str(tasks.get("origin") or "local")), "default"),),
         table=Table(("任务", "状态", "耗时", "Tokens", "收据号"), tuple(rows),
+                    narrow_hide=("耗时", "收据号"),
                     note=str(tasks.get("note") or ""),
                     empty=_empty_text(snapshot, "tasks", "当前没有任务")),
         actions=(Action("tasks.refresh", "刷新"),),
@@ -500,7 +530,9 @@ def _receipts(snapshot: Snapshot) -> View:
                     verify_meta, "mint" if verified else "muted")),
         table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(rows),
                     note=str(receipts.get("note") or ""),
-                    empty=_empty_text(snapshot, "receipts", "还没有收据")),
+                    empty=_empty_text(snapshot, "receipts", "还没有收据"),
+                    narrow_hide=("时间", "Tokens"),
+                    narrow_headers=(("本机校验", "校验"),)),
         actions=(Action("receipts.verify", "校验选中收据", enabled=bool(rows),
                         reason="没有可校验的收据"),),
         unavailable=_missing(snapshot, ("receipts",)),
@@ -536,6 +568,7 @@ def _earnings(snapshot: Snapshot) -> View:
                      else _money(snapshot, "earnings", earnings.get("balance"))),
                     "账户预付款 · 不可提现", "muted")),
         table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
+                    narrow_hide=("币种", "时间"),
                     note=str(earnings.get("note") or ""),
                     empty=(UNAVAILABLE if not available else "暂无计费明细")),
         actions=(Action("earnings.export", "导出明细", enabled=bool(rows),

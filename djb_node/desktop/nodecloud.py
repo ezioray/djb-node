@@ -125,11 +125,18 @@ def _receipt_row(row: Mapping[str, Any]) -> dict[str, Any]:
     所以现在原词保留（``state``），中文另给（``state_text``），校验结论只由本机比对得出。
     """
     state = str(row.get("state") or "")
+    # 列表行的时间字段是 ``issued_at``（服务端由 DB 的 received_at 映射而来）；
+    # 单条详情端点才叫 ``received_at``。按错字段读，列表时间会一直是空。
+    issued = row.get("issued_at") or row.get("received_at")
+    # 金额：``revenue_micro`` 是正式字段，``revenue_minor`` 同名同值但已标 deprecated
+    revenue = row.get("revenue_micro")
+    if revenue is None:
+        revenue = row.get("revenue_minor")
     return {**row, "state": state, "state_text": state_text(state),
             "rejected_code": row.get("rejected_code"),
             "reject_reason": row.get("reject_reason"),
-            "created_at": row.get("issued_at"),
-            "amount": micro_text(row.get("revenue_minor"))}
+            "issued_at": issued, "created_at": issued,
+            "amount": micro_text(revenue)}
 
 
 _ROW_MAPPERS = {"tasks": _task_row, "receipts": _receipt_row}

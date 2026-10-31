@@ -477,3 +477,19 @@ def test_truncated_note_names_the_cursor_rejection_not_a_generic_more():
 
     note = _more_note(section)
     assert "云端拒绝了翻页游标" in note and "已显示前 1 条" in note
+
+
+def test_receipt_row_reads_issued_at_and_prefers_revenue_micro():
+    """列表行时间字段是 ``issued_at``；金额优先 ``revenue_micro``，缺了回落 ``revenue_minor``。"""
+    client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(200, page([
+        {"receipt_id": "r-1", "state": "accepted", "issued_at": "2026-11-01T10:00:00Z",
+         "revenue_micro": 1_250_000, "revenue_minor": 1_250_000, "tokens": 10},
+        {"receipt_id": "r-2", "state": "accepted", "issued_at": "2026-11-01T10:01:00Z",
+         "revenue_minor": 500_000, "tokens": 5},                        # 只有 deprecated 字段
+        {"receipt_id": "r-3", "state": "accepted", "received_at": "2026-11-01T10:02:00Z",
+         "tokens": 1},                                                  # 详情端点才有的名字
+    ]))))
+    rows = client.fetch("receipts")["items"]
+    assert rows[0]["created_at"] == "2026-11-01T10:00:00Z" and rows[0]["amount"] == "1.25"
+    assert rows[1]["amount"] == "0.50"                 # 回落 revenue_minor
+    assert rows[2]["created_at"] == "2026-11-01T10:02:00Z"   # 兼容详情端点的 received_at
