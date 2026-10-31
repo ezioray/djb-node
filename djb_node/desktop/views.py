@@ -430,6 +430,7 @@ def _receipts(snapshot: Snapshot) -> View:
 
 def _earnings(snapshot: Snapshot) -> View:
     earnings = _section(snapshot, "earnings")
+    available = snapshot.ok("earnings")
     payouts = earnings.get("payouts") if isinstance(earnings.get("payouts"), list) else []
     rows = []
     for row in payouts:
@@ -454,9 +455,10 @@ def _earnings(snapshot: Snapshot) -> View:
                      else _money(snapshot, "earnings", earnings.get("balance"))),
                     "账户预付款 · 不可提现", "muted")),
         table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
-                    note=str(earnings.get("note") or ""), empty="暂无计费明细"),
+                    note=str(earnings.get("note") or ""),
+                    empty=(UNAVAILABLE if not available else "暂无计费明细")),
         actions=(Action("earnings.export", "导出明细", enabled=bool(rows),
-                        reason="没有可导出的记录"),),
+                        reason=("暂不可用" if not available else "没有可导出的记录")),),
         unavailable=_missing(snapshot, ("earnings",)),
         notes=tuple(filter(None, (
             "金额原样展示，不预测、不承诺收益；额度只能抵扣推理。",
@@ -621,14 +623,15 @@ def _account(snapshot: Snapshot) -> View:
         subtitle="节点身份 · 绑定 · 双因素 · 登出",
         cards=(Card("账户", identity, identity_meta, "default"), second,
                Card("本机凭据", str(security.get("storage") or "—"),
-                    str(security.get("node_id") or "未配对"), "muted")),
+                    str(security.get("node_id") or "本机未保存"), "muted")),
         fields=tuple(fields),
         actions=(Action("account.enable_2fa", "启用双因素验证",
                         enabled=twofa is not True,
                         reason="已开启" if twofa is True else "登录后可用",
                         primary=True),
                  Action("account.logout", "登出", enabled=bool(security.get("node_id")),
-                        reason="尚未登录")),
+                        reason=("尚未登录" if not node_id
+                                else "本机无凭据（登出要清本机密钥）"))),
         unavailable=_missing(snapshot, ("account",)),
         notes=(str(account.get("note") or "未登录时只显示本机信息。"),),
     )

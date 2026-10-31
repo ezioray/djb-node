@@ -585,3 +585,38 @@ def test_earnings_export_escapes_commas_in_cells(tmp_path):
     assert controller.action("earnings.export").ok is True
     line = target.read_text(encoding="utf-8-sig").splitlines()[1]
     assert '"req,1"' in line and '"ta""sk"' in line
+
+
+def test_unavailable_earnings_never_says_empty():
+    """真联调发现：详情域不可用时表格空文案还写「暂无计费明细」，读起来像「真的是 0」。"""
+    from djb_node.desktop.datasource import ProviderError
+    from djb_node.desktop.views import build_view
+
+    class Cloud:
+        def fetch(self, kind):
+            return {"items": [], "next_cursor": None, "truncated": False}
+
+        def earnings(self):
+            raise ProviderError("该节点还没有计费记录")
+
+    from djb_node.desktop.datasource import LocalDataSource
+
+    snapshot = LocalDataSource(cloud=Cloud()).snapshot()
+    text = build_view("earnings", snapshot).plain_text()
+    assert "（暂不可用）" in text
+    assert "暂无计费明细" not in text
+    assert "置灰：暂不可用" in text
+
+
+def test_logout_disabled_reason_tells_which_side_is_missing():
+    """云端有节点身份但本机无凭据 → 理由要说「本机无凭据」，不能说「尚未登录」。"""
+    from djb_node.desktop.views import build_view
+
+    cloud_only = {"account": {"profile": {"node_id": "n_1", "state": "active"},
+                              "security": {}, "note": ""}}
+    text = build_view("account", ds.FakeDataSource(cloud_only).snapshot()).plain_text()
+    assert "本机无凭据" in text and "尚未登录" not in text
+
+    nothing = {"account": {"profile": {}, "security": {}, "note": ""}}
+    text = build_view("account", ds.FakeDataSource(nothing).snapshot()).plain_text()
+    assert "尚未登录" in text
