@@ -102,9 +102,14 @@ class DesktopApp:
         self._view_title = ttk.Label(top, text=VIEW_TITLES[self._controller.view],
                                      style="TopH3.TLabel")
         self._view_title.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        # 演示数据必须在窗口上贴标签：截图/录屏不许被误当成真机数据
+        self._demo_badge = None
+        if getattr(self._controller.snapshot, "source", "") == "demo":
+            self._demo_badge = ttk.Label(top, text="· 演示数据（--demo）", style="PillWait.TLabel")
+            self._demo_badge.grid(row=0, column=2, sticky="e", padx=(0, 8))
         self._state_pill = ttk.Label(top, text="状态未知", style="PillMuted.TLabel")
-        self._state_pill.grid(row=0, column=2, sticky="e", padx=(0, 12))
-        ttk.Button(top, text="刷新 / F5", command=self.refresh).grid(row=0, column=3, sticky="e")
+        self._state_pill.grid(row=0, column=3, sticky="e", padx=(0, 12))
+        ttk.Button(top, text="刷新 / F5", command=self.refresh).grid(row=0, column=4, sticky="e")
         side = ttk.Frame(self._root, style="Sidebar.TFrame", padding=(10, 12))
         side.grid(row=1, column=0, sticky="nsew")
         ttk.Label(side, text="导航", style="Meta.TLabel").pack(anchor="w", padx=6, pady=(0, 8))
@@ -500,8 +505,10 @@ _DEMO_SECTIONS = {
                                "anthropic": "http://127.0.0.1:1717"},
                   "downlink": {"url": "http://127.0.0.1:1717/agent", "token": "djb_sc_…9f2c"},
                   "note": "下行令牌只读展示；轮换请到服务端控制台。"},
-        "access": {"config": {"node_id": "node-7c31", "node_secret": "djb_ns_…4e11",
-                              "api_key": "djb_sk_…abcd", "price_mode": "跟随平台建议价",
+        "access": {"valid": True, "saved": True,
+                   "config": {"node_id": "node-7c31", "node_secret": "djb_ns_…4e11",
+                              "api_key": "djb_sk_…abcd", "price_mode": "auto",
+                              "price_mode_label": "跟随平台建议价",
                               "price_note": "—", "usdt_address": "TQn9Xa…7f3d",
                               "openai_base_url": "http://127.0.0.1:1717/v1",
                               "anthropic_base_url": "http://127.0.0.1:1717",
@@ -527,22 +534,34 @@ _DEMO_SECTIONS = {
 
 
 def _make_reloader(home: str | os.PathLike | None):
-    """接 daemon 的热重载：支持 → RELOAD_OK；不支持/未运行 → 对应状态（不谎报）。"""
-    def reload() -> str:
+    """接 daemon 的热重载：与 `djb daemon reload` **同一条控制命令**。
+
+    返回 ``(状态, 说明)``：成功给新配置的变更摘要，失败给 daemon 的原话（可读原因），
+    没接上/旧版本 → 对应状态，绝不谎报「已生效」。
+    """
+    def reload() -> tuple[str, str]:
         try:
             from ..daemon import ControlClient
             from ..config import Paths
-            from ..errors import NotRunningError
-        except ImportError:
-            return RELOAD_UNSUPPORTED
+            from ..errors import NotRunningError, UsageError
+        except ImportError:                       # pragma: no cover - 防御
+            return RELOAD_UNSUPPORTED, ""
         paths = Paths(str(home) if home else os.path.expanduser("~/.djb"))
         try:
-            response = ControlClient(paths).call({"cmd": "reload"}, timeout=5.0)
+            response = ControlClient(paths).call({"cmd": "reload"}, timeout=15.0)
         except NotRunningError:
-            return RELOAD_DAEMON_DOWN
-        except Exception:
-            return RELOAD_UNSUPPORTED
-        return RELOAD_OK if response.get("ok") is True else RELOAD_FAILED
+            return RELOAD_DAEMON_DOWN, ""
+        except UsageError:
+            # 旧 daemon 不认识 reload：这是「没有热重载能力」，不是保存失败
+            return RELOAD_UNSUPPORTED, ""
+        except Exception as exc:
+            return RELOAD_FAILED, type(exc).__name__
+        if response.get("ok") is True:
+            changed = response.get("changed") or []
+            detail = ("已重载：" + ", ".join(str(item) for item in changed)) if changed \
+                else "配置无变化"
+            return RELOAD_OK, detail
+        return RELOAD_FAILED, str(response.get("error") or "原因未知")
     return reload
 
 

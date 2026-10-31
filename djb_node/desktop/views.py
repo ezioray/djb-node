@@ -173,7 +173,7 @@ def _num(value: Any) -> str:
     return str(value)
 
 
-def _flag(value: Any, true: str, false: str, unknown: str = "? 暂不可用") -> str:
+def _flag(value: Any, true: str, false: str, unknown: str = "暂不可用") -> str:
     if value is True:
         return MARK_DONE + " " + true
     if value is False:
@@ -474,16 +474,36 @@ def _agent(snapshot: Snapshot) -> View:
     )
 
 
+def _binding_bound(binding: Mapping[str, Any]) -> bool | None:
+    """绑定态兼容：布尔 ``bound`` 优先，其次 ``state`` 字符串（active/bound/paired…）。"""
+    if not binding:
+        return None
+    value = binding.get("bound")
+    if isinstance(value, bool):
+        return value
+    state = str(binding.get("state") or "").strip().lower()
+    if not state:
+        return None
+    if state in ("bound", "active", "paired", "online", "ok"):
+        return True
+    if state in ("unbound", "none", "detached", "revoked", "inactive"):
+        return False
+    return None
+
+
 def _access(snapshot: Snapshot) -> View:
     access = _section(snapshot, "access")
     config = access.get("config") if isinstance(access.get("config"), Mapping) else {}
     binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
-    bound = binding.get("state") or binding.get("bound")
+    bound = _binding_bound(binding)
     valid = access.get("valid")
     return View(
         key="access", title="接入配置",
         subtitle="保存 → daemon reload → 回读一致",
-        cards=(Card("配置有效性", _flag(valid, "通过校验", "有字段需修正"), "", "mint" if valid else "amber"),
+        cards=(Card("配置有效性",
+                    "尚未保存" if access.get("saved") is False
+                    else _flag(valid, "通过校验", "有字段需修正"), "",
+                    "amber" if access.get("saved") is False or not valid else "mint"),
                Card("节点绑定", _flag(bound if bound is not None else None, "已绑定", "未绑定"),
                     str(binding.get("node_id") or config.get("node_id") or "—"), "default")),
         fields=(

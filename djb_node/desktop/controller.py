@@ -231,8 +231,11 @@ class DesktopController:
         service = self._service()
         state = service.reload()
         from .access import RELOAD_TEXT
-        return ActionResult(RELOAD_TEXT.get(state, RELOAD_TEXT[RELOAD_FAILED]),
-                            ok=state == RELOAD_OK, effect="reload", payload=state)
+        message = RELOAD_TEXT.get(state, RELOAD_TEXT[RELOAD_FAILED])
+        detail = getattr(service, "last_reload_detail", "")
+        if detail:
+            message += "（" + detail + "）"
+        return ActionResult(message, ok=state == RELOAD_OK, effect="reload", payload=state)
 
     # ── 动作路由
     def action(self, key: str, *, confirm: Callable[[str], bool] | None = None) -> ActionResult:
@@ -350,7 +353,8 @@ class DesktopController:
             state_text = STATE_LABELS.get(str(status.get("state")), "状态未知")
         else:
             state_text = "暂不可用"
-        return "daemon：" + state_text + "    ·    " + self.message
+        prefix = "【演示数据】" if getattr(self.snapshot, "source", "") == "demo" else ""
+        return prefix + "daemon：" + state_text + "    ·    " + self.message
 
 
 def secret_hint(value: str) -> str:

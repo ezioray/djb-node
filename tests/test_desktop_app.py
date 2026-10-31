@@ -94,3 +94,14 @@ def test_demo_snapshot_has_all_sections():
     assert set(snapshot.sections) == set(SECTIONS)
     for name in SECTIONS:
         assert snapshot.ok(name), name
+
+
+def test_demo_mode_is_labelled_on_screen(tmp_path):
+    """--demo 必须在界面上贴标签，截图不许被误当成真机数据。"""
+    controller = desktop_app.make_controller(home=tmp_path, demo=True)
+    assert controller.snapshot.source == "demo"
+    assert controller.status_line().startswith("【演示数据】")
+
+    real = desktop_app.make_controller(home=tmp_path, demo=False)
+    assert real.snapshot.source != "demo"
+    assert not real.status_line().startswith("【演示数据】")

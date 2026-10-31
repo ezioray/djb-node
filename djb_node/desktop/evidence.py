@@ -146,7 +146,13 @@ def _manifest(out: Path, paths: Sequence[Path]) -> str:
     shots = sorted(p.name for p in out.glob("*.png"))
     if shots:
         lines.append("")
-        lines.append("截图（Xvfb + import，共 " + str(len(shots)) + " 张）：" + "  ".join(shots))
+        lines.append("真实数据截图（Xvfb + import，共 " + str(len(shots)) + " 张）："
+                     + "  ".join(shots))
+    demo = sorted(p.name for p in (out / "demo").glob("*.png"))
+    if demo:
+        lines.append("")
+        lines.append("演示数据截图（--demo，界面带「演示数据（--demo）」角标，共 "
+                     + str(len(demo)) + " 张）：" + "  ".join(demo))
     return "\n".join(lines)
 
 
