@@ -184,3 +184,46 @@ def test_priority_beats_weight():
     group = _group("g", [_member("u1", "*", priority=1, weight=9),
                          _member("u2", "*", priority=0, weight=1)])
     assert pr.pick_target([group], model="m", picker=lambda total: total - 1).upstream_id == "u2"
+
+
+# --------------------------------------------------------------- 模型级预算（叠加在组预算之上）
+def test_model_budget_blocks_only_that_model():
+    """贵模型单独设小额度：耗尽后只有它不可用，其它模型照常。"""
+    group = _group("g", [_member("u-gpt", "gpt-4o"), _member("u-mini", "gpt-4o-mini")], day=10**6)
+    group["model_budgets"] = {"gpt-4o": {"budget_usd_minor_day": 500}}
+    group["spent_by_model"] = {"gpt-4o": {"spent_usd_minor_day": 500}}
+    assert pr.pick_target([group], model="gpt-4o") is None
+    assert pr.pick_target([group], model="gpt-4o-mini").upstream_id == "u-mini"
+
+
+def test_model_budget_and_group_budget_take_tighter():
+    group = _group("g", [_member("u1", "m")], day=1000, month=10**6)
+    group["model_budgets"] = {"m": {"budget_usd_minor_day": 10**6, "budget_usd_minor_month": 300}}
+    group["spent_by_model"] = {"m": {"spent_usd_minor_day": 0, "spent_usd_minor_month": 300}}
+    # 日额度充足、月额度耗尽 → 取更紧的（月）→ 不可用
+    assert pr.pick_target([group], model="m") is None
+
+
+def test_model_budget_absent_means_unlimited():
+    group = _group("g", [_member("u1", "m")], day=1000)
+    group["spent_by_model"] = {"m": {"spent_usd_minor_day": 999}}
+    assert pr.pick_target([group], model="m") is not None
+
+
+def test_group_budget_still_caps_every_model():
+    """模型级都没超，但组池耗尽 → 全部不可用。"""
+    group = _group("g", [_member("u-gpt", "gpt-4o"), _member("u-mini", "gpt-4o-mini")],
+                   day=1000, spent_day=1000)
+    group["model_budgets"] = {"gpt-4o": {"budget_usd_minor_day": 10**6},
+                              "gpt-4o-mini": {"budget_usd_minor_day": 10**6}}
+    assert pr.pick_target([group], model="gpt-4o") is None
+    assert pr.pick_target([group], model="gpt-4o-mini") is None
+
+
+def test_effective_budget_left_reports_tighter():
+    group = {"budget_usd_minor_day": 1000, "spent_usd_minor_day": 900,
+             "model_budgets": {"m": {"budget_usd_minor_day": 50}},
+             "spent_by_model": {"m": {"spent_usd_minor_day": 40}}}
+    assert pr.effective_budget_left(group, "m") == 10          # 模型级更紧
+    group["model_budgets"] = {"m": {"budget_usd_minor_day": 10**6}}
+    assert pr.effective_budget_left(group, "m") == 100         # 组级更紧
