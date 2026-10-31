@@ -690,9 +690,19 @@ class LocalDataSource:
             buffer = SealedReceiptBuffer(store, CredentialStore(Paths(str(self._home))).buffer_key())
             rows: list[dict[str, Any]] = []
             for item in store.receipts(limit=200):
-                record = item.to_dict() if hasattr(item, "to_dict") else dict(item)
-                decoded = buffer.get(str(record.get("receipt_id") or ""))
-                rows.append(dict(decoded) if isinstance(decoded, Mapping) else record)
+                receipt_id = str(getattr(item, "receipt_id", "") or "")
+                try:
+                    decoded = buffer.get(receipt_id) if receipt_id else None
+                except Exception:                    # 单条解不开只影响这一条，别整库判死
+                    decoded = None
+                if isinstance(decoded, Mapping):
+                    rows.append(dict(decoded))
+                else:
+                    # 有密封行但解不开（密钥换了 / 数据坏了）：标成 sealed_only，
+                    # 由比对逻辑说「本机不可读」，而不是假装「本机没有副本」。
+                    rows.append({"receipt_id": receipt_id,
+                                 "buffered_at": str(getattr(item, "buffered_at", "") or ""),
+                                 "_sealed_only": True})
             return rows, "", True
         except Exception as exc:
             return [], "本地收据不可读（" + type(exc).__name__ + "）", False
@@ -808,6 +818,13 @@ class LocalDataSource:
                 "levels": list(LOG_LEVELS), "note": ""}
 
 
+def _sig_prefix(receipt: Mapping[str, Any]) -> str:
+    """本机供方签名摘要前 8 位（与云端掩码 ``hash`` 同一口径；形态 ``hmac-sha256:<hex>``）。"""
+    signature = str(receipt.get("sig_provider") or receipt.get("hash") or "")
+    digest = signature.rsplit(":", 1)[-1].strip().lower()
+    return digest[:8] if len(digest) >= 8 else ""
+
+
 def _hash_prefix(value: Any, size: int = 8) -> str:
     """云端 ``hash`` 是掩码过的（前 8 位 + …）；本机是全量，比较只能比前缀。"""
     text = str(value or "").strip().rstrip("…").strip().lower()
@@ -815,13 +832,23 @@ def _hash_prefix(value: Any, size: int = 8) -> str:
 
 
 def _receipt_local_check(cloud: Mapping[str, Any], local: Mapping[str, Any] | None) -> str:
-    """本机副本 vs 云端受理行：``match`` / ``mismatch`` / ``no_local``。"""
+    """本机副本 vs 云端受理行：``match`` / ``mismatch`` / ``no_local`` / ``unreadable``。
+
+    比的是**供方签名摘要前缀**（本机 ``sig_provider`` 的 digest vs 云端脱敏 ``hash``）；
+    摘要读不到就退回比 task_id / tokens——但绝不能在没比到签名的情况下说「一致」。
+    """
     if not local:
         return "no_local"
-    mine_hash = _hash_prefix(local.get("hash") or local.get("payload_hash"))
+    if local.get("_sealed_only"):
+        return "unreadable"
+    mine_hash = _sig_prefix(local)
     theirs_hash = _hash_prefix(cloud.get("hash"))
-    if mine_hash and theirs_hash and mine_hash != theirs_hash:
-        return "mismatch"
+    if mine_hash and theirs_hash:
+        if mine_hash != theirs_hash:
+            return "mismatch"
+    elif theirs_hash and not mine_hash:
+        # 本机没有可比对的签名摘要：不能说「一致」，只能说本机读不全
+        return "unreadable"
     if str(local.get("task_id") or "") and str(cloud.get("task_id") or ""):
         if str(local.get("task_id")) != str(cloud.get("task_id")):
             return "mismatch"

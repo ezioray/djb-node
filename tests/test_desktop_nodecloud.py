@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from djb_node.desktop import views as vw
@@ -493,3 +495,67 @@ def test_receipt_row_reads_issued_at_and_prefers_revenue_micro():
     assert rows[0]["created_at"] == "2026-11-01T10:00:00Z" and rows[0]["amount"] == "1.25"
     assert rows[1]["amount"] == "0.50"                 # 回落 revenue_minor
     assert rows[2]["created_at"] == "2026-11-01T10:02:00Z"   # 兼容详情端点的 received_at
+
+
+# ───────────────────────────────────────────── 本机副本比对（真密封收据，不 mock 解密）
+def _seed_local_receipt(home, receipt_id: str, task_id: str, *, signature_hex: str) -> None:
+    from pathlib import Path
+
+    from djb_node import facts
+    from djb_node.config import Paths
+    from djb_node.outbox import SealedReceiptBuffer, canonical_fields_of, canonical_string
+    from djb_node.secure import CredentialStore
+    from djb_node.store import Store
+    from djb_node.util import hmac_sha256
+
+    path = str(Path(home) / "state.db")
+    Store.create(path) if not os.path.exists(path) else None
+    store = Store(path)
+    buffer = SealedReceiptBuffer(store, CredentialStore(Paths(str(home))).buffer_key())
+    receipt = {"receipt_id": receipt_id, "task_id": task_id, "access": "A1",
+               "usage": {"amount": "0.001500", "unit": "USDT"},
+               "price": {"amount": "1.25", "unit": "USDT"},
+               "sig_consumer": facts.RECEIPT_SIGNATURE_PREFIX + "c" * 64}
+    receipt["sig_provider"] = facts.RECEIPT_SIGNATURE_PREFIX + signature_hex
+    buffer.enqueue(receipt)
+
+
+def test_local_copy_is_actually_compared_not_assumed_missing(tmp_path):
+    """有本机副本就要真比：签名摘要不一致 → mismatch（不是「本机无副本」也不是「一致」）。"""
+    from djb_node.desktop.datasource import LocalDataSource
+
+    _seed_local_receipt(tmp_path, "r1", "t1", signature_hex="a" * 64)
+    cloud = FakeCloud(receipts={"items": [
+        {"receipt_id": "r1", "task_id": "t1", "state": "accepted", "hash": "bbbbbbbb…",
+         "tokens": 1500, "revenue_minor": 1_250_000, "created_at": "2026-11-01T10:00:00Z"}],
+        "next_cursor": None, "truncated": False})
+    rows = LocalDataSource(home=tmp_path, cloud=cloud).snapshot().get("receipts")["rows"]
+    assert rows[0]["local_check"] == "mismatch"
+
+
+def test_local_copy_with_matching_signature_prefix_is_match(tmp_path):
+    from djb_node.desktop.datasource import LocalDataSource
+
+    signature = "abcdef0123456789" + "0" * 48
+    _seed_local_receipt(tmp_path, "r1", "t1", signature_hex=signature)
+    cloud = FakeCloud(receipts={"items": [
+        {"receipt_id": "r1", "task_id": "t1", "state": "accepted", "hash": "abcdef01…",
+         "tokens": 1500, "revenue_minor": 1_250_000}], "next_cursor": None, "truncated": False})
+    rows = LocalDataSource(home=tmp_path, cloud=cloud).snapshot().get("receipts")["rows"]
+    assert rows[0]["local_check"] == "match"
+
+
+def test_sealed_but_undecodable_local_copy_is_unreadable(tmp_path):
+    """密封行解不开（换密钥/坏数据）→ 「本机不可读」，不能说「本机无副本」更不能说「一致」。"""
+    from djb_node.desktop.datasource import LocalDataSource
+    from djb_node.store import Store
+
+    path = str(tmp_path / "state.db")
+    Store.create(path)
+    store = Store(path)
+    store.add_receipt("r1", b"not-a-sealed-payload")
+    cloud = FakeCloud(receipts={"items": [
+        {"receipt_id": "r1", "state": "accepted", "hash": "abcdef01…"}],
+        "next_cursor": None, "truncated": False})
+    rows = LocalDataSource(home=tmp_path, cloud=cloud).snapshot().get("receipts")["rows"]
+    assert rows[0]["local_check"] == "unreadable"
