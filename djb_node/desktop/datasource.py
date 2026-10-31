@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
+from ..errors import StoreNotInitializedError
 from .access import ACCESS_FILE, AccessConfig, FileAccessStore, mask_secret
 
 __all__ = [
@@ -634,25 +635,32 @@ class LocalDataSource:
             rows, origin, next_cursor = pages["rows"], "cloud", pages["next_cursor"]
             note = _more_note(pages)
         local_ok = True
+        local_note = ""
         if not rows:
             try:
                 store = self._store()
                 for row in store.receipts(limit=200):
                     record = row.to_dict() if hasattr(row, "to_dict") else dict(row)
                     rows.append(record)
+            except StoreNotInitializedError:
+                # 本机还没跑过 daemon：这是「本机没有收据」，不是错误；
+                # 也不能因此把云端明说的 0 张说成不可用。
+                local_note = "本机收据库尚未初始化（daemon 未启动过）"
             except Exception as exc:
                 local_ok = False
-                if not note:
-                    raise ProviderError("本地收据不可读（" + type(exc).__name__ + "）") from None
-                note += "；本地收据不可读"
+                local_note = "本地收据不可读（" + type(exc).__name__ + "）"
         if not rows and not local_ok:
             # 两边都读不到：不能说「0 张」，那是把缺数据说成零
-            raise ProviderError(note, hint="daemon 起来后再刷新；云端收据需要登录节点")
+            raise ProviderError("；".join(filter(None, (note, local_note))),
+                                hint="daemon 起来后再刷新；云端收据需要登录节点")
         if not rows and cloud_error is not None:
             # 云端取不到、本地也没有：如实说「暂不可用（原因）」，不是「还没有收据」
             raise ProviderError(cloud_error.reason, hint=cloud_error.hint)
         if not rows and not note:
             note = "还没有收据"
+        if local_note:
+            # 「还没有收据」+「本机库没初始化」不是两件事，别读成两条警告
+            note = local_note if note == "还没有收据" else "；".join((note, local_note))
         return {"rows": rows, "origin": origin, "note": note, "next_cursor": next_cursor}
 
     def _earnings(self) -> Mapping[str, Any]:

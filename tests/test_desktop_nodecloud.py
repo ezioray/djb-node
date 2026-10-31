@@ -415,3 +415,37 @@ def test_balance_without_user_key_never_guesses():
                                               "payouts": []}))._earnings()
     assert section["balance"] is None
     assert "需要用户凭据" in section["balance_note"]
+
+
+# ───────────────────────────────────────────────── 本机收据库没初始化 ≠ 云端不可用
+def test_cloud_empty_plus_uninitialized_store_is_zero_not_unavailable(tmp_path):
+    """真联调抓到：云端明说 0 张、本机库还没建，页面却整块「暂不可用（内部异常名）」。
+
+    必须给临时 home：默认 home 是真的 ``~/.djb``，测试绝不能去开它。
+    """
+    class Cloud:
+        def fetch(self, kind):
+            return {"items": [], "next_cursor": None, "truncated": False}
+
+        def earnings(self):
+            return {"settled": None, "pending": None, "payouts": [], "currency": "USDT",
+                    "note": ""}
+
+    source = LocalDataSource(home=tmp_path, cloud=Cloud())   # 空 home：还没跑过 daemon
+    section = source._receipts()
+    assert section["rows"] == [] and section["origin"] == "cloud"
+    assert "尚未初始化" in section["note"]
+    assert "还没有收据" not in section["note"]          # 一句话，不要读成两条警告
+
+
+def test_unreadable_store_still_degrades_when_cloud_failed(tmp_path):
+    class Dead:
+        def fetch(self, kind):
+            raise ProviderError("云端连不上（OSError）")
+
+    source = LocalDataSource(home=tmp_path, cloud=Dead())
+    with pytest.raises(ProviderError) as info:
+        source._receipts()
+    assert "云端连不上" in info.value.reason
+    for leak in ("NameError", "StoreNotInitialized", "Traceback"):
+        assert leak not in info.value.reason

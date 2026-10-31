@@ -587,7 +587,7 @@ def test_earnings_export_escapes_commas_in_cells(tmp_path):
     assert '"req,1"' in line and '"ta""sk"' in line
 
 
-def test_unavailable_earnings_never_says_empty():
+def test_unavailable_earnings_never_says_empty(tmp_path):
     """真联调发现：详情域不可用时表格空文案还写「暂无计费明细」，读起来像「真的是 0」。"""
     from djb_node.desktop.datasource import ProviderError
     from djb_node.desktop.views import build_view
@@ -601,7 +601,8 @@ def test_unavailable_earnings_never_says_empty():
 
     from djb_node.desktop.datasource import LocalDataSource
 
-    snapshot = LocalDataSource(cloud=Cloud()).snapshot()
+    # 必须给临时 home：默认 home 是真的 ~/.djb，测试绝不能去开它
+    snapshot = LocalDataSource(home=tmp_path, cloud=Cloud()).snapshot()
     text = build_view("earnings", snapshot).plain_text()
     assert "（暂不可用）" in text
     assert "暂无计费明细" not in text
