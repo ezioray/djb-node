@@ -252,11 +252,23 @@ def test_controller_save_without_reload_says_restart(tmp_path):
 
 def test_controller_unwired_action_is_honest(tmp_path):
     controller = make_controller(tmp_path)
-    for key in ("models.save", "receipts.verify", "earnings.export",
-                "account.enable_2fa", "nope.unknown"):
+    for key in ("models.save", "account.enable_2fa", "nope.unknown"):
         result = controller.action(key)
         assert result.ok is False, key
         assert "暂不可用" in result.message, key
+
+
+def test_receipts_verify_and_earnings_export_are_no_longer_stubs(tmp_path):
+    """三个旧桩里的两个已接线：没选中/没数据时给的是「怎么做」，不是「未接线」。"""
+    controller = make_controller(tmp_path)
+    verify = controller.action("receipts.verify")
+    export = controller.action("earnings.export")
+    for result in (verify, export):
+        assert result.ok is False
+        assert "未接线" not in result.message
+    assert "选中一条收据" in verify.message
+    # 演示快照里有明细行，但测试里没有保存对话框 → 如实说「没有对话框」，也不假装导出成功
+    assert "保存对话框" in export.message or "没有可导出的记录" in export.message
 
 
 def test_logout_is_no_longer_a_stub(tmp_path):
@@ -453,3 +465,123 @@ def test_logout_without_node_says_nothing_to_do():
     result = controller.action("account.logout", confirm=lambda _m: True)
     assert result.ok is False and "尚未登录" in result.message
     assert calls == []
+
+
+# ─────────────────────────────────────────────────────────── 校验收据（云端单条 vs 本机缓存）
+LOCAL_RECEIPT = {"receipt_id": "rc-1", "task_id": "t-1", "access": "A1",
+                 "sig_provider": "hmac-sha256:" + "ab" * 32,
+                 "price": {"amount": "0.0012", "unit": "USDT"}}
+
+
+def make_verify_controller(*, local=None, cloud=None, rows=None):
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource, ProviderError
+
+    receipt_rows = rows if rows is not None else [
+        {"receipt_id": "rc-1", "task_id": "t-1", "status": "verified",
+         "hash": "abababab…", "revenue_minor": 1_200}]
+
+    class Source(FakeDataSource):
+        def local_receipt(self, receipt_id):
+            if isinstance(local, Exception):
+                raise local
+            return local if local is not None else LOCAL_RECEIPT
+
+        def cloud_receipt(self, receipt_id):
+            if isinstance(cloud, Exception):
+                raise cloud
+            return cloud if cloud is not None else {"receipt_id": "rc-1", "state": "accepted"}
+
+    return DesktopController(Source({"receipts": {"rows": receipt_rows, "note": ""}}))
+
+
+def test_verify_needs_a_selected_row():
+    controller = make_verify_controller()
+    result = controller.action("receipts.verify")
+    assert result.ok is False and "选中一条收据" in result.message
+
+
+def test_verify_matching_receipt_says_verified():
+    controller = make_verify_controller()
+    controller.select_row("receipts", "rc-1")
+    result = controller.action("receipts.verify")
+    assert result.ok is True and "已验证" in result.message and "accepted" in result.message
+
+
+def test_verify_lists_differing_fields_with_both_values():
+    rows = [{"receipt_id": "rc-1", "task_id": "t-9", "status": "verified",
+             "hash": "ffffffff…", "revenue_minor": 2_000}]
+    controller = make_verify_controller(rows=rows)
+    controller.select_row("receipts", "rc-1")
+    result = controller.action("receipts.verify")
+    assert result.ok is False and "不一致" in result.message
+    for field in ("task_id", "hash", "金额"):
+        assert field in result.message
+
+
+def test_verify_unreachable_cloud_is_unavailable_not_a_verdict():
+    from djb_node.desktop.datasource import ProviderError
+
+    controller = make_verify_controller(cloud=ProviderError("云端连不上（OSError）"))
+    controller.select_row("receipts", "rc-1")
+    result = controller.action("receipts.verify")
+    assert result.ok is False
+    assert "暂不可用" in result.message and "verified" not in result.message
+
+
+def test_verify_without_local_cache_is_honest():
+    controller = make_verify_controller(local=None)
+    controller.source.local_receipt = lambda _rid: None          # 本机没有这条
+    controller.select_row("receipts", "rc-1")
+    result = controller.action("receipts.verify")
+    assert result.ok is False and "本机没有" in result.message
+
+
+# ─────────────────────────────────────────────────────────── 导出收益明细（本地 CSV）
+def test_earnings_export_writes_csv_with_bom_and_verifies_row_count(tmp_path):
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    section = {"earnings": {"settled": "1.50", "pending": None, "currency": "USDT",
+                            "payouts": [
+                                {"id": "req-1", "task_id": "t-1", "amount": "1.50",
+                                 "currency": "USDT", "status": "settled",
+                                 "created_at": "2026-11-01T10:00:00Z"},
+                                {"id": "req-2", "task_id": "t-2", "amount": "0.25",
+                                 "currency": "USDT", "status": "settled",
+                                 "created_at": "2026-11-01T10:05:00Z"}]}}
+    target = tmp_path / "out" / "earnings.csv"
+    controller = DesktopController(FakeDataSource(section), save_path=lambda _name: str(target))
+    result = controller.action("earnings.export")
+    assert result.ok is True and "已导出 2 行" in result.message and "回读 2 行一致" in result.message
+    raw = target.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")                       # BOM：Excel 不乱码
+    text = raw.decode("utf-8-sig")
+    lines = text.splitlines()
+    assert lines[0] == "时间,任务,请求,收据,Token,金额"
+    assert "2026-11-01T10:00:00Z,t-1,req-1,—,—,1.50" in lines[1]
+    assert "0.25" in lines[2]
+
+
+def test_earnings_export_cancel_writes_nothing(tmp_path):
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    section = {"earnings": {"payouts": [{"id": "req-1", "amount": "1.00"}]}}
+    controller = DesktopController(FakeDataSource(section), save_path=lambda _name: None)
+    result = controller.action("earnings.export")
+    assert result.ok is False and result.effect == "cancelled"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_earnings_export_escapes_commas_in_cells(tmp_path):
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    section = {"earnings": {"payouts": [{"id": "req,1", "task_id": 'ta"sk',
+                                         "amount": "1.00", "created_at": "2026-11-01"}]}}
+    target = tmp_path / "e.csv"
+    controller = DesktopController(FakeDataSource(section), save_path=lambda _name: str(target))
+    assert controller.action("earnings.export").ok is True
+    line = target.read_text(encoding="utf-8-sig").splitlines()[1]
+    assert '"req,1"' in line and '"ta""sk"' in line

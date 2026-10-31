@@ -448,14 +448,21 @@ def _earnings(snapshot: Snapshot) -> View:
                     "结算中不代表到账", "amber"),
                Card("已结算", _money(snapshot, "earnings", earnings.get("settled")),
                     "链上确认后计入", "default"),
-               Card("余额（额度）", _money(snapshot, "earnings", earnings.get("balance")),
-                    "推理额度，不可提现", "muted")),
+               Card("余额（可用）",
+                    ("暂不可用" if earnings.get("balance_note") and
+                     earnings.get("balance") is None
+                     else _money(snapshot, "earnings", earnings.get("balance"))),
+                    "账户预付款 · 不可提现", "muted")),
         table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
                     note=str(earnings.get("note") or ""), empty="暂无计费明细"),
         actions=(Action("earnings.export", "导出明细", enabled=bool(rows),
                         reason="没有可导出的记录"),),
         unavailable=_missing(snapshot, ("earnings",)),
-        notes=("金额原样展示，不预测、不承诺收益；额度只能抵扣推理。",),
+        notes=tuple(filter(None, (
+            "金额原样展示，不预测、不承诺收益；额度只能抵扣推理。",
+            ("余额暂不可用：" + str(earnings.get("balance_note"))) if (
+                earnings.get("balance_note") and earnings.get("balance") is None) else "",
+        ))),
     )
 
 

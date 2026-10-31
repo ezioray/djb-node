@@ -276,7 +276,8 @@ def test_earnings_use_micro_usd_text():
     text = text_of("earnings", source)
     assert "0.25 USDT" in text                        # 今日（带币种）
     assert "[已结算] 1.50" in text and "[待结算] 1.234567" in text
-    assert "[余额（额度）] 0.00" in text
+    assert "[余额（可用）]" in text                       # 余额卡：没用户凭据就说暂不可用
+    assert "需要用户凭据" in text
 
 
 def test_account_uses_profile_fields():
@@ -372,3 +373,45 @@ def test_one_network_failure_does_not_cost_four_timeouts():
     # 账户域即使云端取不到也还能显示本机凭据，但必须把原因写进 note
     account = snapshot.sections["account"]
     assert not snapshot.ok("account") or "云端连不上" in str(account.get("note", ""))
+
+
+# ─────────────────────────────────────────────────────────── 余额（/user/balance，需用户凭据）
+def test_balance_with_user_key_uses_server_value(monkeypatch):
+    source = make_source(FakeCloud())
+    source._user_key = "uk-test"
+    source._cloud = type("Cloud", (), {
+        "fetch": lambda self, kind: {"items": [], "next_cursor": None, "truncated": False},
+        "earnings": lambda self: {"settled": "1.50", "pending": None, "payouts": [],
+                                  "currency": "USDT", "note": ""},
+        "balance": lambda self, key: {"balance": "0.00", "balance_minor": 0,
+                                      "note": "no_balance_record：该账户还没有充值…"},
+    })()
+    section = source._earnings()
+    assert section["balance"] == "0.00"                  # 服务端说是 0 就是 0
+    assert "还没有充值" in section["balance_note"]
+
+
+def test_balance_failure_is_unavailable_not_zero():
+    class Boom:
+        def fetch(self, kind):
+            return {"items": [], "next_cursor": None, "truncated": False}
+
+        def earnings(self):
+            return {"settled": "1.50", "pending": None, "payouts": [], "currency": "USDT",
+                    "note": ""}
+
+        def balance(self, key):
+            raise ProviderError("云端暂时不可用（502）")
+
+    source = make_source(Boom())
+    source._user_key = "uk-test"
+    section = source._earnings()
+    assert section["balance"] is None
+    assert "502" in section["balance_note"]
+
+
+def test_balance_without_user_key_never_guesses():
+    section = make_source(FakeCloud(earnings={"settled": "1.00", "pending": None,
+                                              "payouts": []}))._earnings()
+    assert section["balance"] is None
+    assert "需要用户凭据" in section["balance_note"]

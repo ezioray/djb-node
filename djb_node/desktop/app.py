@@ -71,6 +71,8 @@ class DesktopApp:
         from ..gui.theme import apply_theme
         self._ttk = ttk
         self._controller = controller
+        if getattr(controller, "save_path", None) is None:
+            controller.save_path = _make_save_path(lambda: self._root)
         self._bus = bus
         self._on_quit = on_quit
         self._unsubscribe = None
@@ -324,6 +326,10 @@ class DesktopApp:
             detail.pack_forget()
             return
         values = tree.item(selection[0], "values")
+        try:
+            self._controller.select_row(self._controller.view, values[0] if values else "")
+        except Exception:
+            pass
         detail.pack(fill="x", pady=(0, 10))
         for column, value in zip(self._detail_columns, values):
             line = self._ttk.Frame(detail, style="CardAlt.TFrame")
@@ -382,7 +388,7 @@ class DesktopApp:
         elif result.effect in ("refresh", "access", "bench", "control", "reload"):
             self._render(self._controller.current())
         self._update_status()
-        if result.effect in ("save", "access", "reload", "control") and result.message:
+        if result.effect in ("save", "access", "reload", "control", "export", "verify") and result.message:
             self._toast(result.message, ok=result.ok)
 
     def _copy(self, text: str) -> None:
@@ -532,6 +538,23 @@ _DEMO_SECTIONS = {
             "path": "~/.djb/logs/djb.log", "levels": ["all", "debug", "info", "warning",
                                                       "error"], "note": ""},
 }
+
+
+def _make_save_path(root_getter):
+    """导出用保存对话框：返回用户选的路径；取消/无对话框 → None（绝不自己编路径）。"""
+    def ask(default_name: str) -> str | None:
+        try:
+            from tkinter import filedialog
+
+            root = root_getter()
+            path = filedialog.asksaveasfilename(
+                parent=root, title="导出收益明细", defaultextension=".csv",
+                initialfile=default_name,
+                filetypes=(("CSV 文件", "*.csv"), ("所有文件", "*.*")))
+        except Exception:
+            return None
+        return str(path) if path else None
+    return ask
 
 
 def _make_cli_runner(home):

@@ -35,6 +35,8 @@ PATHS = {
     "receipts": "/api/v1/node/receipts",
     "earnings": "/api/v1/node/earnings",
     "profile": "/api/v1/node/profile",
+    "receipt": "/api/v1/node/receipts/",       # 单条：+ receipt_id
+    "balance": "/api/v1/user/balance",         # 用方余额：需要用户凭据（Bearer），节点密钥读不了
 }
 
 #: 一页最多取多少条（服务端可下调，客户端不硬要）
@@ -177,10 +179,18 @@ class NodeCloudClient:
         path = PATHS[kind] + ("?" + "&".join(params) if params else "")
         if self._transport is not None:
             return self._transport(kind, {"cursor": cursor, "limit": limit})
-        headers = build_headers(client_key=self._client_key)
+        return self._request_json(kind, path)
+
+    def _request_json(self, kind: str, path: str, *,
+                      headers: Mapping[str, str] | None = None) -> Mapping[str, Any]:
+        """一次 GET → JSON；失败一律映射成可读 ``ProviderError``（不含 URL / 令牌）。"""
+        if self._transport is not None:
+            return self._transport(kind, {})
+        request_headers = dict(headers) if headers else build_headers(client_key=self._client_key)
         url = join_url(self.base_url, path)
         try:
-            response = self._http.request("GET", url, headers=headers, timeout=self._timeout)
+            response = self._http.request("GET", url, headers=request_headers,
+                                          timeout=self._timeout)
         except Exception as exc:              # 网络层：只说类型，不把 URL 抛给界面
             raise ProviderError("云端连不上（" + type(exc).__name__ + "）") from None
         status = int(getattr(response, "status", 0) or 0)
@@ -189,7 +199,10 @@ class NodeCloudClient:
         if status == 403:
             raise ProviderError("节点无权访问该数据（403）", hint=LOGIN_HINT)
         if status == 404:
-            # profile 对不存在的节点也回 404：不能一律说成「接口没上线」
+            # 单条收据 / profile 对「不存在或不属于本节点」也回 404：不谎称接口没上线
+            if kind == "receipt":
+                raise ProviderError("云端没有这条收据（404）",
+                                    hint="确认收据号；跨节点收据不会返回")
             raise ProviderError("云端返回 404（接口未上线或节点不存在）",
                                 hint="确认节点已配对；接口未上线时等平台发布")
         if status >= 500:
@@ -272,6 +285,27 @@ class NodeCloudClient:
             "note": reason,
             "payouts": payouts,
         }
+
+    def receipt(self, receipt_id: str) -> dict[str, Any]:
+        """单条收据的云端受理结果（校验用）；不存在/非本节点 → 404 → 可读原因。"""
+        ident = str(receipt_id or "").strip()
+        if not ident:
+            raise ProviderError("收据号为空")
+        payload = self._request_json("receipt", PATHS["receipt"] + quote(ident, safe=""))
+        return dict(payload)
+
+    def balance(self, user_key: str) -> dict[str, Any]:
+        """用方「可用余额」（micro-USD）。**需要用户凭据**（Bearer），节点密钥无权读取。"""
+        key = str(user_key or "").strip()
+        if not key:
+            raise ProviderError("没有用户凭据（节点密钥不能读账户余额）",
+                                hint="在账单页登录后查看")
+        payload = self._request_json("balance", PATHS["balance"],
+                                     headers=build_headers(extra={"Authorization": "Bearer " + key}))
+        return {"balance_minor": payload.get("available_minor"),
+                "balance": micro_text(payload.get("available_minor")),
+                "as_of": payload.get("as_of"),
+                "note": reason_text(payload.get("note")) if payload.get("note") else ""}
 
     def profile(self) -> dict[str, Any]:
         """节点身份（服务端 404 = 节点不存在/无权查看，不编占位值）。"""

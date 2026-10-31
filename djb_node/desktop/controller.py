@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping, Sequence, Protocol, Sequence
+import time
+from pathlib import Path
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED,
                      AccessConfig, AccessService, FileAccessStore, SaveResult, mask_secret)
@@ -99,6 +101,8 @@ class DesktopController:
     bus: Any | None = None
     benchmark_runner: Callable[..., Mapping[str, Any]] = benchmark
     cli: Callable[[Sequence[str]], Any] | None = None
+    save_path: Callable[[str], str | None] | None = None
+    selected: dict[str, str] = field(default_factory=dict)
     log_level: str = "all"
     message: str = DEFAULT_MESSAGE
     view: str = "overview"
@@ -348,15 +352,91 @@ class DesktopController:
         return ActionResult("已登出：节点已解绑、本机密钥已清除；重新配对后才能接单。",
                             effect="refresh")
 
+    def select_row(self, view_key: str, key: str) -> None:
+        """记住当前视图选中的行（第一列文本）；动作据此作用于「这一条」。"""
+        if key:
+            self.selected[str(view_key)] = str(key)
+        else:
+            self.selected.pop(str(view_key), None)
+
+    # ── 收据校验：拉云端单条 + 与本机密封缓存逐字段比对
+    def _act_receipts_verify(self, *, confirm=None) -> ActionResult:
+        receipts = self.snapshot.get("receipts")
+        rows = receipts.get("rows") if isinstance(receipts, Mapping) else None
+        rows = [row for row in (rows or []) if isinstance(row, Mapping)]
+        if not rows:
+            return ActionResult("暂不可用（列表里没有收据可校验）", ok=False)
+        ident = str(self.selected.get("receipts") or "")
+        if not ident:
+            return ActionResult("先在列表里选中一条收据，再点「校验收据」。", ok=False)
+        local_row = next((row for row in rows
+                          if str(row.get("receipt_id") or row.get("id") or "") == ident), None)
+        if local_row is None:
+            return ActionResult("选中的收据不在当前页（刷新后再试）。", ok=False)
+        fetch_local = getattr(self.source, "local_receipt", None)
+        fetch_cloud = getattr(self.source, "cloud_receipt", None)
+        if fetch_local is None or fetch_cloud is None:
+            return ActionResult("暂不可用（数据源未提供校验收据能力）", ok=False)
+        try:
+            local = fetch_local(ident)
+        except ProviderError as exc:
+            return ActionResult("暂不可用（" + exc.reason + "）", ok=False)
+        try:
+            cloud = fetch_cloud(ident)
+        except ProviderError as exc:
+            return ActionResult("暂不可用（" + exc.reason + "）", ok=False)
+        if local is None:
+            return ActionResult("本机没有这条收据的缓存（可能已过期清理）；云端状态："
+                                + str(cloud.get("state") or "—") + "。", ok=False)
+        differences = _receipt_differences(local, local_row, cloud)
+        if not differences:
+            return ActionResult("已验证：云端与本机一致（收据 " + ident + "，状态 "
+                                + str(cloud.get("state") or "—") + "）。", effect="verify")
+        detail = "；".join(field + " 本机=" + mine + " 云端=" + theirs
+                           for field, mine, theirs in differences[:4])
+        more = "" if len(differences) <= 4 else ("；另有 " + str(len(differences) - 4) + " 处不同")
+        return ActionResult("不一致：" + detail + more + "。", ok=False, effect="verify")
+
+    # ── 收益明细导出（本地 CSV，不联网）
+    def _act_earnings_export(self, *, confirm=None) -> ActionResult:
+        earnings = self.snapshot.get("earnings")
+        rows = [row for row in ((earnings or {}).get("payouts") or [])
+                if isinstance(row, Mapping)] if isinstance(earnings, Mapping) else []
+        if not rows:
+            return ActionResult("暂不可用（没有可导出的记录）", ok=False)
+        if self.save_path is None:
+            return ActionResult("暂不可用（没有可用的保存对话框）", ok=False)
+        default = "djb-earnings-" + time.strftime("%Y%m%d-%H%M", time.localtime(time.time())) + ".csv"
+        target = self.save_path(default)
+        if not target:
+            return ActionResult("已取消导出（未生成文件）。", ok=False, effect="cancelled")
+        header = ("时间", "任务", "请求", "收据", "Token", "金额")
+        lines = [",".join(header)]
+        for row in rows:
+            lines.append(",".join(_csv_cell(value) for value in (
+                row.get("created_at") or row.get("recorded_at") or "—",
+                row.get("task_id") or "—", row.get("id") or "—",
+                row.get("receipt_id") or "—", row.get("tokens") or "—",
+                row.get("amount") or "—")))
+        text = "\ufeff" + "\r\n".join(lines) + "\r\n"      # BOM 让 Excel 认 UTF-8
+        try:
+            path = Path(str(target))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            written = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            return ActionResult("导出失败（" + type(exc).__name__ + "）；未生成完整文件。", ok=False)
+        counted = max(0, len(written) - 1)
+        if counted != len(rows):
+            return ActionResult("导出校验失败：写入 " + str(counted) + " 行，应为 "
+                                + str(len(rows)) + " 行。", ok=False)
+        return ActionResult("已导出 " + str(counted) + " 行到 " + str(target)
+                            + "（回读 " + str(counted) + " 行一致）。", effect="export",
+                            payload=str(target))
+
     # 未接线动作：如实说，不假装成功
     def _act_models_save(self, *, confirm=None) -> ActionResult:
         return ActionResult("暂不可用（云端意向上报接口未接线）；改动未上报，未生效。", ok=False)
-
-    def _act_receipts_verify(self, *, confirm=None) -> ActionResult:
-        return ActionResult("暂不可用（收据校验接口未接线）；本地未做任何验证。", ok=False)
-
-    def _act_earnings_export(self, *, confirm=None) -> ActionResult:
-        return ActionResult("暂不可用（出款明细导出未接线）；未生成任何文件。", ok=False)
 
     def _act_account_enable_2fa(self, *, confirm=None) -> ActionResult:
         return ActionResult("暂不可用（2FA 入口在服务端控制台）；本机未做任何改动。", ok=False)
@@ -383,3 +463,58 @@ class DesktopController:
 def secret_hint(value: str) -> str:
     """给 UI 的占位提示（永不回显原值）。"""
     return mask_secret(value) if value else "未设置"
+
+# ─────────────────────────────────────────────────────────────── 小工具（导出 / 校验）
+def _csv_cell(value: Any) -> str:
+    """CSV 单元格：含逗号/引号/换行就加引号转义（不改变内容）。"""
+    text = str(value if value is not None else "—")
+    if any(char in text for char in (',', '"', '\n', '\r')):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def _local_hash(receipt: Mapping[str, Any]) -> str:
+    """本机 sig_provider 的摘要前 8 位（与云端 ``hash`` 同一脱敏口径）。"""
+    signature = str(receipt.get("sig_provider") or "")
+    digest = signature.rsplit(":", 1)[-1].strip()
+    return digest[:8] if len(digest) >= 8 else ""
+
+
+def _amount_text(value: Any) -> str:
+    """十进制字符串 → micro-USD 显示文本（≥2 位、≤6 位、去尾零）；算不出给空串。"""
+    try:
+        micro = round(float(str(value)) * 1_000_000)
+    except (TypeError, ValueError):
+        return ""
+    whole, frac = divmod(abs(micro), 1_000_000)
+    text = f"{frac:06d}".rstrip("0")
+    return ("-" if micro < 0 else "") + f"{whole}." + text.ljust(2, "0")
+
+
+def _receipt_differences(local: Mapping[str, Any], cloud_row: Mapping[str, Any],
+                         cloud_status: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    """本机密封收据 vs 云端（列表行 + 单条状态）逐字段比对；只比对两边都有的字段。"""
+    differences: list[tuple[str, str, str]] = []
+
+    def compare(name: str, mine: Any, theirs: Any) -> None:
+        mine_text = str(mine if mine not in (None, "") else "")
+        theirs_text = str(theirs if theirs not in (None, "") else "")
+        if mine_text and theirs_text and mine_text != theirs_text:
+            differences.append((name, mine_text, theirs_text))
+
+    compare("receipt_id", local.get("receipt_id"), cloud_row.get("receipt_id")
+            or cloud_status.get("receipt_id"))
+    compare("task_id", local.get("task_id"), cloud_row.get("task_id"))
+
+    mine_hash = _local_hash(local)
+    cloud_hash = str(cloud_row.get("hash") or "").rstrip("…").strip()
+    if mine_hash and cloud_hash and not cloud_hash.startswith(mine_hash):
+        differences.append(("hash", mine_hash + "…", cloud_hash + "…"))
+
+    price = local.get("price") if isinstance(local.get("price"), Mapping) else {}
+    mine_amount = _amount_text(price.get("amount"))
+    theirs_amount = _amount_text((int(cloud_row["revenue_minor"]) / 1_000_000)
+                                 if isinstance(cloud_row.get("revenue_minor"), int) else "")
+    if mine_amount and theirs_amount and mine_amount != theirs_amount:
+        differences.append(("金额", mine_amount, theirs_amount))
+    return differences
