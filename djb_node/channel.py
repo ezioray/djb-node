@@ -85,6 +85,14 @@ class ChannelJob:
     temperature: float | None = None
     stop: list[str] | None = None
     timeout_s: float = float(facts.CHANNEL_JOB_TIMEOUT_DEFAULT_S)
+    # R2-1 加性透传：None / 空 时 body 与改前逐字节一致
+    tools: list[Any] | None = None
+    tool_choice: Any = None
+    response_format: dict[str, Any] | None = None
+    top_p: float | None = None
+    seed: int | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
 
     def body(self) -> dict[str, Any]:
         """转给本机镜像端点的 body（只带白名单字段；stream 固定 False）。"""
@@ -96,6 +104,20 @@ class ChannelJob:
             body["temperature"] = self.temperature
         if self.stop:
             body["stop"] = list(self.stop)
+        if self.tools:
+            body["tools"] = list(self.tools)
+        if self.tool_choice is not None:
+            body["tool_choice"] = self.tool_choice
+        if self.response_format is not None:
+            body["response_format"] = dict(self.response_format)
+        if self.top_p is not None:
+            body["top_p"] = self.top_p
+        if self.seed is not None:
+            body["seed"] = self.seed
+        if self.frequency_penalty is not None:
+            body["frequency_penalty"] = self.frequency_penalty
+        if self.presence_penalty is not None:
+            body["presence_penalty"] = self.presence_penalty
         return body
 
 
@@ -157,6 +179,7 @@ def parse_job(payload: Any) -> ChannelJob | None:
     if not model or not isinstance(messages, list) or not messages:
         return None
     stop = request.get("stop")
+    tools = request.get("tools")
     node_id = payload.get("node_id")
     return ChannelJob(
         job_id=job_id,
@@ -167,6 +190,14 @@ def parse_job(payload: Any) -> ChannelJob | None:
         temperature=_float_or_none(request.get("temperature")),
         stop=[str(item) for item in stop] if isinstance(stop, list) else None,
         timeout_s=_timeout_of(payload, request),
+        tools=tools if isinstance(tools, list) and tools else None,
+        tool_choice=request.get("tool_choice"),
+        response_format=(dict(fmt) if isinstance(fmt := request.get("response_format"),
+                                                 Mapping) else None),
+        top_p=_float_or_none(request.get("top_p")),
+        seed=_int_or_none(request.get("seed")),
+        frequency_penalty=_float_or_none(request.get("frequency_penalty")),
+        presence_penalty=_float_or_none(request.get("presence_penalty")),
     )
 
 
