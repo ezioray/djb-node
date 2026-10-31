@@ -67,8 +67,8 @@ def test_micro_text_matches_web_convention(minor, text):
 # ─────────────────────────────────────────────────────────── 翻页
 def test_fetch_follows_next_cursor_to_the_end():
     client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(
-        FakeResponse(200, page([{"id": "t1"}, {"id": "t2"}], "c2")),
-        FakeResponse(200, page([{"id": "t3"}])),
+        FakeResponse(200, page([{"task_id": "t1"}, {"task_id": "t2"}], "c2")),
+        FakeResponse(200, page([{"task_id": "t3"}])),
     ))
     result = client.fetch("tasks")
     assert [row["id"] for row in result["items"]] == ["t1", "t2", "t3"]
@@ -78,11 +78,11 @@ def test_fetch_follows_next_cursor_to_the_end():
 
 def test_fetch_stops_at_page_cap_and_says_so():
     client = NodeCloudClient("http://cloud.test", "ck", max_pages=2, http=FakeHttp(
-        FakeResponse(200, page([{"id": "a"}], "c2")),
-        FakeResponse(200, page([{"id": "b"}], "c3")),
+        FakeResponse(200, page([{"receipt_id": "a"}], "c2")),
+        FakeResponse(200, page([{"receipt_id": "b"}], "c3")),
     ))
     result = client.fetch("receipts")
-    assert [row["id"] for row in result["items"]] == ["a", "b"]
+    assert [row["receipt_id"] for row in result["items"]] == ["a", "b"]
     assert result["truncated"] is True and result["next_cursor"] == "c3"
     assert result["pages"] == 2
 
@@ -106,7 +106,7 @@ def test_401_asks_to_login_again():
 
 
 @pytest.mark.parametrize("status,needle", [
-    (404, "尚未上线"), (403, "无权"), (500, "暂时不可用"), (429, "被拒绝"),
+    (404, "接口未上线或节点不存在"), (403, "无权"), (500, "暂时不可用"), (429, "被拒绝"),
 ])
 def test_http_errors_become_readable_reasons(status, needle):
     client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(status, {})))
@@ -130,12 +130,24 @@ def test_non_json_response_is_reported():
     assert "不是 JSON" in info.value.reason
 
 
-def test_unavailable_reason_marks_the_domain_unavailable():
+def test_earnings_without_any_data_is_unavailable_with_reason():
     client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(
-        FakeResponse(200, {"items": [], "unavailable_reason": "metering 服务维护中"})))
+        FakeResponse(200, {"settled_minor": None, "pending_minor": None, "rows": [],
+                           "unavailable_reason": "no_usage_for_node"})))
     with pytest.raises(ProviderError) as info:
-        client.fetch("receipts")
-    assert "服务端已降级" in info.value.reason and "维护中" in info.value.reason
+        client.earnings()
+    assert "还没有计费记录" in info.value.reason
+
+
+def test_earnings_with_data_keeps_reason_as_note():
+    """有数据但结算排期没配置：照常展示金额，原因降级成 note（不整域判死）。"""
+    client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(
+        FakeResponse(200, {"settled_minor": 1_500_000, "pending_minor": 0, "rows": [],
+                           "next_settlement_at": None,
+                           "unavailable_reason": "settlement_schedule_not_configured"})))
+    data = client.earnings()
+    assert data["settled"] == "1.50" and data["pending"] == "0.00"
+    assert "结算排期尚未配置" in data["note"]
 
 
 def test_client_sends_client_key_header_and_never_in_url():
@@ -279,3 +291,54 @@ def test_no_cloud_means_unavailable_not_zero():
     text = text_of("tasks", source)
     assert UNAVAILABLE in text and "未登录节点" in text
     assert "0 条" not in text
+
+
+# ─────────────────────────────────────────────────────────── 行归一化（对齐 node_console 真实字段）
+def test_task_rows_get_tokens_elapsed_and_state_mapping():
+    client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(200, page([
+        {"task_id": "t-1", "request_id": "req-1", "state": "recorded", "inflight": True,
+         "tokens_in": 30, "tokens_out": 12, "started_at": "2026-11-01T10:00:00Z",
+         "finished_at": "2026-11-01T10:00:09Z", "amount_micro": 1_250_000},
+        {"task_id": None, "request_id": "req-2", "state": "settled", "inflight": False,
+         "tokens_in": 5, "tokens_out": 0, "started_at": "2026-11-01T10:00:00Z",
+         "finished_at": "2026-11-01T10:01:00Z", "amount_micro": 500_000},
+    ]))))
+    rows = client.fetch("tasks")["items"]
+    assert rows[0]["id"] == "t-1" and rows[0]["state"] == "inflight"
+    assert rows[0]["tokens"] == 42 and rows[0]["elapsed_s"] == 9
+    assert rows[0]["amount"] == "1.25"
+    assert rows[1]["id"] == "req-2" and rows[1]["state"] == "done"
+    assert rows[1]["elapsed_s"] == 60 and rows[1]["amount"] == "0.50"
+
+
+def test_receipt_rows_map_accepted_to_verified():
+    client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(200, page([
+        {"receipt_id": "r-1", "state": "accepted", "tokens": 40, "revenue_minor": 2_000_000,
+         "issued_at": "2026-11-01T10:00:00Z", "hash": "deadbeef…"},
+        {"receipt_id": "r-2", "state": "rejected", "tokens": None, "revenue_minor": None,
+         "issued_at": "2026-11-01T10:05:00Z", "reject_reason": "bad signature"},
+    ]))))
+    rows = client.fetch("receipts")["items"]
+    assert rows[0]["status"] == "verified" and rows[0]["state_raw"] == "accepted"
+    assert rows[0]["created_at"] == "2026-11-01T10:00:00Z" and rows[0]["amount"] == "2.00"
+    assert rows[1]["status"] == "failed" and rows[1]["amount"] is None
+
+
+def test_receipt_view_renders_accepted_as_verified_not_failed():
+    cloud = FakeCloud(receipts={"items": [
+        {"receipt_id": "r-1", "status": "verified", "created_at": "2026-11-01T10:00:00Z",
+         "tokens": 40}], "next_cursor": None, "truncated": False})
+    text = text_of("receipts", make_source(cloud))
+    assert "✓ verified" in text
+    assert "✕" not in text.split("收据")[-1]
+
+
+def test_profile_payload_maps_node_identity():
+    client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(200, {
+        "node_id": "node-7c31", "state": "active", "region": "cn-east", "platform": "linux",
+        "upstream_kind": "A1", "capabilities": ["A1:mock-small"], "bound": True,
+        "last_seen_at": "2026-11-01T10:00:00Z"})))
+    profile = client.profile()
+    assert profile["node_id"] == "node-7c31" and profile["bound"] is True
+    assert profile["capabilities"] == ["A1:mock-small"]
+    assert profile["email"] is None                  # 节点接口没有邮箱，不编

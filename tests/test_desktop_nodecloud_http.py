@@ -19,15 +19,20 @@ from djb_node.desktop.datasource import ProviderError
 from djb_node.desktop.nodecloud import NodeCloudClient
 from djb_node.protocol import NODE_KEY_HEADER
 
+# 形状对齐 features 的 app/metering/node_console.py：行在 ``data`` 里，分页在 ``page`` 里
 PAGES = {
     "tasks": [
-        {"items": [{"id": "t1", "state": "running"}], "page": {"next_cursor": "c2"}},
-        {"items": [{"id": "t2", "state": "done"}], "page": {"next_cursor": "c3"}},
-        {"items": [{"id": "t3", "state": "queued"}], "page": {"next_cursor": None}},
+        {"data": [{"task_id": "t1", "state": "recorded", "inflight": True}],
+         "page": {"has_more": True, "next_cursor": "c2"}},
+        {"data": [{"task_id": "t2", "state": "settled", "inflight": False}],
+         "page": {"has_more": True, "next_cursor": "c3"}},
+        {"data": [{"task_id": "t3", "state": "recorded", "inflight": True}],
+         "page": {"has_more": False, "next_cursor": None}},
     ],
     "receipts": [
-        {"items": [{"receipt_id": "r1", "status": "verified", "tokens": 10}],
-         "page": {"next_cursor": None}},
+        {"data": [{"receipt_id": "r1", "state": "accepted", "tokens": 10,
+                   "revenue_minor": 2_000_000}],
+         "page": {"has_more": False, "next_cursor": None}},
     ],
 }
 
@@ -49,15 +54,22 @@ class Handler(BaseHTTPRequestHandler):
         if Handler.mode["value"] == "401":
             return self._send(401, {"error": {"type": "auth_error"}})
         if Handler.mode["value"] == "degraded":
-            return self._send(200, {"items": [], "unavailable_reason": "metering 维护中"})
+            return self._send(200, {"settled_minor": None, "pending_minor": None,
+                                    "rows": [], "unavailable_reason": "no_usage_for_node"})
         kind = parsed.path.rsplit("/", 1)[-1]
         if kind == "earnings":
             return self._send(200, {"currency": "USDT", "settled_minor": 1_500_000,
-                                    "pending_minor": 1_234_567, "today_minor": 250_000,
-                                    "balance_minor": 0, "payouts": []})
+                                    "pending_minor": 1_234_567, "corrected_minor": 0,
+                                    "rows": [{"request_id": "req-1", "task_id": "t-1",
+                                              "state": "settled", "amount_micro": 1_500_000,
+                                              "recorded_at": "2026-11-01T10:00:00Z"}],
+                                    "page": {"has_more": False, "next_cursor": None},
+                                    "unavailable_reason": None})
         if kind == "profile":
-            return self._send(200, {"email": "node@example.test", "role": "node",
-                                    "twofa_enabled": True})
+            return self._send(200, {"node_id": "node-7c31", "state": "active",
+                                    "region": "cn-east", "platform": "linux",
+                                    "capabilities": ["A1:mock-small"], "bound": True,
+                                    "last_seen_at": "2026-11-01T10:00:00Z"})
         pages = PAGES.get(kind, [])
         cursor = (query.get("cursor") or [None])[0]
         index = 0
@@ -102,6 +114,7 @@ def test_real_http_pagination_end_to_end(server):
     client = make_client(server)
     result = client.fetch("tasks")
     assert [row["id"] for row in result["items"]] == ["t1", "t2", "t3"]
+    assert [row["state"] for row in result["items"]] == ["inflight", "done", "inflight"]
     assert result["pages"] == 3 and result["truncated"] is False
     assert [call["query"].get("cursor", [None])[0] for call in Handler.seen] == [None, "c2", "c3"]
     assert all(call["path"] == "/api/v1/node/tasks" for call in Handler.seen)
@@ -125,17 +138,19 @@ def test_real_http_401_maps_to_relogin(server):
 def test_real_http_unavailable_reason_degrades(server):
     Handler.mode["value"] = "degraded"
     with pytest.raises(ProviderError) as info:
-        make_client(server).fetch("receipts")
-    assert "服务端已降级" in info.value.reason and "维护中" in info.value.reason
+        make_client(server).earnings()
+    assert "还没有计费记录" in info.value.reason
 
 
 def test_real_http_earnings_and_profile(server):
     client = make_client(server)
     earnings = client.earnings()
     assert earnings["settled"] == "1.50" and earnings["pending"] == "1.234567"
-    assert earnings["today"] == "0.25" and earnings["balance"] == "0.00"
+    assert earnings["payouts"][0]["amount"] == "1.50"
+    assert earnings["note"] == ""                     # 有数据且没降级原因
     profile = client.profile()
-    assert profile["email"] == "node@example.test" and profile["twofa_enabled"] is True
+    assert profile["node_id"] == "node-7c31" and profile["bound"] is True
+    assert profile["email"] is None                   # 节点接口没有邮箱，不编
 
 
 def test_real_http_connection_refused_is_readable():

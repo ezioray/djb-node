@@ -450,8 +450,8 @@ def _earnings(snapshot: Snapshot) -> View:
                     "链上确认后计入", "default"),
                Card("余额（额度）", _money(snapshot, "earnings", earnings.get("balance")),
                     "推理额度，不可提现", "muted")),
-        table=Table(("出款", "金额", "币种", "状态", "时间"), tuple(rows),
-                    note=str(earnings.get("note") or ""), empty="暂无出款记录"),
+        table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
+                    note=str(earnings.get("note") or ""), empty="暂无计费明细"),
         actions=(Action("earnings.export", "导出明细", enabled=bool(rows),
                         reason="没有可导出的记录"),),
         unavailable=_missing(snapshot, ("earnings",)),
@@ -576,27 +576,50 @@ def _account(snapshot: Snapshot) -> View:
     account = _section(snapshot, "account")
     profile = account.get("profile") if isinstance(account.get("profile"), Mapping) else {}
     security = account.get("security") if isinstance(account.get("security"), Mapping) else {}
-    email = profile.get("email") or "—"
-    role = profile.get("role") or "—"
+    # 节点侧接口给的是**节点身份**（node_id/state/region/platform/bound），
+    # 旧/演示形状给的是账户（email/role/2FA）；两种都如实展示，缺的字段给「—」。
+    node_id = profile.get("node_id")
+    email = profile.get("email")
+    identity = str(node_id or email or "—")
+    identity_meta = str(profile.get("state") or profile.get("role") or "—")
+    bound = profile.get("bound")
     twofa = profile.get("twofa_enabled", profile.get("mfa_enabled"))
-    twofa_text = (_flag(twofa, "已开启", "未开启") if twofa is not None
-                  else MARK_UNKNOWN + " 暂不可用")
+    if bound is not None:
+        second = Card("节点绑定", _flag(bound, "已绑定", "未绑定"),
+                      "服务端视图（只读）", "mint" if bound is True else "amber")
+    else:
+        second = Card("双因素验证", _flag(twofa, "已开启", "未开启", "暂不可用"),
+                      "登录保护的第二步", "mint" if twofa is True else "amber")
+    if node_id:
+        fields: list[Field] = [Field("节点标识", identity, key="node_id",
+                                     hint="节点身份由服务端下发，本机只读")]
+    else:
+        fields = [Field("邮箱", identity, key="email", hint="登录后在服务端修改")]
+    if node_id:
+        fields.extend([
+            Field("节点状态", str(profile.get("state") or "—"), key="state"),
+            Field("地域", str(profile.get("region") or "—"), key="region"),
+            Field("平台", str(profile.get("platform") or "—"), key="platform"),
+            Field("最后在线", str(profile.get("last_seen_at") or "—"), key="last_seen_at"),
+        ])
+    if node_id and email:
+        fields.append(Field("邮箱", str(email), key="email", hint="登录后在服务端修改"))
+    if profile.get("role"):
+        fields.append(Field("角色", str(profile.get("role") or "—"), key="role"))
+    if twofa is not None:
+        fields.append(Field("2FA 状态", _flag(twofa, "已开启", "未开启"), key="twofa"))
+    fields.append(Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录"))
     return View(
         key="account", title="账户与安全",
-        subtitle="邮箱 · 角色 · 双因素 · 登出",
-        cards=(Card("账户", str(email), str(role), "default"),
-               Card("双因素验证", twofa_text, "登录保护的第二步",
-                    "mint" if twofa is True else "amber"),
+        subtitle="节点身份 · 绑定 · 双因素 · 登出",
+        cards=(Card("账户", identity, identity_meta, "default"), second,
                Card("本机凭据", str(security.get("storage") or "—"),
                     str(security.get("node_id") or "未配对"), "muted")),
-        fields=(
-            Field("邮箱", str(email), key="email", hint="登录后在服务端修改"),
-            Field("角色", str(role), key="role"),
-            Field("2FA 状态", twofa_text, key="twofa"),
-            Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录"),
-        ),
-        actions=(Action("account.enable_2fa", "启用双因素验证", enabled=twofa is not True,
-                        reason="已开启", primary=True),
+        fields=tuple(fields),
+        actions=(Action("account.enable_2fa", "启用双因素验证",
+                        enabled=twofa is not True,
+                        reason="已开启" if twofa is True else "登录后可用",
+                        primary=True),
                  Action("account.logout", "登出", enabled=bool(security.get("node_id")),
                         reason="尚未登录")),
         unavailable=_missing(snapshot, ("account",)),

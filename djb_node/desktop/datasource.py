@@ -631,18 +631,21 @@ class LocalDataSource:
                     "pending": None, "settled": None, "payouts": [],
                     "online": False, "note": "结算明细暂不可用：" + exc.reason}
         rows = payload if isinstance(payload, Mapping) else {}
-        # 服务端口径：*_minor 是 micro-USD；客户端已归一化成「至少 2 位、最多 6 位」文本
-        settled = rows.get("settled") if rows.get("settled") is not None else rows.get("settled_minor")
-        pending = rows.get("pending") if rows.get("pending") is not None else rows.get("pending_minor")
-        today_text = rows.get("today") if rows.get("today") is not None else today
-        balance_text = rows.get("balance") if rows.get("balance") is not None else balance
-        return {"balance": balance_text, "today": today_text,
+        # 客户端已把 *_minor（micro-USD）归一化成「至少 2 位、最多 6 位」文本；
+        # 这里只补「本地 status 有、云端没有」的字段（例如余额额度），不反向覆盖云端值。
+        def pick(key: str, fallback: Any) -> Any:
+            value = rows.get(key)
+            return fallback if value is None else value
+
+        return {"balance": pick("balance", balance), "today": pick("today", today),
                 "currency": str(rows.get("currency") or "USDT"),
-                "pending": pending, "settled": settled,
+                "pending": rows.get("pending"), "settled": rows.get("settled"),
+                "corrected": rows.get("corrected"),
                 "settled_minor": rows.get("settled_minor"),
                 "pending_minor": rows.get("pending_minor"),
+                "next_settlement_at": rows.get("next_settlement_at"),
                 "payouts": [row for row in (rows.get("payouts") or []) if isinstance(row, Mapping)],
-                "online": True, "note": ""}
+                "online": True, "note": str(rows.get("note") or "")}
 
     def _agent(self) -> Mapping[str, Any]:
         config = self._access.load()
@@ -707,7 +710,7 @@ class LocalDataSource:
         except Exception as exc:
             note = (note + "；" if note else "") + "本机凭据状态不可读（" + type(exc).__name__ + "）"
         if profile is None and not security:
-            raise ProviderError("账户资料未接线", hint="登录后重试")
+            raise ProviderError("节点资料未接线", hint="登录后重试")
         return {"profile": profile, "security": security, "note": note}
 
     def _logs_section(self) -> Mapping[str, Any]:

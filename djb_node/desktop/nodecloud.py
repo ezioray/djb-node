@@ -42,7 +42,13 @@ PAGE_LIMIT = 50
 #: 自动翻页上限：超过就如实说「还有更多」
 MAX_PAGES = 5
 
-_ITEM_KEYS = ("items", "rows", "data", "tasks", "receipts", "list")
+_ITEM_KEYS = ("items", "data", "rows", "tasks", "receipts", "list")
+
+#: 服务端机器可读原因 → 可读中文（只有真的知道含义的才翻译，其余原样带出）
+REASON_TEXT = {
+    "no_usage_for_node": "该节点还没有计费记录",
+    "settlement_schedule_not_configured": "结算排期尚未配置（不影响已结算金额）",
+}
 
 
 def micro_text(value: Any) -> str | None:
@@ -57,6 +63,56 @@ def micro_text(value: Any) -> str | None:
     whole, frac = divmod(abs(minor), 1_000_000)
     text = f"{frac:06d}".rstrip("0")
     return f"{sign}{whole}.{text.ljust(2, '0')}"
+
+
+def reason_text(code: Any) -> str:
+    """服务端的机器可读原因 → 可读中文（未知码原样带出，不编故事）。"""
+    text = str(code or "").strip()
+    return REASON_TEXT.get(text, "服务端未给出数据（" + text + "）" if text else "")
+
+
+def _seconds(start: Any, end: Any) -> int | None:
+    """两个 ISO 时刻的秒差；解析不了就给 None（不猜）。"""
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    from datetime import datetime
+    try:
+        first = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        second = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0, int((second - first).total_seconds()))
+
+
+def _task_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """任务行：补 tokens 合计与耗时（视图直接用），其余字段原样保留。"""
+    tokens_in, tokens_out = row.get("tokens_in"), row.get("tokens_out")
+    total = None
+    if tokens_in is not None or tokens_out is not None:
+        total = int(tokens_in or 0) + int(tokens_out or 0)
+    state = str(row.get("state") or "")
+    return {**row,
+            "id": row.get("task_id") or row.get("request_id") or row.get("id"),
+            # recorded=已记录未结算，按「在途」展示；settled/corrected=已结算
+            "state": ("inflight" if row.get("inflight") else
+                      "done" if state in ("settled", "corrected") else state),
+            "state_raw": state,
+            "tokens": total,
+            "elapsed_s": _seconds(row.get("started_at"), row.get("finished_at")),
+            "amount": micro_text(row.get("amount_micro"))}
+
+
+def _receipt_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """收据行：服务端 state=accepted/rejected/expired，映射成视图的 verified/failed。"""
+    state = str(row.get("state") or "")
+    status = ("verified" if state == "accepted"
+              else "failed" if state in ("rejected", "expired") else state)
+    return {**row, "status": status, "state_raw": state,
+            "created_at": row.get("issued_at"),
+            "amount": micro_text(row.get("revenue_minor"))}
+
+
+_ROW_MAPPERS = {"tasks": _task_row, "receipts": _receipt_row}
 
 
 def _items(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -133,7 +189,9 @@ class NodeCloudClient:
         if status == 403:
             raise ProviderError("节点无权访问该数据（403）", hint=LOGIN_HINT)
         if status == 404:
-            raise ProviderError("云端接口尚未上线（404）", hint="平台上线后重试")
+            # profile 对不存在的节点也回 404：不能一律说成「接口没上线」
+            raise ProviderError("云端返回 404（接口未上线或节点不存在）",
+                                hint="确认节点已配对；接口未上线时等平台发布")
         if status >= 500:
             raise ProviderError("云端暂时不可用（" + str(status) + "）", hint="稍后重试")
         if status >= 400:
@@ -144,10 +202,6 @@ class NodeCloudClient:
             raise ProviderError("云端返回不是 JSON") from None
         if not isinstance(payload, Mapping):
             raise ProviderError("云端返回结构异常")
-        reason = payload.get("unavailable_reason")
-        if isinstance(reason, str) and reason.strip():
-            # 接口在，但这个域被服务端降级：如实说原因，不当成「空数据」
-            raise ProviderError("服务端已降级：" + reason.strip())
         return payload
 
     def fetch(self, kind: str) -> dict[str, Any]:
@@ -158,7 +212,9 @@ class NodeCloudClient:
         while pages < self.max_pages:
             payload = self._get(kind, cursor=cursor, limit=self.page_limit)
             pages += 1
-            items.extend(_items(payload))
+            mapper = _ROW_MAPPERS.get(kind)
+            rows = _items(payload)
+            items.extend([mapper(row) for row in rows] if mapper else rows)
             cursor = _next_cursor(payload)
             if not cursor:
                 break
@@ -168,37 +224,71 @@ class NodeCloudClient:
     def list_tasks(self, *, cursor: str | None = None,
                    limit: int | None = None) -> dict[str, Any]:
         payload = self._get("tasks", cursor=cursor, limit=limit)
-        return {"items": _items(payload), "next_cursor": _next_cursor(payload)}
+        return {"items": [_task_row(row) for row in _items(payload)],
+                "next_cursor": _next_cursor(payload)}
 
     def list_receipts(self, *, cursor: str | None = None,
                       limit: int | None = None) -> dict[str, Any]:
         payload = self._get("receipts", cursor=cursor, limit=limit)
-        return {"items": _items(payload), "next_cursor": _next_cursor(payload)}
+        return {"items": [_receipt_row(row) for row in _items(payload)],
+                "next_cursor": _next_cursor(payload)}
 
     def earnings(self) -> dict[str, Any]:
-        """归一化收益：``*_minor`` 是 micro-USD，另给显示文本（口径与 web 一致）。"""
+        """归一化收益：``*_minor`` 是 micro-USD，另给显示文本（口径与 web 一致）。
+
+        服务端在「查不到」时给 ``null`` + ``unavailable_reason``；有数据但排期未配置时
+        也会带原因——所以这里的规则是：**没有任何金额与明细才判整域不可用**，
+        否则照常展示并把原因降级成 note。
+        """
         payload = self._get("earnings")
         settled_minor = payload.get("settled_minor")
         pending_minor = payload.get("pending_minor")
         today_minor = payload.get("today_minor")
         balance_minor = payload.get("balance_minor")
-        payouts = payload.get("payouts")
+        rows = [row for row in (payload.get("rows") or []) if isinstance(row, Mapping)]
+        reason = reason_text(payload.get("unavailable_reason"))
+        if settled_minor is None and pending_minor is None and not rows:
+            raise ProviderError(reason or "服务端没有返回收益数据",
+                                hint="等首笔计费结算后再刷新")
+        payouts = [{
+            "id": row.get("request_id") or row.get("task_id") or "—",
+            "task_id": row.get("task_id"),
+            "amount": micro_text(row.get("amount_micro")),
+            "currency": str(payload.get("currency") or "USDT"),
+            "status": str(row.get("state") or "—"),
+            "created_at": row.get("recorded_at") or row.get("settled_at") or "—",
+        } for row in rows]
         return {
             "currency": str(payload.get("currency") or "USDT"),
             "settled_minor": settled_minor, "pending_minor": pending_minor,
+            "corrected_minor": payload.get("corrected_minor"),
             "today_minor": today_minor, "balance_minor": balance_minor,
             "settled": micro_text(settled_minor),
             "pending": micro_text(pending_minor),
+            "corrected": micro_text(payload.get("corrected_minor")),
             "today": micro_text(today_minor),
             "balance": micro_text(balance_minor),
-            "payouts": [row for row in (payouts or []) if isinstance(row, Mapping)],
+            "next_settlement_at": payload.get("next_settlement_at"),
+            "note": reason,
+            "payouts": payouts,
         }
 
     def profile(self) -> dict[str, Any]:
+        """节点身份（服务端 404 = 节点不存在/无权查看，不编占位值）。"""
         payload = self._get("profile")
+        capabilities = payload.get("capabilities")
         return {
+            "node_id": payload.get("node_id"),
+            "state": payload.get("state"),
+            "region": payload.get("region"),
+            "platform": payload.get("platform"),
+            "upstream_kind": payload.get("upstream_kind"),
+            "capabilities": [str(item) for item in (capabilities or [])
+                             if isinstance(item, str)],
+            "bound": payload.get("bound"),
+            "last_seen_at": payload.get("last_seen_at"),
+            # 兼容旧/演示形状（有就给，没有就是 None）
             "email": payload.get("email"),
             "role": payload.get("role"),
             "twofa_enabled": payload.get("twofa_enabled", payload.get("mfa_enabled")),
-            "created_at": payload.get("created_at"),
         }

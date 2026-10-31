@@ -345,3 +345,43 @@ def test_earnings_all_money_cards_say_unavailable_together():
     text = vw.build_view("earnings", source.snapshot()).plain_text()
     assert text.count("暂不可用") >= 4
     assert "0.00" not in text and "USDT 0" not in text
+
+
+def test_account_view_shows_node_identity_from_console_api():
+    """F16：节点侧 profile 给的是节点身份，不是邮箱；视图要如实展示节点字段。"""
+    from djb_node.desktop.datasource import FakeDataSource
+
+    section = {"account": {"profile": {"node_id": "node-7c31", "state": "active",
+                                       "region": "cn-east", "platform": "linux",
+                                       "bound": True,
+                                       "last_seen_at": "2026-11-01T10:00:00Z"},
+                           "security": {"storage": "file", "node_id": "node-7c31"},
+                           "note": ""}}
+    text = vw.build_view("account", FakeDataSource(section).snapshot()).plain_text()
+    assert "node-7c31" in text and "已绑定" in text
+    assert "cn-east" in text and "linux" in text and "2026-11-01T10:00:00Z" in text
+    assert "邮箱" not in text                      # 节点接口没有邮箱，不编一个出来
+
+
+def test_earnings_table_is_labelled_detail_not_payout():
+    from djb_node.desktop.datasource import FakeDataSource
+
+    section = {"earnings": {"payouts": [{"id": "req-1", "amount": "1.50", "currency": "USDT",
+                                         "status": "settled", "created_at": "2026-11-01"}],
+                            "settled": "1.50", "pending": None, "currency": "USDT"}}
+    text = vw.build_view("earnings", FakeDataSource(section).snapshot()).plain_text()
+    assert "明细 | 金额 | 币种 | 状态 | 时间" in text.replace("\n", " ")
+    assert "出款" not in text
+
+
+def test_account_view_labels_email_as_email_when_no_node_id():
+    """没有 node_id 时第一栏必须叫「邮箱」，不能把邮箱标成「节点标识」。"""
+    from djb_node.desktop.datasource import FakeDataSource
+
+    section = {"account": {"profile": {"email": "node@example.com", "role": "共享方",
+                                       "twofa_enabled": False},
+                           "security": {"storage": "file", "node_id": "node-7c31"},
+                           "note": ""}}
+    text = vw.build_view("account", FakeDataSource(section).snapshot()).plain_text()
+    assert "节点标识" not in text
+    assert "邮箱" in text and "node@example.com" in text
