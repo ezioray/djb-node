@@ -497,6 +497,61 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return _pause_resume(args, pause=False)
 
 
+# ─────────────────────────────────────────────────────────── daemon 控制（F14 reload）
+def _reload_text(payload: dict[str, Any]) -> str:
+    lines = [str(payload.get("message") or "配置已重载")]
+    changed = payload.get("changed") or []
+    if changed:
+        lines.append("变更字段：" + ", ".join(str(item) for item in changed))
+    notes = payload.get("notes") or []
+    for note in notes:
+        lines.append("· " + str(note))
+    for item in payload.get("restart_required") or []:
+        if isinstance(item, dict):
+            lines.append("需要重启：" + str(item.get("field")) + " "
+                         + str(item.get("from")) + "→" + str(item.get("to"))
+                         + "（" + str(item.get("reason")) + "）")
+    lines.append("上游地址：" + str(payload.get("upstreams", 0)) + " 条（已按磁盘重读）")
+    lines.append("在途任务：" + str(payload.get("inflight", 0)) + "（重载不中断）")
+    if payload.get("fingerprint"):
+        lines.append("配置指纹：" + str(payload["fingerprint"])
+                     + " · 第 " + str(payload.get("reload_count", 1)) + " 次重载")
+    return "\n".join(lines)
+
+
+def cmd_daemon_reload(args: argparse.Namespace) -> int:
+    """`djb daemon reload`：重读 config.json 与上游地址，不中断在途任务。"""
+    paths = _paths(args)
+    try:
+        response = dict(ControlClient(paths).call({"cmd": "reload"}, timeout=15.0))
+    except NotRunningError:
+        # 配置已在磁盘：下次 djb start 一定读到，如实说明「现在没有进程可重载」
+        print("daemon 未运行；配置已写入磁盘，下次 djb start 生效。")
+        return facts.EXIT_OK
+    except UsageError:
+        print("djb: 当前 daemon 没有 reload 命令（版本较旧）；"
+              "重启 daemon 后生效。", file=sys.stderr)
+        return facts.EXIT_USAGE
+    if response.get("ok") is not True:
+        reason = str(response.get("error") or "原因未知")
+        print("djb: 重载失败：" + reason + "；已保留旧配置（daemon 未中断）",
+              file=sys.stderr)
+        if _json_flag(args):
+            _emit(response, as_json=True)
+        return facts.EXIT_VERIFY
+    _emit(response, as_json=_json_flag(args), text=_reload_text)
+    return facts.EXIT_OK
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    action = getattr(args, "daemon_action", None)
+    if action == "reload":
+        return cmd_daemon_reload(args)
+    print("用法：djb daemon reload [--json]（重载配置与上游地址，不中断在途任务）",
+          file=sys.stderr)
+    return facts.EXIT_USAGE
+
+
 # ─────────────────────────────────────────────────────────── limits
 def cmd_limits(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
@@ -1550,6 +1605,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_common(cmd_pause, "pause", "暂停接单（用户暂停，重启后保留）")
     add_common(cmd_resume, "resume", "恢复接单")
+
+    # F14：daemon 控制组（当前只有 reload）；同一 handler 也挂一个顶层 reload 别名
+    daemon_cmd = add_common(cmd_daemon, "daemon",
+                            "daemon 控制（reload：重载配置与上游地址，不中断在途任务）")
+    daemon_sub = daemon_cmd.add_subparsers(dest="daemon_action", metavar="<action>")
+    daemon_reload = daemon_sub.add_parser(
+        "reload", help="重载 ~/.djb/config.json 与上游地址（不中断在途任务）",
+        description="重读磁盘配置并生效；坏配置保留旧值并报错")
+    daemon_reload.add_argument("--home", help=argparse.SUPPRESS)
+    daemon_reload.add_argument("--json", action="store_true", help="输出 JSON")
+    daemon_reload.set_defaults(handler=cmd_daemon_reload)
+    add_common(cmd_daemon_reload, "reload", "同 djb daemon reload：重载配置与上游地址")
 
     limits = add_common(cmd_limits, "limits", "查看 / 设置限额（并发、日周月、资源、时段、让路）")
     limits.add_argument("--preset", choices=facts.PRESETS)

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -194,6 +195,53 @@ def load_config(paths: Paths) -> ClientConfig:
     if not isinstance(raw, dict):
         return ClientConfig()
     return ClientConfig.from_dict(raw)
+
+
+def load_config_strict(paths: Paths) -> ClientConfig:
+    """热重载专用：**坏配置必须报错**，不许悄悄回落默认值。
+
+    :func:`load_config` 是宽容读（脏配置不能把 daemon 弄崩，启动时也必须能用）；
+    但 ``djb daemon reload`` 的语义是「让磁盘上的新配置生效」——新配置写错了却静默
+    变成默认值，用户会以为改动生效了。所以这里：
+
+    * 文件不存在 / 空文件 → 返回默认值（等于「没有自定义配置」，不算错误）；
+    * JSON 坏 / 顶层不是对象 / 枚举或范围非法 / 类型不对 → 抛 ``ValueError``，
+      调用方保留旧配置并如实报错；
+    * 未知字段仍走 tolerant 进 ``extra``（向前兼容，不因新字段拒绝重载）。
+    """
+    try:
+        with open(paths.config_file, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return ClientConfig()
+    except OSError as exc:
+        raise ValueError("读不到 config.json：" + (exc.strerror or type(exc).__name__)) from exc
+    if not text.strip():
+        return ClientConfig()
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        raise ValueError("config.json 不是合法 JSON：" + str(exc)) from exc
+    if not isinstance(raw, dict):
+        raise ValueError("config.json 顶层必须是对象（当前 " + type(raw).__name__ + "）")
+    port = raw.get("mirror_port")
+    if port is not None and (isinstance(port, bool) or not isinstance(port, int)
+                             or not (facts.PORT_MIN <= port <= facts.PORT_MAX)):
+        raise ValueError("mirror_port 必须是 " + str(facts.PORT_MIN) + "-"
+                         + str(facts.PORT_MAX) + " 的整数（当前 " + repr(port) + "）")
+    for name, allowed in (("update_channel", facts.UPDATE_CHANNELS),
+                          ("log_level", facts.LOG_LEVELS)):
+        value = raw.get(name)
+        if value is not None and value not in allowed:
+            raise ValueError(name + " 必须是 " + "/".join(allowed)
+                             + "（当前 " + repr(value) + "）")
+    for name in ("gateway_url", "update_source"):
+        value = raw.get(name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(name + " 必须是字符串（当前 " + type(value).__name__ + "）")
+    config = ClientConfig.from_dict(raw)
+    config.validate()                    # 兜底：漏网的非法值也不许进内存
+    return config
 
 
 _TRUE_TEXT = ("1", "true", "on", "yes", "y", "enabled")

@@ -306,3 +306,32 @@ def test_controller_action_exception_does_not_escape(tmp_path):
     assert result.ok is False
     assert "跑分失败" in result.message and "RuntimeError" in result.message
     assert "/root" not in result.message                 # 不把内部路径带上屏
+
+
+def test_access_view_says_unsaved_when_no_config_file(tmp_path):
+    """没保存过就说「尚未保存」：不许把「默认值通过校验」说成配置有效。"""
+    from djb_node.desktop.datasource import FakeDataSource
+
+    config = {"node_id": "—", "node_secret": "未设置", "api_key": "未设置",
+              "price_mode": "auto", "price_mode_label": "跟随平台建议价",
+              "usdt_address": "—", "openai_base_url": "未设置",
+              "anthropic_base_url": "未设置"}
+    source = FakeDataSource({"access": {"config": config, "valid": None, "saved": False,
+                                        "binding": None, "note": "", "path": "/tmp/x"}})
+    text = vw.build_view("access", source.snapshot()).plain_text()
+    assert "尚未保存" in text
+    assert "通过校验" not in text
+
+
+def test_access_view_says_valid_after_save(tmp_path):
+    from djb_node.desktop.datasource import FakeDataSource
+
+    config = {"node_id": "node-7c31", "node_secret": "djb_…77be", "api_key": "未设置",
+              "price_mode": "auto", "price_mode_label": "跟随平台建议价",
+              "usdt_address": "—", "openai_base_url": "未设置",
+              "anthropic_base_url": "未设置"}
+    source = FakeDataSource({"access": {"config": config, "valid": True, "saved": True,
+                                        "binding": {"state": "bound", "node_id": "node-7c31"},
+                                        "note": "", "path": "/tmp/x"}})
+    text = vw.build_view("access", source.snapshot()).plain_text()
+    assert "通过校验" in text and "已绑定" in text

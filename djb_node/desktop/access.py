@@ -48,7 +48,7 @@ RELOAD_TEXT: dict[str, str] = {
     RELOAD_OK: "daemon 已重载，配置生效。",
     RELOAD_DAEMON_DOWN: "daemon 未运行；配置已落盘，下次启动时读取。",
     RELOAD_UNSUPPORTED: "当前 daemon 无热重载命令；重启 daemon 后生效（未生效前不谎报）。",
-    RELOAD_FAILED: "重载请求失败；重启 daemon 后生效。",
+    RELOAD_FAILED: "重载未成功，配置未生效（daemon 未中断）。",
 }
 
 _MAX_URL = 512
@@ -283,6 +283,8 @@ class SaveResult:
     reload: str
     message: str
     display: Mapping[str, str] = field(default_factory=dict)
+    #: 重载失败的**可读原因**（daemon 回的原文，例如「log_level 必须是 …」）
+    detail: str = ""
 
     @property
     def effective(self) -> bool:
@@ -293,9 +295,12 @@ class SaveResult:
 class AccessService:
     """保存流程：validate → save → readback → reload → 结论文案。"""
 
-    def __init__(self, store: Any, *, reloader: Callable[[], str] | None = None) -> None:
+    def __init__(self, store: Any, *,
+                 reloader: Callable[[], "str | tuple[str, str]"] | None = None) -> None:
         self._store = store
         self._reloader = reloader
+        #: 最近一次重载的附加说明（失败原因是原文，成功时可能是「无变化」）
+        self.last_reload_detail = ""
 
     def load(self) -> AccessConfig:
         return self._store.load()
@@ -320,19 +325,31 @@ class AccessService:
         display = readback.display() if isinstance(readback, AccessConfig) else config.display()
         if readback != config:
             return SaveResult(True, False, RELOAD_FAILED, "回读与草稿不一致；未生效。", display)
-        state = self._reload()
+        state, detail = self._reload()
         message = "已保存并回读一致。" + RELOAD_TEXT[state]
-        return SaveResult(True, True, state, message, display)
+        if detail:
+            message += "（" + detail + "）"
+        return SaveResult(True, True, state, message, display, detail)
 
     def reload(self) -> str:
         """显式请求一次重载（不改配置）；返回 :data:`RELOAD_*` 取值。"""
-        return self._reload()
+        return self._reload()[0]
 
-    def _reload(self) -> str:
+    def _reload(self) -> tuple[str, str]:
+        """返回 ``(状态, 附加说明)``；说明是 daemon 原话，便于把失败原因显示出来。"""
+        self.last_reload_detail = ""
         if self._reloader is None:
-            return RELOAD_UNSUPPORTED
+            return RELOAD_UNSUPPORTED, ""
         try:
-            state = str(self._reloader() or "")
-        except Exception:
-            return RELOAD_FAILED
-        return state if state in RELOAD_TEXT else RELOAD_FAILED
+            outcome = self._reloader()
+        except Exception as exc:                     # 兜底：不让 UI 崩
+            return RELOAD_FAILED, type(exc).__name__
+        detail = ""
+        if isinstance(outcome, tuple):
+            state, detail = (str(outcome[0]), str(outcome[1] or "")) if len(outcome) >= 2 \
+                else (str(outcome[0]), "")
+        else:
+            state = str(outcome or "")
+        state = state if state in RELOAD_TEXT else RELOAD_FAILED
+        self.last_reload_detail = detail
+        return state, detail

@@ -30,7 +30,7 @@ from typing import Any, Callable
 from . import facts, plan_router, policy as policy_mod, protocol
 from .api import NodeApi, PolicyFetch
 from .channel import ChannelClient, channel_enabled
-from .config import ClientConfig, Paths, feature_flag, load_config
+from .config import ClientConfig, Paths, feature_flag, load_config, load_config_strict
 from .errors import (AuthError, DjbError, ForbiddenError, NetworkError, NotInstalledError,
                      PolicyError, PortInUseError, RateLimitError, UsageError)
 from .httpclient import HttpClient
@@ -208,9 +208,10 @@ class ControlClient:
             raise NotRunningError("daemon 返回不可解析（可能正在退出）") from exc
         if not isinstance(response, dict):
             raise NotRunningError("daemon 返回非法响应")
-        if response.get("ok") is False:
+        if response.get("ok") is False and response.get("soft") is not True:
             error = response.get("error") if isinstance(response.get("error"), dict) else {}
             raise UsageError(str(error.get("message") or "控制命令失败"))
+        # soft=False 才抛；reload 这类「命令合法但结果是否」的返回原样交给调用方
         return response
 
 
@@ -284,6 +285,11 @@ class Daemon:
         self._probe_interval_s = facts.PROBE_PERIODIC_DEFAULT_S
         self._next_probe_at = self._now()
         self._last_probe: dict[str, Any] = {}
+        # F14 热重载：SIGHUP 只置位，实际加载在主循环里做（信号上下文不碰锁）
+        self._reload_requested = False
+        self.last_reload: dict[str, Any] | None = None
+        self._reload_lock = threading.Lock()
+        self._reload_count = 0
 
     # ── 状态持久化
     def _persist(self) -> None:
@@ -531,6 +537,8 @@ class Daemon:
     def run(self, *, max_cycles: int | None = None) -> int:
         if not self._started:
             self.start()
+        # F14：SIGHUP = 重载配置（与 `djb daemon reload` 同一条路径）
+        self._install_reload_signal()
         cycles = 0
         try:
             while not self._stop_event.is_set():
@@ -583,6 +591,164 @@ class Daemon:
                 pass
         self._started = False
         event("daemon.stopped")
+
+    # ── F14 配置热重载（djb daemon reload / SIGHUP）
+    #: 参与「是否变化」比较的字段（``extra`` 单独看，里面是子系统开关）
+    RELOAD_FIELDS: tuple[str, ...] = ("gateway_url", "mirror_port", "update_channel",
+                                      "update_source", "log_level", "yield_enabled", "extra")
+
+    def _config_public(self, config: ClientConfig) -> dict[str, Any]:
+        """重载回执里的配置快照：只含 config.json 的字段，凭据永不出现。"""
+        data = config.to_dict()
+        data["extra_keys"] = sorted(str(key) for key in (config.extra or {}))
+        return data
+
+    def _subsystem_running(self, name: str) -> bool:
+        thread = {"channel": self._channel_thread,
+                  "model_sync": self._model_sync_thread,
+                  "notifications": self._notifications_thread}.get(name)
+        return bool(thread is not None and thread.is_alive())
+
+    def _apply_subsystem_toggles(self, fresh: ClientConfig) -> list[str]:
+        """开关变了就起停对应线程；**不碰**在途请求、状态机、收据缓冲。"""
+        applied: list[str] = []
+        plan = (("channel", channel_enabled, self._start_channel, self._stop_channel),
+                ("model_sync", model_sync_enabled, self._start_model_sync,
+                 self._stop_model_sync),
+                ("notifications", notifications_enabled, self._start_notifications,
+                 self._stop_notifications))
+        was = self.config
+        for name, enabled, starter, stopper in plan:
+            before, after = bool(enabled(was)), bool(enabled(fresh))
+            if before == after:
+                continue
+            running = self._subsystem_running(name)
+            if after and not running:
+                starter()
+                applied.append(name + ":started")
+            elif not after and running:
+                stopper()
+                applied.append(name + ":stopped")
+        return applied
+
+    def reload_config(self) -> dict[str, Any]:
+        """重读 ``~/.djb/config.json`` 与上游地址并生效；失败保留旧值。
+
+        保证：
+
+        * **不中断在途任务**：不动机器状态、不清 ``_inflight``、不动收据缓冲、
+          不停镜像监听、不重启进程；
+        * **坏配置回退**：解析/校验失败时 ``self.config`` 一个字段都不改，
+          返回 ``ok=False`` + 可读原因（调用方必须把原因显示出来）；
+        * **幂等**：同样的磁盘内容重载多次结果一致（``changed`` 为空、指纹相同）。
+        """
+        with self._reload_lock:
+            return self._reload_locked()
+
+    def _reload_locked(self) -> dict[str, Any]:
+        previous = self.config
+        if self._stop_event.is_set():
+            return {"ok": False, "soft": True, "reason": "stopping",
+                    "error": "daemon 正在退出，未重载",
+                    "kept": self._config_public(previous)}
+        try:
+            fresh = load_config_strict(self.paths)
+        except (ValueError, DjbError, OSError) as exc:
+            message = str(exc).strip() or type(exc).__name__
+            event("daemon.reload_rejected", level="warning", error=message)
+            return {"ok": False, "soft": True, "reason": "invalid_config",
+                    "error": message, "error_type": type(exc).__name__,
+                    "kept": self._config_public(previous),
+                    "message": "配置未生效：已保留旧配置（daemon 未中断）"}
+        restart_required: list[dict[str, Any]] = []
+        if int(fresh.mirror_port) != int(previous.mirror_port):
+            restart_required.append({
+                "field": "mirror_port", "from": int(previous.mirror_port),
+                "to": int(fresh.mirror_port),
+                "reason": "运行中的镜像端口不能热切换；旧端口继续服务，重启 daemon 后生效"})
+            fresh.mirror_port = previous.mirror_port   # 不谎报：实际仍在用旧端口
+        changed = [name for name in self.RELOAD_FIELDS
+                   if getattr(previous, name, None) != getattr(fresh, name, None)]
+        applied: list[str] = []
+        notes: list[str] = []
+        self.config = fresh
+        if "gateway_url" in changed:
+            # 下一次 tick 按新地址重建客户端；已建立的长连接不动（在途请求照常完成）
+            self.api = None
+            notes.append("服务端地址已切换；下次心跳起走新地址")
+            applied.append("gateway_url")
+        if "log_level" in changed:
+            try:
+                setup_logging(self.paths.log_file, level=fresh.log_level)
+                applied.append("log_level")
+            except (OSError, ValueError) as exc:            # pragma: no cover - 防御
+                notes.append("日志级别未切换：" + (str(exc) or type(exc).__name__))
+        for name in ("update_channel", "update_source"):
+            if name in changed:
+                applied.append(name)
+        self.update.source = fresh.update_source
+        self.update.channel = fresh.update_channel
+        if "extra" in changed:
+            # 镜像端点用 extra 做行为开关（如 tokens.compare）；直接换掉旧字典
+            self.server.settings = dict(fresh.extra or {})
+            applied.append("extra")
+        # 上游地址：manager 每次都读 store，换实例只为把「已重载」这件事做实
+        self.upstreams = UpstreamManager(self.store, self.credentials, http=self.http)
+        upstream_count = len(self.upstreams.list())
+        applied.extend(self._apply_subsystem_toggles(fresh))
+        self._reload_count += 1
+        fingerprint = sha256_hex(json.dumps(fresh.to_dict(), sort_keys=True,
+                                            ensure_ascii=False))[:16]
+        result: dict[str, Any] = {
+            "ok": True,
+            "changed": changed,
+            "applied": applied,
+            "unchanged": not changed,
+            "restart_required": restart_required,
+            "notes": notes,
+            "fingerprint": fingerprint,
+            "reload_count": self._reload_count,
+            "upstreams": upstream_count,
+            "inflight": self._inflight,
+            "state": self.machine.snapshot.state,
+            "config": self._config_public(fresh),
+            "message": ("配置已重载（无变化）" if not changed
+                        else "配置已重载并生效：" + ", ".join(changed)),
+        }
+        sample = self.store.policy()
+        result["policy_version"] = getattr(sample, "policy_version", None)
+        event("daemon.reloaded", changed=changed, applied=applied,
+              restart_required=[item["field"] for item in restart_required],
+              fingerprint=fingerprint, upstreams=upstream_count)
+        self.last_reload = result
+        return result
+
+    def _consume_reload_flag(self) -> dict[str, Any] | None:
+        """主循环消费一次 SIGHUP 请求；没请求时返回 None（幂等、不重复加载）。"""
+        if not self._reload_requested:
+            return None
+        self._reload_requested = False
+        result = self.reload_config()
+        self._last_reload_signal_ok = bool(result.get("ok"))
+        event("daemon.reload_signal", ok=self._last_reload_signal_ok,
+              changed=result.get("changed"))
+        return result
+
+    def _on_sighup(self, _signum: int | None = None, _frame: Any = None) -> None:
+        """SIGHUP 只置位：真正加载在主循环里做（信号上下文里不做 I/O、不抢锁）。"""
+        self._reload_requested = True
+
+    def _install_reload_signal(self) -> bool:
+        """主线程才装 SIGHUP（Windows 无 SIGHUP：返回 False，走控制命令即可）。"""
+        if not hasattr(signal, "SIGHUP"):
+            return False
+        if threading.current_thread() is not threading.main_thread():
+            return False
+        try:
+            signal.signal(signal.SIGHUP, self._on_sighup)
+        except (ValueError, OSError, RuntimeError):        # pragma: no cover - 受限环境
+            return False
+        return True
 
     # ── C10c 出站长轮询通道（默认关闭）
     def _start_channel(self) -> None:
@@ -766,6 +932,7 @@ class Daemon:
         moment = now or self._now()
         if self._stop_event.is_set():
             return {"stopped": True}
+        self._consume_reload_flag()                 # F14：SIGHUP 置位 → 主循环里加载
         if self.api is None:
             self.api = self._api_factory(self.config.gateway_url,
                                          self.credentials.client_key())
@@ -1415,6 +1582,14 @@ class Daemon:
             self._persist()
             event("daemon.user_resumed")
             return {"ok": True, "status": self.status()}
+        if action in ("reload", "reload_config"):
+            result = self.reload_config()
+            if result.get("ok") is not True:
+                # 失败也回 ok=False + 原因；调用方（CLI / GUI）必须显示出来
+                return result
+            result = dict(result)
+            result["status"] = self.status()
+            return result
         if action == "stop":
             threading.Thread(target=self.stop, name="djb-stop", daemon=True).start()
             return {"ok": True, "message": "daemon 正在退出"}

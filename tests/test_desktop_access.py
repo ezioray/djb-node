@@ -214,7 +214,7 @@ def test_service_save_invalid_does_not_write(tmp_path):
 @pytest.mark.parametrize("state,word", [
     (ac.RELOAD_DAEMON_DOWN, "daemon 未运行"),
     (ac.RELOAD_UNSUPPORTED, "无热重载命令"),
-    (ac.RELOAD_FAILED, "重载请求失败"),
+    (ac.RELOAD_FAILED, "重载未成功"),
 ])
 def test_service_never_claims_effective_without_reload(tmp_path, state, word):
     service = ac.AccessService(ac.FileAccessStore(tmp_path / "c.json"),

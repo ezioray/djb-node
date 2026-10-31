@@ -633,7 +633,11 @@ class LocalDataSource:
                 binding = self._cloud_call("binding", node_id)
         except ProviderError as exc:
             note = "云端绑定状态暂不可用：" + exc.reason
-        return {"config": config.display(), "valid": _valid(config), "binding": binding,
+        # 文件不存在 ≠ 通过校验：没保存过就说没保存过，避免「通过校验」误导
+        saved = bool(getattr(self._access, "path", None)
+                     and Path(self._access.path).exists())
+        return {"config": config.display(), "valid": _valid(config) if saved else None,
+                "saved": saved, "binding": binding,
                 "note": note, "path": str(self._access.path)}
 
     def _yield(self) -> Mapping[str, Any]:
