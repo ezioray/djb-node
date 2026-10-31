@@ -516,8 +516,27 @@ class LocalDataSource:
             raise ProviderError("云端接口未接线（" + method + "）", hint="等待平台提供该接口")
         try:
             return handler(*args, **kwargs)
+        except ProviderError:
+            raise                       # 已经带可读原因（401 / 服务端降级 / 未上线）
         except Exception as exc:
             raise ProviderError("云端请求失败（" + type(exc).__name__ + "）") from None
+
+    def _cloud_pages(self, kind: str, method: str) -> dict[str, Any]:
+        """按 ``page.next_cursor`` 取全量（客户端负责翻页上限）；无 ``fetch`` 的桩只取单页。"""
+        fetch = getattr(self._cloud, "fetch", None) if self._cloud is not None else None
+        if callable(fetch):
+            payload = fetch(kind)
+            rows = payload.get("items") if isinstance(payload, Mapping) else payload
+            return {"rows": [row for row in (rows or []) if isinstance(row, Mapping)],
+                    "next_cursor": payload.get("next_cursor") if isinstance(payload, Mapping) else None,
+                    "truncated": bool(payload.get("truncated")) if isinstance(payload, Mapping) else False}
+        payload = self._cloud_call(method)
+        rows = _as_rows(payload)
+        cursor = None
+        if isinstance(payload, Mapping):
+            page = payload.get("page") if isinstance(payload.get("page"), Mapping) else payload
+            cursor = page.get("next_cursor") if isinstance(page, Mapping) else None
+        return {"rows": rows, "next_cursor": cursor, "truncated": False}
 
     def _local_models(self) -> list[dict[str, Any]]:
         try:
@@ -557,23 +576,28 @@ class LocalDataSource:
         inflight = status.get("inflight") if isinstance(status, Mapping) else None
         rows = [row for row in inflight if isinstance(row, Mapping)] if isinstance(inflight, list) else []
         try:
-            payload = self._cloud_call("list_tasks")
+            pages = self._cloud_pages("tasks", "list_tasks")
         except ProviderError as exc:
             if not rows:
                 raise ProviderError(exc.reason, hint="本地也没有在途任务；有任务时再刷新") from None
-            return {"rows": rows, "origin": "local", "note": "云端任务列表暂不可用：" + exc.reason}
-        return {"rows": _as_rows(payload), "origin": "cloud", "note": ""}
+            return {"rows": rows, "origin": "local",
+                    "note": "云端任务列表暂不可用：" + exc.reason}
+        note = _more_note(pages)
+        return {"rows": pages["rows"], "origin": "cloud", "note": note,
+                "next_cursor": pages["next_cursor"]}
 
     def _receipts(self) -> Mapping[str, Any]:
         rows: list[dict[str, Any]] = []
         origin = "local"
         note = ""
+        next_cursor = None
         try:
-            payload = self._cloud_call("list_receipts")
+            pages = self._cloud_pages("receipts", "list_receipts")
         except ProviderError as exc:
             note = "云端收据暂不可用：" + exc.reason
         else:
-            rows, origin = _as_rows(payload), "cloud"
+            rows, origin, next_cursor = pages["rows"], "cloud", pages["next_cursor"]
+            note = _more_note(pages)
         local_ok = True
         if not rows:
             try:
@@ -591,7 +615,7 @@ class LocalDataSource:
             raise ProviderError(note, hint="daemon 起来后再刷新；云端收据需要登录节点")
         if not rows and not note:
             note = "还没有收据"
-        return {"rows": rows, "origin": origin, "note": note}
+        return {"rows": rows, "origin": origin, "note": note, "next_cursor": next_cursor}
 
     def _earnings(self) -> Mapping[str, Any]:
         status = self._safe("status", self._status)
@@ -607,9 +631,16 @@ class LocalDataSource:
                     "pending": None, "settled": None, "payouts": [],
                     "online": False, "note": "结算明细暂不可用：" + exc.reason}
         rows = payload if isinstance(payload, Mapping) else {}
-        return {"balance": rows.get("balance", balance), "today": rows.get("today", today),
+        # 服务端口径：*_minor 是 micro-USD；客户端已归一化成「至少 2 位、最多 6 位」文本
+        settled = rows.get("settled") if rows.get("settled") is not None else rows.get("settled_minor")
+        pending = rows.get("pending") if rows.get("pending") is not None else rows.get("pending_minor")
+        today_text = rows.get("today") if rows.get("today") is not None else today
+        balance_text = rows.get("balance") if rows.get("balance") is not None else balance
+        return {"balance": balance_text, "today": today_text,
                 "currency": str(rows.get("currency") or "USDT"),
-                "pending": rows.get("pending"), "settled": rows.get("settled"),
+                "pending": pending, "settled": settled,
+                "settled_minor": rows.get("settled_minor"),
+                "pending_minor": rows.get("pending_minor"),
                 "payouts": [row for row in (rows.get("payouts") or []) if isinstance(row, Mapping)],
                 "online": True, "note": ""}
 
@@ -683,6 +714,14 @@ class LocalDataSource:
         rows = self._logs.tail(limit=200)
         return {"rows": rows, "path": str(self._logs.path),
                 "levels": list(LOG_LEVELS), "note": ""}
+
+
+def _more_note(pages: Mapping[str, Any]) -> str:
+    """翻到上限还有游标就如实说「还有更多、本轮没拉全」，不当场承诺刷新就能续上。"""
+    if pages.get("truncated") and pages.get("next_cursor"):
+        count = len(pages.get("rows") or [])
+        return "已显示前 " + str(count) + " 条，还有更多（本轮未全部拉取）"
+    return ""
 
 
 def _valid(config: AccessConfig) -> bool:

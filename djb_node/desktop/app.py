@@ -575,7 +575,14 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
     """装配：数据源 + 接入配置服务 + 控制通道 + 状态总线。"""
     from ..gui.state import ControlBus
     bus = bus if bus is not None else ControlBus()
-    source = demo_source() if demo else LocalDataSource(home=home, cloud=cloud)
+    if demo:
+        source: Any = demo_source()
+    else:
+        if cloud is None:
+            # 没显式注入就按 ~/.djb 自己装：没登录节点时是 None（视图照常显示「暂不可用」）
+            from .nodecloud import NodeCloudClient
+            cloud = NodeCloudClient.from_home(home)
+        source = LocalDataSource(home=home, cloud=cloud)
     store = FileAccessStore(None if home is None else
                             os.path.join(str(home), ACCESS_FILE))
     access = AccessService(store, reloader=_make_reloader(home))
