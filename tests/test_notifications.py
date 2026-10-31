@@ -332,7 +332,16 @@ def test_db_file_is_private(paths, clock):
     store.upsert(ITEM)
     path = notification_db_file(paths)
     assert os.path.basename(path) == facts.NOTIFICATIONS_DB
-    assert oct(os.stat(path).st_mode)[-3:] == "600"
+    try:
+        if os.name == "nt":
+            from djb_node.file_security import assert_private_file_object
+            for filename in (path, path + "-wal", path + "-shm"):
+                assert os.path.isfile(filename)
+                assert_private_file_object(os.path.abspath(filename))
+        else:
+            assert oct(os.stat(path).st_mode)[-3:] == "600"
+    finally:
+        store.close()
 
 
 def test_events_carry_no_token_or_payload(paths, clock, events):
@@ -528,6 +537,12 @@ def test_daemon_has_no_notifications_by_default(daemon_env, monkeypatch):
     monkeypatch.setattr(daemon_module, "NotificationStore", StubNotifications)
     daemon = make_daemon(paths, store, credentials, mock)
     daemon.start()
+    if os.name == "nt":
+        from djb_node.ipc_windows import IpcUnavailable
+        assert daemon._started is True
+        assert daemon.status()["control"] == {"available": False, "reason": "windows_control_unsupported"}
+        with pytest.raises(IpcUnavailable):
+            daemon.control({"cmd": "ping"})
     try:
         assert StubNotifications.instances == []
         assert daemon._notifications is None and daemon._notifications_thread is None
@@ -549,6 +564,12 @@ def test_daemon_starts_and_stops_notifications_thread(daemon_env, monkeypatch):
                           extra={facts.NOTIFICATIONS_FLAG: True})
     daemon = make_daemon(paths, store, credentials, mock, config=config)
     daemon.start()
+    if os.name == "nt":
+        from djb_node.ipc_windows import IpcUnavailable
+        assert daemon._started is True
+        assert daemon.status()["control"] == {"available": False, "reason": "windows_control_unsupported"}
+        with pytest.raises(IpcUnavailable):
+            daemon.control({"cmd": "ping"})
     thread = daemon._notifications_thread
     try:
         assert len(StubNotifications.instances) == 1
@@ -573,8 +594,175 @@ def test_daemon_env_switch_starts_thread_for_s2(daemon_env, monkeypatch):
     monkeypatch.setattr(daemon_module, "NotificationStore", StubNotifications)
     daemon = make_daemon(paths, store, credentials, mock)
     daemon.start()
+    if os.name == "nt":
+        from djb_node.ipc_windows import IpcUnavailable
+        assert daemon._started is True
+        assert daemon.status()["control"] == {"available": False, "reason": "windows_control_unsupported"}
+        with pytest.raises(IpcUnavailable):
+            daemon.control({"cmd": "ping"})
     try:
         assert len(StubNotifications.instances) == 1
         assert daemon.status()["notifications"]["running"] is True
     finally:
         daemon.stop()
+
+
+
+def test_windows_start_control_unavailable_does_not_hide_other_errors(daemon_env, monkeypatch):
+    from djb_node import daemon as module
+    paths, store, credentials, mock, make_daemon = daemon_env
+    daemon = make_daemon(paths, store, credentials, mock)
+    def fail(*a, **k): raise ValueError("test-factory-failure")
+    monkeypatch.setattr(module, "control_server_factory", fail)
+    with pytest.raises(ValueError, match="test-factory-failure"):
+        daemon._start_windows()
+    assert not daemon._started and daemon._control is None
+
+
+def test_windows_start_fake_available_control_preserves_wiring(daemon_env, monkeypatch):
+    from djb_node import daemon as module
+    paths, store, credentials, mock, make_daemon = daemon_env
+    daemon = make_daemon(paths, store, credentials, mock)
+    calls = []
+    class Control:
+        alive = False
+        def open(self): calls.append("open")
+        def start(self): self.alive = True; calls.append("start")
+        def is_alive(self): return self.alive
+        def join(self, **kw): self.alive = False
+        def close_bound(self): calls.append("close")
+    control = Control()
+    monkeypatch.setattr(module, "control_server_factory", lambda *a, **k: control)
+    daemon._start_windows()
+    try:
+        assert calls == ["open", "start"]
+        assert daemon.status()["control"] == {"available": True, "reason": None}
+        assert daemon.control({"cmd": "ping"})["ok"] is True
+    finally:
+        daemon.stop()
+
+
+def test_windows_start_fake_unavailable_open_keeps_daemon(daemon_env, monkeypatch):
+    from djb_node import daemon as module
+    from djb_node.ipc_windows import IpcUnavailable
+    paths, store, credentials, mock, make_daemon = daemon_env
+    daemon = make_daemon(paths, store, credentials, mock)
+    closed = []
+    class Control:
+        def open(self): raise IpcUnavailable("test-unavailable")
+        def close_bound(self): closed.append(True)
+    monkeypatch.setattr(module, "control_server_factory", lambda *a, **k: Control())
+    daemon._start_windows()
+    try:
+        assert daemon._started and daemon._control is None and closed == [True]
+        assert daemon.status()["control"]["available"] is False
+        with pytest.raises(IpcUnavailable): daemon.control({"cmd": "pause"})
+    finally:
+        daemon.stop()
+
+
+def test_file_object_api_does_not_call_ancestor_pins(monkeypatch):
+    from djb_node import file_security as fs
+    sid = "S-1-5-21-123"
+    calls = []
+    class Backend:
+        def identity(self): return sid
+        def volume(self, root): calls.append("volume")
+        def open(self, path): return 7
+        def close(self, handle): calls.append("close")
+        def snapshot(self, handle):
+            return fs._Security(sid, True, False, True, (fs._Ace(0,0,fs._FILE,sid),), False, False, 1)
+    monkeypatch.setattr(fs, "_Win32", Backend)
+    monkeypatch.setattr(fs.os, "name", "nt")
+    monkeypatch.setattr(fs, "_pinned_ancestors", lambda *a: pytest.fail("object-only API pinned ancestors"))
+    fs.assert_private_file_object(r"E:\private\notifications.db")
+    assert calls == ["volume", "close"]
+
+
+def test_file_object_api_rejects_public_dacl(monkeypatch):
+    from djb_node import file_security as fs
+    sid = "S-1-5-21-123"
+    closed = []
+    class Backend:
+        def identity(self): return sid
+        def volume(self, root): pass
+        def open(self, path): return 7
+        def close(self, handle): closed.append(handle)
+        def snapshot(self, handle):
+            return fs._Security(sid, True, False, True,
+                (fs._Ace(0,0,fs._FILE,sid), fs._Ace(0,0,0x120089,"S-1-1-0")), False, False, 1)
+    monkeypatch.setattr(fs, "_Win32", Backend)
+    monkeypatch.setattr(fs.os, "name", "nt")
+    with pytest.raises(fs.FileSecurityError, match="unsafe_dacl"):
+        fs.assert_private_file_object(r"E:\private\notifications.db")
+    assert closed == [7]
+
+
+
+@pytest.mark.parametrize("failure", ["restore", "mirror", "join"])
+def test_windows_failed_start_cleanup_sentinel_blocks_retry(monkeypatch, failure):
+    from types import SimpleNamespace
+    import threading
+    from djb_node import daemon as module
+    from djb_node.ipc_windows import IpcUnavailable
+    from djb_node.errors import UsageError
+    d = module.Daemon.__new__(module.Daemon)
+    d._started = False; d._control = None
+    d._stop_event = threading.Event()
+    d.paths = SimpleNamespace(prepare=lambda: None, log_file="unused")
+    d.store = SimpleNamespace(get_kv=lambda _: {}, is_initialized=lambda: True, set_kv=lambda *a: None)
+    d.config = SimpleNamespace(log_level="INFO")
+    d.credentials = SimpleNamespace(ensure_permissions=lambda: None)
+    d._persist = lambda: None
+    from djb_node.util import utcnow
+    d._now = utcnow
+    restores = []
+    def restore(value):
+        restores.append(value)
+        if failure == "restore" and len(restores) > 1: raise RuntimeError("rollback")
+    d.machine = SimpleNamespace(snapshot="before", restore=restore, start=lambda: None)
+    def start_fail(): raise ValueError("start-failed")
+    def close():
+        if failure == "mirror": raise RuntimeError("close-failed")
+    d.server = SimpleNamespace(bind=lambda: None, port=1, token_fingerprint=lambda: "test",
+                               start=start_fail, close_bound=close)
+    class Control:
+        alive = False
+        def open(self): pass
+        def start(self): self.alive = True
+        def is_alive(self): return self.alive
+        def join(self, **kw): pass
+    control = Control()
+    def factory(*a, **k):
+        if failure != "join": raise IpcUnavailable("test")
+        return control
+    monkeypatch.setattr(module, "control_server_factory", factory)
+    monkeypatch.setattr(module, "setup_logging", lambda *a, **k: None)
+    with pytest.raises(ValueError, match="start-failed"):
+        d._start_windows()
+    assert d._start_cleanup_incomplete is True
+    assert d._control is (control if failure == "join" else None)
+    with pytest.raises(UsageError, match="清理未完成"):
+        d.start()
+
+
+
+def test_windows_open_unavailable_close_failure_preserves_error_and_blocks_retry(daemon_env, monkeypatch):
+    from djb_node import daemon as module
+    from djb_node.ipc_windows import IpcUnavailable
+    from djb_node.errors import UsageError
+    paths, store, credentials, mock, make_daemon = daemon_env
+    daemon = make_daemon(paths, store, credentials, mock)
+    failure = OSError("test-close-failed")
+    class Control:
+        def open(self): raise IpcUnavailable("test-open-unavailable")
+        def close_bound(self): raise failure
+    control = Control()
+    monkeypatch.setattr(module, "control_server_factory", lambda *a, **k: control)
+    with pytest.raises(OSError, match="^test-close-failed$") as raised:
+        daemon._start_windows()
+    assert raised.value is failure
+    assert daemon._start_cleanup_incomplete is True
+    assert daemon._control is control
+    with pytest.raises(UsageError, match="清理未完成"):
+        daemon.start()

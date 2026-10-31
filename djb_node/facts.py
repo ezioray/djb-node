@@ -538,3 +538,21 @@ NOTIFICATIONS_MAX_PENDING = 500
 """离线读态队列上限（超过丢最旧，避免无界增长）。"""
 NOTIFICATIONS_SEVERITIES: tuple[str, ...] = ("P0", "P1", "P2")
 NOTIFICATIONS_ACTIONS: tuple[str, ...] = ("read", "ack")
+
+# UI-NODE: local tray control is opt-in; expiry enforced at every action boundary.
+FEATURE_FLAGS["client.tray.control.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "关闭后托盘暂停/恢复退回命令指南；不改变 daemon 状态，不写离线偏好",
+    "description": "托盘用户确认后暂停/恢复；先读状态、独立回读、到期强制关闭",
+}
+
+# IPC-WIN-001: opt-in local named-pipe transport; runtime checks enforce UTC expiry.
+FEATURE_FLAGS["client.ipc.windows.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好",
+    "description": "Windows同SID/session/integrity安全命名管道；不解禁GUI托盘控制",
+}

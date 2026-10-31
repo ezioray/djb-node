@@ -126,6 +126,8 @@ class LocalApiServer:
 
     # ── 生命周期
     def bind(self) -> None:
+        if self._server is not None or self._thread is not None:
+            raise UsageError("本机镜像已绑定或启动，拒绝覆盖现有listener")
         handler = _make_handler(self)
         try:
             self._server = _Server((self.host, self.port), handler)
@@ -137,9 +139,18 @@ class LocalApiServer:
                 code=40919) from exc
         bound_host, bound_port = self._server.server_address[:2]
         if str(bound_host) != self.host:
-            self._server.server_close()
+            self.close_bound()
             raise UsageError("实际绑定地址不是回环（" + str(bound_host) + "）：拒绝启动")
         self.port = int(bound_port)
+
+    def close_bound(self) -> None:
+        """Close only a bound-but-unstarted listener; never wait for serve_forever."""
+        if self._thread is not None and self._thread.ident is not None:
+            raise UsageError("本机镜像已启动，拒绝按未启动listener关闭")
+        if self._server is not None:
+            self._server.server_close()
+            self._server = None
+        self._thread = None
 
     @property
     def address(self) -> tuple[str, int]:

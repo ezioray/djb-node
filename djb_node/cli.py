@@ -592,7 +592,8 @@ def cmd_upstream(args: argparse.Namespace) -> int:
                 raise UsageError("relay 接入开关关闭（默认关闭）：先 djb flags --enable "
                                  + facts.RELAY_FLAG + " 再添加（本次未创建上游）")
         record = manager.add(access_type=args.access, base_url=args.base_url,
-                             models=args.models, secret=secret, protocol=args.protocol)
+                             models=args.models, secret=secret, protocol=args.protocol,
+                             upstream_kind=getattr(args, "kind", None))
         if getattr(args, "kind", None) == facts.RELAY_KIND:
             relay_mgr = RelayManager(store, credentials, config=config)
             relay_profile = relay_mgr.add(
@@ -1303,8 +1304,11 @@ def cmd_proxy(args: argparse.Namespace) -> int:
 def cmd_gui(args: argparse.Namespace) -> int:
     """启动 S3 共享设置窗口；无图形会话时 gui.main 返回 3，不抛 traceback。"""
     from .gui.window import main as gui_main
-    argv = ["--preset", str(getattr(args, "preset", "balanced")),
-            "--upload-mbps", str(getattr(args, "upload_mbps", 0.0))]
+    argv = ["--upload-mbps", str(getattr(args, "upload_mbps", 0.0))]
+    if getattr(args, "home", None):
+        argv.extend(["--home", str(args.home)])
+    if getattr(args, "preset", None):
+        argv.extend(["--preset", str(args.preset)])
     if getattr(args, "no_realtime", False):
         argv.append("--no-realtime")
     if getattr(args, "no_batch", False):
@@ -1541,7 +1545,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="代理档位；缺省 fidelity")
 
     gui = add_common(cmd_gui, "gui", "打开 S3 共享设置窗口（预设 / 三档 / 组网）")
-    gui.add_argument("--preset", choices=("saver", "balanced", "full"), default="balanced")
+    gui.add_argument("--preset", choices=("saver", "balanced", "full"), default=None)
     gui.add_argument("--no-realtime", action="store_true", help="关闭实时算力")
     gui.add_argument("--no-batch", action="store_true", help="关闭慢任务")
     gui.add_argument("--network", action="store_true", help="开启组网参与（默认关）")

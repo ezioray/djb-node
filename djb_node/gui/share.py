@@ -11,7 +11,7 @@ from typing import Mapping
 PRESETS: dict[str, tuple[str, str]] = {
     "saver": ("省心模式", "只在我不用电脑时工作，几乎感觉不到"),
     "balanced": ("均衡模式", "工作时段实时算力，其余时段慢任务"),
-    "full": ("全力以赴", "全天共享，含参与超大模型组网"),
+    "full": ("全力以赴", "全天共享意向；组网需独立选择且当前仅为草稿"),
 }
 
 
@@ -83,7 +83,9 @@ def build_share_view(settings: ShareSettings, *,
         for key, (label, summary) in PRESETS.items()
     )
     warnings: list[str] = []
-    if settings.network and not network_ok:
+    if settings.network and upload_mbps == 0:
+        warnings.append("网络尚未检测；组网意向不会实际开启。")
+    elif settings.network and not network_ok:
         warnings.append(
             f"组网参与未达标：上行 {upload_mbps:g} Mbps（需 ≥{min_upload_mbps:g}）"
         )
@@ -98,7 +100,8 @@ def build_share_view(settings: ShareSettings, *,
         realtime_label=f"实时算力 · {_yes_no(settings.realtime)}",
         batch_label=f"慢任务 · {_yes_no(settings.batch)}",
         network_label=f"组网参与 · {_yes_no(settings.network)}",
-        network_badge="✅ 达标" if network_ok else "❌ 未达标",
+        network_badge=("— 未检测（可输入上行参考值）" if upload_mbps == 0 else
+                       "参考上行达标（不代表组网可用）" if network_ok else "参考上行未达标"),
         network_ok=network_ok,
         warnings=tuple(warnings),
         estimates=tuple(lines),

@@ -4,4 +4,4 @@
 
 | 编号 | 标题 | 状态 | 关联 |
 | --- | --- | --- | --- |
-| — | 暂无 | — | — |
+| IPC-WIN-001 | [Windows 安全本机控制命名管道](windows-control-ipc.md) | R3 限定验证通过 / 默认关闭 | M15 / Windows IPC |

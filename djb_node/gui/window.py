@@ -9,17 +9,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable, Protocol, Sequence, runtime_checkable
 
 from .share import ShareSettings, ShareView, build_share_view
+from .theme import apply_theme
 
 __all__ = ["EXIT_HEADLESS", "EXIT_OK", "HeadlessError", "ShareBackend", "ShareWindow",
            "TkBackend", "main"]
+
+DRAFT_NOTICE = "草稿，尚未生效；不会修改运行中的共享规则。"
 
 EXIT_OK = 0
 EXIT_HEADLESS = 3
@@ -58,6 +62,7 @@ class ShareWindow:
         self._min_upload_mbps = float(min_upload_mbps)
         self._estimates = dict(estimates or {})
         self._advanced = False
+        self.status_message = DRAFT_NOTICE
         backend.set_handlers(on_change=self._changed, on_save=self.save)
         self.refresh()
 
@@ -67,6 +72,7 @@ class ShareWindow:
 
     def _changed(self) -> None:
         self._settings = self._backend.current_settings()
+        self.status_message = "有未保存的草稿更改。" + DRAFT_NOTICE
         self.refresh()
 
     def toggle_advanced(self) -> None:
@@ -87,11 +93,21 @@ class ShareWindow:
 
     def refresh(self) -> None:
         self._backend.render(self.view())
+        feedback = getattr(self._backend, "set_status", None)
+        if callable(feedback):
+            feedback(self.status_message)
 
     def save(self) -> None:
         """校验后只把设置交给 sink；不写 store、不改 daemon。"""
-        self._settings.validate()
-        self._save_sink(self._settings)
+        try:
+            self._settings = self._backend.current_settings()
+            self._settings.validate()
+            self._save_sink(self._settings)
+        except Exception:
+            self.status_message = "草稿保存失败或回读未确认；请检查目录权限后重试。尚未生效。"
+        else:
+            self.status_message = "草稿已保存。" + DRAFT_NOTICE
+        self.refresh()
 
     def run(self) -> None:
         self._backend.run()
@@ -101,69 +117,99 @@ class ShareWindow:
 
 
 class TkBackend:
-    """tkinter 渲染：只有本类 import tkinter；控件状态与 :class:`ShareSettings` 同步。"""
+    """Stable widgets: projection updates never destroy keyboard focus."""
 
     def __init__(self, settings: ShareSettings) -> None:
         try:
             import tkinter as tk
             from tkinter import ttk
-        except Exception as exc:  # pragma: no cover - 平台相关
-            raise HeadlessError(str(exc)) from exc
-        self._tk = tk
-        try:
             self._root = tk.Tk()
-        except Exception as exc:  # pragma: no cover - 无 DISPLAY
-            raise HeadlessError(str(exc)) from exc
-        self._root.title("DJB 联脑 · 共享设置")
-        self._root.geometry("560x420")
-        self._settings = settings
+        except Exception as exc:
+            raise HeadlessError(type(exc).__name__) from None
+        self._tk, self._ttk, self._settings = tk, ttk, settings
+        self._root.title("DJB / NIGHT SIGNAL · 共享草稿")
+        self._root.geometry("840x850")
+        self._root.minsize(700, 700)
+        apply_theme(self._root, ttk)
         self._preset = tk.StringVar(value=settings.preset)
         self._realtime = tk.BooleanVar(value=settings.realtime)
         self._batch = tk.BooleanVar(value=settings.batch)
         self._network = tk.BooleanVar(value=settings.network)
-        self._on_change: Callable[[], None] = lambda: None
-        self._on_save: Callable[[], None] = lambda: None
-        self._ttk = ttk
-        self._body = ttk.Frame(self._root, padding=12)
-        self._body.pack(fill="both", expand=True)
+        self._on_change = lambda: None
+        self._on_save = lambda: None
+        self._body = ttk.Frame(self._root, padding=24)
+        self._body.pack(fill="both", expand=True, padx=2, pady=2)
+        ttk.Label(self._body, text="◢ DJB / NIGHT SIGNAL     // LOCAL DRAFT",
+                  style="Signal.TLabel").pack(anchor="w")
+        ttk.Label(self._body, text="你想怎么共享？", font=("Microsoft YaHei UI", 22, "bold")).pack(anchor="w", pady=(12, 4))
+        ttk.Label(self._body, text="最终有效规则 = 本地规则与平台策略中更严格者", style="Muted.TLabel").pack(anchor="w")
+        self._notice = ttk.Label(self._body, text=DRAFT_NOTICE, style="Warning.TLabel", wraplength=740)
+        self._notice.pack(fill="x", pady=12)
+        ttk.Label(self._body, text="01 / 共享预设 · 仅编辑意向", style="Signal.TLabel").pack(anchor="w")
+        self._options = {}
+        for key in ("saver", "balanced", "full"):
+            button = ttk.Radiobutton(self._body, variable=self._preset, value=key,
+                                     command=self._changed, takefocus=True)
+            button.pack(fill="x", pady=2)
+            self._options[key] = button
+        ttk.Separator(self._body).pack(fill="x", pady=12)
+        ttk.Label(self._body, text="02 / 能力草稿 · 不是运行状态", style="Signal.TLabel").pack(anchor="w")
+        self._checks = []
+        for variable in (self._realtime, self._batch, self._network):
+            button = ttk.Checkbutton(self._body, variable=variable, command=self._changed, takefocus=True)
+            button.pack(fill="x")
+            self._checks.append(button)
+        self._estimates = ttk.Label(self._body, style="Muted.TLabel", wraplength=740)
+        self._estimates.pack(anchor="w", pady=8)
+        self._warnings = ttk.Label(self._body, style="Warning.TLabel", wraplength=740)
+        self._warnings.pack(anchor="w")
+        self._details = ttk.Label(self._body, style="Muted.TLabel", wraplength=740)
+        self._details.pack(fill="x", pady=6)
+        footer = ttk.Frame(self._body)
+        footer.pack(fill="x", side="bottom", pady=(12, 0))
+        self._save_button = ttk.Button(footer, text="保存草稿 / Ctrl+S", command=lambda: self._on_save(), takefocus=True)
+        self._save_button.pack(side="right")
+        ttk.Button(footer, text="关闭 / Esc", command=self.stop, takefocus=True).pack(side="left")
+        self._root.bind("<Control-s>", self._save_shortcut)
+        self._root.bind("<Command-s>", self._save_shortcut)
+        self._root.bind("<Escape>", lambda _e: self.stop())
+        self._options[settings.preset].focus_set()
 
-    def set_handlers(self, *, on_change: Callable[[], None],
-                     on_save: Callable[[], None]) -> None:
-        self._on_change = on_change
-        self._on_save = on_save
+    def _save_shortcut(self, _event=None):
+        if "disabled" not in self._save_button.state():
+            self._on_save()
+        return "break"
+
+    def set_handlers(self, *, on_change, on_save) -> None:
+        self._on_change, self._on_save = on_change, on_save
 
     def current_settings(self) -> ShareSettings:
-        return ShareSettings(preset=self._preset.get(),
-                             realtime=bool(self._realtime.get()),
-                             batch=bool(self._batch.get()),
-                             network=bool(self._network.get()))
+        return replace(self._settings, preset=self._preset.get(),
+                       realtime=bool(self._realtime.get()), batch=bool(self._batch.get()),
+                       network=bool(self._network.get()))
 
     def _changed(self) -> None:
         self._settings = self.current_settings()
         self._on_change()
 
+    def set_status(self, text: str) -> None:
+        self._notice.configure(text=text)
+
+    def set_draft_source(self, path: Path, message: str) -> None:
+        self._details.configure(text="03 / 本地证据\n" + message + "\n草稿路径：" + str(path)
+                                + "\n价格模式保留原值；不上传凭据，不调用 daemon reload。")
+
     def render(self, view: ShareView) -> None:
-        ttk = self._ttk
-        for child in self._body.winfo_children():
-            child.destroy()
-        ttk.Label(self._body, text=view.title, font=("", 14, "bold")).pack(anchor="w")
         for option in view.options:
-            ttk.Radiobutton(self._body, text=f"{option.label}  {option.summary}",
-                            value=option.key, variable=self._preset,
-                            command=self._changed).pack(anchor="w", pady=2)
-        ttk.Separator(self._body).pack(fill="x", pady=8)
-        ttk.Checkbutton(self._body, text=view.realtime_label, variable=self._realtime,
-                        command=self._changed).pack(anchor="w")
-        ttk.Checkbutton(self._body, text=view.batch_label, variable=self._batch,
-                        command=self._changed).pack(anchor="w")
-        ttk.Checkbutton(self._body, text=f"{view.network_label}  {view.network_badge}",
-                        variable=self._network, command=self._changed).pack(anchor="w")
-        for line in view.estimates:
-            ttk.Label(self._body, text=line).pack(anchor="w", pady=1)
-        for warning in view.warnings:
-            ttk.Label(self._body, text="⚠️ " + warning, foreground="#b45309").pack(anchor="w")
-        ttk.Button(self._body, text="保存偏好", command=self._on_save,
-                   state=("normal" if view.save_enabled else "disabled")).pack(anchor="e", pady=10)
+            self._options[option.key].configure(text=f"{option.label}  /  {option.summary}")
+        for button, label in zip(self._checks, (view.realtime_label, view.batch_label,
+                                               view.network_label + "  " + view.network_badge)):
+            button.configure(text="草稿 · " + label)
+        self._estimates.configure(text="收益预估 / " + "  ·  ".join(view.estimates)
+                                  + "\n— 表示无服务端数据，不代表零收益。")
+        self._warnings.configure(text="\n".join(view.warnings)
+                                 + "\n组网仅记录意向；未接运行时，不会开启组网。")
+        self._save_button.state(["!disabled"] if view.save_enabled else ["disabled"])
 
     def run(self) -> None:
         self._root.mainloop()
@@ -171,13 +217,38 @@ class TkBackend:
     def stop(self) -> None:
         try:
             self._root.destroy()
-        except Exception:  # pragma: no cover
+        except Exception:
             pass
+
+
+def draft_path(home: str | None = None) -> Path:
+    # Keep historical default; explicit --home / DJB_HOME is honored.
+    return Path(home or os.environ.get("DJB_HOME") or (Path.home() / ".djb")).expanduser() / "share-preferences.json"
+
+
+def load_local(path: Path | None = None) -> ShareSettings:
+    target = Path(path) if path is not None else draft_path()
+    if target.stat().st_size > 16384:
+        raise ValueError("草稿过大")
+    data = json.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("草稿格式错误")
+    values = {key: data[key] for key in asdict(ShareSettings()) if key in data}
+    for key in ("realtime", "batch", "network"):
+        if key in values and type(values[key]) is not bool:
+            raise ValueError("草稿开关类型错误")
+    for key in ("preset", "price_mode"):
+        if key in values and not isinstance(values[key], str):
+            raise ValueError("草稿文本类型错误")
+    settings = ShareSettings(**values)
+    settings.validate()
+    return settings
 
 
 def save_local(settings: ShareSettings, path: Path | None = None) -> Path:
     """原子写本机偏好（不含凭据）；daemon 重载由后续接线完成，不假装已生效。"""
-    target = Path(path) if path is not None else Path.home() / ".djb" / "share-preferences.json"
+    settings.validate()
+    target = Path(path) if path is not None else draft_path()
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = json.dumps({
         "preset": settings.preset, "realtime": settings.realtime,
@@ -188,41 +259,65 @@ def save_local(settings: ShareSettings, path: Path | None = None) -> Path:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, target)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+    if load_local(target) != settings:
+        raise ValueError("草稿回读不一致")
     return target
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """打开共享设置窗口；无图形环境返回 3 并打印一行说明。"""
-    parser = argparse.ArgumentParser(prog="djb gui", description="S3 共享设置窗口")
-    parser.add_argument("--preset", choices=("saver", "balanced", "full"), default="balanced")
+    parser = argparse.ArgumentParser(prog="djb gui", description="共享偏好草稿（尚未生效）")
+    parser.add_argument("--home", help="本机草稿目录；不会修改运行配置")
+    parser.add_argument("--preset", choices=("saver", "balanced", "full"), default=None)
     parser.add_argument("--no-realtime", action="store_true")
     parser.add_argument("--no-batch", action="store_true")
-    parser.add_argument("--network", action="store_true", help="开启组网参与（默认关）")
-    parser.add_argument("--upload-mbps", type=float, default=0.0, help="实测上行 Mbps")
+    parser.add_argument("--network", action="store_true", help="记录组网草稿意向（不实际开启）")
+    parser.add_argument("--upload-mbps", type=float, default=0.0, help="手动输入上行 Mbps，非实时检测")
     args = parser.parse_args(list(argv) if argv is not None else None)
-    settings = ShareSettings(preset=args.preset, realtime=not args.no_realtime,
-                             batch=not args.no_batch, network=args.network)
+    path = draft_path(args.home)
+    source_message = "未找到本地草稿，使用编辑默认值；不是运行配置。"
+    blocked = False
+    try:
+        settings = load_local(path)
+        source_message = "已回读本地草稿；不是运行配置。"
+    except FileNotFoundError:
+        settings = ShareSettings()
+    except (OSError, ValueError, TypeError):
+        settings = ShareSettings()
+        source_message = "原草稿不可读，已阻止覆盖。请先备份并修复草稿，再重新打开。"
+        blocked = True
+    settings = replace(settings, preset=args.preset or settings.preset,
+                       realtime=False if args.no_realtime else settings.realtime,
+                       batch=False if args.no_batch else settings.batch,
+                       network=True if args.network else settings.network)
     try:
         settings.validate()
+        if not math.isfinite(args.upload_mbps) or args.upload_mbps < 0:
+            raise ValueError("上行 Mbps 必须为非负有限数")
     except ValueError as exc:
         print(f"参数不合法：{exc}", file=sys.stderr)
         return 2
     try:
         backend = TkBackend(settings)
-    except HeadlessError as exc:
-        print(f"{HEADLESS_HINT}（{exc}）")
+    except HeadlessError:
+        print(HEADLESS_HINT)
         return EXIT_HEADLESS
+    if hasattr(backend, "set_draft_source"):
+        backend.set_draft_source(path, source_message)
+
     def _save(value: ShareSettings) -> None:
-        target = save_local(value)
-        print(f"已保存共享偏好：{target}（daemon 重载待接线）")
+        if blocked:
+            raise ValueError("原草稿不可读，禁止覆盖")
+        save_local(value, path)
+        print("草稿已保存并回读，尚未生效；未调用 daemon reload。")
 
     window = ShareWindow(backend, settings, save_sink=_save,
-                         network_ok=args.upload_mbps >= 50.0,
-                         upload_mbps=args.upload_mbps)
+                         network_ok=args.upload_mbps >= 50.0, upload_mbps=args.upload_mbps)
     window.run()
     return EXIT_OK

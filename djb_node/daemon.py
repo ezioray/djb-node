@@ -53,12 +53,33 @@ from .util import (iso, new_request_id, new_token, parse_iso, sha256_hex, utcnow
 # ─────────────────────────────────────────────────────────── 控制套接字
 def control_socket_file(paths: Paths) -> str:
     """Unix socket 路径上限 ~108 字节；太长时退到 /tmp 的确定性命中路径。"""
+    if os.name == "nt":
+        from .ipc_windows import Win32, pipe_name, unavailable
+        if not windows_control_enabled(paths):
+            raise unavailable()
+        return pipe_name(paths.home, Win32().current_identity())
     primary = paths.socket_file
     if len(primary) <= 100:
         return primary
     import hashlib
     digest = hashlib.sha256(paths.home.encode("utf-8")).hexdigest()[:12]
     return os.path.join("/tmp", "djb-" + str(os.getuid()) + "-" + digest + ".sock")
+
+
+def windows_control_enabled(paths: Paths) -> bool:
+    """Fresh loader on every boundary; parse/config/expiry failures are closed."""
+    from .ipc_windows import fresh_enabled
+    return fresh_enabled(lambda: load_config(paths))
+
+
+def control_server_factory(paths: Paths, handler, *, stop_event):
+    if os.name == "nt":
+        from .ipc_windows import WindowsControlServer, unavailable
+        if not windows_control_enabled(paths):
+            raise unavailable()
+        return WindowsControlServer(paths.home, handler, stop_event=stop_event,
+                                    enabled=lambda: windows_control_enabled(paths))
+    return ControlServer(control_socket_file(paths), handler, stop_event=stop_event)
 
 
 class ControlServer(threading.Thread):
@@ -150,10 +171,14 @@ class ControlServer(threading.Thread):
 class ControlClient:
     def __init__(self, paths: Paths) -> None:
         self.paths = paths
-        self.socket_path = control_socket_file(paths)
+        self.socket_path = None if os.name == "nt" else control_socket_file(paths)
 
     def call(self, command: dict[str, Any], *, timeout: float = 5.0) -> dict[str, Any]:
         from .errors import NotRunningError
+        if os.name == "nt":
+            from .ipc_windows import windows_call
+            return windows_call(self.paths.home, command, timeout=timeout,
+                                enabled=lambda: windows_control_enabled(self.paths))
         if not os.path.exists(self.socket_path):
             raise NotRunningError("daemon 未运行（控制套接字不存在）：先 djb start")
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -293,8 +318,12 @@ class Daemon:
 
     # ── 启动 / 停止
     def start(self) -> dict[str, Any]:
+        if getattr(self, "_start_cleanup_incomplete", False):
+            raise UsageError("启动清理未完成，拒绝重复启动")
         if self._started:
             return self.status()
+        if os.name == "nt":
+            return self._start_windows()
         self.paths.prepare()
         if not self.store.is_initialized():
             raise NotInstalledError("本机未初始化：先执行 djb init")
@@ -316,6 +345,99 @@ class Daemon:
         self._control.open()
         self._control.start()
         self.server.start()
+        self._started = True
+        event("daemon.started", port=self.server.port, pid=os.getpid(),
+              protocol_version=facts.PROTOCOL_VERSION)
+        self._bootstrap()
+        self._start_channel()
+        self._start_model_sync()
+        self._start_notifications()
+        if self._user_paused:
+            self._transition_pause("user_paused")
+        return self.status()
+
+    def _start_windows(self) -> dict[str, Any]:
+        """Transport preflight first; rollback only resources from this attempt."""
+        if getattr(self, "_start_cleanup_incomplete", False) or self._control is not None:
+            raise UsageError("已有控制实例或未完全回收的启动，请勿重复启动")
+        from .ipc_windows import IpcUnavailable
+        control = None
+        self._control_unavailable_reason = None
+        previous_state = self.store.get_kv("daemon_state")
+        previous_runtime = self.store.get_kv("runtime")
+        previous_snapshot = self.machine.snapshot
+        opened = False
+        mirror_owned = False
+        old_stop = self._stop_event.is_set()
+        if getattr(self.server, "_server", None) is not None or getattr(self.server, "_thread", None) is not None:
+            raise UsageError("本次启动不得接管既有本机镜像listener")
+        try:
+            try:
+                control = control_server_factory(self.paths, self.control, stop_event=self._stop_event)
+                control.open()
+                opened = True
+            except IpcUnavailable:
+                # The authenticated control plane is optional, never replaced by TCP.
+                if control is not None:
+                    try:
+                        control.close_bound()
+                    except Exception:
+                        self._control = control
+                        self._start_cleanup_incomplete = True
+                        raise
+                control = None
+                self._control_unavailable_reason = "windows_control_unsupported"
+                event("daemon.control_unavailable", reason=self._control_unavailable_reason)
+            self.paths.prepare()
+            if not self.store.is_initialized():
+                raise NotInstalledError("本机未初始化：先执行 djb init")
+            setup_logging(self.paths.log_file, level=self.config.log_level)
+            self.credentials.ensure_permissions()
+            self.server.bind()
+            mirror_owned = True
+            self.machine.restore(Snapshot(state="stopped", since=iso(self._now())))
+            self.machine.start()
+            self._persist()
+            self.store.set_kv("runtime", {"pid": os.getpid(), "port": self.server.port,
+                                          "started_at": iso(self._now()), "loopback_only": True,
+                                          "token_fingerprint": self.server.token_fingerprint()})
+            self._control = control
+            if control is not None:
+                control.start()
+            self.server.start()
+        except BaseException:
+            control_alive = getattr(self, "_start_cleanup_incomplete", False)
+            try:
+                if opened:
+                    if control.is_alive():
+                        self._stop_event.set()
+                        control.join(timeout=2.0)
+                        control_alive = control.is_alive()
+                    else:
+                        control.close_bound()
+            except Exception:
+                control_alive = True  # retain ownership on uncertain cleanup
+            if mirror_owned:
+                try:
+                    self.server.close_bound()
+                except Exception:
+                    # Preserve the original startup error; do not stop another running listener.
+                    control_alive = True
+            if not old_stop and not control_alive:
+                self._stop_event.clear()
+            self._control = control if control_alive else None
+            self._start_cleanup_incomplete = control_alive
+            try:
+                self.machine.restore(previous_snapshot)
+                self.store.set_kv("daemon_state", previous_state)
+                self.store.set_kv("runtime", previous_runtime)
+            except Exception:
+                self._control = control  # preserve any owned control reference
+                self._start_cleanup_incomplete = True
+            if self._start_cleanup_incomplete:
+                event("daemon.start_cleanup_incomplete", level="warning")
+            raise
+        self._start_cleanup_incomplete = False
         self._started = True
         event("daemon.started", port=self.server.port, pid=os.getpid(),
               protocol_version=facts.PROTOCOL_VERSION)
@@ -424,6 +546,8 @@ class Daemon:
         return 0
 
     def stop(self) -> None:
+        if os.name == "nt" and not self._started and self._control is not None:
+            raise UsageError("Windows 控制启动清理未完成；拒绝完整stop或重复操作")
         if not self._started and self._control is None:
             return
         event("daemon.stopping")
@@ -445,9 +569,14 @@ class Daemon:
         self.store.set_kv("runtime", {})
         if self._control is not None:
             self._control.join(timeout=2.0)
+            if os.name == "nt" and self._control.is_alive():
+                event("daemon.stop_cleanup_incomplete", level="warning")
+                # Preserve ownership and prevent another start/stop claiming full cleanup.
+                self._started = False
+                raise UsageError("Windows 控制线程尚未回收；清理未完成")
             self._control = None
-        socket_path = control_socket_file(self.paths)
-        if os.path.exists(socket_path):
+        socket_path = control_socket_file(self.paths) if os.name != "nt" else None
+        if socket_path is not None and os.path.exists(socket_path):
             try:
                 os.unlink(socket_path)
             except OSError:
@@ -1122,6 +1251,7 @@ class Daemon:
         profile = self.store.profile()
         return {
             "state": snapshot.state,
+            "control": self.control_status(),
             "reason": snapshot.reason,
             "reason_label": reason_label(snapshot.reason),
             "next_step": snapshot.next_step,
@@ -1178,8 +1308,19 @@ class Daemon:
             "timestamp": iso(self._now()),
         }
 
+    def control_status(self) -> dict[str, Any]:
+        """Control transport availability is independent from daemon health."""
+        reason = getattr(self, "_control_unavailable_reason", None)
+        available = (reason is None and self._control is not None
+                     and self._control.is_alive())
+        return {"available": available,
+                "reason": None if available else (reason or "control_not_running")}
+
     # ── 控制命令
     def control(self, command: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self, "_control_unavailable_reason", None) is not None:
+            from .ipc_windows import IpcUnavailable
+            raise IpcUnavailable("Windows 控制通道不受支持；daemon独立运行，未执行控制命令")
         action = str(command.get("cmd") or "").strip()
         if action in ("ping", ""):
             return {"ok": True, "pid": os.getpid()}

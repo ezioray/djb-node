@@ -155,17 +155,33 @@ class NotificationStore:
             return self._connection
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), mode=0o700,
                     exist_ok=True)
+        windows_files = (self.db_path, self.db_path + "-wal", self.db_path + "-shm")
+        if os.name == "nt":
+            from .file_security import create_private_file_object
+            # Pre-create all SQLite writable sidecars with explicit private DACL.
+            # This is object confidentiality, NOT ancestor/path authentication.
+            for path in windows_files:
+                create_private_file_object(os.path.abspath(path))
         connection = sqlite3.connect(self.db_path, timeout=10.0,
                                      check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=5000")
-        with connection:
-            for statement in _SCHEMA_SQL:
-                connection.execute(statement)
-            connection.execute("PRAGMA user_version="
-                               + str(facts.NOTIFICATIONS_SCHEMA_VERSION))
-        _chmod_private(self.db_path)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            with connection:
+                for statement in _SCHEMA_SQL:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version="
+                                   + str(facts.NOTIFICATIONS_SCHEMA_VERSION))
+            if os.name == "nt":
+                from .file_security import assert_private_file_object
+                for path in windows_files:
+                    assert_private_file_object(os.path.abspath(path))
+            else:
+                _chmod_private(self.db_path)
+        except BaseException:
+            connection.close()
+            raise
         self._connection = connection
         return connection
 

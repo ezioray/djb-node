@@ -48,6 +48,9 @@ from ..errors import UsageError
 from ..logging_setup import event
 from .model import TrayAction, TrayIntent, TrayMenuItem, TrayModel
 from .notifications import FETCH_LIMIT, summarize
+from ..gui.theme import COLORS, menu_options
+from .actions import apply_control, control_enabled
+from .panels import DesktopPanel, project_pages
 
 __all__ = [
     "Backend",
@@ -130,6 +133,8 @@ class TrayApp:
         self._notifications_provider = notifications_provider
         self._intent_sink = intent_sink
         self._interval_ms = int(interval_ms)
+        self._status_known = False
+        self._notifications_known = False
         self._model: TrayModel | None = None
         self._timer: Any = None
         self._closed = False
@@ -153,10 +158,17 @@ class TrayApp:
     def refresh(self) -> TrayModel:
         """拉一次 provider 并渲染（唯一写界面的入口；顺序固定 title → items → badge）。"""
         status = self._collect(self._status_provider, {})
-        notifications = self._collect(self._notifications_provider, ())
+        # Legacy model still consumes an empty fallback; UI keeps failure metadata.
+        unavailable = object()
+        notification_result = self._collect(self._notifications_provider, unavailable)
+        notifications = () if notification_result is unavailable else notification_result
+        notification_context = {"known": False} if notification_result is unavailable else notification_result
         model = TrayModel.build(status if isinstance(status, Mapping) else {},
                                 self._summary(notifications))
         self._model = model
+        context = getattr(self._backend, "set_context", None)
+        if callable(context):
+            context(status, notification_context)
         self._backend.set_title(model.status_line())
         self._backend.set_menu_items(model.items)
         self._backend.set_badge(self._badge_of(model))
@@ -168,7 +180,7 @@ class TrayApp:
             value = provider()
         except Exception as exc:                       # 托盘是旁路：provider 崩了也不能拖垮壳
             event("tray.provider_failed", level="warning",
-                  error=type(exc).__name__, message=str(exc)[:200])
+                  error=type(exc).__name__)
             return default
         return default if value is None else value
 
@@ -250,7 +262,15 @@ class TkBackend:
         self._title = str(title)
         self._badge: str | None = None
         self._handler: Callable[[str], None] | None = None
-        self._menu = self._tk.Menu(self._root, tearoff=0)
+        self._menu = self._tk.Menu(self._root, tearoff=0, **menu_options())
+        self._context = ({}, ())
+        self._panel = None
+        self._refresh_handler = lambda: None
+        self._control_enabled = lambda: False
+        self._root.configure(background=COLORS["bg"])
+        self._root.bind("<F10>", self._keyboard_popup)
+        self._root.bind("<Shift-F10>", self._keyboard_popup)
+        self._root.bind("<Escape>", lambda _e: self._hide())
         self._icon = self._make_icon()
         self._attach()
         self.set_title(self._title)
@@ -271,7 +291,7 @@ class TkBackend:
         self._menu.delete(0, "end")
         for item in items:
             self._menu.add_command(
-                label=_menu_label(item), command=self._command(item.key),
+                label=self._visible_label(item), command=self._command(item.key),
                 state="normal" if item.enabled else "disabled")
 
     def after(self, delay_ms: int, callback: Callable[[], None]) -> Any:
@@ -287,6 +307,99 @@ class TkBackend:
         except Exception:                              # 已销毁 / 解释器已退出：忽略
             pass
 
+    def set_context(self, status, notifications) -> None:
+        self._context = (status, notifications)
+        if self._panel is not None:
+            self._render_panel()
+
+    def set_refresh_handler(self, handler) -> None:
+        self._refresh_handler = handler
+
+    def set_control_enabled(self, enabled) -> None:
+        self._control_enabled = enabled
+
+    def _visible_label(self, item):
+        label = _menu_label(item)
+        status, notifications = self._context
+        known = isinstance(status, Mapping) and status.get("state") in (
+            "online", "starting", "paused", "updating", "stopped", "error")
+        if item.key == "status":
+            if not known:
+                return "? 状态未知 / 打开只读面板"
+            labels = {"online": "运行中", "starting": "启动中", "paused": "已暂停",
+                      "updating": "更新中", "stopped": "已停止", "error": "错误"}
+            return "状态 / " + labels[status["state"]] + " / 只读面板"
+        if item.key == "messages":
+            if not isinstance(notifications, (list, tuple)):
+                return "! 消息读取失败 / 请刷新"
+            return label + (" / P0 重要·静默" if item.badge and item.badge.startswith("!") else " / 只读")
+        if item.action in (TrayAction.PAUSE, TrayAction.RESUME):
+            return label + (" / 确认后执行并回读" if self._control_enabled() else " / 命令指南·未执行")
+        if item.action in (TrayAction.DIAGNOSE, TrayAction.OPEN_LOGS):
+            return label + " / 命令指南·未执行"
+        return label
+
+    def _render_panel(self):
+        status, notifications = self._context
+        self._panel.render(project_pages(
+            status if isinstance(status, Mapping) else {},
+            notifications if isinstance(notifications, (list, tuple)) else None,
+            status_known=isinstance(status, Mapping) and status.get("state") in (
+                "online", "starting", "paused", "updating", "stopped", "error"),
+            notifications_known=isinstance(notifications, (list, tuple))))
+
+    def show_page(self, page):
+        if self._panel is None:
+            self._panel = DesktopPanel(self._root, self._tk, refresh=self._refresh_handler)
+        self._render_panel()
+        self._panel.show(page)
+
+    def show_feedback(self, title, message):
+        # Nonmodal, silent, no bell or default system messagebox sounds.
+        from tkinter import ttk
+        window = self._tk.Toplevel(self._root)
+        from ..gui.theme import apply_theme
+        apply_theme(window, ttk)
+        window.title("DJB / " + title)
+        window.geometry("640x300")
+        body = ttk.Frame(window, padding=24)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="◢ " + title, style="Signal.TLabel").pack(anchor="w")
+        ttk.Label(body, text=message, wraplength=580).pack(fill="x", pady=20)
+        close = ttk.Button(body, text="关闭 / Esc", command=window.destroy)
+        close.pack(anchor="e")
+        close.focus_set()
+        window.bind("<Escape>", lambda _e: window.destroy())
+
+    def confirm_control(self, message):
+        from tkinter import ttk
+        from ..gui.theme import apply_theme
+        window = self._tk.Toplevel(self._root)
+        apply_theme(window, ttk)
+        window.title("DJB / 确认本机控制")
+        window.geometry("640x300")
+        choice = [False]
+        body = ttk.Frame(window, padding=24)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="! 影响确认 / 可取消", style="Warning.TLabel").pack(anchor="w")
+        ttk.Label(body, text=message, wraplength=580).pack(fill="x", pady=24)
+        def accept():
+            choice[0] = True
+            window.destroy()
+        ttk.Button(body, text="确认执行并回读", command=accept).pack(side="right")
+        cancel = ttk.Button(body, text="取消 / Esc", command=window.destroy)
+        cancel.pack(side="left")
+        cancel.focus_set()
+        window.bind("<Escape>", lambda _e: window.destroy())
+        window.grab_set()
+        self._root.wait_window(window)
+        return choice[0]
+
+    def _keyboard_popup(self, _event):
+        self._menu.tk_popup(self._root.winfo_rootx() + 20, self._root.winfo_rooty() + 20)
+        self._menu.grab_release()
+        return "break"
+
     # ─────────────────────────────────────────────────── 窗口细节
     def _attach(self) -> None:
         """把菜单挂到系统菜单栏（macOS）或右键（Windows / Linux）。"""
@@ -300,8 +413,10 @@ class TkBackend:
     def _make_icon(self) -> Any:
         """16×16 纯色图标（不下载图片资源；窗口管理器不支持时静默省略）。"""
         icon = self._tk.PhotoImage(width=16, height=16)
-        icon.put("#2f6feb", to=(0, 0, 16, 16))
-        icon.put("#ffffff", to=(5, 5, 11, 11))
+        icon.put(COLORS["bg"], to=(0, 0, 16, 16))
+        icon.put(COLORS["cyan"], to=(2, 4, 5, 14))
+        icon.put(COLORS["cyan"], to=(5, 11, 12, 14))
+        icon.put(COLORS["violet"], to=(10, 2, 14, 10))
         try:
             self._root.iconphoto(True, icon)
         except Exception:                              # 部分 WM 不支持 iconphoto：省略图标
@@ -310,7 +425,14 @@ class TkBackend:
 
     def _apply_title(self) -> None:
         suffix = " [" + self._badge + "]" if self._badge else ""
-        self._root.title(self._title + suffix)
+        status, notifications = self._context
+        if not isinstance(status, Mapping) or status.get("state") not in (
+                "online", "starting", "paused", "updating", "stopped", "error"):
+            self._root.title("DJB / ? 状态未知 · 请刷新" + suffix)
+        else:
+            labels = {"online": "运行中", "starting": "启动中", "paused": "已暂停",
+                      "updating": "更新中", "stopped": "已停止", "error": "错误"}
+            self._root.title("DJB / " + labels[status["state"]] + suffix)
 
     def _popup(self, event: Any) -> None:
         try:
@@ -369,8 +491,7 @@ def _run_cli_json(cli_args: Sequence[str], *, timeout: float = CLI_TIMEOUT_S) ->
         return None
     if completed.returncode != 0:
         event("tray.cli_failed", level="warning", command=label,
-              exit_code=completed.returncode,
-              message=(completed.stderr or "").strip()[:200])
+              exit_code=completed.returncode)
         return None
     try:
         return json.loads(completed.stdout or "")
@@ -401,6 +522,65 @@ def _rows(value: Any) -> tuple[Mapping[str, Any], ...]:
     except TypeError:
         return ()
     return tuple(item for item in items if isinstance(item, Mapping))
+
+
+def desktop_status():
+    """Strict UI provider; legacy cli_status fallback remains API-compatible."""
+    payload = _run_cli_json(("status", "--json"))
+    return dict(payload) if isinstance(payload, Mapping) else {"state": "unknown"}
+
+
+def desktop_notifications():
+    payload = _run_cli_json(("notify", "list", "--json", "--limit", str(FETCH_LIMIT)))
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("items"), list):
+        return {"known": False}
+    rows = payload["items"]
+    if any(not isinstance(row, Mapping) for row in rows):
+        return {"known": False}
+    return _rows(rows)
+
+
+def desktop_intent_sink(backend, *, refresh):
+    """Bind real read-only panels and guarded local control; guides are explicit."""
+    def enabled():
+        # Existing daemon IPC is AF_UNIX/POSIX; do not pretend Windows is supported.
+        if sys.platform == "win32":
+            return False
+        try:
+            from ..config import Paths, load_config, resolve_home
+            return control_enabled(load_config(Paths(resolve_home())))
+        except Exception:
+            return False
+
+    if hasattr(backend, "set_control_enabled"):
+        backend.set_control_enabled(enabled)
+
+    def sink(intent):
+        if intent.action is TrayAction.QUIT:
+            return
+        if intent.action in (TrayAction.OPEN_STATUS, TrayAction.OPEN_MESSAGES):
+            refresh()
+            backend.show_page("运行" if intent.action is TrayAction.OPEN_STATUS else "通知")
+            event("tray.panel_opened", action=intent.action.value)
+            return
+        if intent.action in (TrayAction.PAUSE, TrayAction.RESUME) and enabled():
+            from ..config import Paths, resolve_home
+            from ..daemon import ControlClient
+            def call(command, *, timeout):
+                return ControlClient(Paths(resolve_home())).call(command, timeout=timeout)
+            result = apply_control(intent.action, call=call,
+                                   enabled=enabled, confirm=backend.confirm_control)
+            refresh()
+            backend.show_feedback("本机控制回读", result.message)
+            event("tray.control_result", action=intent.action.value, verified=result.verified)
+            return
+        backend.show_feedback("命令指南 / 未执行", "此动作未自动执行。\n\n"
+                              + " ".join(intent.command) + "\n\n" + intent.description
+                              + ("\nWindows 本机控制 IPC 尚未通过支持验证；不会执行托盘控制。"
+                                 if sys.platform == "win32" and intent.action in (TrayAction.PAUSE, TrayAction.RESUME) else "")
+                              + "\n执行后请刷新核对实际状态。")
+        event("tray.command_guide", action=intent.action.value)
+    return sink
 
 
 # ─────────────────────────────────────────────────────────── 默认 sink / 日志 / 入口
@@ -455,8 +635,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(HEADLESS_HINT + "：" + str(exc))
         return EXIT_HEADLESS
     _setup_logging()
-    app = TrayApp(backend, cli_status, cli_notifications, _default_intent_sink,
-                  interval_ms=args.interval_ms)
+    # Old injected backends preserve the seven-method protocol and intent-only contract.
+    interactive = callable(getattr(backend, "show_page", None))
+    app = TrayApp(backend, desktop_status if interactive else cli_status,
+                  desktop_notifications if interactive else cli_notifications,
+                  _default_intent_sink, interval_ms=args.interval_ms)
+    if interactive:
+        backend.set_refresh_handler(app.refresh)
+        app._intent_sink = desktop_intent_sink(backend, refresh=app.refresh)
     try:
         app.run()
     except KeyboardInterrupt:                          # 从终端启动时 Ctrl-C = 退出托盘
