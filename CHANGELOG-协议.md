@@ -3,6 +3,107 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.3.0 · 2026-10-30 · MINOR
+
+**类型**：MINOR（纯加性：3 个请求字段 / 3 个公告 schema / 1 个错误码 / 1 个可选响应头；
+无删除、无类型更改、无既有 path / schema 语义变更；路径 153、操作 176 不变，schema 281 → 284）
+
+**变更**
+1. **网关请求三字段（全部可选，缺省行为不变）**：
+   - `ChatCompletionRequest.djb_proxy_mode`：`fidelity|balanced|max_save`，缺省 `fidelity`；
+   - `ChatCompletionRequest.djb_composition`：`single|mono_pair|hetero_pair`，缺省 `single`；
+   - `ChatCompletionRequest.djb_effort`：`minimal|low|medium|high|auto`，缺省 `auto`。
+   旧请求不带三字段时，代理档位保持 `fidelity`，逐字节行为不变。
+2. **节点公告 `capacity_announcement.token_route`（整体可选）**：
+   `supported` 必填；`supported=true` 时 `model_pairs[]` / `p_hist` / `overlap` /
+   `max_concurrency_seg` / `stale_after_s` 必填。新增 schema `TokenRoute` /
+   `TokenRouteModelPair` / `TokenRoutePHist`。
+3. **词表门**：`TokenRouteModelPair.vocab_fingerprint` **必填**（`hash` 64 位小写十六进制 +
+   `vocab_size`）；两侧不一致的组合不可公告，不允许“能跑就跑”。
+4. **错误码 `40003`**：仅当 `service_tier=batch` 且**显式**请求 `djb_proxy_mode ∈ {balanced,
+   max_save}`；`fidelity` / 未指定不触发。与 `40001`（格式/值错）、`40002`（参数不被认识）
+   语义互斥；响应体带 `conflicts[]` 与可选项列表（`Error.error.conflicts[]` 已声明，可选）。
+5. **诊断头 `X-DJB-Proxy-Diag`**：`/v1/chat/completions` 200 可选返回
+   `mode=...; reason=...; downgraded_from=...`；`fidelity` 下可缺省，客户端必须容忍缺失。
+6. 未新增路径 / 操作；未改任何既有字段的类型、必填性或语义。
+
+**影响面**
+- M04 scheduler-pricing：`resolve()` 可消费三字段；24 格投影不变。
+- M03 gateway：透传三字段，映射 `40003`，回填诊断头。
+- M02 node-supply：心跳容量公告可带 `token_route`；老节点不报仍合法。
+- M15 client-runtime：请求构造可带三字段；不识别时按 tolerant reader 忽略。
+- SDK / 文档站：新增可选字段与枚举；未知枚举值仍按 tolerant reader 处理。
+
+**兼容矩阵**
+- v1 未发布 → N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无**（全部为可选字段/可选对象；`vocab_fingerprint` 仅在新对象且
+  `supported=true` 时必填）。
+- 老请求：不带 `djb_*` 字段 → `fidelity` / `single` / `auto`，行为与 1.2.15 一致。
+- 老节点：不报 `token_route` → 不参与代理模式，不报错。
+
+**门禁与证据**
+- `tools/ci/spec_compat.py HEAD`：无删除 / 改类型 / 新增既有必填（本轮执行）。
+- `tests/test_spec_contract.py`、`tests/supply/test_spec_routes.py`：route-vs-spec 差集 0。
+- `tests/test_spec_1_3_0.py`：三字段默认值 / token_route 条件必填 / 40003 / 诊断头。
+- 证据：`ops/audit/reports/S4-SPEC-1.3.0-20261030.md`。
+
+**复核人**：lead（提议 / 实现）· release-manager（发布窗口内复核）
+
+**备注**
+- `djb_effort=auto` 只在 `single` 形态可用；`mono_pair` / `hetero_pair` 下必须显式选，
+  否则 `40001`（不静默猜）。
+- `token_route.model_pairs[].vocab_fingerprint` 复用 M18 `tokenizer_hash` 口径的待裁决项
+  仍未关闭；本版先按 v0.3 设计落 `vocab_fingerprint`，不改 M18 既有字段。
+
+**补登 · 2026-10-31 · M07 代理授权契约面（纯加性：+3 路径 / +4 操作 / +3 schema）**
+
+**类型**：MINOR（纯加性：**3 条路径 / 4 个操作 / 3 个 schema**；无删除、无类型更改、无既有
+path / schema 语义变更、无既有必填性变化）。**版本号不升**：1.3.0 尚未发布（无 tag），
+本次只把已实现的 W1 契约面登记进同一版本。文件当前合计 **157 路径 / 181 操作 / 289 schema**，
+其中另含同期在途的 `POST /api/v1/auth/step-up` 加性条目（由 MFA 卡单独登记，不在本条内计数）。
+
+**变更**
+1. `GET /api/v1/user/nodes/{node_id}/proxy-authorization`（`getProxyAuthorization`）：
+   读取当前账户对该节点的代理授权状态；鉴权 `userBearer`。
+2. `PUT /api/v1/user/nodes/{node_id}/proxy-authorization`（`putProxyAuthorization`）：
+   写入授权（单节点单行 upsert）；请求体 `ProxyAuthorizationUpdate`；
+   可选头 `X-Admin-Step-Up`（仅 `proxy_serve=true` 时需要）。
+3. `DELETE /api/v1/user/nodes/{node_id}/proxy-authorization/{scope}`
+   （`deleteProxyAuthorization`）：按 `scope ∈ {proxy_serve, proxy_model_pairs}` 单项撤销。
+4. `GET /api/v1/node/proxy-authorization`（`getNodeProxyAuthorization`）：节点侧只读自身授权；
+   鉴权 `nodeClientKey`（`X-Client-Key`）。
+5. 新增 schema：`ProxyAuthorizationState`（7 必填字段）、`ProxyAuthorizationUpdate`
+   （`proxy_serve` 必填）、`ProxyModelPair`（`execution_model` / `lead_model` 必填，≤128 字符）。
+
+**语义（登记既有实现，不改行为）**
+- **默认关闭**：无授权记录时 `proxy_serve=false`、`model_pairs=[]`、`revision=0`、`active=false`，
+  返回 200 而不是 404；`active=true` 当且仅当已开启且未撤销。
+- **step-up 双口径**：开启/修改需 step-up；当前实现返回 **403 + `40301`**，平台登记口径为
+  **424 + `42401`**（`StepUpRequired`），客户端必须同时处理两种；撤销单项与关闭开关不需要 step-up。
+- **越权/不存在统一 404 + `40401`**（不泄露节点存在性）；账户归属只读 M02 供给节点快照。
+- `model_pairs` 缺省按空数组处理（**等价于清空白名单**），重复项去重、按
+  `execution_model, lead_model` 稳定排序。
+- `revision` 每次成功写入（PUT / DELETE）递增 1：重复 PUT 不产生重复行、最终状态一致，
+  但 `revision` 会变（**非严格幂等**，客户端以返回值为准）。
+- 审计：变更写 `node_events`（`kind=proxy_authorization`），payload 只含 action / 布尔 /
+  模型对 / revision，**不含凭据、请求正文或价格**。
+- 节点侧的 `account_id` 固定为 `null`（不向节点暴露账户标识）。
+
+**影响面**
+- M07 节点代理：契约面首次登记（此前实现已上线、spec 未登记，属漏登记补齐）。
+- M02 node-supply：账户归属判定只读 `v_supply_node_snapshot`，不新增写路径。
+- 客户端 / SDK：新增 4 个操作与 3 个 schema；未调用者无感知，未知字段按 tolerant reader 处理。
+- 管理面 / 资金面：无改动。
+
+**兼容矩阵**
+- 纯加性：v1 未发布 → N/N-1/N-2 不适用；无存量客户端。
+- 破坏性变更：无（既有 path / schema 未改；仅新增）。
+
+**复核人**：contract-authz（制单）· 复核人：lead（待签）· 证据：
+`reports/proxy-authz-contract/`（报告 / diff / 静态校验 / 实现对账脚本）
+
+---
+
 ## 1.2.16 · 2026-10-30 · MINOR（含一处文档订正）
 
 **类型**：MINOR（新增 1 个错误码、补登 1 个错误码、订正 1 处既有码的语义文档；**不改结构 / 路径 / 操作 / schema**）
