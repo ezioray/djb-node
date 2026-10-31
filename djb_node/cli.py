@@ -40,6 +40,8 @@ from .relay import RelayError, RelayManager, capacity_targets
 from .secure import CredentialStore
 from .state import StateMachine, Snapshot
 from .store import ProfileRecord, Store, UpstreamRecord
+from . import plan_router
+from . import store as store_module
 from . import tokens as tokens_mod
 from .update import UpdateManager
 from .upstream import (UpstreamManager, a2_prompt, parse_models, probe_upstream,
@@ -801,6 +803,166 @@ def cmd_token(args: argparse.Namespace) -> int:
     return 0
 
 
+# ─────────────────────────────────────────── plan（多 plan 组 / 组级共享预算）
+def _plan_flag_state(config: ClientConfig) -> dict[str, Any]:
+    """当前 ``plan.groups`` 开关状态（写操作也必须报「现在生效吗」）。"""
+    spec = facts.FEATURE_FLAGS.get(facts.PLAN_GROUPS_FLAG) or {}
+    enabled = feature_flag(config, facts.PLAN_GROUPS_FLAG)
+    return {"name": facts.PLAN_GROUPS_FLAG, "enabled": enabled,
+            "default": bool(spec.get("default", False)),
+            "owner": spec.get("owner"), "expire_at": spec.get("expire_at"),
+            "note": ("开关已开启（重启 daemon 后生效）" if enabled else
+                     "开关关闭：配置照常保存，但**当前不生效**；"
+                     "djb flags --enable " + facts.PLAN_GROUPS_FLAG + " 后重启 daemon 生效")}
+
+
+def _plan_group_text(group: dict[str, Any], now: Any = None) -> str:
+    """一个组的人类可读摘要（CLI 文本输出用）。"""
+    view = plan_router.budget_view(group, now)
+    members = ", ".join(
+        str(item.get("upstream_id")) + "(p" + str(item.get("priority", 0))
+        + "/w" + str(item.get("weight", 1)) + ("" if item.get("enabled", True) else "/关")
+        + ")" for item in view["members"]) or "（没有成员）"
+    return (str(view["group"]) + " · priority " + str(view["priority"])
+            + ("" if view["enabled"] else " · 组已关")
+            + " · 日 " + str(view["spent_day_usd"]) + "/" + str(view["budget_day_usd"])
+            + " · 月 " + str(view["spent_month_usd"]) + "/" + str(view["budget_month_usd"])
+            + (" · ⛔ 预算耗尽（" + str(view["budget_exhausted"]) + "）"
+               if view["budget_exhausted"] else "")
+            + " · token 日/月 " + str(view["spent_tokens_day"]) + "/"
+            + str(view["spent_tokens_month"])
+            + (" · 无 usage 请求 " + str(view["unknown_usage_count"])
+               if view["unknown_usage_count"] else "")
+            + (" · 允许降级" if view["allow_model_downgrade"] else "")
+            + "\n    成员：" + members)
+
+
+def _plan_minor(value: Any) -> int:
+    """CLI 金额字符串 -> minor；非法输入按用法错误（退出码 2）。"""
+    try:
+        return plan_router.parse_usd_minor(value)
+    except ValueError as exc:
+        raise UsageError(str(exc))
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """多 plan 组 / 组级共享预算：只动本机 state.db，不碰凭据、不发请求。"""
+    paths, config, store = _context(args)
+    action = getattr(args, "plan_action", "group.list") or "group.list"
+    flag = _plan_flag_state(config)
+    now = utcnow()
+    note = "\n" + str(flag["note"]) if action != "group.list" and action != "budget.show" else ""
+    show_note = "\n" + str(flag["note"])
+
+    if action == "group.add":
+        day = None if getattr(args, "no_day", False) else (
+            _plan_minor(args.day) if getattr(args, "day", None) else None)
+        month = None if getattr(args, "no_month", False) else (
+            _plan_minor(args.month) if getattr(args, "month", None) else None)
+        group = store.add_plan_group(
+            name=args.name, budget_day_minor=day, budget_month_minor=month,
+            priority=int(getattr(args, "priority", 100) or 100),
+            enabled=not getattr(args, "disabled", False),
+            allow_model_downgrade=bool(getattr(args, "allow_downgrade", False)),
+            model_fallbacks=getattr(args, "fallback", None) or (), now=now)
+        payload = {"action": action, "group": plan_router.budget_view(group, now), "flag": flag}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: ("已建组 " + str(value["group"]["group"]) + "（id "
+                                  + str(value["group"]["id"]) + "）\n"
+                                  + _plan_group_text(group, now) + note))
+        return 0
+
+    if action == "group.list":
+        groups = store.plan_groups()
+        payload = {"action": action, "count": len(groups),
+                   "groups": [plan_router.budget_view(item, now) for item in groups],
+                   "flag": flag}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: ("\n".join(_plan_group_text(item, now) for item in groups)
+                                 if groups else "（没有 plan 组）") + show_note)
+        return 0
+
+    if action == "group.remove":
+        removed = store.remove_plan_group(args.group)
+        payload = {"action": action, "group": args.group, "removed": removed, "flag": flag}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: (("已删组 " + str(value["group"])) if removed
+                                  else ("组不存在，未改动：" + str(value["group"]))))
+        return 0
+
+    if action == "group.add-upstream":
+        group = store.add_plan_group_member(
+            args.group, upstream_id=args.id,
+            priority=int(getattr(args, "priority", 100) or 100),
+            weight=int(getattr(args, "weight", 1) or 1),
+            enabled=not getattr(args, "disabled", False), now=now)
+        payload = {"action": action, "group": plan_router.budget_view(group, now), "flag": flag}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: ("已加入 " + str(args.id) + " → "
+                                  + str(value["group"]["group"]) + "\n"
+                                  + _plan_group_text(group, now) + note))
+        return 0
+
+    if action == "group.remove-upstream":
+        removed = store.remove_plan_group_member(args.group, args.id, now=now)
+        payload = {"action": action, "group": args.group, "upstream_id": args.id,
+                   "removed": removed, "flag": flag}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: (("已移出 " + str(args.id) + " ← " + str(value["group"]))
+                                  if removed else
+                                  ("该上游不在组里，未改动：" + str(args.id))))
+        return 0
+
+    if action == "budget.set":
+        if not getattr(args, "group", None):
+            raise UsageError("budget set 需要 --group（组名或 id）")
+        day: Any = store_module.UNSET
+        month: Any = store_module.UNSET
+        downgrade: Any = store_module.UNSET
+        fallbacks: Any = store_module.UNSET
+        if getattr(args, "no_day", False):
+            day = None
+        elif getattr(args, "day", None):
+            day = _plan_minor(args.day)
+        if getattr(args, "no_month", False):
+            month = None
+        elif getattr(args, "month", None):
+            month = _plan_minor(args.month)
+        if getattr(args, "allow_downgrade", False):
+            downgrade = True
+        if getattr(args, "no_downgrade", False):
+            downgrade = False
+        if getattr(args, "fallback", None) is not None:
+            fallbacks = args.fallback
+        if (day is store_module.UNSET and month is store_module.UNSET
+                and downgrade is store_module.UNSET and fallbacks is store_module.UNSET):
+            raise UsageError("没给要改的东西：--day/--month/--no-day/--no-month/"
+                             "--allow-downgrade/--no-downgrade/--fallback 至少一个")
+        group = store.set_plan_budget(args.group, day_minor=day, month_minor=month,
+                                      allow_model_downgrade=downgrade,
+                                      model_fallbacks=fallbacks, now=now)
+        payload = {"action": action, "group": plan_router.budget_view(group, now), "flag": flag}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: ("已更新预算 " + str(value["group"]["group"]) + "\n"
+                                  + _plan_group_text(group, now) + note))
+        return 0
+
+    if action == "budget.show":
+        key = getattr(args, "group", None)
+        groups = [store.plan_group(key)] if key else store.plan_groups()
+        payload = {"action": action, "count": len(groups),
+                   "groups": [plan_router.budget_view(item, now) for item in groups],
+                   "flag": flag}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: ("\n".join(_plan_group_text(item, now) for item in groups)
+                                  if groups else "（没有 plan 组）")
+              + "\n金额口径：minor（USD x 100 整数）；拿不到单价只记 token、"
+                "没有 usage 只计 unknown_usage_count；切换与耗尽都会写事件日志。" + show_note)
+        return 0
+
+    raise UsageError("未知的 plan 动作：" + str(action))
+
+
 def cmd_flags(args: argparse.Namespace) -> int:
     """查看 / 设置本机特性开关（默认关闭；只允许登记过的开关）。"""
     paths, config, store = _context(args)
@@ -1501,6 +1663,65 @@ def build_parser() -> argparse.ArgumentParser:
     model_sync_sub.add_parser("sync", help="手动拉取并应用一次（失败保留旧版）")
     for child in model_sync_sub.choices.values():
         _sub_flags(child)
+
+    plan_cmd = add_common(cmd_plan, "plan",
+                          "多 plan 组：组内自动切换 + 组级共享预算（开关 plan.groups）")
+    plan_sub = plan_cmd.add_subparsers(dest="plan_action", metavar="<group|budget>")
+    plan_group = plan_sub.add_parser("group", help="组与成员：add / list / remove / add-upstream / remove-upstream")
+    plan_group_sub = plan_group.add_subparsers(dest="plan_group_action", metavar="<action>")
+    _sub_flags(plan_group)
+    pg_add = plan_group_sub.add_parser("add", help="建组（金额是 USD 字符串，如 1.50）")
+    pg_add.add_argument("--name", required=True, help="组名（唯一）")
+    pg_add.add_argument("--priority", type=int, default=100, help="组优先级（小的先选）")
+    pg_add.add_argument("--day", help="日预算 USD（如 1.50；不填=不限）")
+    pg_add.add_argument("--month", help="月预算 USD（如 30.00；不填=不限）")
+    pg_add.add_argument("--no-day", action="store_true", help="日预算不限")
+    pg_add.add_argument("--no-month", action="store_true", help="月预算不限")
+    pg_add.add_argument("--disabled", action="store_true", help="建成关闭状态")
+    pg_add.add_argument("--allow-downgrade", action="store_true",
+                        help="允许跨模型降级（默认禁止；需同时配 --fallback）")
+    pg_add.add_argument("--fallback", help="降级链，逗号分隔（默认空）")
+    _sub_flags(pg_add)
+    pg_add.set_defaults(plan_action="group.add")
+    pg_list = plan_group_sub.add_parser("list", help="列出组 / 成员 / 已花预算")
+    _sub_flags(pg_list)
+    pg_list.set_defaults(plan_action="group.list")
+    pg_remove = plan_group_sub.add_parser("remove", help="删组（连同成员；不动上游）")
+    pg_remove.add_argument("--group", required=True, help="组名或 id")
+    _sub_flags(pg_remove)
+    pg_remove.set_defaults(plan_action="group.remove")
+    pg_member = plan_group_sub.add_parser("add-upstream", help="把上游加进组")
+    pg_member.add_argument("--group", required=True, help="组名或 id")
+    pg_member.add_argument("--id", required=True, help="上游 id")
+    pg_member.add_argument("--priority", type=int, default=100, help="组内优先级（小的先用）")
+    pg_member.add_argument("--weight", type=int, default=1, help="同优先级内权重（1–1000）")
+    pg_member.add_argument("--disabled", action="store_true", help="加入但先停用")
+    _sub_flags(pg_member)
+    pg_member.set_defaults(plan_action="group.add-upstream")
+    pg_unmember = plan_group_sub.add_parser("remove-upstream", help="把上游移出组")
+    pg_unmember.add_argument("--group", required=True, help="组名或 id")
+    pg_unmember.add_argument("--id", required=True, help="上游 id")
+    _sub_flags(pg_unmember)
+    pg_unmember.set_defaults(plan_action="group.remove-upstream")
+
+    plan_budget = plan_sub.add_parser("budget", help="组预算是 / 设置（日 / 月，USD）")
+    plan_budget_sub = plan_budget.add_subparsers(dest="plan_budget_action", metavar="<action>")
+    _sub_flags(plan_budget)
+    pb_set = plan_budget_sub.add_parser("set", help="设置日 / 月预算（不改上游与凭据）")
+    pb_set.add_argument("--group", required=True, help="组名或 id")
+    pb_set.add_argument("--day", help="日预算 USD（如 1.50）")
+    pb_set.add_argument("--month", help="月预算 USD（如 30.00）")
+    pb_set.add_argument("--no-day", action="store_true", help="取消日预算上限")
+    pb_set.add_argument("--no-month", action="store_true", help="取消月预算上限")
+    pb_set.add_argument("--allow-downgrade", action="store_true", help="允许跨模型降级")
+    pb_set.add_argument("--no-downgrade", action="store_true", help="禁止跨模型降级")
+    pb_set.add_argument("--fallback", help="降级链，逗号分隔（空串=清空）")
+    _sub_flags(pb_set)
+    pb_set.set_defaults(plan_action="budget.set")
+    pb_show = plan_budget_sub.add_parser("show", help="看已花 / 剩余 / 是否耗尽")
+    pb_show.add_argument("--group", help="只看一个组（组名或 id）")
+    _sub_flags(pb_show)
+    pb_show.set_defaults(plan_action="budget.show")
 
     flags = add_common(cmd_flags, "flags", "查看 / 设置本机特性开关（默认关闭）")
     flags.add_argument("--enable", metavar="NAME")

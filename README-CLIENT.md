@@ -38,7 +38,8 @@ S2 P1 增量（2026-10-24，默认开关关闭）：平台抽象层（Windows/ma
 | djb limits | 查看 / 设置并发、日周月配额、资源上限、时段、让路 | --preset --daily-tokens --weekly-tokens --monthly-tokens --concurrent --cpu/--gpu/--mem --yield/--no-yield --schedule --schedule-json --clear-schedule |
 | djb upstream | A1/A2/B 上游、模型开关与最低价、探测、relay、A2 prompt | add / list / probe / discover / map / unmap / relay / enable / disable / price / remove / a2-prompt / declare |
 | djb token count | 本地 token 计数（不联网；估算值标 estimated） | --model --text --file --messages --tools |
-| djb flags | 查看 / 设置本机特性开关（登记表 4 条，默认关闭） | --enable NAME / --disable NAME |
+| djb plan | 多 plan 组：组与成员、组级共享日/月预算（金额 USD，内部按 minor 整数记账） | group add/list/remove/add-upstream/remove-upstream；budget set/show |
+| djb flags | 查看 / 设置本机特性开关（登记表见 facts.FEATURE_FLAGS，默认关闭） | --enable NAME / --disable NAME |
 | djb attest | 查看本地模型身份证明记录（客户端线索，不自我宣称 verified） | --id --model |
 | djb announce | 手动公告容量（模型 / 价格 / QPS） | --dry-run |
 | djb update | 更新骨架：检查 / 安装 / 回滚 / 状态 | --check --apply --rollback --status --source --channel |
@@ -58,6 +59,7 @@ S2 P1 增量（2026-10-24，默认开关关闭）：平台抽象层（Windows/ma
 | token 计数 | `djb token count --model M --text ...`；返回 tokens / tokenizer / estimated；无 tiktoken 时启发式（中文 ≈1 token/字） | `client.token.compare.enabled`（差异检测） | 关闭 → 只记录上游 usage，不比较 |
 | 第三方中转站 | `djb upstream add --kind third_party_relay --auth bearer --secret-stdin` → `discover` → `map`；未映射不公告 | `client.relay.enabled` | 关闭 → 隐藏写路径；已有配置只读、不删除 |
 | 模型身份证明 | 客户端产出 L0–L5 证据线索，`djb attest` 查看；本地不宣称 verified | `supply.attestation.enabled` | 关闭 → 回退 L2 可达性；已存证明只读 |
+| 多 plan 组 | `djb plan group add --name main --day 1.00 --month 30.00` → `add-upstream --group main --id <upstream>`；请求按组 priority → 成员 priority → 同档 weight 选一个上游，429/401/403/5xx/超时会换下一个（最多 3 次），组预算（日/月，USD，minor 整数）耗尽整组跳过 | `plan.groups` | 关闭（默认即关）→ 退回单上游 `route()` 路径，库表与 spent_* 只读保留；库版本只前进（v4） |
 | 平台抽象层 | `platform.paths` / `service` / `credentials`；Linux 路径与 S1 逐字一致，macOS/Windows 默认目录按系统约定 | 无 | — |
 
 开关三字段（owner / expire_at / rollback_rule）登记在 `djb_node/facts.py`；`djb flags` 只能改登记过的开关，

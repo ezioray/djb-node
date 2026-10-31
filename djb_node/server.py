@@ -22,14 +22,15 @@ from __future__ import annotations
 
 import hmac
 import json
+import random
 import socket
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import ThreadingMixIn
-from typing import Iterator, Any, Protocol
+from typing import Callable, Iterator, Any, Protocol
 
-from . import facts, protocol, tokens, upstream_protocols as up
+from . import facts, plan_router, protocol, tokens, upstream_protocols as up
 from .errors import PortInUseError, UsageError
 from .httpclient import HttpClient, InputStream, join_url
 from .logging_setup import event
@@ -49,6 +50,24 @@ class RouteTarget:
     credential: str | None = None
     #: 上游协议：``openai-chat``（缺省）/ ``anthropic-messages``（R4-3）
     protocol: str = "openai-chat"
+
+
+@dataclass
+class AttemptResult:
+    """一次上游转发尝试的结论（plan 组模式用来决定「换下一个 / 就此作罢」）。
+
+    * ``delivered``：是否已经把响应（或错误信封）写给客户端；
+    * ``ok``：上游返回的是否 2xx；
+    * ``status``：上游 HTTP 状态（网络层失败为 ``None``）；
+    * ``error_kind``：``timeout`` / ``unreachable`` / ``http_<code>`` 等错误类别；
+    * ``usage``：``(prompt, completion, total)``；上游没回 usage 时为 ``None``。
+    """
+
+    delivered: bool = True
+    ok: bool = False
+    status: int | None = None
+    error_kind: str | None = None
+    usage: tuple[int, int, int] | None = None
 
 
 @dataclass
@@ -123,6 +142,8 @@ class LocalApiServer:
         self.http = http or HttpClient(timeout=UPSTREAM_TIMEOUT_S)
         # C8：开关宿主（client.* 配置树 / extra）；缺省 None = 按 facts 默认（关闭）
         self.settings = dict(settings or {})
+        # plan 组：进程内的冷却 / 失败计数 / 统计（**不持久化**，重启即清空）
+        self._plan_state = plan_router.GroupState()
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -203,6 +224,59 @@ class LocalApiServer:
     def token_compare_enabled(self) -> bool:
         """开关 ``client.token.compare.enabled``（默认关闭 = 只记录上游 usage）。"""
         return tokens.compare_enabled(self.settings)
+
+    # ── plan 组（开关 plan.groups；默认关闭 = 走原来的单上游 route() 路径）
+    def plan_groups_enabled(self) -> bool:
+        """开关 ``plan.groups``（默认关闭）。关闭时 ``plan_*`` 一律不被调用。"""
+        return tokens.flag_enabled(facts.PLAN_GROUPS_FLAG, self.settings)
+
+    def plan_state(self) -> Any:
+        """进程内的组态（冷却 / 失败计数 / 统计）；重启即清空，不落库。"""
+        return self._plan_state
+
+    def plan_stats(self) -> dict[str, int]:
+        """plan 路由的进程内计数快照（``failover_total`` 等，供事件/排障读取）。"""
+        return plan_router.stats_snapshot(self._plan_state)
+
+    def plan_groups(self) -> list[Any]:
+        """plan 组快照（由运行时提供）。
+
+        运行时没实现 / 读库失败 -> 返回空表并记一条 ``plan.groups_unavailable`` 事件
+        （不静默）；上层看到空表会退回原来的单上游路径并记 ``plan.no_groups``。
+        """
+        getter = getattr(self.runtime, "plan_groups", None)
+        if not callable(getter):
+            return []
+        try:
+            return list(getter() or [])
+        except Exception as exc:                           # pragma: no cover - 防御
+            event("plan.groups_unavailable", level="warning", error=type(exc).__name__)
+            return []
+
+    def plan_route(self, upstream_id: str, model: str) -> RouteTarget | None:
+        """把组内成员解析成 RouteTarget（凭据在运行时侧取，永不进日志）。"""
+        resolver = getattr(self.runtime, "plan_route", None)
+        if not callable(resolver):
+            return None
+        try:
+            return resolver(upstream_id, model)
+        except Exception as exc:                           # pragma: no cover - 防御
+            event("plan.route_failed", level="warning", model=model,
+                  error=type(exc).__name__)
+            return None
+
+    def plan_charge(self, target: Any, model: str,
+                    usage: tuple[int, int, int] | None) -> dict[str, Any]:
+        """成功请求的组预算记账（运行时实现；失败只记事件，不影响已发出的响应）。"""
+        charger = getattr(self.runtime, "plan_charge", None)
+        if not callable(charger):
+            return {}
+        try:
+            return dict(charger(target, model, usage) or {})
+        except Exception as exc:                           # pragma: no cover - 防御
+            event("plan.charge_failed", level="warning", model=model,
+                  error=type(exc).__name__)
+            return {}
 
 
 # ─────────────────────────────────────────────────────────── HTTP handler
@@ -359,33 +433,26 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                             reason=admission.reason, retry_after=admission.retry_after,
                             extra_headers=extra)
                 return
+            # plan 组模式（开关 plan.groups 打开 **且** 有组）：组内自动切换。
+            # 开关关闭时下面这个 if 的第一项就是 False，plan_groups() 都不会被调用，
+            # 行为与接入前逐字节一致。
+            if server.plan_groups_enabled():
+                if server.plan_groups():
+                    self._handle_chat_plan(request_id, model, payload, stream)
+                    return
+                event("plan.no_groups", level="warning", model=model,
+                      reason="empty", request_id=request_id)
             target = server.runtime.route(model)
             if target is None:
                 self._error(503, facts.LOCAL_ERROR_CODES["no_upstream"],
                             "没有可用的上游能服务该模型", request_id)
                 return
-            upstream_headers: dict[str, str] = {}
-            anthropic = up.is_anthropic(getattr(target, "protocol", None))
-            if anthropic:
-                if target.credential:
-                    upstream_headers["x-api-key"] = target.credential
-                upstream_headers["anthropic-version"] = up.ANTHROPIC_VERSION
-                url = join_url(target.base_url.rstrip("/"),
-                               up.messages_path("anthropic-messages",
-                                                target.base_url.rstrip("/")))
-                try:
-                    payload = up.to_anthropic_request(payload)
-                except up.ProtocolError as exc:
-                    self._error(400, facts.LOCAL_ERROR_CODES["invalid_request"],
-                                "请求无法转换为上游协议：" + str(exc), request_id)
-                    return
-            else:
-                if target.credential:
-                    upstream_headers["Authorization"] = "Bearer " + target.credential
-                url = join_url(target.base_url.rstrip("/"),
-                               "/chat/completions"
-                               if target.base_url.rstrip("/").endswith("/v1")
-                               else "/v1/chat/completions")
+            try:
+                url, upstream_headers, payload = upstream_request(target, payload)
+            except up.ProtocolError as exc:
+                self._error(400, facts.LOCAL_ERROR_CODES["invalid_request"],
+                            "请求无法转换为上游协议：" + str(exc), request_id)
+                return
             begin = getattr(server.runtime, "begin_task", None)
             end = getattr(server.runtime, "end_task", None)
             if callable(begin):
@@ -401,26 +468,147 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                 if callable(end):
                     end()
 
+        # ── plan 组模式（开关 plan.groups）
+        def _handle_chat_plan(self, request_id: str, model: str,
+                              payload: dict[str, Any], stream: bool) -> None:
+            """组内按 priority 选上游；失败按 ``should_failover`` 切下一个，最多 3 次。
+
+            口径（与 ``plan_router`` 的 docstring 一致）：
+
+            * 每次尝试都重新 ``pick_target``：组按 priority、成员按 priority + weight，
+              预算耗尽的组 / 冷却中的凭据 / 本请求试过的上游都会被跳过；
+            * 切换**不换模型**（``target.model`` 与请求一致）；只有组显式开了
+              ``allow_model_downgrade`` 才会降级，且降级一定留 ``plan.model_downgrade`` 事件；
+            * ``400`` 这类「换 plan 也没用」的失败按原逻辑直发客户端，不消耗额外尝试；
+            * 全部不可用 → ``503``（**不**瞎选一个）；
+            * 成功 → ``record_outcome`` 清失败计数 + ``plan_charge`` 记组预算 + ``plan.chat`` 事件。
+
+            日志只含组名 / upstream_id / 状态码 / 金额 / token，**不含凭据与请求正文**。
+            """
+            groups = server.plan_groups()
+            state = server.plan_state()
+            tried: list[str] = []
+            attempts = 0
+            last: AttemptResult | None = None
+            begin = getattr(server.runtime, "begin_task", None)
+            end = getattr(server.runtime, "end_task", None)
+            if callable(begin):
+                begin()
+            try:
+                while attempts < plan_router.MAX_ATTEMPTS:
+                    target = plan_router.pick_target(groups, model=model, state=state,
+                                                     exclude=tried,
+                                                     picker=_plan_picker)
+                    if target is None:
+                        break
+                    tried.append(target.upstream_id)
+                    resolved = server.plan_route(target.upstream_id, target.model)
+                    if resolved is None:
+                        # 该上游不服务这个模型：不是「尝试失败」，不消耗尝试次数
+                        event("plan.skip_upstream", level="warning", model=model,
+                              group=target.group, upstream_id=target.upstream_id,
+                              reason="model_unavailable", request_id=request_id)
+                        continue
+                    attempts += 1
+                    body_in = payload
+                    if target.model != model:                  # 只有显式允许才会发生
+                        body_in = dict(payload, model=target.model)
+                        event("plan.model_downgrade", level="warning", model=model,
+                              downgraded_to=target.model, group=target.group,
+                              upstream_id=target.upstream_id, request_id=request_id)
+                    try:
+                        url, headers, body = upstream_request(resolved, body_in)
+                    except up.ProtocolError as exc:
+                        self._error(400, facts.LOCAL_ERROR_CODES["invalid_request"],
+                                    "请求无法转换为上游协议：" + str(exc), request_id)
+                        return
+                    attempt_no = attempts
+
+                    def _retry(status: int | None, error_kind: str | None,
+                               _n: int = attempt_no) -> bool:
+                        # 最后一次尝试按原逻辑直发（不再咽错误）
+                        return (_n < plan_router.MAX_ATTEMPTS
+                                and plan_router.should_failover(status, error_kind)[0])
+
+                    if stream:
+                        result = self._forward_stream(url, body, headers, model,
+                                                      request_id, resolved,
+                                                      retry_hook=_retry)
+                    else:
+                        result = self._forward_json(url, body, headers, model,
+                                                    request_id, resolved,
+                                                    retry_hook=_retry)
+                    last = result
+                    failover, reason = plan_router.record_outcome(
+                        state, target, status=result.status,
+                        error_kind=result.error_kind)
+                    if result.ok:                              # 2xx：记账 + 收工
+                        charged = server.plan_charge(target, target.model, result.usage)
+                        event("plan.chat", model=model, served_model=target.model,
+                              group=target.group, upstream_id=target.upstream_id,
+                              status=result.status, cost_minor=charged.get("cost_minor"),
+                              tokens=(result.usage[2] if result.usage else None),
+                              spent_day_minor=charged.get("spent_usd_minor_day"),
+                              spent_month_minor=charged.get("spent_usd_minor_month"),
+                              price_known=charged.get("price_known"),
+                              request_id=request_id)
+                        return
+                    if not failover:
+                        if result.delivered:
+                            event("plan.not_retryable", level="warning", model=model,
+                                  group=target.group, upstream_id=target.upstream_id,
+                                  status=result.status, request_id=request_id)
+                            return
+                        break
+                    event("plan.failover", level="warning", model=model,
+                          group=target.group, upstream_id=target.upstream_id,
+                          status=result.status, error_class=result.error_kind,
+                          reason=reason, attempt=attempts, request_id=request_id)
+                    if result.delivered:                       # 最后一次：错误已发出
+                        return
+            finally:
+                if callable(end):
+                    end()
+            if last is not None and last.delivered:
+                return
+            event("plan.no_target", level="warning", model=model,
+                  reason=("attempts_exhausted" if attempts else "no_target"),
+                  attempts=attempts, stats=server.plan_stats(), request_id=request_id)
+            self._error(503, facts.LOCAL_ERROR_CODES["no_upstream"],
+                        "plan 组全部不可用（预算耗尽 / 凭据冷却 / 全部失败）："
+                        "djb plan budget show 查看预算", request_id)
+
         # ── 转发：非流式
         def _forward_json(self, url: str, payload: dict[str, Any],
                           headers: dict[str, str], model: str, request_id: str,
-                          target: RouteTarget) -> None:
+                          target: RouteTarget,
+                          retry_hook: Callable[[int | None, str | None], bool] | None = None,
+                          ) -> AttemptResult:
+            """非流式转发。``retry_hook`` 非空时（plan 组模式）可「先不回客户端」地返回，
+            让上层换下一个 plan 重试；为 ``None`` 时行为与接入前完全一致。"""
             from .errors import NetworkError
             try:
                 response = server.http.request("POST", url, headers=headers,
                                                json_body=payload,
                                                timeout=UPSTREAM_TIMEOUT_S)
             except NetworkError as exc:
+                kind = str(exc.reason)
+                event("local_api.upstream_failed", level="warning", model=model,
+                      error_class=kind, request_id=request_id)
+                if retry_hook is not None and retry_hook(None, kind):
+                    return AttemptResult(delivered=False, status=None, error_kind=kind)
                 status = 504 if exc.reason == "timeout" else 502
                 code = (facts.LOCAL_ERROR_CODES["upstream_timeout"]
                         if exc.reason == "timeout"
                         else facts.LOCAL_ERROR_CODES["upstream_error"])
                 self._error(status, code, "上游" + ("超时" if exc.reason == "timeout"
                                                    else "不可达"), request_id)
-                event("local_api.upstream_failed", level="warning", model=model,
-                      error_class=str(exc.reason), request_id=request_id)
-                return
+                return AttemptResult(delivered=True, status=None, error_kind=kind)
             self._echo_upstream_status(response.status, response, model, request_id)
+            if (retry_hook is not None and not 200 <= response.status < 300
+                    and retry_hook(response.status, "http_" + str(response.status))):
+                return AttemptResult(delivered=False, status=response.status,
+                                     error_kind="http_" + str(response.status))
             if up.is_anthropic(getattr(target, "protocol", None)):
                 try:
                     converted = openai_body_from_anthropic(response.json(), model=model)
@@ -454,6 +642,11 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
             event("local_api.chat", model=model, status=response.status,
                   access=target.access, duration_ms=response.elapsed_ms,
                   tokens=(usage[2] if usage else None), request_id=request_id)
+            succeeded = 200 <= response.status < 300
+            return AttemptResult(delivered=True, ok=succeeded, status=response.status,
+                                 error_kind=(None if succeeded
+                                             else "http_" + str(response.status)),
+                                 usage=usage)
 
         def _echo_upstream_status(self, status: int, response: Any, model: str,
                                   request_id: str) -> None:
@@ -495,18 +688,26 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
         # ── 转发：SSE
         def _forward_stream(self, url: str, payload: dict[str, Any],
                             headers: dict[str, str], model: str, request_id: str,
-                            target: RouteTarget) -> None:
+                            target: RouteTarget,
+                            retry_hook: Callable[[int | None, str | None], bool] | None = None,
+                            ) -> AttemptResult:
+            """SSE 透传。``retry_hook`` 语义同 ``_forward_json``（plan 组模式用）。"""
             from .errors import NetworkError
             try:
                 stream = server.http.open_stream("POST", url, headers=headers,
                                                  json_body=payload,
                                                  timeout=UPSTREAM_TIMEOUT_S)
             except NetworkError as exc:
+                kind = str(exc.reason)
+                if retry_hook is not None and retry_hook(None, kind):
+                    event("local_api.upstream_failed", level="warning", model=model,
+                          error_class=kind, request_id=request_id)
+                    return AttemptResult(delivered=False, status=None, error_kind=kind)
                 status = 504 if exc.reason == "timeout" else 502
                 code = (facts.LOCAL_ERROR_CODES["upstream_timeout"]
                         if exc.reason == "timeout" else facts.LOCAL_ERROR_CODES["upstream_error"])
                 self._error(status, code, "上游不可达", request_id)
-                return
+                return AttemptResult(delivered=True, status=None, error_kind=kind)
             with stream:
                 if stream.status >= 400:
                     body = b""
@@ -514,11 +715,16 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                         body = stream._response.read()
                     except Exception:                          # pragma: no cover
                         body = b""
+                    if (retry_hook is not None
+                            and retry_hook(stream.status, "http_" + str(stream.status))):
+                        return AttemptResult(delivered=False, status=stream.status,
+                                             error_kind="http_" + str(stream.status))
                     self._error(502, facts.LOCAL_ERROR_CODES["upstream_error"],
                                 "上游拒绝请求（HTTP " + str(stream.status) + "）", request_id)
                     event("local_api.stream_rejected", level="warning", model=model,
                           status=stream.status, request_id=request_id)
-                    return
+                    return AttemptResult(delivered=True, status=stream.status,
+                                         error_kind="http_" + str(stream.status))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -557,6 +763,7 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                 event("local_api.chat_stream", model=model, status=200,
                       access=target.access, tokens=(usage[2] if usage else None),
                       request_id=request_id)
+                return AttemptResult(delivered=True, ok=True, status=200, usage=usage)
 
         def _relay_anthropic_stream(self, stream: Any, *, model: str,
                                     request_id: str) -> tuple[int, int, int] | None:
@@ -589,6 +796,40 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
             return prompt, completion, prompt + completion
 
     return Handler
+
+
+def _plan_picker(total: int) -> int:
+    """同 priority 档内的加权随机票号（``plan_router.pick_target`` 的 ``picker``）。
+
+    ``pick_target`` 默认的 picker 恒返回 0（便于单测确定性）；生产路径必须注入真随机，
+    否则同档内 ``weight`` 不生效。
+    """
+    return random.randrange(max(1, int(total)))
+
+
+def upstream_request(target: RouteTarget, payload: dict[str, Any]
+                     ) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """按上游协议算出 ``(url, headers, body)``（_handle_chat 与 plan 组模式共用）。
+
+    * ``anthropic-messages``：``x-api-key`` + ``anthropic-version``，body 走协议转换；
+    * ``openai-chat``：``Authorization: Bearer``，base 以 ``/v1`` 结尾时不重复拼。
+
+    转换失败抛 ``upstream_protocols.ProtocolError``（调用方按 400 处理）。
+    凭据只进 headers，**不进日志**。
+    """
+    headers: dict[str, str] = {}
+    base = target.base_url.rstrip("/")
+    if up.is_anthropic(getattr(target, "protocol", None)):
+        if target.credential:
+            headers["x-api-key"] = target.credential
+        headers["anthropic-version"] = up.ANTHROPIC_VERSION
+        url = join_url(base, up.messages_path("anthropic-messages", base))
+        return url, headers, up.to_anthropic_request(payload)
+    if target.credential:
+        headers["Authorization"] = "Bearer " + target.credential
+    url = join_url(base, "/chat/completions" if base.endswith("/v1")
+                   else "/v1/chat/completions")
+    return url, headers, payload
 
 
 def _usage_from_json(payload: Any) -> tuple[int, int, int] | None:
