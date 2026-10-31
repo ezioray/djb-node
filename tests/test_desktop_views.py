@@ -335,3 +335,13 @@ def test_access_view_says_valid_after_save(tmp_path):
                                         "note": "", "path": "/tmp/x"}})
     text = vw.build_view("access", source.snapshot()).plain_text()
     assert "通过校验" in text and "已绑定" in text
+
+
+def test_earnings_all_money_cards_say_unavailable_together():
+    """整域取不到时四张金额卡口径一致（不许一张「暂不可用」三张「—」）。"""
+    from djb_node.desktop.datasource import FakeDataSource
+
+    source = FakeDataSource({})          # 只给空 sections：earnings 不可用
+    text = vw.build_view("earnings", source.snapshot()).plain_text()
+    assert text.count("暂不可用") >= 4
+    assert "0.00" not in text and "USDT 0" not in text

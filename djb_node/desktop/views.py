@@ -173,6 +173,14 @@ def _num(value: Any) -> str:
     return str(value)
 
 
+def _money(snapshot: Snapshot, name: str, value: Any, currency: str = "") -> str:
+    """金额卡：整域不可用就统一说「暂不可用」；缺单个值给「—」，绝不补 0。"""
+    if not snapshot.ok(name):
+        return UNAVAILABLE
+    text = _num(value)
+    return text + " " + currency if currency and text != "—" else text
+
+
 def _flag(value: Any, true: str, false: str, unknown: str = "暂不可用") -> str:
     if value is True:
         return MARK_DONE + " " + true
@@ -434,11 +442,14 @@ def _earnings(snapshot: Snapshot) -> View:
     return View(
         key="earnings", title="收益",
         subtitle="按完成任务直接结算 " + currency,
-        cards=(Card("今日", _count(snapshot, "earnings", _num(earnings.get("today")) + " " + currency),
+        cards=(Card("今日", _money(snapshot, "earnings", earnings.get("today"), currency),
                     "完成即结算", "mint"),
-               Card("待结算", _num(earnings.get("pending")), "结算中不代表到账", "amber"),
-               Card("已结算", _num(earnings.get("settled")), "链上确认后计入", "default"),
-               Card("余额（额度）", _num(earnings.get("balance")), "推理额度，不可提现", "muted")),
+               Card("待结算", _money(snapshot, "earnings", earnings.get("pending")),
+                    "结算中不代表到账", "amber"),
+               Card("已结算", _money(snapshot, "earnings", earnings.get("settled")),
+                    "链上确认后计入", "default"),
+               Card("余额（额度）", _money(snapshot, "earnings", earnings.get("balance")),
+                    "推理额度，不可提现", "muted")),
         table=Table(("出款", "金额", "币种", "状态", "时间"), tuple(rows),
                     note=str(earnings.get("note") or ""), empty="暂无出款记录"),
         actions=(Action("earnings.export", "导出明细", enabled=bool(rows),
