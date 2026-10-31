@@ -24,7 +24,7 @@ from . import facts
 from .errors import StoreDowngradeError, StoreNotInitializedError
 from .util import iso, new_install_id, parse_iso, sha256_hex, utcnow
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL: tuple[str, ...] = (
     """
@@ -65,6 +65,7 @@ _SCHEMA_SQL: tuple[str, ...] = (
         state TEXT NOT NULL,
         last_probe_at TEXT,
         protocol TEXT,
+        upstream_kind TEXT,
         created_at TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1
     )
@@ -213,6 +214,7 @@ class UpstreamRecord:
     protocol: str
     created_at: str
     enabled: bool
+    upstream_kind: str | None = None        # M17 §4.1；NULL=未标注
 
     def model_ids(self) -> list[str]:
         return [str(item.get("id")) for item in self.models if item.get("id")]
@@ -322,6 +324,9 @@ class Store:
                 if version < 1:
                     for statement in _SCHEMA_SQL:
                         connection.execute(statement)
+                if version < 3 and not _has_column(connection, "upstreams", "upstream_kind"):
+                    # v3：上游加类型标签（M17 §4.1 upstream_kind；NULL=未标注，旧行不回填）
+                    connection.execute("ALTER TABLE upstreams ADD COLUMN upstream_kind TEXT")
                 if version < 2 and not _has_column(connection, "receipts", "stale"):
                     # v2：收据增加 stale 标记（超 24 h 不丢弃，标 stale + 停接单，Lead 裁决 CR-2）
                     connection.execute("ALTER TABLE receipts ADD COLUMN stale INTEGER"
@@ -473,16 +478,17 @@ class Store:
     def add_upstream(self, *, upstream_id: str, access_type: str, base_url: str,
                      models: list[dict[str, Any]], credential_ref: str | None,
                      protocol: str = facts.DEFAULT_UPSTREAM_PROTOCOL,
+                     upstream_kind: str | None = None,
                      state: str = "declared", created_at: str | None = None) -> UpstreamRecord:
         moment = created_at or iso(self._now())
         with self._conn() as connection:
             connection.execute(
                 "INSERT INTO upstreams (id, access_type, base_url, models, credential_ref,"
-                " state, last_probe_at, protocol, created_at, enabled)"
-                " VALUES (?,?,?,?,?,?,NULL,?,?,1)",
+                " state, last_probe_at, protocol, upstream_kind, created_at, enabled)"
+                " VALUES (?,?,?,?,?,?,NULL,?,?,?,1)",
                 (upstream_id, access_type, base_url,
                  json.dumps(models, ensure_ascii=False), credential_ref, state, protocol,
-                 moment))
+                 upstream_kind, moment))
         return self.upstream(upstream_id)
 
     def upstream(self, upstream_id: str) -> UpstreamRecord:
@@ -834,7 +840,8 @@ def _row_to_upstream(row: sqlite3.Row) -> UpstreamRecord:
         id=row["id"], access_type=row["access_type"], base_url=row["base_url"],
         models=models, credential_ref=row["credential_ref"], state=row["state"],
         last_probe_at=row["last_probe_at"], protocol=row["protocol"] or "",
-        created_at=row["created_at"], enabled=bool(row["enabled"]))
+        created_at=row["created_at"], enabled=bool(row["enabled"]),
+        upstream_kind=(row["upstream_kind"] if "upstream_kind" in row.keys() else None))
 
 
 def _row_to_policy(row: sqlite3.Row) -> PolicyRecord:

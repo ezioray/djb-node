@@ -140,6 +140,17 @@ def validate_access_type(access_type: Any) -> str:
     return value
 
 
+def validate_upstream_kind(value: Any) -> str | None:
+    """M17 §4.1 ``upstream_kind``：合法四值原样返回；未知/空/非串 → ``None``。
+
+    容忍口径与服务端一致：**未知值忽略为未标注，不报错**（新客户端打老服务端不应被拒）。
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if text in facts.UPSTREAM_KINDS else None
+
+
 def validate_base_url(base_url: Any) -> str:
     """只允许 http(s)；拒绝 userinfo（凭据不许进 URL）与空白/控制字符。"""
     text = str(base_url or "").strip()
@@ -304,6 +315,7 @@ class UpstreamManager:
 
     def add(self, *, access_type: str, base_url: str, models: str | Iterable[str],
             secret: str | None = None, protocol: str = facts.DEFAULT_UPSTREAM_PROTOCOL,
+            upstream_kind: str | None = None,
             upstream_id: str | None = None) -> UpstreamRecord:
         access = validate_access_type(access_type)
         url = validate_base_url(base_url)
@@ -314,7 +326,8 @@ class UpstreamManager:
         ref = credential_ref_for(identifier) if (secret or access == "A2") else None
         return self.store.add_upstream(
             upstream_id=identifier, access_type=access, base_url=url,
-            models=entries, credential_ref=ref, protocol=protocol)
+            models=entries, credential_ref=ref, protocol=protocol,
+            upstream_kind=validate_upstream_kind(upstream_kind))
 
     def list(self) -> list[UpstreamRecord]:
         return self.store.upstreams()
@@ -554,7 +567,7 @@ class UpstreamManager:
 
     def declare_payload(self, record: UpstreamRecord) -> dict[str, Any]:
         """M02 /node/upstream 请求体：只有引用，没有密钥。"""
-        return {
+        payload = {
             "access_type": record.access_type,
             "base_url": record.base_url,
             "models": record.model_ids(),
@@ -562,3 +575,8 @@ class UpstreamManager:
             **({"credential_handle": record.credential_ref}
                if record.credential_ref else {}),
         }
+        # M17 §4.1：kind 是可选加性字段；未标注时不出现（旧服务端行为不变）
+        kind = validate_upstream_kind(record.upstream_kind)
+        if kind:
+            payload["upstream_kind"] = kind
+        return payload
