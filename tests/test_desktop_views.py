@@ -253,10 +253,18 @@ def test_controller_save_without_reload_says_restart(tmp_path):
 def test_controller_unwired_action_is_honest(tmp_path):
     controller = make_controller(tmp_path)
     for key in ("models.save", "receipts.verify", "earnings.export",
-                "account.enable_2fa", "account.logout", "nope.unknown"):
+                "account.enable_2fa", "nope.unknown"):
         result = controller.action(key)
         assert result.ok is False, key
         assert "暂不可用" in result.message, key
+
+
+def test_logout_is_no_longer_a_stub(tmp_path):
+    """登出已接线：没登录时说「无需登出」，登录了要二次确认——不是「未接线」。"""
+    result = make_controller(tmp_path).action("account.logout", confirm=lambda _m: True)
+    assert result.ok is False
+    assert "未接线" not in result.message
+    assert "尚未登录" in result.message or "本机命令通道未接通" in result.message
 
 
 def test_controller_pause_requires_confirmation(tmp_path):
@@ -385,3 +393,63 @@ def test_account_view_labels_email_as_email_when_no_node_id():
     text = vw.build_view("account", FakeDataSource(section).snapshot()).plain_text()
     assert "节点标识" not in text
     assert "邮箱" in text and "node@example.com" in text
+
+
+# ─────────────────────────────────────────────────────────── 登出（解绑）真的接到 CLI
+def make_logout_controller(calls: list, *, payload=None, error=None):
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    section = {"account": {"profile": {"node_id": "node-7c31", "state": "active"},
+                           "security": {"storage": "file", "node_id": "node-7c31"},
+                           "note": ""}}
+
+    def cli(argv):
+        calls.append(list(argv))
+        if error is not None:
+            raise error
+        return payload if payload is not None else {"unbound": True}
+
+    return DesktopController(FakeDataSource(section), cli=cli)
+
+
+def test_logout_requires_confirmation_and_does_nothing_when_declined():
+    calls: list = []
+    controller = make_logout_controller(calls)
+    result = controller.action("account.logout", confirm=lambda _m: False)
+    assert result.ok is False and result.effect == "cancelled"
+    assert calls == []                                   # 没确认就绝不动凭据
+    assert "未改动" in result.message
+
+
+def test_logout_unbinds_through_the_cli():
+    calls: list = []
+    controller = make_logout_controller(calls)
+    result = controller.action("account.logout", confirm=lambda _m: True)
+    assert calls == [["auth", "--unbind", "--yes"]]
+    assert result.ok is True and "已登出" in result.message
+
+
+def test_logout_failure_keeps_credentials_and_says_why():
+    from djb_node.desktop.datasource import ProviderError
+
+    calls: list = []
+    controller = make_logout_controller(
+        calls, error=ProviderError("无法连接服务端（gw.test）：网络或服务不可用"))
+    result = controller.action("account.logout", confirm=lambda _m: True)
+    assert result.ok is False
+    assert "登出未成功" in result.message and "网络或服务不可用" in result.message
+    assert "本机凭据未改动" in result.message
+
+
+def test_logout_without_node_says_nothing_to_do():
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    calls: list = []
+    controller = DesktopController(FakeDataSource({"account": {"profile": {}, "security": {},
+                                                               "note": ""}}),
+                                   cli=lambda argv: calls.append(argv))
+    result = controller.action("account.logout", confirm=lambda _m: True)
+    assert result.ok is False and "尚未登录" in result.message
+    assert calls == []

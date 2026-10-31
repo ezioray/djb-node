@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from typing import Any, Mapping, Sequence
@@ -25,7 +26,7 @@ from typing import Any, Mapping, Sequence
 from .access import ACCESS_FILE, RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED
 from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
-from .datasource import FakeDataSource, LocalDataSource, Snapshot
+from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
 from .views import VIEW_KEYS, VIEW_TITLES, Action, Card, Field, Row, Table, View
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
@@ -533,6 +534,36 @@ _DEMO_SECTIONS = {
 }
 
 
+def _make_cli_runner(home):
+    """本机命令通道：显式带上 ``DJB_HOME``，避免子进程读到别的 home。"""
+    def run(argv):
+        import subprocess
+        import sys
+
+        env = dict(os.environ)
+        env["DJB_HOME"] = str(home)
+        command = [sys.executable, "-m", "djb_node", *argv]
+        if "--json" not in argv:
+            command.append("--json")
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=20,
+                                       env=env, stdin=subprocess.DEVNULL, check=False)
+        except subprocess.TimeoutExpired:
+            raise ProviderError("本地命令超时（20s）") from None
+        except OSError as exc:
+            raise ProviderError("本地命令无法执行（" + type(exc).__name__ + "）") from None
+        if completed.returncode != 0:
+            lines = [line.strip() for line in (completed.stderr or completed.stdout or "").splitlines()
+                     if line.strip() and not line.strip().startswith("details=")]
+            detail = lines[0].removeprefix("djb: ") if lines else "退出码 " + str(completed.returncode)
+            raise ProviderError(detail[:160])
+        try:
+            return json.loads(completed.stdout or "{}")
+        except ValueError:
+            raise ProviderError("本地命令输出不是 JSON") from None
+    return run
+
+
 def _make_reloader(home: str | os.PathLike | None):
     """接 daemon 的热重载：与 `djb daemon reload` **同一条控制命令**。
 
@@ -586,7 +617,8 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
     store = FileAccessStore(None if home is None else
                             os.path.join(str(home), ACCESS_FILE))
     access = AccessService(store, reloader=_make_reloader(home))
-    return DesktopController(source, access=access, control=LocalControlChannel(home), bus=bus)
+    return DesktopController(source, access=access, control=LocalControlChannel(home), bus=bus,
+                             cli=_make_cli_runner(home) if not demo else None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

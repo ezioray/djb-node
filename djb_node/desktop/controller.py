@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Sequence, Protocol, Sequence
 
 from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED,
                      AccessConfig, AccessService, FileAccessStore, SaveResult, mask_secret)
@@ -98,6 +98,7 @@ class DesktopController:
     control: ControlChannel | None = None
     bus: Any | None = None
     benchmark_runner: Callable[..., Mapping[str, Any]] = benchmark
+    cli: Callable[[Sequence[str]], Any] | None = None
     log_level: str = "all"
     message: str = DEFAULT_MESSAGE
     view: str = "overview"
@@ -322,6 +323,31 @@ class DesktopController:
         return ActionResult(outcome.message, ok=outcome.verified, effect="control",
                             payload=outcome.state)
 
+    def _act_account_logout(self, *, confirm=None) -> ActionResult:
+        """登出 = 解绑节点（服务端吊销 + 本机清凭据）。必须二次确认，失败不动凭据。"""
+        account = self.snapshot.get("account")
+        security = account.get("security") if isinstance(account, Mapping) else None
+        node_id = str((security or {}).get("node_id") or "") if isinstance(security, Mapping) else ""
+        if not node_id:
+            return ActionResult("尚未登录节点，无需登出。", ok=False)
+        if not confirm("登出会解绑节点并清除本机密钥，daemon 需要重新配对才能接单。确认登出？"):
+            return ActionResult("已取消登出（本机凭据未改动）。", ok=False, effect="cancelled")
+        if self.cli is None:
+            return ActionResult("暂不可用（本机命令通道未接通）；本机凭据未改动。", ok=False)
+        try:
+            payload = self.cli(["auth", "--unbind", "--yes"])
+        except ProviderError as exc:
+            return ActionResult("登出未成功：" + exc.reason + "；本机凭据未改动。", ok=False)
+        except Exception as exc:
+            return ActionResult("登出未成功（" + type(exc).__name__ + "）；本机凭据未改动。",
+                                ok=False)
+        if isinstance(payload, Mapping) and payload.get("ok") is False:
+            return ActionResult("登出未成功：" + str(payload.get("error") or "服务端拒绝")
+                                + "；本机凭据未改动。", ok=False)
+        self.refresh()
+        return ActionResult("已登出：节点已解绑、本机密钥已清除；重新配对后才能接单。",
+                            effect="refresh")
+
     # 未接线动作：如实说，不假装成功
     def _act_models_save(self, *, confirm=None) -> ActionResult:
         return ActionResult("暂不可用（云端意向上报接口未接线）；改动未上报，未生效。", ok=False)
@@ -334,9 +360,6 @@ class DesktopController:
 
     def _act_account_enable_2fa(self, *, confirm=None) -> ActionResult:
         return ActionResult("暂不可用（2FA 入口在服务端控制台）；本机未做任何改动。", ok=False)
-
-    def _act_account_logout(self, *, confirm=None) -> ActionResult:
-        return ActionResult("暂不可用（登出接口未接线）；本机凭据未改动。", ok=False)
 
     # ── 筛选
     def set_log_level(self, level: str) -> View:
