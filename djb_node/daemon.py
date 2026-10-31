@@ -1167,7 +1167,8 @@ class Daemon:
         secret = self.credentials.upstream_secret(record.id)
         return RouteTarget(base_url=record.base_url, model=str(entry.get("id")),
                            access=record.access_type, upstream_id=record.id,
-                           credential=secret)
+                           credential=secret,
+                           protocol=getattr(record, "protocol", None) or "openai-chat")
 
     def begin_task(self) -> None:
         with self._inflight_lock:

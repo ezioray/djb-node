@@ -27,9 +27,9 @@ import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import ThreadingMixIn
-from typing import Any, Protocol
+from typing import Iterator, Any, Protocol
 
-from . import facts, protocol, tokens
+from . import facts, protocol, tokens, upstream_protocols as up
 from .errors import PortInUseError, UsageError
 from .httpclient import HttpClient, InputStream, join_url
 from .logging_setup import event
@@ -47,6 +47,8 @@ class RouteTarget:
     access: str
     upstream_id: str
     credential: str | None = None
+    #: 上游协议：``openai-chat``（缺省）/ ``anthropic-messages``（R4-3）
+    protocol: str = "openai-chat"
 
 
 @dataclass
@@ -363,11 +365,27 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                             "没有可用的上游能服务该模型", request_id)
                 return
             upstream_headers: dict[str, str] = {}
-            if target.credential:
-                upstream_headers["Authorization"] = "Bearer " + target.credential
-            url = join_url(target.base_url.rstrip("/"),
-                           "/chat/completions" if target.base_url.rstrip("/").endswith("/v1")
-                           else "/v1/chat/completions")
+            anthropic = up.is_anthropic(getattr(target, "protocol", None))
+            if anthropic:
+                if target.credential:
+                    upstream_headers["x-api-key"] = target.credential
+                upstream_headers["anthropic-version"] = up.ANTHROPIC_VERSION
+                url = join_url(target.base_url.rstrip("/"),
+                               up.messages_path("anthropic-messages",
+                                                target.base_url.rstrip("/")))
+                try:
+                    payload = up.to_anthropic_request(payload)
+                except up.ProtocolError as exc:
+                    self._error(400, facts.LOCAL_ERROR_CODES["invalid_request"],
+                                "请求无法转换为上游协议：" + str(exc), request_id)
+                    return
+            else:
+                if target.credential:
+                    upstream_headers["Authorization"] = "Bearer " + target.credential
+                url = join_url(target.base_url.rstrip("/"),
+                               "/chat/completions"
+                               if target.base_url.rstrip("/").endswith("/v1")
+                               else "/v1/chat/completions")
             begin = getattr(server.runtime, "begin_task", None)
             end = getattr(server.runtime, "end_task", None)
             if callable(begin):
@@ -403,8 +421,17 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                       error_class=str(exc.reason), request_id=request_id)
                 return
             self._echo_upstream_status(response.status, response, model, request_id)
-            body = response.body or b"{}"
-            usage = _usage_from_json(response.json())
+            if up.is_anthropic(getattr(target, "protocol", None)):
+                try:
+                    converted = openai_body_from_anthropic(response.json(), model=model)
+                except up.ProtocolError as exc:
+                    self._error(502, facts.LOCAL_ERROR_CODES["upstream_error"],
+                                "上游响应无法解析：" + str(exc), request_id)
+                    return
+                body = json.dumps(converted, ensure_ascii=False).encode("utf-8")
+            else:
+                body = response.body or b"{}"
+            usage = _usage_from_json(json.loads(body) if body else None)
             if 200 <= response.status < 300 and usage is not None:
                 server.runtime.observe(model=model, prompt_tokens=usage[0],
                                        completion_tokens=usage[1], total_tokens=usage[2],
@@ -499,15 +526,20 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Connection", "close")
                 self.end_headers()
                 usage: tuple[int, int, int] | None = None
+                anthropic = up.is_anthropic(getattr(target, "protocol", None))
                 try:
-                    for line in stream.lines():
-                        if not line:
-                            break
-                        self.wfile.write(line)
-                        self.wfile.flush()
-                        parsed = _usage_from_sse_line(line)
-                        if parsed is not None:
-                            usage = parsed
+                    if anthropic:
+                        usage = self._relay_anthropic_stream(stream, model=model,
+                                                             request_id=request_id)
+                    else:
+                        for line in stream.lines():
+                            if not line:
+                                break
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                            parsed = _usage_from_sse_line(line)
+                            if parsed is not None:
+                                usage = parsed
                 except (BrokenPipeError, ConnectionResetError):
                     event("local_api.stream_client_gone", level="warning",
                           model=model, request_id=request_id)
@@ -525,6 +557,36 @@ def _make_handler(server: LocalApiServer) -> type[BaseHTTPRequestHandler]:
                 event("local_api.chat_stream", model=model, status=200,
                       access=target.access, tokens=(usage[2] if usage else None),
                       request_id=request_id)
+
+        def _relay_anthropic_stream(self, stream: Any, *, model: str,
+                                    request_id: str) -> tuple[int, int, int] | None:
+            """把 Anthropic SSE 转成 OpenAI ``chat.completion.chunk`` 逐条写出。
+
+            用量（input/output tokens）从映射后的 chunk 里取，返回 ``(p, c, p+c)``。
+            """
+            prompt_tokens: int | None = None
+            completion_tokens: int | None = None
+            try:
+                for chunk in up.iter_anthropic_sse(_anthropic_events(stream.lines())):
+                    usage = chunk.get("usage") or {}
+                    if isinstance(usage.get("prompt_tokens"), int):
+                        prompt_tokens = usage["prompt_tokens"]
+                    if isinstance(usage.get("completion_tokens"), int):
+                        completion_tokens = usage["completion_tokens"]
+                    line = ("data: " + json.dumps(chunk, ensure_ascii=False,
+                                                  separators=(",", ":")) + "\n\n")
+                    self.wfile.write(line.encode("utf-8"))
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except up.ProtocolError as exc:
+                event("local_api.stream_protocol_error", level="warning", model=model,
+                      error=str(exc), request_id=request_id)
+            if prompt_tokens is None and completion_tokens is None:
+                return None
+            prompt = prompt_tokens or 0
+            completion = completion_tokens or 0
+            return prompt, completion, prompt + completion
 
     return Handler
 
@@ -557,3 +619,55 @@ def _usage_from_sse_line(line: bytes) -> tuple[int, int, int] | None:
         return _usage_from_json(json.loads(data))
     except ValueError:
         return None
+
+
+def _anthropic_events(lines: Any) -> Iterator[tuple[str | None, Any]]:
+    """Anthropic SSE 字节行 → ``(event_name, data)`` 序列（供 ``iter_anthropic_sse``）。
+
+    Anthropic 的流按 ``event: xxx`` + ``data: {...}`` 成对出现；这里只做解析，
+    不做语义映射（映射在 ``upstream_protocols``，便于单测）。
+    """
+    name: str | None = None
+    for raw in lines:
+        text = raw.decode("utf-8", errors="replace").strip() if isinstance(raw, bytes) \
+            else str(raw).strip()
+        if not text:
+            name = None
+            continue
+        if text.startswith("event:"):
+            name = text[len("event:"):].strip()
+            continue
+        if not text.startswith("data:"):
+            continue
+        data = text[len("data:"):].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            continue
+        yield (name or (payload.get("type") if isinstance(payload, dict) else None), payload)
+        name = None
+
+
+def openai_body_from_anthropic(payload: Any, *, model: str) -> dict[str, Any]:
+    """Anthropic ``/v1/messages`` 响应 → OpenAI ``chat.completion`` 响应体。
+
+    本机镜像端点对外承诺 OpenAI 兼容；协议差异只在这里收口。
+    """
+    result = up.from_anthropic_response(payload)
+    message: dict[str, Any] = {"role": "assistant", "content": result["content"]}
+    if result.get("tool_calls"):
+        message["tool_calls"] = result["tool_calls"]
+        message["content"] = result["content"] or None
+    prompt = result.get("tokens_in") or 0
+    completion = result.get("tokens_out") or 0
+    return {
+        "id": "chatcmpl-anthropic",
+        "object": "chat.completion",
+        "model": result.get("model") or model,
+        "choices": [{"index": 0, "message": message,
+                     "finish_reason": result["finish_reason"]}],
+        "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
+                  "total_tokens": prompt + completion},
+    }
