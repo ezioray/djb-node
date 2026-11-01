@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 
-from djb_node import envcheck
+from djb_node import envcheck, facts
 from djb_node.cli import main
 from djb_node.config import Paths
 from djb_node.store import Store
@@ -68,8 +68,10 @@ def test_update_cli_apply_and_rollback(home, tmp_path, capsys, monkeypatch):
     assert main(["init", "--no-env"]) == 0
     capsys.readouterr()
     paths = Paths(str(home))
-    os.makedirs(os.path.join(paths.versions_dir, "0.1.0"), exist_ok=True)
-    source = build_source(tmp_path, version="0.2.0")
+    # 回滚目标 = 装之前的版本（= 包版本），目录要先存在，否则 target_missing
+    os.makedirs(os.path.join(paths.versions_dir, facts.CLIENT_VERSION), exist_ok=True)
+    # 清单版本要高于已装版本（已装版本 = 包版本），否则是 up_to_date 不是 eligible
+    source = build_source(tmp_path, version="0.9.0")
     assert main(["init", "--no-env", "--update-source", source]) == 0
     capsys.readouterr()
     assert main(["update", "--check", "--json"]) == 0
@@ -88,7 +90,8 @@ def test_update_cli_failed_verify(home, tmp_path, capsys, monkeypatch):
     assert main(["init", "--no-env"]) == 0
     capsys.readouterr()
     paths = Paths(str(home))
-    source = build_source(tmp_path, version="0.2.0")
+    # 清单版本要高于已装版本（已装版本 = 包版本），否则是 up_to_date 不是 eligible
+    source = build_source(tmp_path, version="0.9.0")
     assert main(["init", "--no-env", "--update-source", source]) == 0
     capsys.readouterr()
     store = Store(paths.db_file)
