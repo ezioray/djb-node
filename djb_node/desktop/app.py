@@ -27,6 +27,7 @@ from .access import ACCESS_FILE, RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, R
 from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
+from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
 from .views import VIEW_KEYS, VIEW_TITLES, Action, Card, Field, Row, Table, View
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
@@ -59,16 +60,23 @@ def _has_display() -> bool:
 class DesktopApp:
     """主窗口：一个 sidebar + 一个内容区（视图切换只重画内容区，不重建侧栏）。"""
 
+    #: 主题切换的渐变：3 帧 × 40ms = 120ms（只改背景色，不做重绘风暴）
+    THEME_FADE_STEPS = 3
+    THEME_FADE_MS = 40
+    #: 视图切入淡入：3 帧 × 33ms ≈ 100ms
+    PAGE_FADE_STEPS = 3
+    PAGE_FADE_MS = 33
+
     def __init__(self, controller: DesktopController, *, root: Any = None,
                  tk: Any = None, title: str = "DJB 联脑 · 桌面控制台",
-                 bus: Any | None = None, on_quit: Any = None) -> None:
+                 bus: Any | None = None, on_quit: Any = None,
+                 prefs_home: Any = None) -> None:
         self._tk = tk if tk is not None else _import_tk()
         try:
             self._root = root if root is not None else self._tk.Tk()
         except Exception as exc:                    # TclError：没有 DISPLAY / 会话不可用
             raise HeadlessError("窗口创建失败：" + type(exc).__name__) from None
         from tkinter import ttk
-        from ..gui.theme import apply_theme
         self._ttk = ttk
         self._controller = controller
         if getattr(controller, "save_path", None) is None:
@@ -86,7 +94,12 @@ class DesktopApp:
         self._root.title(title)
         self._root.geometry("1180x780")
         self._root.minsize(900, 620)
-        apply_theme(self._root, ttk)
+        # 偏好落在数据源自己的 home（临时 home 的窗口不会写真实 ~/.djb）
+        self._prefs_home = prefs_home if prefs_home is not None else getattr(
+            getattr(controller, "source", None), "_home", None)
+        self._fade_job = None
+        self._theme_name = dual.load(self._prefs_home)
+        dual.apply(self._root, ttk, self._theme_name)
         self._build_shell()
         self._bind_keys()
         self._root.bind("<Configure>",
@@ -114,12 +127,16 @@ class DesktopApp:
             self._demo_badge.grid(row=0, column=2, sticky="e", padx=(0, 8))
         self._state_pill = ttk.Label(top, text="状态未知", style="PillMuted.TLabel")
         self._state_pill.grid(row=0, column=3, sticky="e", padx=(0, 12))
-        ttk.Button(top, text="刷新 / F5", command=self.refresh).grid(row=0, column=4, sticky="e")
+        self._theme_button = ttk.Button(top, text=self._theme_button_text(),
+                                        command=self.toggle_theme)
+        self._theme_button.grid(row=0, column=4, sticky="e", padx=(0, 8))
+        self._refresh_button = ttk.Button(top, text="刷新 / F5", command=self.refresh)
+        self._refresh_button.grid(row=0, column=5, sticky="e")
         # 窄窗（<760）时侧栏放不下：导航改成一个下拉，仍然一个都不少
         self._nav_combo = ttk.Combobox(top, state="readonly", takefocus=True,
                                        values=[str(i) + " · " + VIEW_TITLES[key]
                                                for i, key in enumerate(VIEW_KEYS, start=1)])
-        self._nav_combo.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        self._nav_combo.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
         self._nav_combo.grid_remove()
         self._nav_combo.bind("<<ComboboxSelected>>", self._on_nav_combo)
         self._top = top
@@ -138,8 +155,7 @@ class DesktopApp:
         wrapper.grid(row=1, column=1, sticky="nsew")
         wrapper.rowconfigure(0, weight=1)
         wrapper.columnconfigure(0, weight=1)
-        from ..gui.theme import TOKENS
-        self._canvas = tk.Canvas(wrapper, background=TOKENS["bg"], highlightthickness=0,
+        self._canvas = tk.Canvas(wrapper, background=dual.color("bg"), highlightthickness=0,
                                  borderwidth=0)
         self._canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=self._canvas.yview)
@@ -184,6 +200,7 @@ class DesktopApp:
             self._root.update_idletasks()
         except Exception:
             pass
+        self._page_fade()
         return view
 
     def refresh(self) -> View:
@@ -191,6 +208,105 @@ class DesktopApp:
         self._render(view)
         self._update_status()
         return view
+
+    # ── 双主题（day / night）
+    def _theme_button_text(self, narrow: bool | None = None) -> str:
+        """窄窗只留图标（390 宽时顶栏放不下四个带字的控件）。"""
+        if narrow is None:
+            narrow = bool(getattr(self, "_narrow", False))
+        day = getattr(self, "_theme_name", dual.DEFAULT_THEME) == "day"
+        if narrow:
+            return "日" if day else "夜"
+        return "◐ 日间" if day else "☾ 夜间"
+
+    def toggle_theme(self, *, animate: bool = True, persist: bool = True) -> str:
+        """顶栏那个按钮：day ↔ night。返回切换后的主题名。"""
+        self._install_theme(dual.toggle(self._theme_name), animate=animate, persist=persist)
+        return self._theme_name
+
+    def _install_theme(self, name: str, *, animate: bool = True,
+                       persist: bool = True) -> str:
+        """换主题：先 120ms 背景渐变，再把样式换过去并重画当前视图。"""
+        previous = dual.color("bg")
+        target = dual.palette(name)["bg"]
+
+        def finish() -> None:
+            self._cancel_fade()
+            self._theme_name = dual.apply(self._root, self._ttk, name)
+            try:
+                self._theme_button.configure(text=self._theme_button_text())
+            except Exception:                      # pragma: no cover - 控件已销毁
+                pass
+            self._paint_backgrounds()
+            view = getattr(self, "_last_view", None)
+            if view is not None:
+                # 表格 tag 颜色、卡片 tone 都是渲染时取的：重画一次才真正换色
+                self._render(view)
+                tree = getattr(self, "_tree", None)
+                if tree is not None:
+                    self._fit_columns(tree)
+            self._update_status()
+            if persist:
+                try:
+                    dual.save(self._theme_name, self._prefs_home)
+                except OSError as exc:
+                    self._toast("主题已切换，但偏好没写进去：" + str(exc), ok=False)
+
+        if not animate or not self._can_animate():
+            finish()
+            return self._theme_name
+        self._fade(previous, target, self.THEME_FADE_STEPS, self.THEME_FADE_MS, finish)
+        return self._theme_name
+
+    def _can_animate(self) -> bool:
+        return callable(getattr(self._root, "after", None))
+
+    def _paint_backgrounds(self, colour: str | None = None) -> None:
+        value = colour or dual.color("bg")
+        for widget in (self._root, getattr(self, "_canvas", None)):
+            if widget is None:
+                continue
+            try:
+                widget.configure(background=value)
+            except Exception:                      # pragma: no cover - 控件已销毁
+                pass
+
+    def _cancel_fade(self) -> None:
+        """取消还没跑完的旧渐变：否则上一帧会把刚换好的主题底色又盖回去。"""
+        job, self._fade_job = getattr(self, "_fade_job", None), None
+        if job is None:
+            return
+        try:
+            self._root.after_cancel(job)
+        except Exception:                          # pragma: no cover - 已执行/已销毁
+            pass
+
+    def _fade(self, start: str, end: str, steps: int, delay_ms: int,
+              done: Any) -> None:
+        """分帧改背景色（只碰背景，不重排、不重绘子树）。"""
+        self._cancel_fade()
+
+        def frame(step: int) -> None:
+            self._fade_job = None
+            if step >= steps:
+                self._paint_backgrounds(end)
+                done()
+                return
+            self._paint_backgrounds(dual.mix_step(start, end, step + 1, steps))
+            try:
+                self._fade_job = self._root.after(delay_ms, lambda: frame(step + 1))
+            except Exception:                      # pragma: no cover - 窗口销毁
+                done()
+
+        frame(0)
+
+    def _page_fade(self) -> None:
+        """切视图时内容区 100ms 淡入（画布底色由浅到正）。"""
+        if not self._can_animate():
+            return
+        background = dual.color("bg")
+        start = dual.blend(dual.color("surface"), background, 0.65)
+        self._fade(start, background, self.PAGE_FADE_STEPS, self.PAGE_FADE_MS, lambda: None)
 
     #: 窄窗阈值：低于这个宽度侧栏让位给内容（E10 口径 390 也算“能看全”）
     NARROW_WIDTH = 760
@@ -229,6 +345,34 @@ class DesktopApp:
             self._side.grid()
             self._nav_combo.grid_remove()
             self._view_title.grid()
+        # 390 宽顶栏放不下四个带字控件：把「主题 / 刷新」挪到导航下拉那一行右侧，
+        # 下拉让出两格（它本来就只需要显示当前视图名）。
+        # 窄窗要显式给 width（字符数）：ttk 默认按上一次的文字宽度记着，
+        # 光换 text 不换 width，390 宽顶栏仍会按「◐ 日间」的宽度排，把刷新挤出屏幕。
+        for widget, text, chars in (
+                (getattr(self, "_theme_button", None), self._theme_button_text(narrow), 2),
+                (getattr(self, "_refresh_button", None), "刷新" if narrow else "刷新 / F5", 4)):
+            if widget is not None:
+                try:
+                    widget.configure(text=text, width=(chars if narrow else 0))
+                except Exception:                  # pragma: no cover - 控件已销毁
+                    pass
+        if getattr(self, "_theme_button", None) is not None:
+            row = 1 if narrow else 0
+            for widget, column in ((self._theme_button, 4), (self._refresh_button, 5)):
+                try:
+                    widget.grid_configure(row=row, column=column, sticky="e",
+                                          padx=(0, 8) if column == 4 else 0)
+                except Exception:                  # pragma: no cover - 控件已销毁
+                    pass
+            try:
+                self._nav_combo.grid_configure(columnspan=4 if narrow else 6)
+                if not narrow:
+                    # grid_configure 会把 grid_remove 过的控件重新映射：宽窗要再收一次，
+                    # 否则侧栏下面会多出一条没用的下拉
+                    self._nav_combo.grid_remove()
+            except Exception:                      # pragma: no cover
+                pass
         self._sync_nav(self._controller.view)
         tree = getattr(self, "_tree", None)
         if tree is not None:
@@ -411,10 +555,10 @@ class DesktopApp:
         for column in table.columns:
             tree.heading(column, text=column, anchor="w")
             tree.column(column, anchor="w", width=120, stretch=True)
-        from ..gui.theme import MUTED_TEXT, TOKENS, MINT_TEXT, AMBER_TEXT, RED_TEXT
-        tree.tag_configure("disabled", foreground=MUTED_TEXT)
-        tag_colors = {"mint": MINT_TEXT, "amber": AMBER_TEXT, "red": RED_TEXT,
-                      "muted": MUTED_TEXT, "default": TOKENS["ink"]}
+        tree.tag_configure("disabled", foreground=dual.color("muted_text"))
+        tag_colors = {"mint": dual.color("mint_text"), "amber": dual.color("amber_text"),
+                      "red": dual.color("red_text"), "muted": dual.color("muted_text"),
+                      "default": dual.color("ink")}
         for name, color in tag_colors.items():
             tree.tag_configure("tone-" + name, foreground=color)
         self._row_notes = {}
@@ -615,9 +759,8 @@ class DesktopApp:
     def _confirm(self, message: str) -> bool:
         """二次确认（模态，键盘可达：Esc 取消，Enter 确认）。"""
         tk, ttk = self._tk, self._ttk
-        from ..gui.theme import apply_theme
         window = tk.Toplevel(self._root)
-        apply_theme(window, ttk)
+        dual.apply(window, ttk, self._theme_name)
         window.title("DJB / 确认本机控制")
         window.geometry("560x260")
         choice = [False]
@@ -850,6 +993,12 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
                              cli=_make_cli_runner(home) if not demo else None)
 
 
+def _default_home() -> str:
+    """本机数据目录：``$DJB_HOME`` 优先，否则 ``~/.djb``（与 CLI 一致）。"""
+    from ..config import resolve_home
+    return str(resolve_home())
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="djb desktop", description="DJB 联脑桌面控制台（12 视图）")
     parser.add_argument("--home", help="本机数据目录（默认 $DJB_HOME 或 ~/.djb）")
@@ -860,7 +1009,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     controller = make_controller(home=args.home, demo=args.demo)
     try:
-        app = DesktopApp(controller, on_quit=lambda: None)
+        # prefs_home 必须显式给：demo 数据源没有 home，不给就会把主题偏好写到真实 ~/.djb
+        app = DesktopApp(controller, on_quit=lambda: None,
+                         prefs_home=args.home or _default_home())
     except HeadlessError:
         print(HEADLESS_HINT)
         return EXIT_HEADLESS

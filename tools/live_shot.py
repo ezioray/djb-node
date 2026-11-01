@@ -18,6 +18,8 @@ parser.add_argument("--base", default="http://127.0.0.1:18090")
 parser.add_argument("--key-file", default="~/.djb/secrets/testnode-client-key")
 parser.add_argument("--home", default=os.environ.get("DJB_HOME", "/tmp/djb-wp6-live"),
                     help="临时 home（不碰 ~/.djb）；默认跟 DJB_HOME，避免截图与文本跑在不同 home 上")
+parser.add_argument("--theme", default=None, choices=("day", "night"),
+                    help="截图用哪套主题（默认读桌面端偏好，没有则日间）")
 args = parser.parse_args()
 
 out = args.out
@@ -25,8 +27,12 @@ os.makedirs(out, exist_ok=True)
 key = open(os.path.expanduser(args.key_file)).read().strip()
 cloud = NodeCloudClient(args.base, key, timeout=10.0)
 controller = make_controller(home=args.home, cloud=cloud)
-app = DesktopApp(controller, on_quit=lambda: None)
+app = DesktopApp(controller, on_quit=lambda: None, prefs_home=args.home)
+if getattr(args, "theme", None):
+    app._install_theme(args.theme, animate=False, persist=False)   # noqa: SLF001 - 取证脚本
 app.show_view('overview')
+app._cancel_fade()                                     # noqa: SLF001 - 截图不等渐变
+app._paint_backgrounds()                               # noqa: SLF001
 print(_shoot(app, out)[:2])
 for view in ('tasks', 'receipts', 'earnings', 'account'):
     text = app.show_view(view).plain_text()

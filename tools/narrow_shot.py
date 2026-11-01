@@ -26,6 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--height", type=int, default=780)
     parser.add_argument("--view", default="receipts")
     parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--theme", default=None, choices=("day", "night"),
+                        help="截图用哪套主题（默认读桌面端偏好，没有则日间）")
     parser.add_argument("--base", default="http://127.0.0.1:18090")
     parser.add_argument("--key-file", default="~/.djb/secrets/testnode-client-key")
     args = parser.parse_args(argv)
@@ -40,17 +42,22 @@ def main(argv: list[str] | None = None) -> int:
         cloud = NodeCloudClient(args.base, key)          # key 只在内存里
     home = Path(os.environ.get("DJB_HOME", "/tmp/djb-narrow"))
     controller = make_controller(home=home, demo=args.demo, cloud=cloud)
-    app = DesktopApp(controller)
+    app = DesktopApp(controller, prefs_home=home)
     root = app._root                                  # noqa: SLF001 - 取证脚本
     root.minsize(1, 1)                                # 强制压到 390（产品本身 minsize 900）
     root.geometry(str(args.width) + "x" + str(args.height))
+    if getattr(args, "theme", None):
+        app._install_theme(args.theme, animate=False, persist=False)   # noqa: SLF001 - 取证脚本
     app.show_view(args.view)
+    app._cancel_fade()                                 # noqa: SLF001 - 截图不等渐变
+    app._paint_backgrounds()                           # noqa: SLF001
     root.update_idletasks()
     root.update()
     tree = getattr(app, "_tree", None)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    png = out / ("narrow-" + str(args.width) + "-" + args.view + ".png")
+    suffix = ("-" + args.theme) if getattr(args, "theme", None) else ""
+    png = out / ("narrow-" + str(args.width) + "-" + args.view + suffix + ".png")
     try:
         subprocess.run(["import", "-window", str(root.winfo_id()), str(png)],
                        check=False, timeout=30)
