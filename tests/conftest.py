@@ -44,7 +44,9 @@ def paths(home) -> Paths:
 
 @pytest.fixture
 def store(paths) -> Store:
-    item = Store.create(paths.db_file)
+    # 安装记录里的版本显式钉住：不要跟着 facts.CLIENT_VERSION 漂，
+    # 否则「更新可用」类用例会因为包版本一变就变成 up_to_date（测的东西就变了）。
+    item = Store.create(paths.db_file, version="0.1.0")
     yield item
     item.close()
 

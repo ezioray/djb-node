@@ -294,7 +294,9 @@ def test_mock_branch_requires_env_flag_and_key(tmp_path, paths, store, clock, mo
     manager = UpdateManager(paths, store, source="", client_version="0.1.0",
                             config=config, now=clock)
     assert manager.mock_requested() is True
-    manager.source = mock_source(tmp_path, key)
+    # 清单版本要明显高于已装版本（store fixture 的安装记录版本 = 包版本，
+    # 会随 facts.CLIENT_VERSION 变），这里测的是 mock 门禁，不是版本比较。
+    manager.source = mock_source(tmp_path, key, version="0.9.0")
     check = manager.check()
     assert check["state"] == "eligible"
     assert manager.apply()["installed"] is True
