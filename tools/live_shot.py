@@ -16,7 +16,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("out", help="截图/文本输出目录")
 parser.add_argument("--base", default="http://127.0.0.1:18090")
 parser.add_argument("--key-file", default="~/.djb/secrets/testnode-client-key")
-parser.add_argument("--home", default="/tmp/djb-wp6-live", help="临时 home（不碰 ~/.djb）")
+parser.add_argument("--home", default=os.environ.get("DJB_HOME", "/tmp/djb-wp6-live"),
+                    help="临时 home（不碰 ~/.djb）；默认跟 DJB_HOME，避免截图与文本跑在不同 home 上")
 args = parser.parse_args()
 
 out = args.out
