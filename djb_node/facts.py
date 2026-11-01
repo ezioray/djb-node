@@ -15,7 +15,18 @@
 
 # ─────────────────────────────────────────────────────────── 模块 / 版本
 MODULE_ID = "M15"
-CLIENT_VERSION = "0.1.0"
+#: 对外申报的客户端版本 = 包版本（单一事实来源）。
+#: 修前这里硬编码 "0.1.0"，而 ``djb --version`` 打的是 ``__version__``=0.2.0：
+#: 用户看到的版本、云端心跳里的版本、安装记录里的版本会各说各话（M10「版本如实」）。
+def _package_version() -> str:
+    try:
+        from . import __version__ as version       # 包自身，不会循环导入
+        return str(version)
+    except Exception:                              # pragma: no cover - 极端打包场景
+        return "0.0.0"
+
+
+CLIENT_VERSION = _package_version()
 PROTOCOL_VERSION = "1.0.0"
 SPEC_VERSION = "1.2.4"
 

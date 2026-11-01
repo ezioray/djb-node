@@ -313,6 +313,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             response = ControlClient(paths).call({"cmd": "ping"}, timeout=1.0)
             if response.get("ok"):
                 pid = response.get("pid")
+                last_error = ""      # 控制口已就绪：别把之前的「套接字不存在」当结论（会误导）
                 break
         except NotRunningError as exc:
             last_error = exc.message
@@ -323,21 +324,36 @@ def cmd_start(args: argparse.Namespace) -> int:
     # 控制口起来 ≠ 已经接单：等状态机真的走到 online（或走到 paused/error 这类终态）。
     # 否则用户看到「已启动」，实际还在 starting、一单也不接。
     state, reason = "", ""
+    error_seen = 0
     while time.monotonic() < deadline:
         try:
             status = ControlClient(paths).call({"cmd": "status"}, timeout=2.0).get("status") or {}
         except NotRunningError as exc:
+            # 控制口刚起来时 daemon 可能正忙着 bootstrap（网络/数据库），这一次读不到
+            # 不代表没起来：继续等到 deadline。Windows 命名管道上尤其常见。
             last_error = exc.message
-            break
+            time.sleep(0.25)
+            continue
         state = str(status.get("state") or "")
         reason = str(status.get("reason") or "")
         if state in _START_SETTLED_STATES:
+            # error 可能是**瞬时**的（例：注册被拒 -> 随即落到 paused/unbound）。
+            # 连续两次都读到 error 才当终态，否则会误报「启动失败」。
+            if state == "error":
+                error_seen += 1
+                if error_seen < 2:
+                    time.sleep(0.25)
+                    continue
             break
         time.sleep(0.25)
     if state not in _START_ACCEPT_STATES:
-        detail = last_error or ("daemon 已启动但状态是 " + (state or "未知")
-                                + ("（" + reason + "）" if reason else "")
-                                + "，没有进入接单状态；查看 djb status / djb logs --tail 50")
+        # 状态优先于「早期连接错误」：daemon 已经起来了，真正的原因是没进接单状态
+        # （例如未绑定账户 -> paused/unbound），这时再说「控制套接字不存在」是误导。
+        detail = ("daemon 已启动但状态是 " + (state or "未知")
+                  + ("（" + reason + "）" if reason else "")
+                  + "，没有进入接单状态；查看 djb status / djb logs --tail 50")
+        if not state and last_error:
+            detail = "daemon 没有起来：" + last_error
         print("djb: " + detail, file=sys.stderr)
         return facts.EXIT_NOT_RUNNING
     payload = {"started": True, "pid": pid, "state": state,

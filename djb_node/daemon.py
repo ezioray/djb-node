@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from . import facts, plan_router, policy as policy_mod, protocol
+from . import facts, machine_profile, plan_router, policy as policy_mod, protocol
 from .api import NodeApi, PolicyFetch
 from .channel import ChannelClient, channel_enabled
 from .config import ClientConfig, Paths, feature_flag, load_config, load_config_strict
@@ -971,7 +971,7 @@ class Daemon:
                 home=getattr(self.paths, "home", None), benchmark=True)
         except Exception as exc:                        # 画像失败绝不影响 daemon
             event("daemon.machine_profile_failed", level="warning",
-                  error=type(exc).__name__)
+                  error=type(exc).__name__ + ": " + str(exc)[:160])
             self._machine_eval = None
         return self._machine_eval
 

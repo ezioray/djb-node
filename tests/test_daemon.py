@@ -325,3 +325,33 @@ def test_port_in_use_refuses_to_start(paths, store, credentials, mock):
         assert "--port" in str(info.value)
     finally:
         holder.close()
+
+
+def test_heartbeat_machine_field_is_additive_and_flag_gated(paths, store, credentials,
+                                                           mock, clock):
+    """M3：机器画像只在开关打开时以加性字段 `machine` 出现在心跳里。"""
+    _add_upstream(store, mock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        assert "machine" not in mock.heartbeats[-1]          # 默认关：字段整体不出现
+        assert daemon.status()["machine"]["schema"] == "djb.machine-eval/1"
+        assert daemon.status()["machine_reported"] is False
+    finally:
+        daemon.stop()
+
+    enabled = ClientConfig(gateway_url=mock.base_url, mirror_port=1717,
+                           extra={"feature_flags": {facts.MACHINE_PROFILE_FLAG: True}})
+    daemon2 = _daemon(paths, store, credentials, mock, clock=clock, config=enabled)
+    daemon2.start()
+    try:
+        payload = mock.heartbeats[-1]
+        machine = payload.get("machine")
+        assert isinstance(machine, dict)
+        assert machine["schema"] == "djb.machine-eval/1"
+        # 老服务端只认 capacity/load；加性字段不影响既有键
+        assert payload["capacity"][0]["model"] == "mock-model"
+        assert "load" in payload
+        assert daemon2.status()["machine_reported"] is True
+    finally:
+        daemon2.stop()

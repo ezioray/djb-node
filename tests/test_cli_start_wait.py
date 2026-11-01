@@ -64,3 +64,30 @@ def test_start_stops_waiting_on_paused_and_says_why(started_home, capsys):
     assert cli_module.main(["start", "--timeout", "5", "--json"]) == facts.EXIT_NOT_RUNNING
     err = capsys.readouterr().err
     assert "paused" in err and "没有进入接单状态" in err
+
+
+def test_start_does_not_mistake_transient_error_for_failure(started_home, capsys):
+    """注册被拒时 daemon 会短暂闪过 error 再落到 paused：不能就此报「启动失败」。"""
+    FakeControl.states = ["starting", "error", "paused", "paused"]
+    assert cli_module.main(["start", "--timeout", "5", "--json"]) == facts.EXIT_NOT_RUNNING
+    err = capsys.readouterr().err
+    assert "paused" in err
+    assert "error" not in err
+
+
+def test_start_reports_stale_socket_message_only_when_never_started(started_home, capsys,
+                                                                  monkeypatch):
+    """daemon 真的没起来时，才说「控制套接字不存在」；起来了但没接单要说真实状态。"""
+
+    class DownControl(FakeControl):
+        def call(self, payload, timeout=None):
+            if payload.get("cmd") == "ping":
+                from djb_node.errors import NotRunningError
+                raise NotRunningError("daemon 未运行（控制套接字不存在）：先 djb start")
+            return super().call(payload, timeout=timeout)
+
+    monkeypatch.setattr(cli_module, "ControlClient", DownControl)
+    assert cli_module.main(["start", "--timeout", "1", "--json"]) == facts.EXIT_NOT_RUNNING
+    err = capsys.readouterr().err
+    assert "控制套接字不存在" in err
+    assert "状态是" not in err          # 没起来就不要臆造状态
