@@ -331,3 +331,12 @@ def test_disk_section_falls_back_when_home_missing(tmp_path):
     info, probe = mp._disk_section(str(tmp_path / "not-yet-created" / "home"))
     assert probe.ok is True
     assert info["total_bytes"] and info["free_bytes"]
+
+
+def test_client_version_matches_package_version():
+    """M10 版本如实：`djb --version`、心跳/User-Agent、安装记录必须是同一个版本号。"""
+    from djb_node import __version__
+    from djb_node import facts
+
+    assert facts.CLIENT_VERSION == __version__
+    assert __version__ in facts.USER_AGENT
