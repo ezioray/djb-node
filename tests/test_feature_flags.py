@@ -25,8 +25,10 @@ def make_config(**extra) -> ClientConfig:
     return config
 
 
-#: 各开关自己的到期日（默认 2026-12-31；plan.groups 按任务单到 2027-06-30）
-EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30"}
+#: 各开关自己的到期日（默认 2026-12-31；按任务单另定的在这里列明）
+EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30",
+                    # M3 机器画像上报：跟 E2E 周期一起，2027-06-30 前必须收敛成默认开或删掉
+                    facts.MACHINE_PROFILE_FLAG: "2027-06-30"}
 
 
 def test_every_flag_has_three_fields_and_default_off():

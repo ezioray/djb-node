@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
-from . import facts
+from . import facts, machine_profile
 from .config import ClientConfig, GATEWAY_PLACEHOLDER, Paths
 from .limits import ResourceMonitor
 from .store import ProfileRecord, Store
@@ -176,21 +176,73 @@ def check_kernel(now: datetime) -> Check:
                  {"release": release})
 
 
-def check_hardware(now: datetime) -> Check:
+def machine_profile_or_none(home: str | None = None) -> dict[str, Any] | None:
+    """采集机器画像；**任何异常都降级成 None**（环境检测不因为画像失败而失败）。"""
+    try:
+        return machine_profile.collect(home=home).to_dict()
+    except Exception:                                   # pragma: no cover - 防御
+        return None
+
+
+def check_hardware(now: datetime, *, home: str | None = None,
+                   profile: dict[str, Any] | None = None) -> Check:
+    """硬件/算力评估（M3）：CPU 型号·核·频率、内存、磁盘、GPU 型号/显存/驱动/利用率。
+
+    `profile` 可传入已采集的画像（避免重复扫）；为 None 时现场采一次。
+    缺失字段由 `machine_profile` 保证为 None（不编造），evidence 里同时给出 `probe`
+    说明每段数据从哪来 / 为什么没有。
+    """
     cores = os.cpu_count() or 0
     memory = _mem_total_gb()
     monitor = ResourceMonitor().snapshot()
+    data = profile if isinstance(profile, dict) else machine_profile_or_none(home)
+    profile_summary = machine_profile.summary_of(data) if data else None
+    cpu = (data or {}).get("cpu") or {}
+    disk = (data or {}).get("disk") or {}
+    gpu = (data or {}).get("gpu") or {}
+    devices = gpu.get("devices") or []
     status = "ok"
     next_step = "无需处理"
     conclusion = "CPU " + str(cores) + " 核 · 内存 " + str(memory) + " GB"
+    if cpu.get("model"):
+        conclusion = str(cpu.get("model")) + " · " + str(cores) + " 线程 · 内存 " \
+            + str(memory) + " GB"
+    if cpu.get("freq_mhz_max"):
+        conclusion += " · " + str(cpu.get("freq_mhz_max")) + " MHz"
+    if devices:
+        first = devices[0]
+        conclusion += " · GPU " + str(first.get("model") or "未知")
+        if first.get("memory_total_mb"):
+            conclusion += "（" + str(first.get("memory_total_mb")) + " MB）"
+    else:
+        conclusion += " · 未检测到 GPU"
     if cores < 2 or (0 < memory < 2):
         status = "warn"
         conclusion += "（偏小）"
         next_step = "内存 <2 GB 或 CPU <2 核：建议只用 Token 中转（A1/A2），并把并发设为 1"
-    return Check("hardware", "硬件", status, conclusion, next_step,
-                 {"cpu_count": cores, "mem_gb": memory,
-                  "load_cpu_pct": round(monitor["cpu_pct"] or 0.0, 1),
-                  "mem_pct": round(monitor["mem_pct"] or 0.0, 1)})
+    evidence: dict[str, Any] = {
+        "cpu_count": cores, "mem_gb": memory,
+        "load_cpu_pct": round(monitor["cpu_pct"] or 0.0, 1),
+        "mem_pct": round(monitor["mem_pct"] or 0.0, 1),
+        # ↓ 加性字段（M3 机器评估）：老字段一个不动，读方按需取
+        "cpu_model": cpu.get("model"), "cpu_vendor": cpu.get("vendor"),
+        "cpu_cores_physical": cpu.get("physical_cores"),
+        "cpu_cores_logical": cpu.get("logical_cores") or cores,
+        "cpu_freq_mhz": cpu.get("freq_mhz_max"),
+        "disk_path": disk.get("path"), "disk_total_gb": disk.get("total_gb"),
+        "disk_free_gb": disk.get("free_gb"),
+        "gpu_count": len(devices),
+        "gpus": [{"vendor": item.get("vendor"), "model": item.get("model"),
+                  "memory_total_mb": item.get("memory_total_mb"),
+                  "memory_used_mb": item.get("memory_used_mb"),
+                  "utilization_pct": item.get("utilization_pct"),
+                  "driver_version": item.get("driver_version"),
+                  "source": item.get("source")} for item in devices],
+        "gpu_source": gpu.get("source"),
+        "os_summary": profile_summary.get("os") if profile_summary else None,
+        "machine": data,
+    }
+    return Check("hardware", "硬件", status, conclusion, next_step, evidence)
 
 
 def check_runtime(now: datetime, paths: Paths) -> Check:
@@ -216,7 +268,24 @@ def check_runtime(now: datetime, paths: Paths) -> Check:
                   "home_mode": oct(mode) if mode is not None else None})
 
 
-def check_acceleration(now: datetime) -> Check:
+def check_acceleration(now: datetime, *, profile: dict[str, Any] | None = None) -> Check:
+    # 先看机器画像：它覆盖 NVIDIA / AMD(rocm-smi) / Windows WMI / macOS system_profiler，
+    # 只有画像里完全没有 GPU 时才回退到「装没装 nvidia-smi」的老判定。
+    devices = ((profile or {}).get("gpu") or {}).get("devices") or []
+    if devices:
+        first = devices[0]
+        detail = str(first.get("model") or "未知 GPU")
+        if first.get("driver_version"):
+            detail += " · 驱动 " + str(first.get("driver_version"))
+        if first.get("memory_total_mb"):
+            detail += " · 显存 " + str(first.get("memory_total_mb")) + " MB"
+        return Check("acceleration", "加速栈", "ok",
+                     "检测到 GPU：" + detail,
+                     "无需处理",
+                     {"nvidia_smi": shutil.which("nvidia-smi") is not None,
+                      "gpu_source": (profile or {}).get("gpu", {}).get("source"),
+                      "gpus": len(devices),
+                      "gpu_models": [item.get("model") for item in devices]})
     binary = shutil.which("nvidia-smi")
     if not binary:
         return Check("acceleration", "加速栈", "warn",
@@ -294,12 +363,15 @@ class EnvChecker:
         started = utcnow()
         checks: list[Check] = []
         budget_exceeded = False
+        # 机器画像一次采集、两处复用（hardware 展示 + acceleration 判 GPU）；
+        # 采集失败 -> None，各自按「无数据」走，不影响其它检查项。
+        profile = machine_profile_or_none(getattr(self.paths, "home", None))
         probes: list[tuple[str, Callable[[], Check]]] = [
             ("system", lambda: check_system(self._now())),
             ("kernel", lambda: check_kernel(self._now())),
-            ("hardware", lambda: check_hardware(self._now())),
+            ("hardware", lambda: check_hardware(self._now(), profile=profile)),
             ("runtime", lambda: check_runtime(self._now(), self.paths)),
-            ("acceleration", lambda: check_acceleration(self._now())),
+            ("acceleration", lambda: check_acceleration(self._now(), profile=profile)),
             ("network", lambda: check_network(self._now(), self.config,
                                               self.config.mirror_port)),
         ]

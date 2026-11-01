@@ -45,6 +45,7 @@ __all__ = [
     "NotificationRecord",
     "notification_db_file",
     "notifications_enabled",
+    "parse_unread_count",
 ]
 
 _SCHEMA_SQL: tuple[str, ...] = (
@@ -497,14 +498,19 @@ class NotificationStore:
                 "db": facts.NOTIFICATIONS_DB}
 
     def server_unread_count(self) -> int | None:
-        """服务端未读数（只读展示用；不可达返回 None，不影响本地）。"""
+        """服务端未读数（只读展示用；不可达返回 None，不影响本地）。
+
+        字段口径见 `facts.NOTIFICATIONS_UNREAD_FIELDS`：spec 是 ``unread``，
+        ``unread_count`` 作为回退（tolerant reader）。两者都缺 → None
+        （不把「解析不到」伪装成 0，否则角标又是「没有新消息」）。
+        """
         if self.api is None:
             return None
         try:
             payload = self.api.node_notification_unread_count()
         except DjbError:
             return None
-        value = payload.get("unread_count") if isinstance(payload, Mapping) else None
+        value = parse_unread_count(payload)
         if isinstance(value, int) and not isinstance(value, bool):
             return value
         return None
@@ -542,6 +548,21 @@ class NotificationStore:
 
 
 # ─────────────────────────────────────────────────────────── 归一工具
+def parse_unread_count(payload: Any) -> int | None:
+    """未读数响应 → int；解析不到返回 None（**不猜 0**）。
+
+    字段优先级见 `facts.NOTIFICATIONS_UNREAD_FIELDS`（spec 的 ``unread`` 优先，
+    ``unread_count`` 回退）。非整数 / 布尔 / 负数一律视为「解析不到」。
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    for key in facts.NOTIFICATIONS_UNREAD_FIELDS:
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
 def _items_of(payload: Any) -> list[Mapping[str, Any]]:
     """服务端列表字段兜底：items / notifications / data。"""
     if not isinstance(payload, Mapping):

@@ -12,8 +12,12 @@
 * 离线降级：拉不到清单不算失败，保持当前版本并明确提示；
 * 提权逐次申请：本模块不做任何提权动作。
 
-S1 签名口径：HMAC-SHA256（mock 源，密钥来自 DJB_UPDATE_SIGNING_KEY 或本地
-keys/update_mock.key 0600）；S2 换成 M16 发布签名（Ed25519 + 固定公钥）。见 README CR-M15-06。
+S1 签名口径（G10 已换）：信任锚是**内置 Ed25519 公钥**（`facts.UPDATE_PUBLIC_KEY_HEX`），
+私钥只在发布侧 / E2E 的 `~/.djb/secrets/e2e/update-signing.key`（0600），客户端永不持有；
+test-only 的对称 HMAC mock 必须同时满足 `DJB_ENV=test` + 开关
+`client.update.mock_signature.enabled`（三字段、默认关）+ 显式 `DJB_UPDATE_SIGNING_KEY`；
+其余情况一律按内置公钥验签，公钥缺失/非法 → fail-closed（`failed_verify`，版本不变，
+**绝不本地自生成密钥自签通过**）。见 README CR-M15-06 / 审计 G10、P1-3。
 """
 from __future__ import annotations
 
@@ -22,35 +26,111 @@ import json
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from . import facts
-from .config import Paths
+from . import ed25519, facts
+from .config import Paths, feature_flag, load_config
 from .errors import NetworkError, UpdateError
 from .httpclient import HttpClient
 from .logging_setup import event
 from .store import Store, UpdateRecord
 from .util import (atomic_write, canonical_json, ensure_dir, hmac_sha256, iso,
-                   new_key, parse_iso, read_json, utcnow, write_json)
+                   parse_iso, read_json, utcnow, write_json)
 
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
-SIG_RE = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
+#: 新信任锚只认 ed25519；hmac 形态保留解析能力，但只在 test-only mock 分支被接受。
+SIG_RE = re.compile(r"^(?:hmac-sha256:[0-9a-f]{64}|ed25519:[0-9a-f]{128})$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 MANIFEST_MAX_BYTES = 1024 * 1024
 ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
-MOCK_KEY_ENV = "DJB_UPDATE_SIGNING_KEY"
+MOCK_KEY_ENV = facts.UPDATE_MOCK_KEY_ENV
+
+
+# ─────────────────────────────────────────────────────────── 信任锚（G10）
+@dataclass(frozen=True)
+class TrustAnchor:
+    """验签用的信任锚（方案 + 材料 + 可展示标识）。
+
+    ``material`` 只在内存里用：ed25519 是**公钥**（公开数据）；hmac 是 test-only 对称密钥。
+    ``to_dict`` 只给标识与指纹，**任何路径都不回显材料**（状态 / 日志 / 诊断包）。
+    """
+
+    scheme: str
+    material: bytes
+    key_id: str
+    fingerprint: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"scheme": self.scheme, "key_id": self.key_id,
+                "key_fingerprint": self.fingerprint}
+
+
+def _fingerprint(material: bytes) -> str:
+    return hashlib.sha256(material).hexdigest()[:12]
+
+
+def ed25519_anchor(public_key_hex: str | None = None, *,
+                   key_id: str | None = None) -> TrustAnchor:
+    """内置公钥信任锚；公钥缺失/非法 → 抛 UpdateError（fail-closed）。"""
+    text = (public_key_hex if public_key_hex is not None
+            else getattr(facts, "UPDATE_PUBLIC_KEY_HEX", "") or "").strip()
+    if not text:
+        raise UpdateError("内置更新公钥缺失：拒绝验签（fail-closed；不会本地自生成密钥）")
+    if not ed25519.is_valid_public_key_hex(text):
+        raise UpdateError("内置更新公钥非法（不是合法 Ed25519 公钥）：拒绝验签（fail-closed）")
+    material = bytes.fromhex(text)
+    return TrustAnchor(facts.UPDATE_SIGNATURE_ALG_ED25519, material,
+                       key_id or facts.UPDATE_KEY_ID, _fingerprint(material))
+
+
+def mock_anchor(key: bytes, *, key_id: str = "mock-test-only") -> TrustAnchor:
+    """test-only HMAC 信任锚（只允许 mock 分支构造）。"""
+    if not isinstance(key, (bytes, bytearray)) or len(key) < 32:
+        raise UpdateError("mock 验签密钥必须是 ≥32 字节（hex 解码后）")
+    return TrustAnchor(facts.UPDATE_SIGNATURE_ALG, bytes(key), key_id,
+                       _fingerprint(bytes(key)))
+
+
+def _as_anchor(value: Any) -> TrustAnchor:
+    """兼容旧调用：裸 bytes 视为 test-only HMAC 锚（内部工具 / 测试用）。"""
+    if isinstance(value, TrustAnchor):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return mock_anchor(bytes(value))
+    raise UpdateError("验签锚缺失（需要 TrustAnchor）")
 
 
 # ─────────────────────────────────────────────────────────── 清单 / 签名
 def sign_manifest(payload: dict[str, Any], key: bytes) -> dict[str, Any]:
-    """参考实现（mock 源 / 测试）：对 payload 的规范 JSON 做 HMAC-SHA256。"""
+    """参考实现（**仅 test-only mock / 测试**）：对 payload 的规范 JSON 做 HMAC-SHA256。"""
     signature = facts.UPDATE_SIGNATURE_PREFIX + hmac_sha256(key, canonical_json(payload))
     return {"payload": payload, "signature": signature}
 
 
-def verify_manifest(manifest: Any, key: bytes) -> dict[str, Any]:
+def _check_signature(data: bytes, signature: str, anchor: TrustAnchor, *, what: str) -> None:
+    """统一「签名形态 + 验签」（ed25519 走内置公钥；hmac 只走 test-only mock 锚）。"""
+    if anchor.scheme == facts.UPDATE_SIGNATURE_ALG_ED25519:
+        prefix = facts.UPDATE_ED25519_PREFIX
+        if not signature.startswith(prefix):
+            raise UpdateError(what + "签名形态非法（要求 " + prefix + "…）")
+        try:
+            raw = bytes.fromhex(signature[len(prefix):])
+        except ValueError as exc:
+            raise UpdateError(what + "签名不是合法 hex") from exc
+        if not ed25519.verify(anchor.material, data, raw):
+            raise UpdateError(what + "签名校验失败（拒绝安装）")
+        return
+    prefix = facts.UPDATE_SIGNATURE_PREFIX
+    if not signature.startswith(prefix):
+        raise UpdateError(what + "签名形态非法（mock 分支要求 " + prefix + "…）")
+    if prefix + hmac_sha256(anchor.material, data) != signature:
+        raise UpdateError(what + "签名校验失败（拒绝安装）")
+
+
+def verify_manifest(manifest: Any, anchor: Any) -> dict[str, Any]:
     """校验清单签名与形状；失败抛 UpdateError（拒绝安装，版本不变）。"""
     if not isinstance(manifest, dict):
         raise UpdateError("更新清单不是 JSON 对象")
@@ -60,9 +140,16 @@ def verify_manifest(manifest: Any, key: bytes) -> dict[str, Any]:
         raise UpdateError("更新清单缺 payload")
     if not isinstance(signature, str) or not SIG_RE.match(signature):
         raise UpdateError("更新清单签名缺失或格式非法")
-    expected = facts.UPDATE_SIGNATURE_PREFIX + hmac_sha256(key, canonical_json(payload))
-    if expected != signature:
-        raise UpdateError("更新清单签名校验失败（拒绝安装）")
+    _check_signature(canonical_json(payload).encode("utf-8"), signature, _as_anchor(anchor),
+                     what="更新清单")
+    declared_key = payload.get("key_id")
+    if declared_key is not None:
+        anchor_view = _as_anchor(anchor)
+        if str(declared_key) != anchor_view.key_id:
+            # 密钥轮换的诚实口径：清单声明的 key_id 与本地信任锚不一致 -> 拒绝
+            # （不是「静默用旧公钥验过」，那会让轮换看起来成功、其实没换）。
+            raise UpdateError("清单 key_id（" + str(declared_key) + "）与本机信任锚（"
+                             + anchor_view.key_id + "）不一致（拒绝安装）")
     version = payload.get("version")
     if not isinstance(version, str) or not VERSION_RE.match(version):
         raise UpdateError("更新清单 version 非法")
@@ -81,13 +168,15 @@ def verify_manifest(manifest: Any, key: bytes) -> dict[str, Any]:
     return payload
 
 
-def verify_artifact(data: bytes, artifact: dict[str, Any], key: bytes) -> None:
+def verify_artifact(data: bytes, artifact: dict[str, Any], anchor: Any) -> None:
+    """先比 sha256（便宜、快速拒），再验签（贵）——**顺序不要调换**。"""
     digest = hashlib.sha256(data).hexdigest()
     if digest != artifact.get("sha256"):
         raise UpdateError("下载包哈希不一致（拒绝安装）")
-    expected = facts.UPDATE_SIGNATURE_PREFIX + hmac_sha256(key, data)
-    if expected != artifact.get("signature"):
-        raise UpdateError("下载包签名校验失败（拒绝安装）")
+    signature = artifact.get("signature")
+    if not isinstance(signature, str):
+        raise UpdateError("下载包缺签名（拒绝安装）")
+    _check_signature(data, signature, _as_anchor(anchor), what="下载包")
 
 
 def select_artifact(payload: dict[str, Any], *, os_name: str = facts.PLATFORM,
@@ -134,6 +223,7 @@ class UpdateManager:
                  channel: str = facts.DEFAULT_UPDATE_CHANNEL,
                  client_version: str = facts.CLIENT_VERSION,
                  http: HttpClient | None = None,
+                 config: Any = None,
                  now: Callable[[], datetime] = utcnow) -> None:
         self.paths = paths
         self.store = store
@@ -142,31 +232,47 @@ class UpdateManager:
             else facts.DEFAULT_UPDATE_CHANNEL
         self.client_version = client_version
         self.http = http or HttpClient(timeout=15.0)
+        self._config = config
         self._now = now
 
-    # ── 签名密钥（mock；S2 换固定公钥）
-    def signing_key(self) -> bytes:
-        raw = os.environ.get(MOCK_KEY_ENV)
-        if raw:
-            try:
-                key = bytes.fromhex(raw.strip())
-                if len(key) >= 32:
-                    return key
-            except ValueError:
-                pass
-        path = os.path.join(self.paths.keys_dir, "update_mock.key")
+    # ── 信任锚（G10：内置公钥；mock 三条件齐备才允许对称分支）
+    def _effective_config(self) -> Any:
+        if self._config is not None:
+            return self._config
         try:
-            with open(path, "r", encoding="ascii") as handle:
-                key = bytes.fromhex(handle.read().strip())
-            if len(key) >= 32:
-                return key
-        except (OSError, ValueError):
-            pass
-        ensure_dir(self.paths.keys_dir, 0o700)
-        key = new_key()
-        atomic_write(path, key.hex(), mode=0o600)
-        event("update.mock_key_created", level="warning", path=path)
-        return key
+            return load_config(self.paths)
+        except Exception:                                  # 配置读不到 → 按默认（mock 关）
+            return None
+
+    def mock_requested(self) -> bool:
+        """是否**被要求**走 test-only mock（环境门 + 开关；不含密钥是否就绪）。"""
+        env = os.environ.get(facts.UPDATE_TEST_ENV, "").strip().lower()
+        if env != facts.UPDATE_TEST_ENV_VALUE:
+            return False
+        return bool(feature_flag(self._effective_config(), facts.UPDATE_MOCK_FLAG))
+
+    def trust_anchor(self) -> TrustAnchor:
+        """本次验签的信任锚；不可用一律抛 UpdateError（fail-closed）。
+
+        判定顺序（都不满足 → 内置公钥）：
+
+        1. `DJB_ENV=test` **且** 开关 ``client.update.mock_signature.enabled`` 打开
+           **且** 显式给了 `DJB_UPDATE_SIGNING_KEY` → test-only HMAC 锚；
+        2. 否则 → 内置 Ed25519 公钥（唯一生产信任锚）。
+
+        开启了 mock 却没给密钥 → 直接失败（**不静默回退**、**不本地生成**）。
+        """
+        if self.mock_requested():
+            raw = os.environ.get(MOCK_KEY_ENV, "").strip()
+            if not raw:
+                raise UpdateError("mock 验签已开启但未提供 " + MOCK_KEY_ENV
+                                  + "：拒绝自签 / 拒绝静默回退（fail-closed）")
+            try:
+                key = bytes.fromhex(raw)
+            except ValueError as exc:
+                raise UpdateError("mock 验签密钥不是合法 hex（fail-closed）") from exc
+            return mock_anchor(key)
+        return ed25519_anchor()
 
     # ── 清单获取
     def _load_manifest(self) -> dict[str, Any] | None:
@@ -222,11 +328,24 @@ class UpdateManager:
     def status(self) -> dict[str, Any]:
         state = self.store.update_state()
         install = self.store.install()
+        # M10「版本与签名状态如实」：把当前**实际会用**的信任锚标识展示出来
+        # （只有 scheme / key_id / 指纹，绝无密钥材料）。
+        try:
+            anchor_info = self.trust_anchor().to_dict()
+            anchor_available = True
+            anchor_error = None
+        except UpdateError as exc:
+            anchor_info = {"scheme": None, "key_id": None, "key_fingerprint": None}
+            anchor_available = False
+            anchor_error = str(exc)
         return {"channel": self.channel, "current_version": install.version,
                 "recorded_current": state.current_version, "next_version": state.next_version,
                 "rollback_to": state.rollback_to, "verify_state": state.verify_state,
                 "bucket": install.bucket, "checked_at": state.checked_at,
-                "source": self.source or "(mock: versions/mock-manifest.json)"}
+                "source": self.source or "(mock: versions/mock-manifest.json)",
+                "signature": {**anchor_info, "available": anchor_available,
+                              "error": anchor_error,
+                              "mock": bool(self.mock_requested())}}
 
     def check(self) -> dict[str, Any]:
         moment = self._now()
@@ -249,10 +368,20 @@ class UpdateManager:
             self._record("no_source", None, None)
             return base
         try:
-            payload = verify_manifest(manifest, self.signing_key())
+            anchor = self.trust_anchor()
         except UpdateError as exc:
+            # 信任锚缺失/非法：拒绝验签（fail-closed）。版本不变，绝不自生成密钥自签。
+            event("update.trust_anchor_unavailable", level="error", error=str(exc)[:120])
             base.update({"state": "failed_verify", "message": str(exc),
                          "current_version": self.store.install().version})
+            self._record("failed_verify", None, None)
+            return base
+        try:
+            payload = verify_manifest(manifest, anchor)
+        except UpdateError as exc:
+            base.update({"state": "failed_verify", "message": str(exc),
+                         "current_version": self.store.install().version,
+                         "signature": anchor.to_dict()})
             self._record("failed_verify", None, None)
             return base
         version = str(payload["version"])
@@ -265,7 +394,8 @@ class UpdateManager:
             return base
         base.update({"manifest_version": version,
                      "current_version": self.store.install().version,
-                     "released_at": payload.get("released_at")})
+                     "released_at": payload.get("released_at"),
+                     "signature": anchor.to_dict()})
         if _version_tuple(version) <= _version_tuple(self.store.install().version):
             base.update({"state": "up_to_date", "message": "已是最新版本（不做降级）"})
             self._record("up_to_date", None, version)
@@ -312,7 +442,11 @@ class UpdateManager:
             return {"installed": False, "state": check.get("state"),
                     "message": check.get("message") or "当前不需要更新",
                     "current_version": check.get("current_version")}
-        key = self.signing_key()
+        try:
+            key = self.trust_anchor()
+        except UpdateError as exc:
+            self._record("failed_verify", None, None)
+            return {"installed": False, "state": "failed_verify", "message": str(exc)}
         if manifest is None:
             try:
                 manifest = self._load_manifest()

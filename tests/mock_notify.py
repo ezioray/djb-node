@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """C16 测试替身：站内信端点（纯 http.server，无外网）。
 
-    GET  /api/v1/node/notifications?since=&limit=&category=   200 {"items": [...], "unread_count": n}
-    GET  /api/v1/node/notifications/unread-count              200 {"unread_count": n}
+    GET  /api/v1/node/notifications?since=&limit=&category=   200 {"items": [...], "has_more": false}
+    GET  /api/v1/node/notifications/unread_count              200 {"unread": n}
+
+口径与 spec 1.2.13 对齐（G4）：未读数路径是**下划线** ``unread_count``，响应字段是 ``unread``
+（`NodeNotificationUnread.required = [unread]`）。旧替身写的是 ``unread-count`` + ``unread_count``，
+把客户端的错路径「喂绿」了 —— 替身必须照 spec 回，否则契约测试形同虚设。
     POST /api/v1/node/notifications/{id}/read|ack             200 {"ok": true}
 
 可脚本化：list_status / action_status / fail_read_times / fail_ack_times。
@@ -68,11 +72,18 @@ class MockNotify:
                     if outer.list_status >= 400:
                         self._error(outer.list_status)
                         return
-                    self._json(200, {"items": list(outer.items),
-                                     "unread_count": outer.unread_count})
+                    self._json(200, {"items": list(outer.items), "has_more": False,
+                                     "unread": outer.unread_count})
+                    return
+                if path == "/api/v1/node/notifications/unread_count":
+                    self._json(200, {"unread": outer.unread_count})
                     return
                 if path == "/api/v1/node/notifications/unread-count":
-                    self._json(200, {"unread_count": outer.unread_count})
+                    # 旧错路径：显式 404，让「路径写错」在测试里立刻红
+                    self._json(404, {"error": {"type": "not_found", "code": 40401,
+                                               "message": "unknown path",
+                                               "request_id": "mock"}})
+                    return
                     return
                 self._json(404, {"error": {"type": "not_found", "code": 40401,
                                            "message": "not found", "request_id": "mock"}})

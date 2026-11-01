@@ -18,7 +18,7 @@
     GET  /api/v1/node/model-catalog       200 / 304（M18b 模型/tokenizer 签名 bundle）
     POST /api/v1/node/model-sync/state    200  上报已应用版本 / 漂移 / 错误类
     GET  /api/v1/node/notifications       200  站内信列表（游标 since / limit / category）
-    GET  /api/v1/node/notifications/unread-count  200 未读数
+    GET  /api/v1/node/notifications/unread_count  200 未读数（G4：下划线，spec 口径）
     POST /api/v1/node/notifications/{id}/read     200 标记已读（幂等）
     POST /api/v1/node/notifications/{id}/ack      200 确认（幂等）
 
@@ -279,7 +279,7 @@ class NodeApi:
         return payload if isinstance(payload, dict) else {"items": []}
 
     def node_notification_unread_count(self) -> dict[str, Any]:
-        """GET /api/v1/node/notifications/unread-count 服务端未读数。"""
+        """GET /api/v1/node/notifications/unread_count 服务端未读数（spec 口径，G4）。"""
         response = self._call("GET", facts.NOTIFICATIONS_UNREAD_PATH,
                               timeout=facts.NOTIFICATIONS_ACTION_TIMEOUT_S)
         payload = response.json()
