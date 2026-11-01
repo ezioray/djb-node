@@ -295,3 +295,39 @@ def test_eval_platform_mapping(monkeypatch):
     assert mp.eval_platform() == "windows"
     monkeypatch.setattr(mp._platform, "system", lambda: "Linux")
     assert mp.eval_platform() == "linux"
+
+
+# ─────────────────────────────────────────────────────────── Windows 服务会话坑
+def test_resolve_tool_survives_missing_which(monkeypatch, tmp_path):
+    """S4U/服务会话 PATH 里没有 System32 时，which=None 也要能用绝对路径起来。"""
+    tool = tmp_path / "nvidia-smi.exe"
+    tool.write_text("", encoding="utf-8")
+    monkeypatch.setattr(mp.shutil, "which", lambda name: None)
+    argv = mp._resolve_tool("nvidia-smi", str(tool))
+    assert argv == [str(tool)]
+    # 绝对路径也不存在时，退回原名（Windows CreateProcess 仍可能自己找到）
+    assert mp._resolve_tool("nvidia-smi", str(tmp_path / "nope.exe")) == ["nvidia-smi"]
+
+
+def test_decode_output_handles_utf16_and_gbk():
+    assert mp._decode_output("中文".encode("utf-16")) == "中文"      # 带 BOM
+    assert mp._decode_output("中文".encode("gbk")) == "中文"
+    assert mp._decode_output(b"plain ascii") == "plain ascii"
+    assert mp._decode_output(b"") == ""
+
+
+def test_gpu_found_even_if_which_fails(monkeypatch):
+    """RTX 4070 场景：which 说没有，nvidia-smi 其实能跑 -> 必须采到真显存。"""
+    monkeypatch.setattr(mp.shutil, "which", lambda name: None)
+    runner = FakeRunner({"nvidia-smi": (0, "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 1234, 3, 596.49\n", "")})
+    devices, probe = mp._gpu_nvidia(runner)
+    assert probe.ok and len(devices) == 1
+    assert devices[0]["model"] == "NVIDIA GeForce RTX 4070 Laptop GPU"
+    assert devices[0]["memory_total_bytes"] == 8188 * 1024 * 1024
+
+
+def test_disk_section_falls_back_when_home_missing(tmp_path):
+    """DJB_HOME 还没建出来时，磁盘不能报 FileNotFoundError（改用用户目录/根）。"""
+    info, probe = mp._disk_section(str(tmp_path / "not-yet-created" / "home"))
+    assert probe.ok is True
+    assert info["total_bytes"] and info["free_bytes"]

@@ -30,6 +30,7 @@ GPU         ``nvidia-smi --query-gpu``（NVIDIA，三端）→ AMD ``rocm-smi`` 
 from __future__ import annotations
 
 import json
+import locale
 import os
 import platform as _platform
 import shutil
@@ -54,18 +55,66 @@ _MEMINFO = "/proc/meminfo"
 Runner = Callable[..., Any]
 
 
+def _decode_output(raw: bytes) -> str:
+    """Windows 上命令输出编码很乱（UTF-8 / GBK / UTF-16LE），逐个试，别猜一个就报错。"""
+    if not raw:
+        return ""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", "replace")
+    for encoding in ("utf-8", locale.getpreferredencoding(False), "gbk", "utf-16-le"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 def _run(args: list[str], *, timeout: float = DEFAULT_TIMEOUT_S) -> tuple[int, str, str]:
     """跑一条只读命令 -> (returncode, stdout, stderr)。失败归一成 (-1, "", 原因)。"""
     try:
-        completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
-                                   check=False)
+        completed = subprocess.run(args, capture_output=True, timeout=timeout, check=False)
     except FileNotFoundError:
         return -1, "", "not_found"
     except subprocess.TimeoutExpired:
         return -1, "", "timeout"
     except OSError as exc:                               # pragma: no cover - 极端环境
         return -1, "", type(exc).__name__
-    return completed.returncode, completed.stdout or "", completed.stderr or ""
+    return (completed.returncode, _decode_output(completed.stdout or b""),
+            _decode_output(completed.stderr or b""))
+
+
+
+def _windows_root() -> str:
+    return os.environ.get("SystemRoot") or r"C:\Windows"
+
+
+def _resolve_tool(name: str, *absolute_candidates: str) -> list[str]:
+    """返回**可执行的 argv 前缀**（可能含绝对路径）。
+
+    Windows 服务会话（S4U / 计划任务）的 PATH 里常常没有 System32，
+    ``shutil.which`` 于是返回 None——但直接 CreateProcess 又能起来。
+    所以：which -> 绝对候选 -> 原名 逐个试，绝不因为 which 失败就判「没有这个工具」。
+    """
+    found = shutil.which(name)
+    if found:
+        return [found]
+    for candidate in absolute_candidates:
+        if candidate and os.path.exists(candidate):
+            return [candidate]
+    return [name]
+
+
+def _powershell_argv(script: str) -> list[str]:
+    return _resolve_tool(
+        "powershell",
+        os.path.join(_windows_root(), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        os.path.join(_windows_root(), "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ) + ["-NoProfile", "-NonInteractive", "-Command", script]
+
+
+def _nvidia_smi_argv() -> list[str]:
+    return _resolve_tool("nvidia-smi",
+                         os.path.join(_windows_root(), "System32", "nvidia-smi.exe"))
 
 
 def _first_line(text: str) -> str | None:
@@ -349,11 +398,10 @@ def _cpu_section(runner: Runner) -> tuple[dict[str, Any], Probe]:
             probe.error = "model_missing"
     elif system == "windows":
         probe.source = "wmi"
-        code, out, _ = runner([
-            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+        code, out, _ = runner(_powershell_argv(
             "Get-CimInstance Win32_Processor | Select-Object -First 1 "
             "Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed "
-            "| ConvertTo-Json -Compress"])
+            "| ConvertTo-Json -Compress"))
         if code == 0 and _first_line(out):
             try:
                 payload = json.loads(out)
@@ -419,10 +467,9 @@ def _memory_section(runner: Runner) -> tuple[dict[str, Any], Probe]:
             probe.error = "parse_failed"
     elif system == "windows":
         probe.source = "wmi"
-        code, out, _ = runner([
-            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+        code, out, _ = runner(_powershell_argv(
             "Get-CimInstance Win32_OperatingSystem | Select-Object "
-            "TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json -Compress"])
+            "TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json -Compress"))
         if code == 0 and _first_line(out):
             try:
                 payload = json.loads(out)
@@ -445,7 +492,13 @@ def _memory_section(runner: Runner) -> tuple[dict[str, Any], Probe]:
 
 
 def _disk_section(home: str | None) -> tuple[dict[str, Any], Probe]:
-    target = home or os.path.expanduser("~")
+    candidates = [home, os.path.expanduser("~"), os.path.abspath(os.sep)]
+    target = next((item for item in candidates if item and os.path.exists(item)), None)
+    if target is None:
+        return ({"path": home, "total_gb": None, "free_gb": None, "used_gb": None,
+                 "total_bytes": None, "free_bytes": None, "used_bytes": None,
+                 "rotational": None},
+                Probe(ok=False, source="shutil.disk_usage", error="path_missing"))
     probe = Probe(source="shutil.disk_usage")
     info: dict[str, Any] = {"path": target, "total_gb": None, "free_gb": None,
                             "used_gb": None, "total_bytes": None, "free_bytes": None,
@@ -529,10 +582,9 @@ def _gpu_section(runner: Runner) -> tuple[dict[str, Any], Probe]:
 
 
 def _gpu_nvidia(runner: Runner) -> tuple[list[dict[str, Any]], Probe]:
-    if shutil.which("nvidia-smi") is None:
-        return [], Probe(ok=False, source="nvidia-smi", error="not_found")
-    code, out, err = runner(["nvidia-smi", "--query-gpu=" + NVIDIA_QUERY,
-                             "--format=csv,noheader,nounits"], timeout=3.0)
+    # 不先看 which：Windows 服务会话里 which 会说「没有」，实际能跑（见 _resolve_tool）
+    code, out, err = runner(_nvidia_smi_argv() + ["--query-gpu=" + NVIDIA_QUERY,
+                                                 "--format=csv,noheader,nounits"], timeout=3.0)
     if code != 0:
         return [], Probe(ok=False, source="nvidia-smi",
                          error="exit_" + str(code) + ("|" + _first_line(err) if err else ""))
@@ -607,10 +659,9 @@ def _vram_bytes(values: dict[str, Any]) -> int | None:
 def _gpu_windows_wmi(runner: Runner) -> tuple[list[dict[str, Any]], Probe]:
     if (_platform.system() or "").lower() != "windows":
         return [], Probe(ok=False, source="wmi", error="not_supported")
-    code, out, _ = runner([
-        "powershell", "-NoProfile", "-NonInteractive", "-Command",
+    code, out, _ = runner(_powershell_argv(
         "Get-CimInstance Win32_VideoController | Select-Object "
-        "Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress"], timeout=3.0)
+        "Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress"), timeout=3.0)
     if code != 0 or not _first_line(out):
         return [], Probe(ok=False, source="wmi", error="exit_" + str(code))
     try:
