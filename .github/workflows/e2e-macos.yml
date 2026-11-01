@@ -20,7 +20,8 @@ permissions:
 
 concurrency:
   group: e2e-macos-${{ github.ref }}
-  cancel-in-progress: true
+  # 取证跑不能被后来的触发互相掐掉（第一次 push 就因为 cancel-in-progress 被自己取消）
+  cancel-in-progress: false
 
 jobs:
   machine-eval:
