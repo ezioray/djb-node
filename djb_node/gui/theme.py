@@ -1,8 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DJB Daylight Signal 浅色 token + ttk 样式（静态；本模块**不 import tkinter**）。
+"""DJB Aurora Signal 浅色 token + ttk 样式（静态；本模块**不 import tkinter**）。
 
-唯一取值来源是 :data:`TOKENS`（对齐 `ops/uta/UI-BASELINE-2026-11-01.md` §1）。
-页面/控件不得自定义十六进制，只能引用本模块常量或样式名。
+唯一取值来源是 :data:`TOKENS`，与 `design/15-DJB-Aurora-Signal-配色修订-v1.md` §1.1 的
+**day（藕粉晨光）** 列逐项对齐；夜间列在 :mod:`djb_node.desktop.theme` 的
+``PALETTES["night"]``——两套主题共用同一组 token 名，只换值。
+
+Tk 没有 alpha 合成（CSS 的 ``rgba()`` 在这里必须落成实色），派生规则固定：
+
+* **分隔线** ``line`` / ``line2``：把 §1.1 的 rgba 合成到**页面底** ``TOKENS["bg"]``；
+* **控件边界** ``line3``：§1.1 的 ``--line-3`` 是 ``rgba(60,40,110,.55)``（≥3:1 口径），
+  这里取它合成到页面底的实色 :data:`BORDER`——白卡 3.52:1 / 输入底 3.32:1 /
+  三级面 3.07:1 / 页面底 3.16:1，四处都过 3:1；
+* **文字**：每个色相单独给 ``*_TEXT``（≥4.5:1）；实心填充上的字单独给 ``ON_*``。
+
+命名常量与 token 的对照（``*_TEXT`` / ``BORDER`` / ``ON_*`` 是 Tk 派生，不是 §1.1 的 token 名）：
+
+================  ==============================  ====================================
+常量              取值                            用途
+================  ==============================  ====================================
+``MUTED_TEXT``    ``#5B5375``                     说明/元信息（比 ``muted`` 再深一档）
+``BORDER``        ``TOKENS["line3"]``             输入框/表格/控件描边
+``MINT_TEXT``     ``#256B57``                     成功、链接、主色文字
+``MINT_STRONG``   ``TOKENS["mint_strong"]``       主按钮按下 / 实心强调
+``MINT_HOVER``    ``TOKENS["mint_hover"]``        主按钮 hover
+``AMBER_TEXT``    ``#8A5D12``                     等待/同步文字
+``RED_TEXT``      ``#A84540``                     真失败文字
+``INFO_TEXT``     ``TOKENS["cyan_text"]``         信息/开发者辅助文字
+``VIOLET``        ``TOKENS["violet"]``            第二强调：导航/链接 hover/选中
+``VIOLET2``       ``TOKENS["violet2"]``           紫色浅色/描边
+``VIOLET3``       ``TOKENS["violet3"]``           紫色底（选中底/紫胶囊底）
+``VIOLET_TEXT``   ``TOKENS["violet_text"]``       紫色文字专用（≥4.5:1）
+``PINK``          ``TOKENS["pink"]``              第三强调：eyebrow/装饰徽标/图表
+``PINK2``         ``TOKENS["pink2"]``             粉色浅色/描边
+``PINK3``         ``TOKENS["pink3"]``             粉色底（文本选中/粉胶囊底）
+``PINK_TEXT``     ``TOKENS["pink_text"]``         粉色文字专用（≥4.5:1）
+``ON_VIOLET``     ``#FFFFFF``                     压紫实心上的字
+``ON_PINK``       ``#FFFFFF``                     压粉实心上的字
+================  ==============================  ====================================
+
+粉色**只做非状态强调**：不得表达成功/等待/失败/危险（:func:`apply_theme` 里没有粉色按钮，
+粉底只出现在 eyebrow 与装饰胶囊上）。状态语义仍是 玉绿=完成 / 琥珀=等待 / 珊瑚=失败。
 
 兼容层
 ======
@@ -10,90 +47,124 @@
 :mod:`djb_node.tray.panels`）与 `tests/test_cyberpunk_ui.py` 读的是旧键名
 （``bg`` / ``panel`` / ``input`` / ``text`` / ``muted`` / ``border`` / ``cyan`` /
 ``violet`` / ``wait`` / ``danger`` / ``ok``），且断言「文字对 ``panel`` ≥4.5:1、
-``border`` 对 ``input`` ≥3:1」。本模块保留这些键名，取值改成浅色语义：
+``border`` 对 ``input`` ≥3:1」。键名全部保留，值换成 Aurora Signal 新口径：
 
 ============  =========================  ====================================
-旧键名        浅色取值                    说明
+旧键名        现取值                      说明
 ============  =========================  ====================================
 ``bg``        ``TOKENS["bg"]``            页面底
-``panel``     ``TOKENS["surface"]``       卡片（原暗色面板）
+``panel``     ``TOKENS["surface"]``       卡片
 ``input``     ``TOKENS["surface2"]``      输入底
 ``text``      ``TOKENS["ink"]``           正文
-``muted``     :data:`MUTED_TEXT`          说明文字（见下）
-``border``    :data:`BORDER`              控件边界（见下）
-``cyan``      :data:`INFO_TEXT`           信息/开发者文字（见下）
-``violet``    ``TOKENS["violet"]``        非状态强调
-``wait``      :data:`AMBER_TEXT`          等待文字（见下）
+``muted``     :data:`MUTED_TEXT`          说明文字
+``border``    :data:`BORDER`              控件边界
+``cyan``      :data:`INFO_TEXT`           信息/开发者文字
+``violet``    ``TOKENS["violet"]``        第二强调
+``wait``      :data:`AMBER_TEXT`          等待文字
 ``danger``    ``TOKENS["red"]``           真失败
-``ok``        :data:`MINT_TEXT`           成功
+``ok``        :data:`MINT_TEXT`           完成/成功
 ============  =========================  ====================================
 
-四处「取值 ≠ 基准表」是有意的、可复核的无障碍修正（基准表自己的 5:1 声明也达不到）：
-
-* ``--muted #607A74`` 对白底只有 **4.63:1**、对 ``#EEF5F1`` 只有 4.18:1，
-  低于基准表宣称的 ≥5:1；说明文字改用 :data:`MUTED_TEXT` ``#526B65``
-  （白底 5.75:1 / 页底 5.20:1）。
-* ``--mint #008F78`` 对白底 4.04:1，只够 WCAG 1.4.11 的 3:1（非文字/大字号），
-  因此「薄荷色**文字**」用 :data:`MINT_TEXT` ``#007A66``（白底 5.28:1）；
-  ``#008F78`` 仍用于填充、进度条、状态点与选中底。
-* ``--amber #A9741C`` 4.04:1、``--cyan #2F7FA3`` 4.48:1、``--red #B94F47``
-  4.44:1（对**页底** ``#EEF5F1``）同理：文字用 :data:`AMBER_TEXT` ``#8F6118``
-  (页底 4.87:1) / :data:`INFO_TEXT` ``#2C7699``(白底 5.05:1) /
-  :data:`RED_TEXT` ``#A84540``(页底 5.28:1)；原始值保留给徽章底、状态点、
-  进度条等非文字用途。
-* ``--line-2 #C2D6CE`` 对白底只有 1.52:1，做**交互控件描边**不达标（WCAG 1.4.11 要 3:1），
-  所以控件边界用 :data:`BORDER` ``#7A948C``（对白 3.26:1、对 ``#F7FBF9`` 3.12:1），
-  ``#C2D6CE`` 降级为纯分隔细线 ``TOKENS["line2"]``。
-
-所有数字由 :func:`contrast_ratio` 现算，`tests/test_desktop_theme.py` 与
-`ops/uta/evidence/wp6/palette-contrast.txt` 用同一函数复算，避免手抄。
+所有对比度数字由 :func:`contrast_ratio` 现算，`tests/test_desktop_theme.py` 与
+`tests/test_desktop_dual_theme.py` 用同一函数复算，不手抄、不放宽阈值。
 """
 from __future__ import annotations
 
 __all__ = [
-    "AMBER_TEXT", "BORDER", "COLORS", "CONTROL_HEIGHT", "FONT", "FONT_FAMILIES",
-    "INFO_TEXT", "MINT_TEXT", "MONO", "MONO_FAMILIES", "MUTED_TEXT", "RADIUS",
-    "ROW_HEIGHT", "SPACE", "TOKENS", "TYPE_SCALE", "apply_theme", "contrast_ratio",
+    "AMBER_TEXT", "BORDER", "COLORS", "CONTROL_HEIGHT", "CYAN_TEXT", "FONT",
+    "FONT_FAMILIES", "INFO_TEXT", "MINT_HOVER", "MINT_STRONG", "MINT_TEXT", "MONO",
+    "MONO_FAMILIES", "MUTED_TEXT", "ON_PINK", "ON_VIOLET", "PINK", "PINK2", "PINK3",
+    "PINK_TEXT", "RADIUS", "RED_TEXT", "ROW_HEIGHT", "SPACE", "TOKENS", "TYPE_SCALE",
+    "VIOLET", "VIOLET2", "VIOLET3", "VIOLET_TEXT", "apply_theme", "contrast_ratio",
     "luminance", "menu_options", "pick_family", "token",
 ]
 
 #: 设计 token（唯一取值；禁止页面自定义十六进制）
 TOKENS: dict[str, str] = {
-    "bg": "#EEF5F1",
-    "bg2": "#E6F0EB",
+    # ── 底 / 面
+    "bg": "#F5F1FA",
+    "bg2": "#EDE7F6",
     "surface": "#FFFFFF",
-    "surface2": "#F7FBF9",
-    "ink": "#0D2925",
-    "ink2": "#29443F",
-    "muted": "#607A74",
-    "line": "#D6E4DE",
-    "line2": "#C2D6CE",
-    "mint": "#008F78",
-    "mint2": "#00B89A",
-    "mint3": "#D9F5EC",
-    "amber": "#A9741C",
+    "surface2": "#FAF7FE",
+    "surface3": "#F3EDFA",
+    # ── 正文
+    "ink": "#1B1530",
+    "ink2": "#3C3457",
+    "muted": "#6B6385",
+    # ── 分隔 / 控件边界（line3 见模块 docstring 的合成口径）
+    "line": "#DBD5E6",
+    "line2": "#C9C1D8",
+    "line3": "#8F82AD",
+    # ── 玉绿主色（温和玉，不再是荧光薄荷）
+    "mint": "#2F7D66",
+    "mint2": "#3FA184",
+    "mint3": "#DDF3EA",
+    "mint_strong": "#256B57",
+    "mint_hover": "#2A735E",
+    # ── 信息 / 开发者辅助
+    "cyan": "#2F7F9E",
+    "cyan_text": "#2A6E8C",
+    # ── 紫（第二强调）
+    "violet": "#6A4FBF",
+    "violet2": "#8A6FE0",
+    "violet3": "#EEE8FF",
+    "violet_text": "#5B3FA8",
+    # ── 粉（第三强调；不承担状态语义）
+    "pink": "#B93C7E",
+    "pink2": "#D967A6",
+    "pink3": "#FBE7F3",
+    "pink_text": "#A83270",
+    # ── 状态（语义固定：琥珀等待 / 珊瑚失败）
+    "amber": "#9A6A16",
+    "amber_bg": "#FDF4E1",
     "red": "#B94F47",
-    "cyan": "#2F7FA3",
-    "violet": "#6C55A3",
-    "focus": "#008F78",
+    "red_bg": "#FBEAE8",
+    # ── 焦点环 / 实心主色上的字
+    "focus": "#2F7D66",
     "white": "#FFFFFF",
-    "amber_bg": "#F6EBD8",
-    "red_bg": "#F8E3E1",
 }
 
-#: 可读性修正后的文字色（见模块 docstring 的四条说明）
-MUTED_TEXT = "#526B65"
-BORDER = "#7A948C"
-MINT_TEXT = "#007A66"
-AMBER_TEXT = "#8F6118"
-INFO_TEXT = "#2C7699"
+#: 说明/元信息文字（``muted`` 自身白卡 5.60:1，这里再深一档给 9px 小字留余量）
+MUTED_TEXT = "#5B5375"
+#: 控件边界 = ``line3``（白卡 3.52:1 / 输入底 3.32:1 / 三级面 3.07:1 / 页底 3.16:1）
+BORDER = TOKENS["line3"]
+#: 主色文字（白卡 6.33:1 / 页底 5.68:1）
+MINT_TEXT = "#256B57"
+#: 主按钮按下态底色（白字 6.33:1）
+MINT_STRONG = TOKENS["mint_strong"]
+#: 主按钮 hover 底色（白字 5.65:1）
+MINT_HOVER = TOKENS["mint_hover"]
+#: 等待文字（白卡 5.75:1 / 页底 5.16:1）
+AMBER_TEXT = "#8A5D12"
+#: 信息/开发者文字（白卡 5.66:1 / 页底 5.08:1）
+INFO_TEXT = TOKENS["cyan_text"]
+#: ``INFO_TEXT`` 的新名字（token 名与 §1.1 对齐；旧名保留）
+CYAN_TEXT = TOKENS["cyan_text"]
+#: 失败文字（白卡 5.85:1 / 页底 5.25:1）
 RED_TEXT = "#A84540"
+#: 紫（第二强调）：白卡 6.03:1
+VIOLET = TOKENS["violet"]
+VIOLET2 = TOKENS["violet2"]
+VIOLET3 = TOKENS["violet3"]
+#: 紫色文字（白卡 7.72:1 / 页底 6.93:1）
+VIOLET_TEXT = TOKENS["violet_text"]
+#: 粉（第三强调；只做装饰，不做状态）：白卡 5.24:1（对白字）
+PINK = TOKENS["pink"]
+PINK2 = TOKENS["pink2"]
+PINK3 = TOKENS["pink3"]
+#: 粉色文字（白卡 6.26:1 / 页底 5.62:1）
+PINK_TEXT = TOKENS["pink_text"]
+#: 压紫实心上的字（紫底 6.03:1）
+ON_VIOLET = "#FFFFFF"
+#: 压粉实心上的字（粉底 5.24:1）
+ON_PINK = "#FFFFFF"
 
-#: 兼容旧键名（浅色取值）；新代码不要新增旧键
+#: 兼容旧键名；新代码不要新增旧键
 COLORS: dict[str, str] = {
     "bg": TOKENS["bg"],
     "panel": TOKENS["surface"],
     "panel2": TOKENS["surface2"],
+    "panel3": TOKENS["surface3"],
     "input": TOKENS["surface2"],
     "text": TOKENS["ink"],
     "text2": TOKENS["ink2"],
@@ -101,14 +172,26 @@ COLORS: dict[str, str] = {
     "border": BORDER,
     "line": TOKENS["line"],
     "line2": TOKENS["line2"],
+    "line3": TOKENS["line3"],
     "cyan": INFO_TEXT,
     "violet": TOKENS["violet"],
+    "violet2": VIOLET2,
+    "violet3": VIOLET3,
+    "violet_text": VIOLET_TEXT,
+    "pink": PINK,
+    "pink2": PINK2,
+    "pink3": PINK3,
+    "pink_text": PINK_TEXT,
+    "on_violet": ON_VIOLET,
+    "on_pink": ON_PINK,
     "wait": AMBER_TEXT,
     "danger": RED_TEXT,
     "ok": MINT_TEXT,
     "mint": TOKENS["mint"],
     "mint2": TOKENS["mint2"],
     "mint3": TOKENS["mint3"],
+    "mint_strong": MINT_STRONG,
+    "mint_hover": MINT_HOVER,
     "amber": TOKENS["amber"],
     "red": TOKENS["red"],
     "red_text": RED_TEXT,
@@ -193,6 +276,8 @@ def apply_theme(root, ttk, *, available_families=None):
     """clam + 浅色 map：原生 ttk 默认值不能悄悄把浅色字段变回系统灰。
 
     ``available_families`` 可注入（测试用），默认从 ``root`` 现查。
+    紫色只进「导航当前项 / 选中 / hover / 信息徽标 / 标题」，粉色只进
+    「eyebrow / 装饰胶囊」，两者都不进状态位（等待/失败/成功仍是琥珀/珊瑚/玉绿）。
     """
     global FONT, MONO
     families = (frozenset(available_families) if available_families is not None
@@ -202,17 +287,24 @@ def apply_theme(root, ttk, *, available_families=None):
     FONT = (family, TYPE_SCALE["md"])
     MONO = (mono_family, TYPE_SCALE["md"])
     body, small = FONT, (family, TYPE_SCALE["sm"])
+    eyebrow = (family, TYPE_SCALE["xs"], "bold")
     heading, title = (family, TYPE_SCALE["lg"], "bold"), (family, TYPE_SCALE["xl"], "bold")
     display, mono = (family, TYPE_SCALE["display"], "bold"), MONO
 
     root.configure(background=TOKENS["bg"])
     root.option_add("*Font", body)
+    # Combobox 的下拉是 tk.Listbox（不是 ttk），只能走 option 数据库；文本选中用粉底
+    root.option_add("*TCombobox*Listbox.background", TOKENS["surface"])
+    root.option_add("*TCombobox*Listbox.foreground", TOKENS["ink"])
+    root.option_add("*TCombobox*Listbox.selectBackground", PINK3)
+    root.option_add("*TCombobox*Listbox.selectForeground", TOKENS["ink"])
     style = ttk.Style(root)
     style.theme_use("clam")
+    # 文本选中用粉（§1.1 --selection），行选中用紫底（VIOLET3），两者都不承担状态语义
     style.configure(".", background=TOKENS["bg"], foreground=TOKENS["ink"],
                     font=body, bordercolor=BORDER, focuscolor=TOKENS["focus"],
                     troughcolor=TOKENS["bg2"], insertcolor=TOKENS["ink"],
-                    selectbackground=TOKENS["mint3"], selectforeground=TOKENS["ink"],
+                    selectbackground=PINK3, selectforeground=TOKENS["ink"],
                     fieldbackground=TOKENS["surface"], lightcolor=TOKENS["surface"],
                     darkcolor=TOKENS["line2"])
     # ── 容器
@@ -233,7 +325,8 @@ def apply_theme(root, ttk, *, available_families=None):
     style.configure("Signal.TLabel", background=TOKENS["bg"], foreground=MINT_TEXT, font=mono)
     style.configure("Mono.TLabel", background=TOKENS["surface"], foreground=TOKENS["ink2"],
                     font=mono)
-    style.configure("H1.TLabel", background=TOKENS["bg"], foreground=TOKENS["ink"], font=display)
+    # 一级标题用紫（第二强调），二三级仍用正文色保证信息层级不被强调色抢走
+    style.configure("H1.TLabel", background=TOKENS["bg"], foreground=VIOLET_TEXT, font=display)
     style.configure("H2.TLabel", background=TOKENS["bg"], foreground=TOKENS["ink"], font=title)
     style.configure("H3.TLabel", background=TOKENS["surface"], foreground=TOKENS["ink"],
                     font=heading)
@@ -246,7 +339,7 @@ def apply_theme(root, ttk, *, available_families=None):
         style.configure(name + ".TLabel", background=TOKENS["surface"], foreground=color,
                         font=title)
     # 顶栏（白底）用的同字号变体：同一页面里底色不同必须换样式，不能只改颜色
-    style.configure("TopH2.TLabel", background=TOKENS["surface"], foreground=TOKENS["ink"],
+    style.configure("TopH2.TLabel", background=TOKENS["surface"], foreground=VIOLET_TEXT,
                     font=title)
     style.configure("TopH3.TLabel", background=TOKENS["surface"], foreground=TOKENS["ink2"],
                     font=heading)
@@ -256,6 +349,12 @@ def apply_theme(root, ttk, *, available_families=None):
     style.configure("Danger.TLabel", background=TOKENS["bg"], foreground=RED_TEXT)
     style.configure("Success.TLabel", background=TOKENS["bg"], foreground=MINT_TEXT)
     style.configure("Info.TLabel", background=TOKENS["bg"], foreground=INFO_TEXT)
+    # 紫＝第二强调（链接/关注/信息徽标），粉＝第三强调（eyebrow/装饰），都不是状态
+    style.configure("Accent.TLabel", background=TOKENS["bg"], foreground=VIOLET_TEXT)
+    style.configure("CardAccent.TLabel", background=TOKENS["surface"],
+                    foreground=VIOLET_TEXT)
+    style.configure("Eyebrow.TLabel", background=TOKENS["bg"], foreground=PINK_TEXT,
+                    font=eyebrow)
     # 胶囊（ttk 无圆角：底色 + padding 近似；文字色保证 ≥4.5:1）
     style.configure("Pill.TLabel", background=TOKENS["mint3"], foreground=MINT_TEXT,
                     font=small, padding=(10, 4))
@@ -265,41 +364,58 @@ def apply_theme(root, ttk, *, available_families=None):
                     font=small, padding=(10, 4))
     style.configure("PillMuted.TLabel", background=TOKENS["bg2"], foreground=MUTED_TEXT,
                     font=small, padding=(10, 4))
+    style.configure("PillViolet.TLabel", background=VIOLET3, foreground=VIOLET_TEXT,
+                    font=small, padding=(10, 4))
+    style.configure("PillPink.TLabel", background=PINK3, foreground=PINK_TEXT,
+                    font=small, padding=(10, 4))
     # ── 按钮（命中区 ≥40）
     style.configure("TButton", padding=(16, 10), focusthickness=2, font=body,
                     background=TOKENS["surface"], foreground=TOKENS["ink"],
                     bordercolor=BORDER, lightcolor=TOKENS["surface"],
                     darkcolor=TOKENS["surface"])
     style.map("TButton",
-              background=[("disabled", TOKENS["bg2"]), ("pressed", TOKENS["mint3"]),
+              background=[("disabled", TOKENS["bg2"]), ("pressed", VIOLET3),
                           ("active", TOKENS["surface2"])],
-              foreground=[("disabled", MUTED_TEXT), ("active", TOKENS["ink"])],
-              bordercolor=[("focus", TOKENS["focus"]), ("!focus", BORDER)])
+              foreground=[("disabled", MUTED_TEXT), ("active", VIOLET_TEXT)],
+              # hover 转紫（§2.1-2）；focus 优先，否则回落到控件边界色
+              bordercolor=[("focus", TOKENS["focus"]), ("active", VIOLET_TEXT),
+                           ("!focus", BORDER)])
     style.configure("Primary.TButton", padding=(16, 10), font=body,
                     background=TOKENS["mint"], foreground=TOKENS["white"],
                     bordercolor=TOKENS["mint"], lightcolor=TOKENS["mint"],
                     darkcolor=TOKENS["mint"])
     style.map("Primary.TButton",
-              background=[("disabled", TOKENS["bg2"]), ("pressed", MINT_TEXT),
-                          ("active", TOKENS["mint2"])],
+              # hover/pressed 都往深里走：按钮字对底仍 ≥4.5:1（不许用更亮的 mint2 压白字）
+              background=[("disabled", TOKENS["bg2"]), ("pressed", MINT_STRONG),
+                          ("active", MINT_HOVER)],
               foreground=[("disabled", MUTED_TEXT), ("active", TOKENS["white"])],
               # clam 的边框/3D 边由 bordercolor/lightcolor/darkcolor 画，禁用态必须一起变色，
               # 否则会留下主色描边，看起来「可点」。
               bordercolor=[("disabled", TOKENS["line2"]), ("focus", TOKENS["focus"])],
-              lightcolor=[("disabled", TOKENS["line2"]), ("active", TOKENS["mint2"])],
-              darkcolor=[("disabled", TOKENS["line2"]), ("active", TOKENS["mint2"])])
+              lightcolor=[("disabled", TOKENS["line2"]), ("active", MINT_HOVER)],
+              darkcolor=[("disabled", TOKENS["line2"]), ("active", MINT_HOVER)])
+    style.configure("Violet.TButton", padding=(16, 10), font=body,
+                    background=VIOLET, foreground=ON_VIOLET,
+                    bordercolor=VIOLET, lightcolor=VIOLET, darkcolor=VIOLET)
+    style.map("Violet.TButton",
+              background=[("disabled", TOKENS["bg2"]), ("pressed", VIOLET_TEXT),
+                          ("active", VIOLET_TEXT)],
+              foreground=[("disabled", MUTED_TEXT), ("active", ON_VIOLET)],
+              bordercolor=[("disabled", TOKENS["line2"]), ("focus", TOKENS["focus"])],
+              lightcolor=[("disabled", TOKENS["line2"]), ("active", VIOLET_TEXT)],
+              darkcolor=[("disabled", TOKENS["line2"]), ("active", VIOLET_TEXT)])
     style.configure("Ghost.TButton", padding=(12, 8), font=small,
                     background=TOKENS["bg"], foreground=MINT_TEXT, bordercolor=TOKENS["bg"])
     style.map("Ghost.TButton",
-              background=[("active", TOKENS["mint3"])],
-              foreground=[("disabled", MUTED_TEXT), ("active", MINT_TEXT)])
-    # 侧栏导航：左对齐 + 44 行高
+              background=[("active", VIOLET3)],
+              foreground=[("disabled", MUTED_TEXT), ("active", VIOLET_TEXT)])
+    # 侧栏导航：当前项＝玉绿字 + 紫底（§2.1-1/3）
     for name, background, foreground in (("Nav.TButton", TOKENS["bg2"], TOKENS["ink2"]),
-                                         ("NavOn.TButton", TOKENS["mint3"], MINT_TEXT)):
+                                         ("NavOn.TButton", VIOLET3, MINT_TEXT)):
         style.configure(name, padding=(14, 11), font=body, anchor="w",
                         background=background, foreground=foreground,
                         bordercolor=background, lightcolor=background, darkcolor=background)
-        style.map(name, background=[("active", TOKENS["mint3"])],
+        style.map(name, background=[("active", VIOLET3)],
                   foreground=[("active", MINT_TEXT)],
                   bordercolor=[("focus", TOKENS["focus"])])
     for name in ("TCheckbutton", "TRadiobutton"):
@@ -323,7 +439,7 @@ def apply_theme(root, ttk, *, available_families=None):
                   fieldbackground=[("disabled", TOKENS["bg2"]), ("readonly", TOKENS["bg2"])],
                   foreground=[("disabled", MUTED_TEXT), ("readonly", TOKENS["ink2"])],
                   bordercolor=[("focus", TOKENS["focus"]), ("!focus", BORDER)])
-    style.configure("TCombobox", selectbackground=TOKENS["surface"],
+    style.configure("TCombobox", selectbackground=PINK3,
                     selectforeground=TOKENS["ink"])
     # ── 表格 / 滚动 / 分隔 / 进度
     style.configure("Treeview", background=TOKENS["surface"],
@@ -331,7 +447,7 @@ def apply_theme(root, ttk, *, available_families=None):
                     font=body, rowheight=ROW_HEIGHT, bordercolor=TOKENS["line"],
                     lightcolor=TOKENS["surface"], darkcolor=TOKENS["surface"])
     style.map("Treeview",
-              background=[("selected", TOKENS["mint3"])],
+              background=[("selected", VIOLET3)],
               foreground=[("selected", TOKENS["ink"])])
     style.configure("Treeview.Heading", background=TOKENS["surface2"],
                     foreground=TOKENS["ink2"], font=small, relief="flat",
@@ -363,8 +479,8 @@ def apply_theme(root, ttk, *, available_families=None):
 
 
 def menu_options() -> dict:
-    """``tk.Menu`` 的浅色参数（托盘右键菜单用）。"""
+    """``tk.Menu`` 的浅色参数（托盘右键菜单用；选中项走紫底）。"""
     return dict(background=TOKENS["surface"], foreground=TOKENS["ink"],
-                activebackground=TOKENS["mint3"], activeforeground=MINT_TEXT,
+                activebackground=VIOLET3, activeforeground=VIOLET_TEXT,
                 disabledforeground=MUTED_TEXT, borderwidth=1, relief="solid",
                 font=FONT)
