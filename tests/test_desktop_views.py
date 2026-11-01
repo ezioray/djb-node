@@ -684,3 +684,15 @@ def test_receipt_verify_compares_masked_cloud_hash_as_prefix():
                  "revenue_minor": 1_250_000}
     diffs = _receipt_differences(local, cloud_bad, {"state": "accepted"})
     assert [field for field, _mine, _theirs in diffs] == ["hash"]
+
+
+def test_yield_state_never_claims_running_when_daemon_stopped(tmp_path):
+    """daemon 没跑时状态卡不许写「运行中」——那是把停止说成在跑。"""
+    from djb_node.desktop.datasource import FakeDataSource
+
+    snapshot = FakeDataSource({"yield": {"state": "stopped", "reason_label": "daemon 未运行",
+                                         "accepting": False}}, source="test").snapshot()
+    lines = [line for line in vw.build_view("yield", snapshot).plain_text().split("\n") if line]
+    card = next(line for line in lines if line.startswith("[当前状态]"))
+    assert "运行中" not in card
+    assert "已停止" in card and "daemon 未运行" in card

@@ -664,6 +664,25 @@ def _access(snapshot: Snapshot) -> View:
     )
 
 
+def _yield_state_text(state: str) -> str:
+    """让路页的状态卡：没跑就别说「运行中」（本地状态词只有 stopped/paused/online…）。"""
+    if state == "paused":
+        return MARK_WAIT + " 已暂停"
+    if state in ("online", "running", "full", "balanced", "saver"):
+        return MARK_DONE + " 运行中"
+    if state == "stopped":
+        return MARK_IDLE + " 已停止"
+    return MARK_UNKNOWN + " 状态未知（" + (state or "未知") + "）"
+
+
+def _yield_state_tone(state: str) -> str:
+    if state == "paused":
+        return "amber"
+    if state in ("online", "running", "full", "balanced", "saver"):
+        return "mint"
+    return "muted"
+
+
 def _yield(snapshot: Snapshot) -> View:
     data = _section(snapshot, "yield")
     state = str(data.get("state") or "unknown")
@@ -681,8 +700,9 @@ def _yield(snapshot: Snapshot) -> View:
     return View(
         key="yield", title="让路 / 节能",
         subtitle="四档模式 · 暂停后与托盘状态一致",
-        cards=(Card("当前状态", (MARK_WAIT + " 已暂停") if paused else (MARK_DONE + " 运行中"),
-                    str(reason or "无让路原因"), "amber" if paused else "mint"),
+        cards=(Card("当前状态", _yield_state_text(state),
+                    str(reason or data.get("reason_label") or "无让路原因"),
+                    _yield_state_tone(state)),
                Card("接单", _flag(data.get("accepting"), "允许", "禁止"), "", "default"),
                Card("模式", mode, "本机配置", "muted")),
         table=Table(("模式", "键", "说明", "当前"), rows, empty="模式暂不可用"),
