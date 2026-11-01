@@ -8,6 +8,10 @@
 #
 # 为什么单独一份：三端取证的 macOS 一段必须跑在真 Apple Silicon 上
 # （Intel runner 的 GPU/内存字段语义不同，不能拿来充数）。
+#
+# 2026-11-02 记：原计划的 macos-14 镜像已进入退役 brownout（GitHub 官方
+# actions/runner-images#13518），任务被直接 cancelled、一步都不跑。
+# 因此改用 macos-15（同为 Apple Silicon / arm64）。
 name: e2e-macos
 
 on:
@@ -25,8 +29,8 @@ concurrency:
 
 jobs:
   machine-eval:
-    name: 机器评估 + 安装/诊断冒烟（macos-14 / arm64）
-    runs-on: macos-14
+    name: 机器评估 + 安装/诊断冒烟（macos-15 / arm64）
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
