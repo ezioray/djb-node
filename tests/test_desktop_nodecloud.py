@@ -559,3 +559,22 @@ def test_sealed_but_undecodable_local_copy_is_unreadable(tmp_path):
         "next_cursor": None, "truncated": False})
     rows = LocalDataSource(home=tmp_path, cloud=cloud).snapshot().get("receipts")["rows"]
     assert rows[0]["local_check"] == "unreadable"
+
+
+def test_today_micro_is_read_when_features_lands_it():
+    """`today_micro`（UTC 日界、无记录→0）上线后直接可用：0 是事实，不是「没数据」。"""
+    client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(200, {
+        "currency": "USDT", "unit": "micro-USD", "today_micro": 0,
+        "settled_micro": 1_250_000, "pending_micro": 0, "usage_rows": 1,
+        "rows": [{"request_id": "req-1", "state": "settled", "amount_micro": 1_250_000}]})))
+    data = client.earnings()
+    assert data["today_minor"] == 0 and data["today"] == "0.00"
+    assert data["settled"] == "1.25"
+
+
+def test_today_stays_unavailable_when_field_absent():
+    client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(200, {
+        "currency": "USDT", "pending_minor": 4_150_000, "usage_rows": 1,
+        "rows": [{"request_id": "req-1", "state": "recorded", "amount_micro": 4_150_000}]})))
+    data = client.earnings()
+    assert data["today_minor"] is None and data["today"] is None   # None → 界面显示「—」
