@@ -18,7 +18,8 @@ from djb_node.api import NodeApi
 from djb_node.config import ClientConfig, save_config
 from djb_node.errors import NetworkError
 from djb_node.httpclient import HttpResponse
-from djb_node.notifications import NotificationStore, notification_db_file, notifications_enabled
+from djb_node.notifications import (NotificationStore, notification_db_file,
+                                     notifications_enabled, parse_unread_count)
 from tests.mock_notify import MockNotify
 
 SECRET = "ck_" + "test_notify_key_0123456789abcdef"
@@ -766,3 +767,37 @@ def test_windows_open_unavailable_close_failure_preserves_error_and_blocks_retry
     assert daemon._control is control
     with pytest.raises(UsageError, match="清理未完成"):
         daemon.start()
+
+
+# ─────────────────────────────────────────────────────────── G4：未读数口径
+def test_unread_count_parses_spec_field_and_fallback():
+    """spec 字段是 ``unread``；``unread_count`` 只是 tolerant 回退；都没有 -> None（不猜 0）。"""
+    assert parse_unread_count({"unread": 3}) == 3
+    assert parse_unread_count({"unread_count": 4}) == 4
+    assert parse_unread_count({"unread": 0}) == 0            # 真的是 0 与「拿不到」要区分
+    assert parse_unread_count({"unread": 2, "unread_count": 9}) == 2   # spec 优先
+    assert parse_unread_count({}) is None
+    assert parse_unread_count(None) is None
+    assert parse_unread_count({"unread": "3"}) is None
+    assert parse_unread_count({"unread": True}) is None
+    assert parse_unread_count({"unread": -1}) is None
+
+
+def test_server_unread_count_uses_spec_shape(paths, credentials):
+    """回环集成：服务端按 spec 回 `{"unread": n}`，客户端必须读出 n（G4 的另一半）。"""
+    from djb_node.httpclient import HttpClient
+    server = MockNotify().start()
+    try:
+        server.unread_count = 7
+        credentials.set_node("node-1", SECRET)
+        config = ClientConfig(gateway_url=server.base_url, mirror_port=1717,
+                              extra={facts.NOTIFICATIONS_FLAG: True})
+        api = NodeApi(config.gateway_url, client_key=credentials.client_key(),
+                      http=HttpClient(timeout=5.0))
+        store = NotificationStore(paths, config=config, api=api)
+        assert store.server_unread_count() == 7
+        # 旧错路径（unread-count）现在服务端 404 -> 客户端不得把 404 当成 0
+        server.unread_count = 0
+        assert store.server_unread_count() == 0
+    finally:
+        server.stop()

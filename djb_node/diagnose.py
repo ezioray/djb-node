@@ -72,6 +72,11 @@ class DiagnoseBuilder:
         upstream = data.get("upstream_keys")
         if isinstance(upstream, dict):
             values.extend([str(item) for item in upstream.values() if item])
+        # G10：更新验签的对称 mock 密钥只在 test 环境出现过，但它一旦被写进日志就必须脱敏；
+        # 内置 Ed25519 公钥是公开数据，不进脱敏清单（进了会把正常内容打成 [REDACTED]）。
+        mock_key = os.environ.get(facts.UPDATE_MOCK_KEY_ENV, "").strip()
+        if len(mock_key) >= 32:
+            values.append(mock_key)
         for path in (self.paths.buffer_key_file, self.paths.provider_key_file,
                      os.path.join(self.paths.keys_dir, "update_mock.key")):
             try:
@@ -135,6 +140,15 @@ class DiagnoseBuilder:
             "credentials": self.credentials.describe(),
         }
 
+    def machine_eval(self) -> dict[str, Any] | None:
+        """本机 `djb.machine-eval/1`（采集失败 -> None，诊断包不因此失败）。"""
+        try:
+            from . import machine_profile
+            return machine_profile.build_machine_eval(
+                home=getattr(self.paths, "home", None), benchmark=True)
+        except Exception:                                # pragma: no cover - 防御
+            return None
+
     def db_summary(self) -> dict[str, Any]:
         profile = self.store.profile()
         return {
@@ -164,10 +178,25 @@ class DiagnoseBuilder:
         manifest = self.manifest(env)
         db_summary = self.db_summary()
         log_files = self._logs(secrets)
+        # M3：机器评估单独成文件（与 env.json 里的 hardware.evidence 冗余是有意的：
+        # 支持同学只看 machine.json 就能复现清单，不必翻 env 结构）
+        machine = self.machine_eval()
+        if machine:
+            manifest["machine"] = {"schema": machine.get("schema"),
+                                   "platform": machine.get("platform"),
+                                   "collected_at": machine.get("collected_at"),
+                                   "cpu_model": (machine.get("cpu") or {}).get("model"),
+                                   "gpus": [item.get("model") for item
+                                            in (machine.get("gpus") or [])],
+                                   "tokens_per_second": (machine.get("benchmark") or {})
+                                   .get("tokens_per_second")}
         files: dict[str, str] = {
             "README.txt": BUNDLE_README,
             "manifest.json": json.dumps(redact_obj(manifest), ensure_ascii=False, indent=2),
             "env.json": json.dumps(env.to_dict(), ensure_ascii=False, indent=2),
+            "machine.json": json.dumps(machine or {"schema": None, "unavailable_reason":
+                                                   "machine_profile_failed"},
+                                       ensure_ascii=False, indent=2),
             "db_summary.json": json.dumps(db_summary, ensure_ascii=False, indent=2),
             "config.json": json.dumps(self.config.to_dict(), ensure_ascii=False, indent=2),
         }

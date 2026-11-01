@@ -496,6 +496,35 @@ def _status_text(value: dict[str, Any]) -> str:
     credentials = value.get("credentials") or {}
     lines.append("凭据：" + ("已配置" if credentials.get("client_key_set") else "未配置")
                  + " · " + str(credentials.get("storage")))
+    machine = value.get("machine") or {}
+    if isinstance(machine, dict) and machine.get("schema"):
+        cpu = machine.get("cpu") or {}
+        memory = machine.get("memory") or {}
+        disks = machine.get("disks") or []
+        gpus = machine.get("gpus") or []
+        bench = machine.get("benchmark") or {}
+        detail = "机器：" + str(cpu.get("model") or "未知 CPU")
+        if cpu.get("threads"):
+            detail += " · " + str(cpu.get("threads")) + " 线程"
+        if memory.get("total_bytes"):
+            detail += " · 内存 " + str(round(memory["total_bytes"] / 1024 ** 3, 1)) + " GB"
+        if disks and disks[0].get("free_bytes"):
+            detail += " · 磁盘可用 " + str(round(disks[0]["free_bytes"] / 1024 ** 3, 1)) + " GB"
+        lines.append(detail)
+        if gpus:
+            for item in gpus:
+                line = "GPU：" + str(item.get("model") or "未知")
+                if item.get("vram_bytes"):
+                    line += " · 显存 " + str(round(item["vram_bytes"] / 1024 ** 3, 1)) + " GB"
+                if item.get("utilization_pct") is not None:
+                    line += " · 利用率 " + str(item["utilization_pct"]) + "%"
+                lines.append(line)
+        else:
+            lines.append("GPU：未检测到（无 GPU 不编造）")
+        if bench.get("tokens_per_second"):
+            lines.append("基准：" + str(bench.get("tokens_per_second")) + " tok/s（"
+                         + str(bench.get("method")) + "）")
+        lines.append("机器画像上报：" + ("开" if value.get("machine_reported") else "关"))
     local_api = value.get("local_api") or {}
     if local_api:
         lines.append("本机镜像：http://" + str(local_api.get("host")) + ":"
@@ -1272,7 +1301,9 @@ def cmd_update(args: argparse.Namespace) -> int:
     manager = UpdateManager(paths, store,
                             source=source if source is not None else config.update_source,
                             channel=getattr(args, "channel", None) or config.update_channel,
-                            http=HttpClient(timeout=20.0))
+                            http=HttpClient(timeout=20.0),
+                            # 开关求值需要 config（mock 验签三条件之一）；生产路径用不到
+                            config=config)
     if getattr(args, "status", False):
         _emit(manager.status(), as_json=_json_flag(args),
               text=lambda value: json.dumps(value, ensure_ascii=False, indent=2))
@@ -1306,6 +1337,40 @@ def cmd_update(args: argparse.Namespace) -> int:
                               + ("\n下一步：djb update --apply" if value.get("state") == "eligible"
                                  else "")))
     return facts.EXIT_VERIFY if result.get("state") == "failed_verify" else 0
+
+
+# ─────────────────────────────────────────────────────────── machine（M3）
+def cmd_machine(args: argparse.Namespace) -> int:
+    """机器评估：CPU / 内存 / 磁盘 / GPU / 负载 + 可选 tokens/s 基准。
+
+    输出口径 = qa-e2e 钉死的 `djb.machine-eval/1`（`ops/e2e/qa/modules/m03_machine.py`）。
+    拿不到的字段写 null + unavailable_reason，**绝不写 0 充数**。
+    """
+    from . import machine_profile
+    paths = _paths(args)
+    benchmark = not getattr(args, "no_benchmark", False)
+    mode = getattr(args, "benchmark_mode", "synthetic") or "synthetic"
+    doc = machine_profile.build_machine_eval(
+        home=paths.home, benchmark=benchmark, benchmark_mode=mode,
+        ollama_url=getattr(args, "ollama_url", None),
+        ollama_model=getattr(args, "ollama_model", None))
+    written: str | None = None
+    out = getattr(args, "out", None)
+    if getattr(args, "e2e", False):
+        out = out or machine_profile.default_eval_path()
+    if out:
+        written = machine_profile.write_machine_eval(out, doc)
+    if _json_flag(args):
+        if written:
+            doc = dict(doc, written_path=written)
+        _emit(doc, as_json=True, text=lambda value: json.dumps(value, ensure_ascii=False,
+                                                               indent=2))
+        return 0
+    _emit(doc, as_json=False,
+          text=lambda value: machine_profile.machine_eval_text(value))
+    if written:
+        print("已写入：" + written + "（0600）")
+    return 0
 
 
 # ─────────────────────────────────────────────────────────── logs
@@ -1609,6 +1674,19 @@ def build_parser() -> argparse.ArgumentParser:
                      help="检测时间预算（秒，默认 10）")
     env.add_argument("--no-persist", action="store_true",
                      help="只打印结论，不写入检测快照")
+
+    machine = add_common(cmd_machine, "machine",
+                         "机器评估：CPU/内存/磁盘/GPU/负载 + tokens/s 基准（djb.machine-eval/1）")
+    machine.add_argument("--no-benchmark", action="store_true", help="不跑 tokens/s 基准")
+    machine.add_argument("--benchmark-mode", choices=("synthetic", "ollama"),
+                         default="synthetic",
+                         help="synthetic=纯 Python 合成参考；ollama=本机 Ollama 实测（默认 synthetic）")
+    machine.add_argument("--ollama-url", default="http://127.0.0.1:11434",
+                         help="本机 Ollama 地址（只允许回环）")
+    machine.add_argument("--ollama-model", default="qwen2.5:7b", help="Ollama 模型名")
+    machine.add_argument("--out", metavar="PATH", help="把评估 JSON 写到指定路径（0600）")
+    machine.add_argument("--e2e", action="store_true",
+                         help="写到 E2E 约定位置 ~/.djb/secrets/e2e/machine-eval/<platform>.json（0600）")
 
     auth = add_common(cmd_auth, "auth", "节点密钥 / 绑定 / 轮换")
     auth.add_argument("--status", action="store_true", help="查看绑定状态（默认）")

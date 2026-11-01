@@ -18,8 +18,25 @@ MODULE_ID = "M15"
 CLIENT_VERSION = "0.1.0"
 PROTOCOL_VERSION = "1.0.0"
 SPEC_VERSION = "1.2.4"
-PLATFORM = "linux"
-USER_AGENT = "djb-node/" + CLIENT_VERSION + " (linux)"
+
+
+def _detect_platform() -> str:
+    """当前 OS 的平台标识（linux / darwin / windows / other）。
+
+    M10 三端：原来这里硬编码 `"linux"`，导致 `update.select_artifact` /
+    `store.update_install` 在 Windows / macOS 上按 linux 选包（更新永远「没有匹配的
+    安装包」）。平台判定只读 `sys.platform` 等，不产生副作用；判定失败保持 linux
+    （S1 行为不变）。
+    """
+    try:
+        from .platform import get_platform
+        return get_platform().os
+    except Exception:                                    # pragma: no cover - 极端环境
+        return "linux"
+
+
+PLATFORM = _detect_platform()
+USER_AGENT = "djb-node/" + CLIENT_VERSION + " (" + PLATFORM + ")"
 
 # ─────────────────────────────────────────────────────────── 状态机（M15 §3 / §5.9）
 DAEMON_STATES: tuple[str, ...] = ("stopped", "starting", "online", "paused", "error", "updating")
@@ -161,7 +178,28 @@ UPDATE_BUCKET_WAVES: tuple[int, ...] = (5, 25, 100)
 UPDATE_BUCKET_OBSERVE_S = 24 * 3600
 UPDATE_KEEP_VERSIONS = 2
 UPDATE_SIGNATURE_PREFIX = "hmac-sha256:"
+"""旧口径（对称 HMAC）。**只允许 test-only mock 分支使用**（见 `UPDATE_MOCK_FLAG`）。"""
 UPDATE_SIGNATURE_ALG = "hmac-sha256"
+UPDATE_ED25519_PREFIX = "ed25519:"
+UPDATE_SIGNATURE_ALG_ED25519 = "ed25519"
+
+# G10：更新链路的**信任锚是内置公钥**（私钥只在发布侧 / E2E 的
+# `~/.djb/secrets/e2e/update-signing.key` 0600，客户端永远不持有）。
+# 原来 `UpdateManager.signing_key()` 会在本地随机自生成一把 HMAC 密钥并自动使用——
+# 那等于「客户端自己造信任锚」，任何拿到本机文件的人都能签出「合法」更新（审计 P1-3）。
+UPDATE_PUBLIC_KEY_HEX = "cecc3a253872f8e60b630d57d94e96433aecdfb227d49b74605cc5925e0add73"
+"""内置 Ed25519 公钥（32 字节，hex）。公钥可入仓；私钥不入仓、不入对话、不进诊断包。"""
+UPDATE_KEY_ID = "djb-e2e-2026-11-02"
+"""公钥标识（轮换时改这里 + `UPDATE_PUBLIC_KEY_HEX`；写进 status / 诊断包便于对账）。"""
+UPDATE_PUBLIC_KEY_FINGERPRINT = "30171de47e02"
+"""公钥指纹 sha256(raw pubkey)[:12]，与安全席登记的指纹一致（status 里如实展示）。"""
+UPDATE_TEST_ENV = "DJB_ENV"
+UPDATE_TEST_ENV_VALUE = "test"
+"""test-only mock 验签的环境门：必须显式 `DJB_ENV=test`。"""
+UPDATE_MOCK_KEY_ENV = "DJB_UPDATE_SIGNING_KEY"
+"""test-only mock 的对称密钥（hex）。**不设默认值、不落盘、不自动生成**。"""
+UPDATE_MOCK_FLAG = "client.update.mock_signature.enabled"
+"""test-only mock 验签开关（登记项见本文件下方的 FEATURE_FLAGS；三字段齐全、默认关闭）。"""
 
 # ─────────────────────────────────────────────────────────── 支持矩阵（§8.2）
 MIN_UBUNTU = (22, 4)
@@ -516,11 +554,44 @@ FEATURE_FLAGS["client.notifications.enabled"] = {
     "rollback_rule": "关闭后停拉取、保留本地消息与待补发读态（本地只读不删）",
     "description": "客户端消息中心（C16）：拉取站内信、未读/已读/ack、离线补拉，默认关闭",
 }
+# M3：把机器画像（CPU/内存/磁盘/GPU/tokens-s）加性地带进心跳，供云端算力视图展示。
+# 纯加性字段（cloud 侧忽略未知键），但**默认关**：先由 E2E 显式打开验证，再谈默认开。
+MACHINE_PROFILE_FLAG = "client.machine_profile.report"
+FEATURE_FLAGS[MACHINE_PROFILE_FLAG] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2027-06-30",
+    "rollback_rule": "关闭即心跳不再携带 machine 字段（云端忽略该字段，历史数据无需迁移）；"
+                     "本地 djb machine / djb status / 诊断包展示不受影响",
+    "description": "心跳上报机器画像（加性字段 machine：cpu/memory/disk/gpu/benchmark 摘要）",
+}
+
+# G10：更新验签的 test-only mock 分支（默认关闭；必须 DJB_ENV=test + 显式密钥）
+FEATURE_FLAGS[UPDATE_MOCK_FLAG] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "关闭即回到内置公钥验签（唯一信任锚）；mock 不产生任何持久状态，"
+                     "已安装版本与回滚点不变",
+    "description": "自动更新验签的 test-only HMAC mock（必须同时满足 DJB_ENV=test + "
+                   "显式 DJB_UPDATE_SIGNING_KEY）；默认关闭，生产永远走内置 Ed25519 公钥",
+}
+
 NOTIFICATIONS_FLAG = "client.notifications.enabled"
 NOTIFICATIONS_ENV = "DJB_NOTIFY"
 """S2 测试网显式激活开关（值 "1" 生效；不改变 facts 里的默认关闭定义）。"""
 NOTIFICATIONS_PATH = "/api/v1/node/notifications"
-NOTIFICATIONS_UNREAD_PATH = "/api/v1/node/notifications/unread-count"
+# G4：路径口径以 spec 1.2.13 / openapi.yaml 为准 —— `/api/v1/node/notifications/unread_count`
+# 是**下划线**。原来写成 `unread-count`（连字符）→ 服务端 100% 404 → 未读角标永远像
+# 「没有新消息」。同文件的 read / ack 两条路径本来就对得上，只有这一条是手写常量漏测。
+NOTIFICATIONS_UNREAD_PATH = "/api/v1/node/notifications/unread_count"
+NOTIFICATIONS_UNREAD_FIELDS: tuple[str, ...] = ("unread", "unread_count")
+"""未读数响应字段（按优先级读取）。
+
+spec `NodeNotificationUnread` 的 required 字段是 ``unread``（cloud 实际就回 `{"unread": n}`）；
+``unread_count`` 作为 tolerant reader 的回退（早期客户端口径 / 旧网关）。两者都没有 → None，
+**不猜 0**（猜 0 等于把「拿不到」伪装成「没有新消息」，正是 G4 的用户可感知症状）。
+"""
 NOTIFICATIONS_DB = "notifications.db"
 """本地消息库（独立 SQLite 文件，不动 state.db 的 schema 版本）。"""
 NOTIFICATIONS_SCHEMA_VERSION = 1

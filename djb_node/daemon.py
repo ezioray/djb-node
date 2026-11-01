@@ -238,6 +238,8 @@ class Daemon:
         self._api_factory = api_factory or (
             lambda base, key: NodeApi(base, client_key=key, http=self.http))
         self.api: NodeApi | None = None
+        # M3：机器画像（与状态机 self.machine 无关，故意另起名字）
+        self._machine_eval: dict[str, Any] | None = None
         self.machine = StateMachine(Snapshot.from_dict(self.store.get_kv("daemon_state")),
                                     now=now)
         self.limiter = limiter or Limiter(self.store, detector=yield_detector or YieldDetector(),
@@ -248,7 +250,7 @@ class Daemon:
         self.update = UpdateManager(paths, self.store, source=self.config.update_source,
                                     channel=self.config.update_channel,
                                     client_version=facts.CLIENT_VERSION, http=self.http,
-                                    now=now)
+                                    config=self.config, now=now)
         self.server = LocalApiServer(self, token=self.token, port=self.port, http=self.http,
                                         settings=self.config.extra)
         self._stop_event = threading.Event()
@@ -959,6 +961,33 @@ class Daemon:
                 "heartbeat_failures": self._consecutive_failures,
                 "receipts": self.buffer.count(), "inflight": self._inflight}
 
+    # ── 机器画像（M3；本地展示始终可用，上报受开关控制）
+    def machine_eval(self, *, refresh: bool = False) -> dict[str, Any] | None:
+        """本机 `djb.machine-eval/1` 文档（懒采集、进程内缓存）。采集失败 -> None。"""
+        if self._machine_eval is not None and not refresh:
+            return self._machine_eval
+        try:
+            self._machine_eval = machine_profile.build_machine_eval(
+                home=getattr(self.paths, "home", None), benchmark=True)
+        except Exception as exc:                        # 画像失败绝不影响 daemon
+            event("daemon.machine_profile_failed", level="warning",
+                  error=type(exc).__name__)
+            self._machine_eval = None
+        return self._machine_eval
+
+    def _machine_payload(self) -> dict[str, Any] | None:
+        """心跳里带的机器摘要；开关关闭 -> None（字段整体不出现，老服务端零感知）。"""
+        if not feature_flag(self.config, facts.MACHINE_PROFILE_FLAG):
+            return None
+        doc = self.machine_eval()
+        if not doc:
+            return None
+        return {"schema": doc.get("schema"), "collected_at": doc.get("collected_at"),
+                "platform": doc.get("platform"), "cpu": doc.get("cpu"),
+                "memory": doc.get("memory"), "gpus": doc.get("gpus"),
+                "disks": doc.get("disks"), "load": doc.get("load"),
+                "benchmark": doc.get("benchmark")}
+
     # ── 心跳
     def _relay_capacity_targets(self, now: datetime) -> dict[str, list[dict[str, Any]]]:
         """C9 接线：relay 发现结果 → 容量目标（开关关闭时返回空 dict，行为不变）。"""
@@ -987,6 +1016,10 @@ class Daemon:
                 profile, now=now, relay=self._relay_capacity_targets(now)),
             "load": {"inflight": self._inflight, "queue_seconds": 0.0},
         }
+        # M3：加性字段（开关关闭时不出现；云端忽略未知键，老版本零感知）
+        machine = self._machine_payload()
+        if machine is not None:
+            payload["machine"] = machine
         try:
             result = self.api.heartbeat(payload)
         except ForbiddenError as exc:
@@ -1530,6 +1563,9 @@ class Daemon:
             "flags": {name: {"enabled": feature_flag(self.config, name), **spec}
                       for name, spec in facts.FEATURE_FLAGS.items()},
             "update": self.update.status(),
+            # M3：机器画像（本地展示始终有；是否上报由 client.machine_profile.report 决定）
+            "machine": self.machine_eval(),
+            "machine_reported": bool(feature_flag(self.config, facts.MACHINE_PROFILE_FLAG)),
             "env": {"authorized_at": (self.store.env_state() or {}).get("authorized_at")},
             "yield": self._last_yield,
             "inflight": self._inflight,

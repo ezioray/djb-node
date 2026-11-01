@@ -8,11 +8,11 @@ import os
 from djb_node import envcheck
 from djb_node.cli import main
 from djb_node.config import Paths
-from djb_node.envcheck import Check
 from djb_node.store import Store
 from djb_node.update import UpdateManager
+from djb_node.envcheck import Check
 from tests.mock_m02 import CLIENT_KEY
-from tests.test_update import _source
+from tests.update_fixtures import build_source, use_test_anchor
 
 
 def test_auth_pair_bind_unbind(home, mock_server, capsys):
@@ -63,18 +63,13 @@ def test_announce_and_upstream_probe_declare(home, mock_server, capsys):
     capsys.readouterr()
 
 
-def test_update_cli_apply_and_rollback(home, tmp_path, capsys):
+def test_update_cli_apply_and_rollback(home, tmp_path, capsys, monkeypatch):
+    use_test_anchor(monkeypatch)
     assert main(["init", "--no-env"]) == 0
     capsys.readouterr()
     paths = Paths(str(home))
-    store = Store(paths.db_file)
-    try:
-        manager = UpdateManager(paths, store)
-        key = manager.signing_key()
-    finally:
-        store.close()
     os.makedirs(os.path.join(paths.versions_dir, "0.1.0"), exist_ok=True)
-    source = _source(tmp_path, key, version="0.2.0")
+    source = build_source(tmp_path, version="0.2.0")
     assert main(["init", "--no-env", "--update-source", source]) == 0
     capsys.readouterr()
     assert main(["update", "--check", "--json"]) == 0
@@ -88,17 +83,12 @@ def test_update_cli_apply_and_rollback(home, tmp_path, capsys):
     assert rolled["rolled_back"] is True
 
 
-def test_update_cli_failed_verify(home, tmp_path, capsys):
+def test_update_cli_failed_verify(home, tmp_path, capsys, monkeypatch):
+    use_test_anchor(monkeypatch)
     assert main(["init", "--no-env"]) == 0
     capsys.readouterr()
     paths = Paths(str(home))
-    store = Store(paths.db_file)
-    try:
-        manager = UpdateManager(paths, store)
-        key = manager.signing_key()
-    finally:
-        store.close()
-    source = _source(tmp_path, key, version="0.2.0")
+    source = build_source(tmp_path, version="0.2.0")
     assert main(["init", "--no-env", "--update-source", source]) == 0
     capsys.readouterr()
     store = Store(paths.db_file)
