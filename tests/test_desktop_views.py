@@ -696,3 +696,15 @@ def test_yield_state_never_claims_running_when_daemon_stopped(tmp_path):
     card = next(line for line in lines if line.startswith("[当前状态]"))
     assert "运行中" not in card
     assert "已停止" in card and "daemon 未运行" in card
+
+
+def test_today_card_says_utc_boundary_so_local_midnight_does_not_look_like_a_bug():
+    """「今日」按 UTC 日界：本地刚过零点但 UTC 还是昨天时，0.00 会被当成 bug——卡上要写明口径。"""
+    from djb_node.desktop.datasource import FakeDataSource
+
+    snapshot = FakeDataSource({"earnings": {"currency": "USDT", "today": "0.00", "pending": "4.15",
+                                           "settled": "0.00", "payouts": []}},
+                              source="test").snapshot()
+    text = vw.build_view("earnings", snapshot).plain_text()
+    card = next(line for line in text.split("\n") if line.startswith("[今日]"))
+    assert "0.00" in card and "UTC" in card

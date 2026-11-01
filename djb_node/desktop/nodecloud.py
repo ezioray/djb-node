@@ -319,6 +319,9 @@ class NodeCloudClient:
                        if state_text(str(row.get("state") or ""))
                        else str(row.get("state") or "—")),
             "created_at": row.get("recorded_at") or row.get("settled_at") or "—",
+            # features 已加性补上：导出 CSV 的「收据 / Token」两列不再只能写「—」
+            "receipt_id": row.get("receipt_id"),
+            "tokens": row.get("tokens"),
         } for row in rows]
         return {
             "currency": str(payload.get("currency") or "USDT"),

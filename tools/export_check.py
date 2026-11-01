@@ -6,7 +6,7 @@ from djb_node.desktop.nodecloud import NodeCloudClient
 key = open(os.path.expanduser("~/.djb/secrets/testnode-client-key")).read().strip()
 c = make_controller(home="/tmp/djb-wp6-verify",
                     cloud=NodeCloudClient("http://127.0.0.1:18090", key))
-target = "/tmp/djb-wp6-export/earnings.csv"
+target = "/tmp/djb-wp6-export/earnings-v2.csv"
 os.makedirs(os.path.dirname(target), exist_ok=True)
 c.save_path = lambda suggested: target          # 用固定路径替代保存对话框（取证用）
 res = c.action("earnings.export")

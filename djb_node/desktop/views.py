@@ -250,8 +250,7 @@ def _overview(snapshot: Snapshot) -> View:
     state_text, tone = state_map.get(str(status.get("state")), (MARK_UNKNOWN + " 状态未知", "muted"))
     cards = (
         Card("今日贡献", _num(earnings.get("today") or status.get("today_earnings")) + " USDT",
-             ("服务端下发值，本机不换算" if (earnings.get("today") or status.get("today_earnings"))
-              else "服务端未下发今日字段；不拿总计冒充今日"), "mint"),
+             _today_note(earnings.get("today") or status.get("today_earnings")), "mint"),
         Card("当前任务", task_text, "在途任务", "default"),
         Card("余额（可用）",
              ("暂不可用" if earnings.get("balance_note") and earnings.get("balance") is None
@@ -557,7 +556,7 @@ def _earnings(snapshot: Snapshot) -> View:
         key="earnings", title="收益",
         subtitle="按完成任务直接结算 " + currency,
         cards=(Card("今日", _money(snapshot, "earnings", earnings.get("today"), currency),
-                    "完成即结算", "mint"),
+                    _today_note(earnings.get("today")) or "完成即结算", "mint"),
                Card("待结算", _money(snapshot, "earnings", earnings.get("pending")),
                     "结算中不代表到账", "amber"),
                Card("已结算", _money(snapshot, "earnings", earnings.get("settled")),
@@ -662,6 +661,13 @@ def _access(snapshot: Snapshot) -> View:
         notes=(str(access.get("note") or ""),
                "配置文件：" + str(access.get("path") or "—") + "（0600，只在本机）"),
     )
+
+
+def _today_note(today: Any) -> str:
+    """「今日」按 UTC 日界（服务端口径）；本地时区跨日时数字会看起来对不上，得写明。"""
+    if today in (None, ""):
+        return "服务端未下发今日字段；不拿总计冒充今日"
+    return "服务端下发值（UTC 日界）；本机不换算"
 
 
 def _yield_state_text(state: str) -> str:

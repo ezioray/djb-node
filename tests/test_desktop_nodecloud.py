@@ -578,3 +578,14 @@ def test_today_stays_unavailable_when_field_absent():
         "rows": [{"request_id": "req-1", "state": "recorded", "amount_micro": 4_150_000}]})))
     data = client.earnings()
     assert data["today_minor"] is None and data["today"] is None   # None → 界面显示「—」
+
+
+def test_earnings_payouts_carry_receipt_id_and_tokens_for_export():
+    """features 加的 receipt_id/tokens 要流到导出用的 payouts 行里（否则 CSV 只能写「—」）。"""
+    client = NodeCloudClient("http://cloud.test", "ck", http=FakeHttp(FakeResponse(200, {
+        "currency": "USDT", "today_micro": 0, "pending_micro": 1_250_000, "usage_rows": 1,
+        "rows": [{"request_id": "req-1", "task_id": "task-1", "receipt_id": "rcpt-1",
+                  "tokens": 1500, "state": "recorded", "amount_micro": 1_250_000,
+                  "recorded_at": "2026-11-01T00:00:00Z"}]})))
+    payout = client.earnings()["payouts"][0]
+    assert payout["receipt_id"] == "rcpt-1" and payout["tokens"] == 1500
