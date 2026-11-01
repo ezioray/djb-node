@@ -582,3 +582,21 @@ def test_tk_dependent_imports_stay_lazy():
     assert not hasattr(app_mod, "tkinter")            # 延迟导入不进模块命名空间
     for forbidden in ("pystray", "rumps", "PyQt5", "PyQt6", "PySide2", "PySide6"):
         assert forbidden not in imported
+
+
+def test_tray_cli_runs_with_the_resolved_home(monkeypatch):
+    """托盘起 CLI 子进程时也要显式给 home（与桌面端同一条规矩），不靠外部环境漂。"""
+    import subprocess
+
+    from djb_node.tray import app as tray_app
+
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["home"] = kwargs.get("env", {}).get("DJB_HOME")
+        return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+    monkeypatch.setenv("DJB_HOME", "/tmp/tray-home-test")
+    monkeypatch.setattr(tray_app.subprocess, "run", fake_run)
+    assert tray_app._run_cli_json(("status", "--json")) == {}
+    assert seen["home"] == "/tmp/tray-home-test"

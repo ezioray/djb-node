@@ -518,9 +518,17 @@ def _run_cli_json(cli_args: Sequence[str], *, timeout: float = CLI_TIMEOUT_S) ->
     """跑一次**只读** CLI 子命令并解析 JSON；任何失败返回 ``None``（壳不抛、不重试）。"""
     command = [sys.executable, "-m", "djb_node", *cli_args]
     label = " ".join(cli_args)
+    # 与桌面端同一条规矩：子进程的 home 必须显式等于本进程解析出的 home
+    # （不显式传就会跟着外部环境漂，读到别人的库）
+    env = dict(os.environ)
+    try:
+        from ..config import resolve_home
+        env["DJB_HOME"] = str(resolve_home())
+    except Exception:                                # pragma: no cover - 配置坏了也别炸壳
+        pass
     try:
         completed = subprocess.run(command, capture_output=True, text=True,
-                                   timeout=timeout, check=False)
+                                   timeout=timeout, check=False, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         event("tray.cli_failed", level="warning", command=label,
               error=type(exc).__name__)
