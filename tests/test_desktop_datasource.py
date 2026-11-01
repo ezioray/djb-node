@@ -351,3 +351,48 @@ def test_bench_view_shows_probe_conclusions(tmp_path):
     text = build_view("bench", ds.LocalDataSource(home=tmp_path).snapshot()).plain_text()
     assert "系统与架构" in text or "硬件" in text
     assert "检测失败" not in text
+
+
+def test_cli_runner_passes_its_own_home_so_temp_windows_never_read_the_real_one(tmp_path):
+    """本机命令必须带自己的 DJB_HOME：否则临时 home 的窗口会显示**别人家**节点的状态。"""
+    import subprocess
+
+    from djb_node.desktop import datasource as ds_mod
+
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["env_home"] = kwargs.get("env", {}).get("DJB_HOME")
+        return subprocess.CompletedProcess(command, 0, stdout='{"state": "stopped"}', stderr="")
+
+    original = ds_mod.subprocess.run
+    ds_mod.subprocess.run = fake_run
+    try:
+        source = ds_mod.LocalDataSource(home=tmp_path)
+        assert source._cli_runner(["status"])["state"] == "stopped"
+    finally:
+        ds_mod.subprocess.run = original
+    assert seen["env_home"] == str(tmp_path)
+
+
+def test_cli_runner_surfaces_the_cli_sentence_not_just_an_exit_code(tmp_path):
+    """失败时要带 CLI 的原话（「本机未初始化：先执行 djb init」），不是「退出码 3」。"""
+    import subprocess
+
+    import pytest
+
+    from djb_node.desktop import datasource as ds_mod
+    from djb_node.desktop.datasource import ProviderError
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 3, stdout="",
+                                           stderr="djb: 本机未初始化：先执行 djb init\n")
+
+    original = ds_mod.subprocess.run
+    ds_mod.subprocess.run = fake_run
+    try:
+        with pytest.raises(ProviderError) as excinfo:
+            ds_mod.LocalDataSource(home=tmp_path)._cli_runner(["status"])
+    finally:
+        ds_mod.subprocess.run = original
+    assert "本机未初始化" in str(excinfo.value)

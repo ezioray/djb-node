@@ -548,9 +548,15 @@ def _earnings(snapshot: Snapshot) -> View:
     for row in payouts:
         if not isinstance(row, Mapping):
             continue
-        rows.append(Row((str(row.get("id") or row.get("txid") or "—"),
-                         _num(row.get("amount")), str(row.get("currency") or "USDT"),
-                         str(row.get("status") or "—"), str(row.get("created_at") or "—"))))
+        ident = str(row.get("id") or row.get("txid") or "—")
+        amount = _num(row.get("amount"))
+        currency = str(row.get("currency") or "USDT")
+        status = str(row.get("status") or "—")
+        created = str(row.get("created_at") or "—")
+        # 窄窗状态只留中文（「已记录（recorded）」在 163px 里会被切一半，原词在详情抽屉里）
+        short_state = status.split("（", 1)[0] if "（" in status else status
+        rows.append(Row((ident, amount, currency, status, created),
+                        narrow=(_short_id(ident) or "—", amount, currency, short_state, created)))
     currency = str(earnings.get("currency") or "USDT")
     return View(
         key="earnings", title="收益",

@@ -234,6 +234,35 @@ class DesktopApp:
         if tree is not None:
             self._apply_narrow_cells(narrow)         # 行文案跟着窄/宽切换
             self._fit_columns(tree)                  # 让位/回位后重排一次列宽
+        if getattr(self, "_rendered_narrow", None) not in (None, narrow) \
+                and not getattr(self, "_in_render", False):
+            # 卡片列数（3 → 1）和「让位列」都是渲染时定的：翻转后重画一次，
+            # 否则窄窗看到的是宽窗那套（卡里的值被截成「0.00 USC…」）。
+            self._relayout_pending = True
+            try:
+                self._root.after_idle(self._reflow)
+            except Exception:                        # pragma: no cover - 无窗口
+                pass
+
+    def _reflow(self) -> None:
+        """窄/宽刚翻转：按新宽度重画当前视图（只在翻转时发生，不参与每次 resize）。"""
+        if not getattr(self, "_relayout_pending", False):
+            return
+        self._relayout_pending = False
+        if getattr(self, "_in_render", False):
+            return
+        view = getattr(self, "_last_view", None)
+        if view is None:                             # 还没画过任何视图
+            return
+        try:
+            # 重画**同一份快照**：resize 不该顺手再拉一次数据（会白等网络，
+            # 还可能撞上瞬时失败把「已停止」变成「状态未知」）。
+            self._render(view)
+            tree = getattr(self, "_tree", None)
+            if tree is not None:
+                self._fit_columns(tree)
+        except Exception:                            # pragma: no cover - 窗口正在销毁
+            pass
 
     def _apply_narrow_cells(self, narrow: bool) -> None:
         """窄窗用行级紧凑文案，回宽恢复完整文案（数据两份都在视图里，不丢字段）。"""
@@ -302,6 +331,9 @@ class DesktopApp:
 
     def _render(self, view: View) -> None:
         ttk = self._ttk
+        self._last_view = view
+        self._in_render = True
+        self._rendered_narrow = self._is_narrow()
         self._clear()
         self._view_title.configure(text=view.title)
         ttk.Label(self._content, text=view.subtitle, style="Muted.TLabel").pack(
@@ -312,8 +344,9 @@ class DesktopApp:
         if view.cards:
             row = ttk.Frame(self._content, style="App.TFrame")
             row.pack(fill="x", pady=(4, 12))
+            per_row = 2 if self._is_narrow() else 3    # 窄窗一行两张：一格 ~150px，标题和值都放得下
             for index, card in enumerate(view.cards):
-                self._render_card(row, card, index)
+                self._render_card(row, card, index, per_row=per_row)
         if view.actions:
             bar = ttk.Frame(self._content, style="App.TFrame")
             bar.pack(fill="x", pady=(0, 12))
@@ -328,22 +361,27 @@ class DesktopApp:
                 continue
             ttk.Label(self._content, text="· " + note, style="Meta.TLabel",
                       wraplength=760).pack(anchor="w", pady=(6, 0))
+        self._in_render = False
 
     def _render_card(self, parent, card: Card, index: int, *, per_row: int = 3) -> None:
-        """指标卡：每行 3 张（窄窗口也不横向溢出），取值按 tone 上色。"""
+        """指标卡：宽窗每行 3 张、窄窗一列；取值按 tone 上色，文字按可用宽度换行。"""
         ttk = self._ttk
         row, column = divmod(index, per_row)
-        frame = ttk.Frame(parent, style="Card.TFrame", padding=(14, 12))
+        pad = (8, 8) if per_row < 3 else (14, 12)
+        frame = ttk.Frame(parent, style="Card.TFrame", padding=pad)
         frame.grid(row=row, column=column, sticky="nsew", padx=(0, 10), pady=(0, 10))
         parent.columnconfigure(column, weight=1, uniform="card")
         ttk.Label(frame, text=card.title, style="CardMuted.TLabel").pack(anchor="w")
         value_style = {"mint": "ValueMint.TLabel", "amber": "ValueWait.TLabel",
                        "red": "ValueFail.TLabel", "muted": "ValueMuted.TLabel",
                        "default": "ValueDefault.TLabel"}.get(card.tone, "ValueDefault.TLabel")
-        ttk.Label(frame, text=card.value, style=value_style, wraplength=240).pack(
+        # 窄窗卡只有 ~100px 宽：wraplength 还写 240 就会被裁成「0.00 USC…」，按真实格宽换行
+        wrap = 240 if not self._is_narrow() else max(
+            80, (self._root.winfo_width() - 40) // per_row - 30)
+        ttk.Label(frame, text=card.value, style=value_style, wraplength=wrap).pack(
             anchor="w", pady=(4, 0))
         if card.meta:
-            ttk.Label(frame, text=card.meta, style="CardMuted.TLabel", wraplength=240).pack(
+            ttk.Label(frame, text=card.meta, style="CardMuted.TLabel", wraplength=wrap).pack(
                 anchor="w", pady=(4, 0))
 
     def _ttk_family(self) -> str:

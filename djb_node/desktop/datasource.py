@@ -415,16 +415,25 @@ class LocalDataSource:
         if "--json" not in argv:
             argv = list(argv) + ["--json"]
         command = [sys.executable, "-m", "djb_node", *argv]
+        # 必须带上本数据源自己的 home：不带就会去读**真实** ~/.djb
+        # （临时 home 的窗口显示别人家的节点状态，甚至因为库版本更新而整域不可用）
+        env = dict(os.environ)
+        if self._home:
+            env["DJB_HOME"] = str(self._home)
         try:
             completed = subprocess.run(command, capture_output=True, text=True,
                                        timeout=self._cli_timeout, check=False,
-                                       stdin=subprocess.DEVNULL)
+                                       env=env, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             raise ProviderError("本地命令超时") from None
         except OSError as exc:
             raise ProviderError("本地命令无法执行（" + type(exc).__name__ + "）") from None
         if completed.returncode != 0:
-            raise ProviderError("本地命令退出码 " + str(completed.returncode))
+            # 把 CLI 的原话带上来（「本机未初始化：先执行 djb init」比「退出码 3」有用得多）
+            lines = [line.strip() for line in (completed.stderr or completed.stdout or "").splitlines()
+                     if line.strip() and not line.strip().startswith("details=")]
+            detail = lines[0].removeprefix("djb: ") if lines else ""
+            raise ProviderError(detail[:160] or "本地命令退出码 " + str(completed.returncode))
         try:
             payload = json.loads(completed.stdout or "{}")
         except ValueError:
