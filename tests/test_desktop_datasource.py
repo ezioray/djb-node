@@ -396,3 +396,19 @@ def test_cli_runner_surfaces_the_cli_sentence_not_just_an_exit_code(tmp_path):
     finally:
         ds_mod.subprocess.run = original
     assert "本机未初始化" in str(excinfo.value)
+
+
+def test_cli_runner_refuses_when_home_is_not_the_configured_one(tmp_path, monkeypatch):
+    """自检：子进程 home ≠ 数据源 home 时必须抛，绝不「照跑然后读别人的库」。"""
+    from djb_node.desktop import datasource as ds_mod
+    from djb_node.desktop.datasource import ProviderError
+
+    source = ds_mod.LocalDataSource(home=tmp_path)
+    monkeypatch.setattr(ds_mod.os, "environ", {"DJB_HOME": "/some/other/home"})
+    # 就算环境里已有别的 DJB_HOME，也应以数据源 home 覆盖后运行；构造「覆盖失败」场景：
+    monkeypatch.setattr(source, "_home", None)
+    import pytest
+
+    with pytest.raises(ProviderError) as excinfo:
+        source._cli_runner(["status"])
+    assert "home" in str(excinfo.value)

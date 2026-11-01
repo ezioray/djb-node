@@ -420,6 +420,11 @@ class LocalDataSource:
         env = dict(os.environ)
         if self._home:
             env["DJB_HOME"] = str(self._home)
+        # 硬自检：子进程的 home 必须就是本数据源的 home。
+        # 少传一次就会去读真实 ~/.djb（窗口显示别人家节点的状态），这里直接拦住。
+        expected = str(self._home or "")
+        if env.get("DJB_HOME", "") != expected:
+            raise ProviderError("本机命令的 home 不一致（拒绝执行）")
         try:
             completed = subprocess.run(command, capture_output=True, text=True,
                                        timeout=self._cli_timeout, check=False,
