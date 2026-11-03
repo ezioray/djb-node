@@ -743,6 +743,13 @@ def cmd_upstream(args: argparse.Namespace) -> int:
             response = api.declare_upstream(manager.declare_payload(record))
             declared = {"declared": True, "response": response}
             store.update_upstream(record.id, state=str(response.get("state") or "declared"))
+            # 服务端自生成的 upstream_id 与本地 id 不同；体检上报必须带服务端 id
+            # （否则 POST /node/upstream/probe 恒 404 NodeNotFound，上游永远停在 declared）。
+            server_upstream_id = response.get("upstream_id")
+            if isinstance(server_upstream_id, str) and server_upstream_id:
+                mapping = store.get_kv("upstream_server_ids", default={}) or {}
+                mapping[str(record.id)] = server_upstream_id
+                store.set_kv("upstream_server_ids", mapping)
         except DjbError as exc:
             declared = {"declared": False, "reason": exc.message}
         payload = {"upstream": manager.store.upstream(record.id).to_dict(),
@@ -776,7 +783,9 @@ def cmd_upstream(args: argparse.Namespace) -> int:
                           http=HttpClient(timeout=15.0))
             report = dict(result)
             report.pop("upstream_id", None)
-            api.report_probe({"upstream_id": record.id, **report})
+            mapping = store.get_kv("upstream_server_ids", default={}) or {}
+            server_upstream_id = mapping.get(str(record.id), record.id)
+            api.report_probe({"upstream_id": server_upstream_id, **report})
             result["reported"] = True
         except DjbError as exc:
             result["reported"] = False

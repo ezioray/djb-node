@@ -235,7 +235,10 @@ class ResourceMonitor:
     def cpu_pct(self) -> float | None:
         try:
             load = os.getloadavg()[0]
-        except OSError:
+        except (OSError, AttributeError):
+            # Windows 上 `os` 模块没有 getloadavg（抛 AttributeError 而不是 OSError）——
+            # 之前只捕 OSError，导致 `djb limits --no-yield` 后守护进程在 _bootstrap →
+            # _evaluate → resources.snapshot() 处直接崩溃退出。取不到就不猜（与 mem_pct 同口径）。
             return None
         cores = os.cpu_count() or 1
         return max(0.0, min(100.0, 100.0 * float(load) / float(cores)))

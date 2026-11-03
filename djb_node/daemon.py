@@ -49,6 +49,11 @@ from .update import UpdateManager
 from .upstream import ModelEntry, UpstreamManager
 from .util import (iso, new_request_id, new_token, parse_iso, sha256_hex, utcnow)
 
+#: D-POLICY-01：剩余租约不足该值即主动拉策略（TTL 默认 3600，留 10 分钟提前量）
+POLICY_REFRESH_AHEAD_S = 600
+#: D-POLICY-01：两次主动拉策略的最小间隔（服务端异常时限频，避免打爆）
+POLICY_REFRESH_MIN_INTERVAL_S = 60
+
 
 # ─────────────────────────────────────────────────────────── 控制套接字
 def control_socket_file(paths: Paths) -> str:
@@ -274,6 +279,8 @@ class Daemon:
         self._next_heartbeat_at = self._now()
         self._heartbeat_interval_s = facts.HEARTBEAT_DEFAULT_S
         self._policy_updated = False
+        # D-POLICY-01：本地策略租约到期/临近到期时主动拉一次（限频，见 _policy_refresh_due）
+        self._next_policy_fetch_at = self._now()
         self._next_receipt_flush_at = self._now()
         self._inflight = 0
         self._inflight_lock = threading.Lock()
@@ -950,6 +957,8 @@ class Daemon:
             self._probe_upstreams(moment, reason="periodic")
         if moment >= self._next_heartbeat_at:
             self._heartbeat(moment)
+        if not self._policy_updated and self._policy_refresh_due(moment):
+            self._policy_updated = True
         if self._policy_updated:
             self._policy_updated = False
             self._fetch_policy(moment)
@@ -1156,6 +1165,64 @@ class Daemon:
         return self._probe_upstreams(self._now(), reason=reason)
 
     # ── 策略
+    # ── 策略租约（D-POLICY-01）
+    def _policy_ttl_s(self, policy: Any) -> int:
+        """本地租约时长（秒）：优先策略里的 ``policy_ttl_s``，否则用 facts 默认值。"""
+        ttl = policy.settings.get("policy_ttl_s") if policy is not None else None
+        if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 1:
+            ttl = facts.POLICY_DEFAULT_TTL_S
+        return int(ttl)
+
+    def _renew_local_policy(self, current: Any, now: datetime, *, via: str) -> Any:
+        """内容不变时的**续租**：版本与 digest 不动，只把本地 ``expires_at`` 推到 now+TTL。
+
+        spec ``NodePolicy`` 没有 ``expires_at`` 字段（CR-M15-05），租约完全由客户端按
+        ``issued_at + TTL`` 自行推算；因此"服务端说没变"必须翻译成"续租"，否则本地会在
+        内容不变的情况下自行过期。事件里带 ``via`` 以便区分 304 / 200 两条来路。
+        """
+        ttl = self._policy_ttl_s(current)
+        renewed = policy_mod.parse_policy({
+            "policy_version": current.policy_version,
+            "protocol_version": current.protocol_version,
+            "issued_at": current.issued_at,
+            "digest": current.digest,
+            "quotas": current.quotas,
+            "directives": current.directives,
+            "settings": {**current.settings, "policy_ttl_s": ttl},
+            "expires_at": iso(now + timedelta(seconds=ttl)),
+        }, now=now)
+        self.store.save_policy(renewed)
+        event("daemon.policy_renewed", policy_version=current.policy_version,
+              expires_at=renewed.expires_at, via=via)
+        return renewed
+
+    def _policy_refresh_due(self, now: datetime) -> bool:
+        """是否该主动拉一次策略：**没有策略 / 已过期 / 剩余不足 10 分钟**。
+
+        修复前只有"服务端说 policy_updated"或启动时才拉策略，于是内容不变 ⇒ 永不拉 ⇒
+        租约到期后永久 conservative。这里给一个限频（``POLICY_REFRESH_MIN_INTERVAL_S``）
+        的前瞻刷新，让"内容不变"不再等于"永不续租"。
+        """
+        if now < self._next_policy_fetch_at:
+            return False
+        policy = self.store.policy()
+        if policy is None:
+            due = True
+        else:
+            # 剩余寿命以**记录里的 expires_at** 为准（续租只推 expires_at，不动
+            # issued_at —— issued_at 是"服务端签发时刻"，不是"租约起点"）。
+            expires = parse_iso(policy.expires_at)
+            if expires is None:
+                ttl = self._policy_ttl_s(policy)
+                issued = parse_iso(policy.issued_at)
+                expires = None if issued is None else issued + timedelta(seconds=ttl)
+            due = True if expires is None else \
+                (expires - now).total_seconds() <= POLICY_REFRESH_AHEAD_S
+        if due:
+            self._next_policy_fetch_at = now + timedelta(
+                seconds=POLICY_REFRESH_MIN_INTERVAL_S)
+        return due
+
     def _fetch_policy(self, now: datetime) -> None:
         if self.api is None or not self.credentials.client_key():
             return
@@ -1175,22 +1242,7 @@ class Daemon:
             if current is not None:
                 self._policy_invalid = False
                 self.store.set_kv("policy_invalid", False)
-                ttl = current.settings.get("policy_ttl_s")
-                if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 1:
-                    ttl = facts.POLICY_DEFAULT_TTL_S
-                renewed = policy_mod.parse_policy({
-                    "policy_version": current.policy_version,
-                    "protocol_version": current.protocol_version,
-                    "issued_at": current.issued_at,
-                    "digest": current.digest,
-                    "quotas": current.quotas,
-                    "directives": current.directives,
-                    "settings": {**current.settings, "policy_ttl_s": ttl},
-                    "expires_at": iso(now + timedelta(seconds=int(ttl))),
-                }, now=now)
-                self.store.save_policy(renewed)
-                event("daemon.policy_renewed", policy_version=current.policy_version,
-                      expires_at=renewed.expires_at)
+                self._renew_local_policy(current, now, via="304")
                 return
             event("daemon.policy_not_modified", policy_version=None)
             return
@@ -1211,6 +1263,17 @@ class Daemon:
             return
         self._policy_invalid = False
         self.store.set_kv("policy_invalid", False)
+        # D-POLICY-01：**服务端返回 200 但版本与 digest 都没变**，等价于「确认你手上的策略仍是最新」
+        # ——这与 304 是同一件事，必须同样按本地租约续租。
+        #
+        # 修复前这里只处理 304：条件拉取开关关闭时服务端一律 200（内容不变则沿用老
+        # `issued_at`），客户端每次都用老 `issued_at` 覆盖本地，`expires_at = issued_at + TTL`
+        # 于是**永远过期** ⇒ `_evaluate` 判定 conservative ⇒ `admit()` 拒绝一切 job
+        # （`no_upstream`）⇒ 平台把节点"不接单"报成"上游异常"。
+        if current is not None and record.policy_version == current.policy_version \
+                and record.digest == current.digest:
+            self._renew_local_policy(current, now, via="200_same_version")
+            return
         if result.etag and result.etag != record.policy_version:
             record.settings = dict(record.settings)
             record.settings["etag"] = result.etag
