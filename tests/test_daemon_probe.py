@@ -237,3 +237,45 @@ def test_health_and_status_report_probe_visibility(paths, store, credentials, mo
         assert details[0]["inference_ok"] is True
     finally:
         daemon.stop()
+
+
+# ──────────────────────────────────────────── D-PROBE-03：周期探针必须上报
+def test_startup_probe_reports_to_cloud(paths, store, credentials, mock, clock):
+    """daemon 的探针结论必须上行 `POST /node/upstream/probe`。
+
+    D-PROBE-03 现场：`report_probe` 全仓只有 `cli.py` 一个调用点，daemon 零处。
+    于是本地 `last_probe_at` 新鲜（节点算得出正 QPS），云端 `verified_at` 却不动，
+    `_gate_unverified(now-900s)` 15 分钟后把容量打回 0，**且只有人工 CLI 能刷新**。
+    这条用例锁的是"自动恢复路径存在"这件事，不是"某个函数被调用了"。
+    """
+    _add_upstream(store, mock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        reports = [item for item in mock.requests
+                   if item.get("path") == "/api/v1/node/upstream/probe"]
+        assert reports, "启动探针没有上报到云端（D-PROBE-03 回归）"
+        body = reports[-1].get("body") or {}
+        # 必须带服务端 id 字段（本地 id 与服务端 id 不同，缺了会 404 NodeNotFound）
+        assert body.get("upstream_id")
+        # 结论字段要和本地探针同形
+        assert "reachable" in body or "model_checks" in body
+    finally:
+        daemon.stop()
+
+
+def test_periodic_probe_reports_each_round(paths, store, credentials, mock, clock):
+    """周期复探打开后，**每一轮**都要上报，而不是只报启动那一次。"""
+    _add_upstream(store, mock)
+    config = _flag_config(mock, True)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock, config=config)
+    daemon.start()
+    try:
+        before = len([item for item in mock.requests
+                      if item.get("path") == "/api/v1/node/upstream/probe"])
+        daemon.probe_now(reason="periodic")
+        after = len([item for item in mock.requests
+                     if item.get("path") == "/api/v1/node/upstream/probe"])
+        assert after == before + 1, "周期探针没有上报（云端 verified_at 会过期）"
+    finally:
+        daemon.stop()

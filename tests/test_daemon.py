@@ -179,7 +179,14 @@ def test_resource_limit_pauses(paths, store, credentials, mock, clock):
         daemon.stop()
 
 
-def test_conservative_when_policy_expires(paths, store, credentials, mock, clock):
+def test_policy_expiry_renews_when_server_confirms_same_version(paths, store, credentials,
+                                                               mock, clock):
+    """D-POLICY-01：本地租约过期但**服务端仍认同一版本**时，必须续租而不是停摆。
+
+    旧行为：只在 304 时续租。而服务端会返回 200 同版本（内容未变），
+    于是 `expires_at = issued_at + TTL` 永久落在过去 ⇒ 节点永远 `paused/conservative`，
+    heartbeat 却照常 200，云端看起来一切正常 —— 这是最难查的一类停摆。
+    """
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock, clock=clock)
     daemon.start()
@@ -188,6 +195,26 @@ def test_conservative_when_policy_expires(paths, store, credentials, mock, clock
         policy = store.policy()
         policy.expires_at = "2026-10-24T00:00:30Z"
         store.save_policy(policy)
+        clock.advance(120)
+        daemon.tick(clock())
+        assert daemon.machine.snapshot.state == "online"      # 续租成功
+        assert store.policy().expires_at != "2026-10-24T00:00:30Z"
+    finally:
+        daemon.stop()
+
+
+def test_conservative_when_policy_expires_and_cannot_refresh(paths, store, credentials,
+                                                            mock, clock):
+    """租约过期**且**服务端拿不到策略 ⇒ 仍然保守停单（fail-closed 不能被续租改动破坏）。"""
+    _add_upstream(store, mock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        assert daemon.machine.snapshot.state == "online"
+        policy = store.policy()
+        policy.expires_at = "2026-10-24T00:00:30Z"
+        store.save_policy(policy)
+        mock.policy_status = 500                              # 服务端拒绝/不可用
         clock.advance(120)
         daemon.tick(clock())
         assert daemon.machine.snapshot.state == "paused"

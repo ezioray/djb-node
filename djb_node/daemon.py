@@ -1141,6 +1141,12 @@ class Daemon:
             models += len(checks)
             if any(item.get("ok") for item in checks):
                 verified += 1
+                # D-PROBE-03：**周期探针的结论必须上报**，否则云端 verified_at 不动。
+                # 旧行为：daemon 只写本地 last_probe_at ⇒ 本地算出正 QPS，但云端
+                # `_gate_unverified(cutoff=now-900s)` 仍按旧的 verified_at 判过期 ⇒
+                # 15 分钟后容量再次归零，且没有任何自动恢复路径（只能人工 `djb upstream probe`）。
+                # 上报走与 CLI 完全相同的一条路（含服务端 upstream_id 映射），失败不影响本地结论。
+                self._report_probe(record, payload, reason=reason)
             else:
                 failed += 1
         self._probe_failures = min(self._probe_failures + 1, facts.PROBE_MAX_BACKOFF_SHIFT) \
@@ -1159,6 +1165,42 @@ class Daemon:
 
     def _upstream_model_count(self) -> int:
         return sum(len(item.model_ids()) for item in self.upstreams.list() if item.enabled)
+
+    def _report_probe(self, record: Any, payload: dict[str, Any], *, reason: str) -> None:
+        """把一次探针结论上报服务端（D-PROBE-03）。**永不抛异常**。
+
+        为什么必须上报：云端 `verified_at` 是容量门控的另一半。只更新本地
+        `last_probe_at` 时，节点自己的公告有正 QPS，云端却仍按旧的 `verified_at`
+        判"未验证太久" ⇒ 15 分钟后容量归零，且**只有人工 probe 能刷新**。
+
+        口径与 `cli.py` 的 `upstream probe` 完全一致：
+        * 去掉本地字段 `upstream_id`（服务端 id 与本地 id 不同）；
+        * 用 `upstream_server_ids` 映射换服务端 id，映射缺失时退回本地 id
+          （与 CLI 同形，不额外发明规则）。
+        """
+        if self.api is None:
+            event("upstream.probe_report_skipped", level="warning", reason=reason,
+                  upstream_id=record.id, why="api_unavailable")
+            return
+        report = {k: v for k, v in dict(payload).items() if k != "upstream_id"}
+        try:
+            mapping = self.store.get_kv("upstream_server_ids", default={}) or {}
+        except Exception:                                    # pragma: no cover - 防御
+            mapping = {}
+        server_id = mapping.get(str(record.id), record.id) if isinstance(mapping, dict) \
+            else record.id
+        try:
+            self.api.report_probe({"upstream_id": server_id, **report})
+        except DjbError as exc:
+            event("upstream.probe_report_failed", level="warning", reason=reason,
+                  upstream_id=record.id, error=type(exc).__name__, code=exc.code)
+            return
+        except Exception as exc:                             # pragma: no cover - 防御
+            event("upstream.probe_report_error", level="warning", reason=reason,
+                  upstream_id=record.id, error=type(exc).__name__)
+            return
+        event("upstream.probe_reported", reason=reason, upstream_id=record.id,
+              server_upstream_id=server_id)
 
     def probe_now(self, *, reason: str = "manual") -> dict[str, Any]:
         """手动触发一轮探针（控制通道 / 测试用；不受周期开关影响）。"""
