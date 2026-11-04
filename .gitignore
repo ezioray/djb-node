@@ -1,4 +1,8 @@
 # Python
+# 虚拟环境：venv 里可能有 pip 凭据文件（~/.config/pip 之外，venv 内 pip.conf / *.pth），
+# 一旦被误提交就是「凭据进仓库」⇒ 永不入库
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -28,7 +28,8 @@ def _package_version() -> str:
 
 CLIENT_VERSION = _package_version()
 PROTOCOL_VERSION = "1.0.0"
-SPEC_VERSION = "1.2.4"
+# 契约版本**不在本仓另立常量**：唯一来源 = spec/openapi.yaml 的 info.version。
+# （本行原有一个手写的契约版本常量，与契约文档不一致且零引用；按"真源只能有一处"删除，不留备份值。）
 
 
 def _detect_platform() -> str:
