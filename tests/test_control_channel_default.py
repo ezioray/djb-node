@@ -14,6 +14,7 @@ from datetime import date
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -110,20 +111,31 @@ def test_control_disabled_start_hint_and_force_stop_clean(home, capsys):
         # 提示里写了 `djb stop --force`，就必须真的能用，而且**不许误杀无关进程**：
         # 造一个"看起来像 daemon、但属于别的 home"的诱饵进程，验证它活下来。
         decoy_home = str(home) + "-decoy"
+        # 第二个诱饵：--home 取**真实 home 的父目录**（字符串上是被真实 home 前缀的真前缀）。
+        # 这是最容易被写成 startswith/子串匹配的地方：若身份校验退化成 startswith 或
+        # "cmdline 里出现 home 子串即算自己人"，它就会被误杀（task-12 实现用
+        # os.path.normcase(normpath(abspath(...))) 全等比对，本用例是它的护栏）。
+        parent_home = str(Path(home).parent)
         decoy = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(120)",
              "djb_node.daemon", "--home", decoy_home],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        decoy_parent = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)",
+             "djb_node.daemon", "--home", parent_home],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            assert decoy.poll() is None
+            assert decoy.poll() is None and decoy_parent.poll() is None
             assert main(["stop", "--force"]) == 0
             capsys.readouterr()
             decoy.wait(timeout=5) if decoy.poll() is not None else None
             assert decoy.poll() is None, "stop --force 误杀了同名前缀的无关进程"
+            assert decoy_parent.poll() is None, "stop --force 误杀了 --home 为父目录的进程（疑似退化成前缀匹配）"
         finally:
-            if decoy.poll() is None:
-                decoy.kill()
-                decoy.wait(timeout=10)
+            for proc in (decoy, decoy_parent):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
         # 真的停了：该 home 下不应再有 daemon 进程（不是"打印了未运行"就算了）
         assert process_tree.wait_gone(process_tree.daemon_pids_for_home(str(paths.home)),
                                       timeout=10.0) == []
