@@ -19,7 +19,7 @@ import sys
 import time
 from typing import Any, Callable
 
-from . import __version__, facts
+from . import __version__, facts, pidfile
 from .api import NodeApi
 from .attest import AttestationManager
 from .config import (ClientConfig, Paths, feature_flag, load_config, resolve_home, save_config)
@@ -402,6 +402,15 @@ def cmd_stop(args: argparse.Namespace) -> int:
     try:
         client.call({"cmd": "stop"}, timeout=5.0)
     except NotRunningError:
+        # 控制面不可用 ≠ 进程没在跑：命名管道/套接字丢了、或 ipc 开关关着时，
+        # daemon 可能还活得好好的。`--force` 的意义正在这里 —— 走 pid 文件 + 身份
+        # 校验的逃生门，而不是打印一句"未在运行"把用户堵死。
+        if getattr(args, "force", False):
+            has_record = pidfile.read(paths) is not None or pidfile.read_raw(paths) is not None
+            if not has_record:
+                print("daemon 未在运行（幂等：无需停止）")
+                return 0
+            return _force_stop(paths)
         print("daemon 未在运行（幂等：无需停止）")
         return 0
     deadline = time.monotonic() + float(getattr(args, "timeout", 15) or 15)
@@ -411,24 +420,56 @@ def cmd_stop(args: argparse.Namespace) -> int:
             return 0
         time.sleep(0.2)
     if getattr(args, "force", False):
-        pid = _read_pid(paths)
-        if pid:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-            print("已强制结束 daemon（pid " + str(pid) + "）")
-            return 0
+        return _force_stop(paths)
     print("djb: 停止超时；可用 djb stop --force", file=sys.stderr)
     return facts.EXIT_CONFLICT
 
 
-def _read_pid(paths: Paths) -> int | None:
+#: 拒绝强杀时给用户的下一步（每种原因码对应"安全且真的有用"的动作）
+_FORCE_HINTS = {
+    pidfile.REASON.MISSING: "记录里的进程已经没了；先跑 djb status 确认状态，必要时删掉 pid 文件",
+    pidfile.REASON.LEGACY: "pid 文件是旧版格式（只有 pid，防不了 PID 复用）；删掉它再重试",
+    pidfile.REASON.MALFORMED: "pid 文件内容不完整；删掉它再重试",
+    pidfile.REASON.TOKEN_UNREADABLE: "读不到目标进程的启动时刻（权限不足或进程刚退）；先 djb status 确认",
+    pidfile.REASON.TOKEN_MISMATCH: "pid 已被系统复用给别的进程；本命令不会杀它，删掉 pid 文件再重试",
+    pidfile.REASON.CMDLINE_UNREADABLE: "读不到目标进程的命令行（权限不足或进程刚退）；先 djb status 确认",
+    pidfile.REASON.NOT_DAEMON: "pid 指向的不是 djb daemon（多半是 pid 复用）；本命令不会杀它",
+    pidfile.REASON.HOME_MISMATCH: "pid 指向的 daemon 属于另一个 --home；确认是不是你想起的那个",
+}
+
+
+def _force_stop(paths: Paths) -> int:
+    """`djb stop --force`：强杀**已确认身份**的 daemon；身份校验不过就拒绝。
+
+    pid 会被复用 ⇒ 只认 pid 就是「误杀门」。这里要求 pid 文件是 (pid, 启动时刻) 双键，
+    并且强杀前重新核一遍：令牌一致 + 命令行含 djb_node.daemon + --home 等于本 paths。
+    """
+    record = pidfile.read(paths)
+    raw = None if record is not None else pidfile.read_raw(paths)
+    ok, reason = pidfile.verify(record, paths)
+    if not ok:
+        print("djb: 拒绝强制结束：pid 文件不可信（" + reason + "）", file=sys.stderr)
+        print("下一步：" + _FORCE_HINTS.get(reason, "手动确认进程身份后再处理"), file=sys.stderr)
+        if raw is not None:
+            print("pid 文件：" + paths.pid_file, file=sys.stderr)
+        return facts.EXIT_CONFLICT
+    pid = int(record["pid"])
     try:
-        with open(paths.pid_file, "r", encoding="ascii") as handle:
-            return int(handle.read().strip())
-    except (OSError, ValueError):
-        return None
+        # Windows 没有 SIGKILL（os.kill 只认 SIGTERM/CTRL_*）；SIGTERM 在 Windows 上
+        # 走 TerminateProcess，语义就是要的"立即结束"。
+        os.kill(pid, signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+    except OSError as exc:
+        print("djb: 强制结束失败（pid " + str(pid) + "）：" + str(exc), file=sys.stderr)
+        return facts.EXIT_CONFLICT
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and pidfile.probe.is_alive(pid):
+        time.sleep(0.1)
+    if pidfile.probe.is_alive(pid):
+        print("djb: 已发强制结束但 pid " + str(pid) + " 仍在；先 djb status 确认", file=sys.stderr)
+        return facts.EXIT_CONFLICT
+    pidfile.remove(paths, pid=pid)
+    print("已强制结束 daemon（pid " + str(pid) + "）")
+    return 0
 
 
 # ─────────────────────────────────────────────────────────── status / pause / resume

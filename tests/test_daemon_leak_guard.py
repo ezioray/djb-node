@@ -55,7 +55,12 @@ def test_kill_daemon_tree_reaps_both_levels(tmp_path):
     outer = subprocess.Popen([sys.executable, "-c", outer_code,
                               "djb_node.daemon", "--home", marker])
     try:
-        pids = _wait_for(lambda: process_tree.daemon_pids_for_home(marker), timeout=15.0)
+        def two_levels():
+            found = process_tree.daemon_pids_for_home(marker)
+            # 外层先起来、内层后 spawn：必须等"真的两层都在"，否则偶发只认到 1 层
+            return found if len(found) >= 2 else None
+
+        pids = _wait_for(two_levels, timeout=15.0)
         assert len(pids) >= 2, "预期识别到外层 + 内层两层 daemon 进程，实际 %r" % (pids,)
 
         killed = process_tree.kill_daemon_tree(marker)

@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from . import facts, machine_profile, plan_router, policy as policy_mod, protocol
+from . import facts, machine_profile, pidfile, plan_router, policy as policy_mod, protocol
 from .api import NodeApi, PolicyFetch
 from .channel import ChannelClient, channel_enabled
 from .config import ClientConfig, Paths, feature_flag, load_config, load_config_strict
@@ -337,6 +337,9 @@ class Daemon:
             raise UsageError("启动清理未完成，拒绝重复启动")
         if self._started:
             return self.status()
+        # 先落 pid 文件：**启动过程本身挂住**（控制面起不来/等网络）时，
+        # `djb stop --force` 才有东西可校验、可强杀。失败时文件自然被 stop() 或下次启动覆盖。
+        self._write_pid_file()
         if os.name == "nt":
             return self._start_windows()
         self.paths.prepare()
@@ -562,6 +565,25 @@ class Daemon:
             self.stop()
         return 0
 
+    # ── runtime/daemon.pid：给 `djb stop --force` 的逃生门（(pid, 启动时刻) 双键）
+    def _write_pid_file(self) -> None:
+        """启动成功后原子写 pid 文件；写失败不阻断启动（逃生门是可选增强，不是启动前提）。"""
+        if getattr(self, "paths", None) is None:               # Daemon.__new__ 构造的半成品
+            return
+        try:
+            pidfile.write(self.paths)
+        except OSError as exc:                                 # pragma: no cover - 只读/满盘
+            event("daemon.pid_file_write_failed", level="warning", error=str(exc))
+
+    def _remove_pid_file(self) -> None:
+        """退出时删掉**自己的** pid 文件（幂等；不删别人的记录）。"""
+        if getattr(self, "paths", None) is None:               # Daemon.__new__ 构造的半成品
+            return
+        try:
+            pidfile.remove(self.paths, pid=os.getpid())
+        except OSError as exc:                                 # pragma: no cover - 防御
+            event("daemon.pid_file_remove_failed", level="warning", error=str(exc))
+
     def stop(self) -> None:
         if os.name == "nt" and not self._started and self._control is not None:
             raise UsageError("Windows 控制启动清理未完成；拒绝完整stop或重复操作")
@@ -584,6 +606,10 @@ class Daemon:
                 pass
         self._persist()
         self.store.set_kv("runtime", {})
+        # 进程从这里起已经在退出路径上：先把 pid 记录撤掉。
+        # **不能**放到 stop() 末尾 —— Windows 上"控制线程未回收"会在那之前 raise，
+        # 结果进程退了、pid 文件却留下来（2026-11-05 真机 E2E 实测到）。
+        self._remove_pid_file()
         if self._control is not None:
             self._control.join(timeout=2.0)
             if os.name == "nt" and self._control.is_alive():
