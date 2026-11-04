@@ -279,3 +279,40 @@ def test_periodic_probe_reports_each_round(paths, store, credentials, mock, cloc
         assert after == before + 1, "周期探针没有上报（云端 verified_at 会过期）"
     finally:
         daemon.stop()
+
+
+# ───────────────────────────────────────── D-PROBE-03：节点/云端判决口径对齐
+def test_partially_working_upstream_counts_as_failed(paths, store, credentials, mock,
+                                                     clock):
+    """一个模型通、一个模型不通 ⇒ 必须计 failed（与云端 `任一失败即拒` 一致）。
+
+    修前用 `any(ok)`：节点自称 verified=1、云端回 rejected（reason=第一条失败原因），
+    两边日志口径不一致。本用例锁住对齐后的语义。
+    """
+    store.add_upstream(upstream_id="u1", access_type="A2",
+                       base_url=mock.upstream_base_url,
+                       models=[{"id": "probe-model", "enabled": True, "min_price": "0.5"},
+                               {"id": "not-served-model", "enabled": True,
+                                "min_price": "0.5"}],
+                       credential_ref="upstream:u1")
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        result = daemon.probe_now(reason="manual")
+        assert result["models"] == 2
+        assert result["verified"] == 0
+        assert result["failed"] == 1
+    finally:
+        daemon.stop()
+
+
+def test_all_models_ok_still_counts_verified(paths, store, credentials, mock, clock):
+    """全通仍计 verified（防止把 all() 写反成"永远 failed"）。"""
+    _add_upstream(store, mock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        result = daemon.probe_now(reason="manual")
+        assert result["verified"] == 1 and result["failed"] == 0
+    finally:
+        daemon.stop()
