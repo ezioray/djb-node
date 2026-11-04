@@ -14,6 +14,7 @@ from djb_node import facts
 from djb_node.cli import main
 from djb_node.config import Paths, feature_flag, load_config
 from djb_node.store import Store
+from tests.feature_flag_policy import DEFAULT_ON_APPROVED
 
 
 @pytest.fixture
@@ -57,7 +58,8 @@ def test_flags_list_defaults_all_off(ready, capsys):
         "client.probe.periodic.enabled", "client.token.compare.enabled",
         "client.relay.enabled", "supply.attestation.enabled", "client.channel.enabled",
         "client.model_sync.enabled", "client.notifications.enabled"}
-    assert all(item["enabled"] is False for item in payload["flags"])
+    # 默认开启只允许白名单里的（逐条批准 + 留痕）；其余开关仍必须默认关
+    assert {item["name"] for item in payload["flags"] if item["enabled"]} == set(DEFAULT_ON_APPROVED)
     assert all(item["owner"] and item["expire_at"] and item["rollback_rule"]
                for item in payload["flags"])
 

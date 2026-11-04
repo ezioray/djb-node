@@ -286,6 +286,29 @@ def cmd_auth(args: argparse.Namespace) -> int:
     return 0
 
 
+#: 本地控制通道被关掉（kill switch）时给用户的可行动提示：**不装死、不喊"不可用"**
+_CONTROL_DISABLED_HINT = (
+    "djb: 本地控制通道已关闭（client.ipc.windows.enabled=false）：daemon 可能仍在运行，"
+    "但 CLI 无法确认它是否起来、也没法优雅停止它。\n"
+    "  · 打开控制通道：编辑 config.json 的 extra.feature_flags[\"client.ipc.windows.enabled\"] = true 后重试"
+    "（发布默认值已是 true，只有你手动关掉才会看到本提示）\n"
+    "  · 停止 daemon：djb stop --force（按 pid 文件 + 进程身份校验，不会误杀无关进程）\n"
+    "  · 只想起服务、不要控制：djb start --foreground（前台运行，Ctrl-C 退出）\n"
+    "  · 排查日志：djb logs --tail 50"
+)
+
+
+def _control_channel_disabled(paths: Paths) -> bool:
+    """本机本地控制通道是否被 kill switch 关掉（仅 Windows 有该通道；其它平台恒 False）。"""
+    if os.name != "nt":
+        return False
+    try:
+        from .daemon import windows_control_enabled
+        return not windows_control_enabled(paths)
+    except Exception:
+        return False
+
+
 #: ``djb start`` 认为「已经可以停下等待」的状态：online 是成功，其余是明确的终态
 _START_ACCEPT_STATES = ("online",)
 _START_SETTLED_STATES = ("online", "paused", "error", "updating", "stopped")
@@ -319,7 +342,10 @@ def cmd_start(args: argparse.Namespace) -> int:
             last_error = exc.message
         time.sleep(0.25)
     else:
-        print("djb: daemon 启动超时（" + last_error + "）；查看 djb logs --tail 50", file=sys.stderr)
+        if _control_channel_disabled(paths):
+            print(_CONTROL_DISABLED_HINT, file=sys.stderr)
+        else:
+            print("djb: daemon 启动超时（" + last_error + "）；查看 djb logs --tail 50", file=sys.stderr)
         return facts.EXIT_NOT_RUNNING
     # 控制口起来 ≠ 已经接单：等状态机真的走到 online（或走到 paused/error 这类终态）。
     # 否则用户看到「已启动」，实际还在 starting、一单也不接。

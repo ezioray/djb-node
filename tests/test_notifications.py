@@ -538,12 +538,11 @@ def test_daemon_has_no_notifications_by_default(daemon_env, monkeypatch):
     monkeypatch.setattr(daemon_module, "NotificationStore", StubNotifications)
     daemon = make_daemon(paths, store, credentials, mock)
     daemon.start()
-    if os.name == "nt":
-        from djb_node.ipc_windows import IpcUnavailable
-        assert daemon._started is True
-        assert daemon.status()["control"] == {"available": False, "reason": "windows_control_unsupported"}
-        with pytest.raises(IpcUnavailable):
-            daemon.control({"cmd": "ping"})
+    # 2026-11-05 起 Windows 本地控制通道**默认开启**（决策人批准，见 tests/feature_flag_policy.py），
+    # 不再有"控制不可用"的默认形态；kill switch 关掉时的降级由
+    # tests/test_control_channel_default.py 覆盖。
+    assert daemon._started is True
+    assert daemon.status()["control"]["available"] is True
     try:
         assert StubNotifications.instances == []
         assert daemon._notifications is None and daemon._notifications_thread is None
@@ -565,12 +564,11 @@ def test_daemon_starts_and_stops_notifications_thread(daemon_env, monkeypatch):
                           extra={facts.NOTIFICATIONS_FLAG: True})
     daemon = make_daemon(paths, store, credentials, mock, config=config)
     daemon.start()
-    if os.name == "nt":
-        from djb_node.ipc_windows import IpcUnavailable
-        assert daemon._started is True
-        assert daemon.status()["control"] == {"available": False, "reason": "windows_control_unsupported"}
-        with pytest.raises(IpcUnavailable):
-            daemon.control({"cmd": "ping"})
+    # 2026-11-05 起 Windows 本地控制通道**默认开启**（决策人批准，见 tests/feature_flag_policy.py），
+    # 不再有"控制不可用"的默认形态；kill switch 关掉时的降级由
+    # tests/test_control_channel_default.py 覆盖。
+    assert daemon._started is True
+    assert daemon.status()["control"]["available"] is True
     thread = daemon._notifications_thread
     try:
         assert len(StubNotifications.instances) == 1
@@ -595,12 +593,11 @@ def test_daemon_env_switch_starts_thread_for_s2(daemon_env, monkeypatch):
     monkeypatch.setattr(daemon_module, "NotificationStore", StubNotifications)
     daemon = make_daemon(paths, store, credentials, mock)
     daemon.start()
-    if os.name == "nt":
-        from djb_node.ipc_windows import IpcUnavailable
-        assert daemon._started is True
-        assert daemon.status()["control"] == {"available": False, "reason": "windows_control_unsupported"}
-        with pytest.raises(IpcUnavailable):
-            daemon.control({"cmd": "ping"})
+    # 2026-11-05 起 Windows 本地控制通道**默认开启**（决策人批准，见 tests/feature_flag_policy.py），
+    # 不再有"控制不可用"的默认形态；kill switch 关掉时的降级由
+    # tests/test_control_channel_default.py 覆盖。
+    assert daemon._started is True
+    assert daemon.status()["control"]["available"] is True
     try:
         assert len(StubNotifications.instances) == 1
         assert daemon.status()["notifications"]["running"] is True

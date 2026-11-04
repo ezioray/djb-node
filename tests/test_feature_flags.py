@@ -14,6 +14,7 @@ from djb_node import facts
 from djb_node.attest import attestation_enabled
 from djb_node.config import ClientConfig, feature_flag, flag_expired, flag_spec
 from djb_node.relay import relay_enabled
+from tests.feature_flag_policy import DEFAULT_ON_APPROVED
 
 EXPIRE_DAY = date(2026, 12, 31)   # facts.FEATURE_FLAGS 全表统一的到期日
 AFTER_EXPIRE = date(2027, 1, 1)
@@ -36,7 +37,13 @@ def test_every_flag_has_three_fields_and_default_off():
     for name, spec in facts.FEATURE_FLAGS.items():
         for field_name in ("owner", "expire_at", "rollback_rule", "default", "description"):
             assert str(spec.get(field_name, "")).strip(), name + " 缺少 " + field_name
-        assert spec["default"] is False, name + " 必须默认关闭"
+        if name in DEFAULT_ON_APPROVED:
+            # 例外：必须**确实是开**的，且回滚三字段齐全（否则「开着的开关」回滚不回去）
+            assert spec["default"] is True, name + " 已批准默认开启，不应是关闭"
+            for field_name in ("owner", "expire_at", "rollback_rule"):
+                assert str(spec.get(field_name, "")).strip(), name + " 例外仍需 " + field_name
+        else:
+            assert spec["default"] is False, name + " 必须默认关闭（要开口子请登记 DEFAULT_ON_APPROVED + 批准依据）"
         assert spec["expire_at"] == EXPIRE_OVERRIDES.get(name, "2026-12-31")
         assert "desc" not in spec, name + " 不要用 desc 字段（统一 description）"
 

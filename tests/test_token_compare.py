@@ -14,6 +14,7 @@ import pytest
 from djb_node import facts, logging_setup, tokens
 from djb_node.server import Admission, LocalApiServer, RouteTarget
 from tests.mock_m02 import MockServer
+from tests.feature_flag_policy import DEFAULT_ON_APPROVED
 
 TOKEN = "t" * 40
 SECRET_TEXT = "机密正文ZZ1234"          # 断言：正文永不出现在日志事件里
@@ -175,7 +176,7 @@ def test_flag_without_resolver_is_off_not_crashing(monkeypatch):
 
 def test_feature_flag_carries_owner_expire_and_rollback():
     for name, meta in facts.FEATURE_FLAGS.items():
-        assert meta["default"] is False, name
+        assert meta["default"] is (name in DEFAULT_ON_APPROVED), name
         for field in ("owner", "expire_at", "rollback_rule", "description"):
             assert meta.get(field), (name, field)
     flag = facts.FEATURE_FLAGS[facts.TOKEN_COMPARE_FLAG]

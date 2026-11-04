@@ -29,6 +29,13 @@ class Clock:
 
 
 @pytest.fixture
+def windows_control_usable():
+    """控制通道「本该可用」的前置检查：不可用（到期/元数据变更）时带理由 skip。见 tests/windows_control.py。"""
+    from tests import windows_control as helper
+    helper.require_usable()
+
+
+@pytest.fixture
 def home(tmp_path, monkeypatch):
     target = tmp_path / "home"
     monkeypatch.setenv("DJB_HOME", str(target))

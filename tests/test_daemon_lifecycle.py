@@ -45,7 +45,7 @@ def _force_stop(paths):
         pass
 
 
-def test_cli_start_stop_subprocess(home, capsys):
+def test_cli_start_stop_subprocess(home, windows_control_usable, capsys):
     server = MockServer().start()
     port = _free_port()
     # paths 必须在 `main(["start"])` **之前**构造：start 会真的 spawn daemon，

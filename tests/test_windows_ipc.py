@@ -26,7 +26,7 @@ def clean_registry(monkeypatch):
 @pytest.fixture
 def flag(monkeypatch):
     monkeypatch.setitem(facts.FEATURE_FLAGS, ipc.FLAG, {
-        "default": False, "owner": "client-seat", "expire_at": "2026-12-31",
+        "default": True, "owner": "client-seat", "expire_at": "2026-12-31",
         "rollback_rule": "关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好",
     })
 
@@ -34,9 +34,15 @@ def flag(monkeypatch):
 def test_flag_default_expiry_and_metadata(flag, monkeypatch):
     config = {"feature_flags": {ipc.FLAG: True}}
     assert ipc.windows_ipc_enabled(config, today=date(2026, 10, 31))
-    assert not ipc.windows_ipc_enabled({}, today=date(2026, 10, 31))
+    # 2026-11-05 起首发默认开启：**空配置**也应为真（用户装完就能用，不需要写 config）
+    assert ipc.windows_ipc_enabled({}, today=date(2026, 10, 31))
+    # 显式关掉 ⇒ 立刻失效（kill switch）
+    assert not ipc.windows_ipc_enabled({"feature_flags": {ipc.FLAG: False}},
+                                       today=date(2026, 10, 31))
     assert not ipc.windows_ipc_enabled(config, today=date(2027, 1, 1))
-    for field, invalid in (("default", True), ("owner", ""), ("expire_at", "bad"), ("rollback_rule", "")):
+    # default 的合法值是「与发布决策一致」（2026-11-05 起为 True）；改回 False ⇒ fail closed
+    for field, invalid in (("default", False), ("owner", ""), ("expire_at", "bad"),
+                           ("rollback_rule", "")):
         original = facts.FEATURE_FLAGS[ipc.FLAG][field]
         facts.FEATURE_FLAGS[ipc.FLAG][field] = invalid
         assert not ipc.windows_ipc_enabled(config, today=date(2026, 10, 31))

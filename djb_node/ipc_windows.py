@@ -54,7 +54,17 @@ def unavailable() -> IpcUnavailable:
 def windows_ipc_enabled(config: Any, *, today: date | None = None) -> bool:
     spec = facts.FEATURE_FLAGS.get(FLAG, {})
     try:
-        if spec.get("default") is not False or spec.get("owner") != "client-seat":
+        # tripwire：本开关的声明默认值必须与发布决策一致（2026-11-05 起首发默认开启）。
+        # 任何人把 default 改回/改成别的值，本函数立刻 fail closed —— 默认值的变更
+        # 必须是一次看得见的改动，而不是悄悄生效。三字段仍逐个校验（见下）。
+        #
+        # ⚠ 改这一行之前先读：**到期转正（expire_at=2026-12-31 之后）或按 rollback_rule
+        #   关掉本开关时，必须同步处理这段**。按 rollback_rule 回滚 = 把 facts.FEATURE_FLAGS
+        #   里的 default 改回 False；那一刻本 tripwire 会立刻 fail closed（这是**预期行为**，
+        #   不是故障），随后要在这里把判据改成与新的发布决策一致（`is not False`），
+        #   否则回滚后所有 Windows 控制用例都会以「开关不可用」skip。
+        #   ⇒ 到期/回滚是一次**成对改动**：facts.py 的 default + 这一行，缺一个就是半截回滚。
+        if spec.get("default") is not True or spec.get("owner") != "client-seat":
             return False
         if not isinstance(spec.get("rollback_rule"), str) or not spec["rollback_rule"].strip():
             return False

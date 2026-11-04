@@ -632,7 +632,10 @@ FEATURE_FLAGS["client.tray.control.enabled"] = {
 
 # IPC-WIN-001: opt-in local named-pipe transport; runtime checks enforce UTC expiry.
 FEATURE_FLAGS["client.ipc.windows.enabled"] = {
-    "default": False,
+    # 首发默认开启（决策人 2026-11-05 拍板；批准记录 ops/release/LAUNCH-ENV-CONSTRAINTS-2026-11-05.md §7）。
+    # 这是对「特性开关默认关闭」的唯一显式例外：owner/expire_at/rollback_rule 三字段齐全，
+    # 关掉即回到「控制不可用 + 可行动提示」，不退回 TCP、不改 daemon 运行偏好。
+    "default": True,
     "owner": "client-seat",
     "expire_at": "2026-12-31",
     "rollback_rule": "关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好",

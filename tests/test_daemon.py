@@ -62,8 +62,8 @@ def _add_upstream(store, mock, secret=None, model="mock-model"):
                               credential_ref="upstream:u1")
 
 
-def test_start_registers_heartbeats_and_goes_online(paths, store, credentials, mock,
-                                                    clock):
+def test_start_registers_heartbeats_and_goes_online(paths, windows_control_usable, store,
+                                                    credentials, mock, clock):
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock, clock=clock)
     status = daemon.start()
@@ -102,7 +102,8 @@ def test_start_requires_init(paths, credentials, mock):
         _daemon(paths, store, credentials, mock).start()
 
 
-def test_control_socket_commands(paths, store, credentials, mock, clock):
+def test_control_socket_commands(windows_control_usable, paths, store, credentials, mock,
+                                 clock):
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock, clock=clock)
     daemon.start()

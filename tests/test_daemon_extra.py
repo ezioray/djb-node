@@ -128,7 +128,8 @@ def test_invalid_policy_goes_conservative(paths, store, credentials, mock, clock
         daemon.stop()
 
 
-def test_start_twice_and_control_receipt_validation(paths, store, credentials, mock, clock):
+def test_start_twice_and_control_receipt_validation(windows_control_usable, paths, store,
+                                                   credentials, mock, clock):
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock, clock=clock)
     daemon.start()
