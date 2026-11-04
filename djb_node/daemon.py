@@ -1097,7 +1097,11 @@ class Daemon:
                 continue
             checks = payload.get("model_checks") or []
             models += len(checks)
-            if any(item.get("ok") for item in checks):
+            # 与服务端口径对齐（2026-11-04，D-PROBE-03）：云端 `_probe_verdict` 是
+            # **任一检查失败即 rejected**（零检查 ⇒ rejected/no_model_check）。
+            # 旧版这里用 `any(...)`：部分模型可用时节点自以为 verified、云端判 rejected，
+            # 两边日志对不上，排障时容易误判。改为 all + 非空，逐字对齐。
+            if checks and all(item.get("ok") for item in checks):
                 verified += 1
             else:
                 failed += 1
