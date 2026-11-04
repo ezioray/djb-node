@@ -51,6 +51,86 @@ def test_upgrade_migrates_forward(paths):
     store.close()
 
 
+# ──────────────────────────── D-NODE-STORE-CREATE：v2 老库经 create() 必须补齐 v3 列
+def _make_legacy_db(path: str, *, user_version: int = 2) -> None:
+    """造一个 v2 老库：`upstreams` 是**旧形状**（没有 v3 才加的 `upstream_kind`），并带一行老数据。"""
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE upstreams ("
+            " id TEXT PRIMARY KEY, access_type TEXT NOT NULL, base_url TEXT NOT NULL,"
+            " models TEXT NOT NULL, credential_ref TEXT, state TEXT NOT NULL,"
+            " last_probe_at TEXT, protocol TEXT, created_at TEXT NOT NULL,"
+            " enabled INTEGER NOT NULL DEFAULT 1)")
+        connection.execute(
+            "INSERT INTO upstreams (id, access_type, base_url, models, credential_ref,"
+            " state, protocol, created_at, enabled)"
+            " VALUES ('legacy-1','A2','https://legacy.example/v1','[\"m1\"]',NULL,"
+            "'declared','openai','2025-01-01T00:00:00Z',1)")
+        connection.execute("PRAGMA user_version=" + str(int(user_version)))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _table_columns(path: str, table: str) -> set[str]:
+    connection = sqlite3.connect(path)
+    try:
+        return {row[1] for row in connection.execute("PRAGMA table_info(" + table + ")")}
+    finally:
+        connection.close()
+
+
+def _user_version(path: str) -> int:
+    connection = sqlite3.connect(path)
+    try:
+        return int(connection.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def test_create_upgrades_v2_db_so_add_upstream_works(paths):
+    """v2 老库走 `djb init`（= `Store.create`）后，`add_upstream()` 不许崩。
+
+    修前：`create()` 只补 v2/v4、漏 v3 的 `upstreams.upstream_kind`，却仍把
+    `user_version` 写成 4 ⇒ 列没补、版本已满 ⇒ 之后 INSERT 抛
+    `OperationalError: table upstreams has no column named upstream_kind`。
+    """
+    _make_legacy_db(paths.db_file, user_version=2)
+    store = Store.create(paths.db_file)
+    try:
+        # 先跑真实的崩溃点（修前这里就是 OperationalError，与生产症状一字不差）
+        record = store.add_upstream(upstream_id="u1", access_type="A2",
+                                    base_url="http://127.0.0.1:1",
+                                    models=[{"id": "m"}], credential_ref=None,
+                                    upstream_kind="aggregator")
+        assert record.upstream_kind == "aggregator"
+        assert "upstream_kind" in _table_columns(paths.db_file, "upstreams")
+        assert _user_version(paths.db_file) == SCHEMA_VERSION
+        # 老数据一条不丢，且新列按设计为 NULL（不回填）
+        assert store.upstream("legacy-1").upstream_kind is None
+    finally:
+        store.close()
+
+
+def test_create_and_connect_apply_the_same_upgrade_ladder(paths):
+    """`create()` 与 `connect()` 必须收敛到**同一个**升级阶梯（防"第三次漏"）。
+
+    同一份 v2 库分别经两条路径升级，`upstreams` 列集合与 `user_version` 必须完全一致。
+    """
+    via_create = str(paths.home) + "/legacy-init.db"
+    via_connect = str(paths.home) + "/legacy-connect.db"
+    for path in (via_create, via_connect):
+        _make_legacy_db(path, user_version=2)
+    Store.create(via_create).close()
+    store = Store(via_connect)
+    store.connect()
+    store.close()
+    assert _table_columns(via_create, "upstreams") == _table_columns(via_connect, "upstreams")
+    assert "upstream_kind" in _table_columns(via_create, "upstreams")
+    assert _user_version(via_create) == _user_version(via_connect) == SCHEMA_VERSION
+
+
 def test_profile_defaults_and_save(store):
     profile = store.profile()
     assert profile.concurrent >= 1

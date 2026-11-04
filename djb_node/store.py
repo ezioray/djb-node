@@ -377,17 +377,7 @@ class Store:
                 if version < 1:
                     for statement in _SCHEMA_SQL:
                         connection.execute(statement)
-                if version < 3 and not _has_column(connection, "upstreams", "upstream_kind"):
-                    # v3：上游加类型标签（M17 §4.1 upstream_kind；NULL=未标注，旧行不回填）
-                    connection.execute("ALTER TABLE upstreams ADD COLUMN upstream_kind TEXT")
-                if version < 2 and not _has_column(connection, "receipts", "stale"):
-                    # v2：收据增加 stale 标记（超 24 h 不丢弃，标 stale + 停接单，Lead 裁决 CR-2）
-                    connection.execute("ALTER TABLE receipts ADD COLUMN stale INTEGER"
-                                       " NOT NULL DEFAULT 0")
-                if version < 4:
-                    # v4：多 plan 组（组内自动切换 + 组级共享预算）。只建新表 / 补增量列，
-                    # 不动任何老表、不回填老数据 —— 老库自动升，升完老数据照旧可用。
-                    _migrate_plan_schema(connection)
+                _apply_schema_upgrades(connection, version)
                 connection.execute("PRAGMA user_version=" + str(SCHEMA_VERSION))
         self._connection = connection
         return connection
@@ -433,12 +423,7 @@ class Store:
             with connection:
                 for statement in _SCHEMA_SQL:
                     connection.execute(statement)
-                if version_before < 2 and not _has_column(connection, "receipts",
-                                                           "stale"):
-                    connection.execute("ALTER TABLE receipts ADD COLUMN stale INTEGER"
-                                       " NOT NULL DEFAULT 0")
-                if version_before < 4:
-                    _migrate_plan_schema(connection)
+                _apply_schema_upgrades(connection, version_before)
                 connection.execute("PRAGMA user_version=" + str(SCHEMA_VERSION))
                 exists = connection.execute(
                     "SELECT COUNT(*) FROM install").fetchone()[0]
@@ -1151,6 +1136,30 @@ def _row_to_plan_group(row: sqlite3.Row, members: list[dict[str, Any]]) -> dict[
         "model_fallbacks": [item.strip() for item in fallbacks.split(",") if item.strip()],
         "members": members,
     }
+
+
+def _apply_schema_upgrades(connection: sqlite3.Connection, version: int) -> None:
+    """schema 升级阶梯（v2 / v3 / v4）——**`connect()` 与 `create()` 共用这一份**。
+
+    单独抽出来的原因（`D-NODE-STORE-CREATE`）：升级逻辑原来在两处各写一遍，v3 的
+    ``upstreams.upstream_kind`` 只补在 `connect()` 里，`create()`（`djb init` 走这条）
+    漏了却照样把 `user_version` 写成 4 ⇒ v2 及更老的库升完"版本是新的、列是旧的"，
+    之后 `add_upstream()` 直接 `OperationalError: table upstreams has no column named
+    upstream_kind`。要加新的升级步骤，**只改这里**，两条路径自动一致。
+
+    幂等：每步都先 `_has_column` / `CREATE TABLE IF NOT EXISTS`，重复执行无副作用。
+    """
+    if version < 3 and not _has_column(connection, "upstreams", "upstream_kind"):
+        # v3：上游加类型标签（M17 §4.1 upstream_kind；NULL=未标注，旧行不回填）
+        connection.execute("ALTER TABLE upstreams ADD COLUMN upstream_kind TEXT")
+    if version < 2 and not _has_column(connection, "receipts", "stale"):
+        # v2：收据增加 stale 标记（超 24 h 不丢弃，标 stale + 停接单，Lead 裁决 CR-2）
+        connection.execute("ALTER TABLE receipts ADD COLUMN stale INTEGER"
+                           " NOT NULL DEFAULT 0")
+    if version < 4:
+        # v4：多 plan 组（组内自动切换 + 组级共享预算）。只建新表 / 补增量列，
+        # 不动任何老表、不回填老数据 —— 老库自动升，升完老数据照旧可用。
+        _migrate_plan_schema(connection)
 
 
 def _has_column(connection: sqlite3.Connection, table: str, column: str) -> bool:
