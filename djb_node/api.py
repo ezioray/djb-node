@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """M02 / M05 出站调用（只消费，不拥有）。
 
-端点与信封按 spec 1.2.4（只读契约）：
+端点与信封按当前契约（只读；版本一律看 `openapi.yaml` 的 `info.version`，本文件不写死版本号）：
 
     POST /api/v1/node/register            201  首次 pending；同指纹幂等
     POST /api/v1/node/pair                201  生成 / 轮换 X-Client-Key（明文只回一次）

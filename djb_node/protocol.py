@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""协议常量与 tolerant reader（spec 1.2.4 / 04-api-contracts §6）。
+"""协议常量与 tolerant reader（契约见 `openapi.yaml` 的 `info.version`；§6 / 04-api-contracts）。
 
 头名、路径、能力集合只在这里出现一次；解析一律容忍未知字段 / 未知枚举
 （spec「客户端必须容忍未知字段」，旧网关仍可用）。

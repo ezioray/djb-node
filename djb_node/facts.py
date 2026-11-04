@@ -7,7 +7,8 @@
 * M15 §8.1：client.* 配置键的默认值与范围（仅本地展示，不覆盖服务端 policy）。
 * M15 §8.2：本模块常量（回环端点、心跳上限、缓冲 24 h、让路 10 s、资源上限、日志 7 天、
   支持矩阵、验收线）。
-* spec 1.2.4 / 04-api-contracts：协议版本、头名、错误码段、收据签名（CR-2 已裁决
+* 契约（版本见 `openapi.yaml` 的 `info.version`，本文件不写死）/ 04-api-contracts：
+  协议版本、头名、错误码段、收据签名（CR-2 已裁决
   hmac-sha256 + 6 字段顺序 + 原样字符串）。
 * M02 CR-6（已裁决）：A2 五字段以产品 §5.4.1 为准
   endpoint / model / credential_ref / concurrency_limit / receipt_sample。
