@@ -3,6 +3,65 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.5.0 · 2026-11-05 · MINOR
+
+**类型**：MINOR（纯加性 + 路径参数改名；**无删除、无操作删除、无 schema 删除、无类型更改**）。
+本条同时把仓库里落后的 1.3.0 副本补齐到 1.4.0/1.5.0 的实际契约面：
+**157 → 213 路径（+56）/ 181 → 252 操作（+71）/ 289 → 339 schema（+50）**。
+
+**背景（为什么一次跳两个版本）**
+- 1.4.0 定版内容为提交 `2343a35`（199 路径），但仓库副本一直停在 1.3.0/157 路径；
+- 1.4.0 之后又落了 **14 条加性路径**（199 → 213），提交信息用的是 `spec(1.2.10)` 这类
+  与文件头两套编号 —— 版本号与提交信息都对不上（2026-11-04 审计 `D-SPEC-01`）；
+- 2026-11-05 定版（决策人 ezio）：按 MINOR 统一为 **1.5.0**，1.4.0 的可复现内容固定为
+  提交 `2343a35`。本条把两个版本的账一起记，此后以本文件为唯一真相源。
+
+**新增路径 56 条（+71 操作）**
+| 前缀 | 条数 | 归属 |
+|---|---|---|
+| `/api/v1/admin` | 18 | 后台：账户、节点、配置发布（approve/promote）、账本摘要、模型同步（publish/rollback）、供应完整性（holds/canary/sampling）、工单、token-route 授权 |
+| `/api/v1/user` | 19 | 用户面：节点代理授权、托管、工单、账本、用量 |
+| `/api/v1/node` | 7 | 节点面：公告、通知 ack/read、能力上报 |
+| `/api/v1/auth` | 3 | 认证：step-up 等 |
+| `/api/v1/tickets` | 3 | 工单 |
+| `/api/v1/hosted` | 2 | 托管 |
+| `/api/v1/internal` | 2 | 内部面 |
+| `/api/v1/treasury` | 2 | 资金 |
+
+**路径参数改名 12 条**（URL 形状不变，只把 `{id}` 改成具名参数，便于 SDK 生成与契约测试定位）
+- `config/publish-requests/{id}/{approve,promote}` → `{request_id}`
+- `model-sync/bundles/{id}/{publish,rollback}` → `{bundle_id}`
+- `supply/integrity/holds/{id}`、`/release` → `{hold_id}`
+- `supply/integrity/canary/runs/{id}/result` → `{run_id}`
+- `supply/integrity/sampling/draws/{id}/result` → `{draw_id}`
+- `supply/integrity/sampling/epochs/{id}`、`/reveal` → `{epoch_id}`
+- `node/notifications/{id}/{ack,read}` → `{notification_id}`
+
+**影响面**
+- cloud：契约测试、admin 路由、配置发布链路（本节新增键均为已实现路径的登记）；
+- node：`daemon` 的节点面/通知面路径参数名变化，只影响 SDK 生成的形参名，不影响 URL；
+- SDK / 文档站：新增 56 条路径与 50 个 schema；`{id}` → 具名参数属**签名改名**，
+  已按 tolerant 方式处理（同一 URL 仍匹配）。
+
+**兼容矩阵**
+- v1 未发布（无 tag）→ N / N-1 / N-2 不适用；无存量客户端。
+- 破坏性变更：**无删除**；12 条路径参数改名不改变 URL 与请求体，客户端按 URL 调用不受影响。
+- 老请求：不带新增可选字段 → 行为不变。
+- 老节点：不实现新增路径 → cloud 侧对应路由返回既有错误码，不静默降级。
+
+**门禁与证据**
+- 逐条比对（2026-11-05）：按方法级核对，`node 157 条路径 / 181 操作`在 1.5.0 中**全部存在**
+  （缺失 0 / 操作缺失 0），新增均为加性。
+- `reports/RC-2026-11-03/audit/AUDIT-2026-11-04-FULL.md` §3（版本混乱实测）
+- `reports/RC-2026-11-03/audit/GAP-CLOSURE-20261104.md` §C2
+
+**复核人**：lead（提议 / 实现）· release-manager（发布窗口内复核并打 tag `spec-1.5.0`）
+
+**备注**
+- 本仓库包版本（`pyproject.toml`）**不动**：协议版本与守护进程包版本是两套编号，本次只补协议面。
+- 缺 tag 台账：`spec-1.2.12` / `spec-1.2.13` 当时未打 tag、`1.3.0` / `1.4.0` 从未打 tag，
+  由 release-manager 在打 `spec-1.5.0` 时一并注记。
+
 ## 1.3.0 · 2026-10-30 · MINOR
 
 **类型**：MINOR（纯加性：3 个请求字段 / 3 个公告 schema / 1 个错误码 / 1 个可选响应头；

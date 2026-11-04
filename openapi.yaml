@@ -17,8 +17,13 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  version: 1.3.0
-  summary: W1 冻结 + M16 审计链 + W2/W3 契约面 + S4 TokenRouter 加性字段（157 路径 / 181 操作；覆盖 M01–M14、M16–M18）
+  # 2026-11-05 定版（决策人 ezio）：1.4.0 之后落地 14 条加性路径（199→213）一直没升
+  # 版本号，现按 MINOR 定为 1.5.0；1.4.0 的可复现内容固定为提交 2343a35（199 路径）。
+  version: 1.5.0
+  # 2026-11-04 审计：此处原先硬编码「157 路径 / 181 操作」——那是 node 快照期的数字，
+  # 与文件实测（213/252）不符，且每次加性变更都会让它更假。规模数字一律由
+  # `reports/RC-2026-11-03/audit/tools/check-spec-single-source.py` 现算，不写进正文。
+  summary: W1 冻结 + M16 审计链 + W2/W3 契约面 + S4 TokenRouter 加性字段（覆盖 M01–M14、M16–M18）
   description: |
     DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
@@ -83,6 +88,1295 @@ tags:
     description: 共享方控制台面（M08 分润 / 出款地址；M04 报价设置；不与 pay 合并）
 
 paths:
+
+  /api/v1/admin/accounts:
+    get:
+      tags:
+      - admin
+      summary: 账户列表（只回哈希前缀）
+      description: 账户列表（只回哈希前缀，不含邮箱 / 手机明文）。
+      operationId: listAdminAccounts
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+
+  /api/v1/admin/ledger/summary:
+    get:
+      tags:
+      - admin
+      summary: 账务只读汇总（今日应收 / 已入账 / 差额）
+      description: 账务只读汇总（今日应收 / 已入账 / 差额；不动账本）。
+      operationId: getAdminLedgerSummary
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+
+  /api/v1/admin/nodes:
+    get:
+      tags:
+      - admin
+      summary: 节点列表（在线判定 / access 分布）
+      description: 节点列表（``state`` / ``online`` 过滤 + 在线判定 + access 分布）。
+      operationId: listAdminNodes
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+
+  /api/v1/admin/supply/summary:
+    get:
+      tags:
+      - admin
+      summary: 供给汇总（节点 / 报价 / 按模型容量与价格）
+      description: 供给汇总（节点数 / 在线数 / 有效报价 / 按模型 max_qps 与价格区间）。
+      operationId: getAdminSupplySummary
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+
+  /api/v1/admin/traffic/summary:
+    get:
+      tags:
+      - admin
+      summary: 流量汇总（窗口调用量 / 成功率 / p95 延迟）
+      description: 流量汇总（最近 ``window_h`` 小时：调用量 / 成功失败 / 错误率 / p95）。
+      operationId: getAdminTrafficSummary
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+
+  /api/v1/node/earnings:
+    get:
+      tags:
+      - metering
+      summary: Get Node Earnings
+      description: 节点控制台：收益汇总 + 近期明细（查不到 → ``null`` + ``unavailable_reason``）。
+      operationId: get_node_earnings_api_v1_node_earnings_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [currency, unit, settled_micro, pending_micro, corrected_micro, today_micro, usage_rows, rows, page]
+                properties:
+                  currency: {type: string, const: USDT}
+                  unit: {type: string, const: micro-USD}
+                  settled_micro: {type: integer, description: 已结算（micro-USD）}
+                  pending_micro: {type: integer, description: 待结算（micro-USD）}
+                  corrected_micro: {type: integer, description: 已更正（micro-USD）}
+                  today_micro:
+                    type: integer
+                    description: 今日计费额（micro-USD），**UTC 日界**（服务端 00:00Z 起算）；今天无记录 = 0
+                  settled_minor: {type: integer, deprecated: true, description: 历史命名，单位实为 micro-USD，与 settled_micro 同值}
+                  pending_minor: {type: integer, deprecated: true, description: 同上，与 pending_micro 同值}
+                  corrected_minor: {type: integer, deprecated: true, description: 同上，与 corrected_micro 同值}
+                  usage_rows: {type: integer}
+                  next_settlement_at: {type: [string, 'null'], format: date-time, description: 无排期表 → null（不猜时间）}
+                  unavailable_reason:
+                    type: [string, 'null']
+                    description: 有数据也可能是 settlement_schedule_not_configured；**不可用才为空金额**，有金额时原因降级为备注
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        request_id: {type: string}
+                        task_id: {type: string}
+                        receipt_id: {type: [string, 'null'], description: 无收据 → null（不填空串）}
+                        tokens: {type: [integer, 'null'], description: tokens_in + tokens_out}
+                        model: {type: string}
+                        state: {type: string, enum: [recorded, settled, corrected]}
+                        amount_micro: {type: integer}
+                        recorded_at: {type: string, format: date-time}
+                        settled_at: {type: [string, 'null'], format: date-time}
+                  page:
+                    type: object
+                    properties:
+                      cursor: {type: string}
+                      has_more: {type: boolean}
+                      next_cursor: {type: [string, 'null']}
+
+  /api/v1/node/profile:
+    get:
+      tags:
+      - metering
+      summary: Get Node Profile
+      description: 节点控制台：本节点身份（只读）。跨节点/不存在 → 404（不泄露存在性）。
+      operationId: get_node_profile_api_v1_node_profile_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [node_id, state, bound]
+                properties:
+                  node_id: {type: string}
+                  display_name: {type: [string, 'null']}
+                  state: {type: string, description: 节点状态词（active/pending/frozen/retired…）}
+                  region: {type: [string, 'null']}
+                  platform: {type: [string, 'null']}
+                  upstream_kind: {type: [string, 'null'], description: A1/A2/B；托管形态为 hosted_agent}
+                  capabilities: {type: array, items: {type: string}}
+                  bound: {type: boolean, description: 是否已绑定账户}
+                  bound_at: {type: [string, 'null'], format: date-time}
+                  last_seen_at: {type: [string, 'null'], format: date-time}
+
+  /api/v1/node/tasks:
+    get:
+      tags:
+      - metering
+      summary: List Node Tasks
+      description: 节点控制台：本节点任务列表（只读，游标分页）。无数据返回空数组，**不返回 404**。
+      operationId: list_node_tasks_api_v1_node_tasks_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: [array]
+                    description: 任务行（task_id/receipt_id/state/inflight/tokens_in/tokens_out/amount_micro/started_at/finished_at 等）
+                  page:
+                    type: object
+                    description: cursor/has_more/next_cursor
+
+
+  /api/v1/user/balance:
+    get:
+      tags:
+      - metering
+      summary: Get User Balance
+      description: '账单页「可用余额」（micro-USD）。
+
+
+        读 M06 只读视图 ``account_balances_latest``（2101 服务预付款，AVAILABLE 子账户）；
+
+        **无记录 → 0**（零是事实：没充过值就是 0），不新表、不直读别人基表。'
+      operationId: get_user_balance_api_v1_user_balance_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [available_minor, unit, account, as_of]
+                properties:
+                  available_minor: {type: integer, description: micro-USD（账本真实零 = 0，不是缺字段）}
+                  unit: {type: string, const: micro-USD}
+                  account: {type: string, const: '2101'}
+                  as_of: {type: string, format: date-time}
+                  note: {type: string, description: 已绑定但账本无记录时的说明（此时 available_minor=0）}
+
+  /api/v1/node/balance:
+    get:
+      tags:
+      - metering
+      summary: Get Node Balance
+      description: '节点侧「绑定账户可用余额」（micro-USD）。
+
+
+        鉴权 ``nodeClientKey``；账户取 M02 ``nodes.bound_account_id``（经只读视图
+        ``v_supply_node_snapshot``），**节点自报的账户 id 一律不采信**，因此拿别人的节点钥
+        也只能看到自己那份。
+
+
+        三态严格区分：绑定且有余额 → 真值；绑定但账本无记录 → ``0``（零是事实）；
+        未绑定 → ``available_minor: null`` + ``unavailable_reason: node_not_bound``（不 404、不写 0）。'
+      operationId: getNodeBalance
+      security: [{nodeClientKey: []}]
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [available_minor, unit, account, as_of]
+                properties:
+                  available_minor:
+                    type: [integer, 'null']
+                    description: micro-USD；未绑定账户时为 null
+                  unit: {type: string, const: micro-USD}
+                  account: {type: string, const: '2101'}
+                  as_of: {type: string, format: date-time}
+                  unavailable_reason: {type: string, const: node_not_bound}
+                  note: {type: string, description: 已绑定但无记录时的说明（此时 available_minor=0）}
+        '401': {description: 40101 缺少或无效的 X-Client-Key}
+
+  /api/v1/hosted/echo:
+    post:
+      tags: [hosted]
+      operationId: hostedAgentEcho
+      summary: 最小回显（证明令牌可用；不转发上游）
+      security: [{hostedAgentBearer: []}]
+      requestBody:
+        required: false
+        content: {application/json: {schema: {type: object}}}
+      responses:
+        '200':
+          description: 200
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, agent_id, echo]
+                properties:
+                  ok: {type: boolean}
+                  agent_id: {type: string, format: uuid}
+                  echo: {type: object}
+        '400': {description: 40001 请求体非 JSON 对象 / 超过 4096 字节}
+        '401': {description: 40101}
+        '404': {description: 40401 开关关闭}
+
+  /api/v1/hosted/health:
+    get:
+      tags: [hosted]
+      operationId: hostedAgentHealth
+      summary: 托管令牌可用性证明
+      security: [{hostedAgentBearer: []}]
+      responses:
+        '200':
+          description: 200
+          content: {application/json: {schema: {$ref: '#/components/schemas/HostedPing'}}}
+        '401': {description: 40101 缺失/未知/已撤销（统一，不区分存在性）}
+        '404': {description: 40401 开关关闭}
+
+  /api/v1/node/hosted-agent:
+    post:
+      tags: [hosted]
+      operationId: registerHostedAgent
+      summary: 注册 / 轮换托管 Agent（明文令牌只返回一次）
+      security: [{nodeClientKey: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name, endpoint_url]
+              properties:
+                display_name: {type: string, minLength: 1, maxLength: 80}
+                endpoint_url:
+                  type: string
+                  description: 必须 https；仅回环（localhost/127.0.0.1/::1）允许 http
+                scopes:
+                  type: array
+                  items: {type: string, enum: [inference.read]}
+                  default: [inference.read]
+              additionalProperties: false
+      responses:
+        '200':
+          description: 已存在 active Agent，覆盖并轮换令牌（旧令牌立即失效）
+          content: {application/json: {schema: {$ref: '#/components/schemas/HostedAgentToken'}}}
+        '201':
+          description: 首次注册
+          content: {application/json: {schema: {$ref: '#/components/schemas/HostedAgentToken'}}}
+        '400': {description: 40001 参数不合法（endpoint 非 https/回环、scope 不在白名单、display_name）}
+        '401': {description: 40101 缺少/未知 X-Client-Key}
+        '404': {description: 40401 开关关闭}
+    get:
+      tags: [hosted]
+      operationId: getHostedAgent
+      summary: 读取本节点托管 Agent（不含令牌）
+      security: [{nodeClientKey: []}]
+      responses:
+        '200':
+          description: 200
+          content: {application/json: {schema: {$ref: '#/components/schemas/HostedAgentEnvelope'}}}
+        '401': {description: 40101}
+        '404': {description: 40401 未注册 / 开关关闭}
+
+  /api/v1/node/hosted-agent/{id}:
+    delete:
+      tags: [hosted]
+      operationId: revokeHostedAgent
+      summary: 撤销（写 revoked_at，令牌立即失效；行不删）
+      security: [{nodeClientKey: []}]
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: 200
+          content: {application/json: {schema: {$ref: '#/components/schemas/HostedAgentEnvelope'}}}
+        '401': {description: 40101}
+        '404': {description: 40401 不存在 / 已撤销 / 跨节点 / 开关关闭}
+
+  /api/v1/user/hosted-agents:
+    get:
+      tags: [hosted]
+      operationId: listHostedAgents
+      summary: 客户侧可用托管 Agent 列表（不含 endpoint / token）
+      security: [{userBearer: []}]
+      responses:
+        '200':
+          description: 200
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, count]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, display_name, scopes]
+                      properties:
+                        id: {type: string, format: uuid}
+                        display_name: {type: string}
+                        scopes: {type: array, items: {type: string}}
+                  count: {type: integer}
+        '401': {description: 40101}
+        '404': {description: 40401 开关关闭}
+
+  /api/v1/admin/tickets:
+    get:
+      operationId: listTickets
+      summary: 后台工单列表（state / priority / tenant 过滤 + 只读聚合）
+      description: |
+        每条附只读聚合 `message_count`（含内部备注）与 `last_message_at`，用于值班队列排序。
+        本端点**不下发**会话正文。
+      tags: [Admin, Tickets]
+      security: [{adminBearer: []}]
+      parameters:
+        - {name: state, in: query, required: false, schema: {$ref: "#/components/schemas/TicketState"}}
+        - {name: priority, in: query, required: false, schema: {$ref: "#/components/schemas/TicketPriority"}}
+        - {name: tenant, in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: cursor, in: query, required: false, schema: {type: string}}
+      responses:
+        "200":
+          description: 工单列表（含聚合）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TicketAdminList"}
+        "400": {description: "40001 过滤值 / limit / cursor 非法"}
+        "401": {description: "40101 未认证 / 主体缺 admin_id"}
+        "403": {description: "40301 缺 scope：ticket.read"}
+        "404": {description: "40401 开关关闭"}
+
+  /api/v1/admin/tickets/{ticket_id}/messages:
+    post:
+      operationId: replyTicket
+      summary: 客服回复 / 内部备注
+      description: |
+        `internal_note=true` 的会话只对后台可见（客户侧读路径在 SQL 层过滤），
+        但会计入后台列表的 `message_count`。
+      tags: [Admin, Tickets]
+      security: [{adminBearer: []}]
+      parameters:
+        - {name: ticket_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TicketReplyRequest"}
+      responses:
+        "201":
+          description: 回复成功
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TicketMessageCreated"}
+        "400": {description: "40001 body 不合法 / internal_note 非布尔"}
+        "401": {description: "40101 未认证 / 主体缺 admin_id"}
+        "403": {description: "40301 缺 scope：ticket.reply"}
+        "404": {description: "40401 工单不存在 / 开关关闭"}
+
+  /api/v1/admin/tickets/{ticket_id}/state:
+    post:
+      operationId: setTicketState
+      summary: 工单状态迁移
+      description: |
+        合法迁移见 info.description；非法迁移 409 `reason=illegal_transition`（附
+        `current` / `target`）；同态重复提交按幂等返回 `changed=false`。
+        `closed` 时写 `closed_at`，重开（→ open）时清空。
+      tags: [Admin, Tickets]
+      security: [{adminBearer: []}]
+      parameters:
+        - {name: ticket_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TicketStateChangeRequest"}
+      responses:
+        "200":
+          description: 迁移结果（`changed=false` 表示同态幂等）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TicketStateChanged"}
+        "400": {description: "40001 state 缺失 / 非枚举值"}
+        "401": {description: "40101 未认证 / 主体缺 admin_id"}
+        "403": {description: "40301 缺 scope：ticket.reply"}
+        "404": {description: "40401 工单不存在 / 开关关闭"}
+        "409": {description: "40919 reason=illegal_transition（附 current / target）"}
+
+  /api/v1/tickets:
+    post:
+      operationId: createTicket
+      summary: 客户提单（同时落地首条会话）
+      description: |
+        `subject` 1..200 字；`body` 1..8000 字；`category` / `priority` 缺省分别为
+        `other` / `normal`。返回工单与首条消息（`author_role=customer`）。
+        同一账号重复提交会创建多张单（本接口**不做**幂等去重）。
+      tags: [Tickets]
+      security: [{userBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TicketCreateRequest"}
+      responses:
+        "201":
+          description: 建单成功
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TicketCreated"}
+        "400": {description: "40001 字段不合法（超长时不回显正文，只给 max_length / actual_length）"}
+        "401": {description: "40101 未认证"}
+        "404": {description: "40401 开关 ticket_center 关闭（不暴露入口）"}
+    get:
+      operationId: listMyTickets
+      summary: 我的工单列表（游标分页 + state 过滤）
+      description: |
+        只返回**鉴权主体本人**的工单，按 `created_at DESC, id DESC` 排序。
+        `cursor` 原样回传上一页的 `page.next_cursor`（不透明，勿解析）。
+      tags: [Tickets]
+      security: [{userBearer: []}]
+      parameters:
+        - {name: state, in: query, required: false, schema: {$ref: "#/components/schemas/TicketState"}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: cursor, in: query, required: false, schema: {type: string}}
+        - {$ref: "#/components/parameters/RequestId"}
+      responses:
+        "200":
+          description: 工单列表
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TicketList"}
+        "400": {description: "40001 limit 越界 / state 非法 / cursor 非法"}
+        "401": {description: "40101 未认证"}
+        "404": {description: "40401 开关关闭"}
+
+  /api/v1/tickets/{ticket_id}:
+    get:
+      operationId: getMyTicket
+      summary: 我的工单详情（含会话，内部备注不可见）
+      description: |
+        别人的工单、跨租户、不存在的 id —— 一律 404，响应逐字一致（不泄漏存在性）。
+        返回的 `messages` **不含** `internal_note=true` 的记录；客服作者不回显 `author_id`。
+      tags: [Tickets]
+      security: [{userBearer: []}]
+      parameters:
+        - {name: ticket_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200":
+          description: 工单 + 会话
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TicketDetail"}
+        "401": {description: "40101 未认证"}
+        "404": {description: "40401 不存在 / 越权 / 开关关闭"}
+
+  /api/v1/tickets/{ticket_id}/messages:
+    post:
+      operationId: createMyTicketMessage
+      summary: 客户追加会话
+      description: |
+        已关闭的工单不再接受客户追加（`409` + `reason=ticket_closed`）；客户不能写内部备注
+        （`internal_note` 只能是 false，传 true 即 400）。
+      tags: [Tickets]
+      security: [{userBearer: []}]
+      parameters:
+        - {name: ticket_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TicketMessageCreateRequest"}
+      responses:
+        "201":
+          description: 追加成功
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TicketMessageCreated"}
+        "400": {description: "40001 body 不合法 / 客户侧不支持 internal_note"}
+        "401": {description: "40101 未认证"}
+        "404": {description: "40401 不存在 / 越权 / 开关关闭"}
+        "409": {description: "40919 reason=ticket_closed（工单已关闭）"}
+
+  /api/v1/admin/supply/nodes/{node_id}/token-route/grant:
+    post:
+      tags:
+      - node
+      summary: 授权节点申报 token 路由（节点维度白名单；需 step-up）
+      description: '写节点白名单（``token_route_grants``）；未授权 = 默认，撤销不删行。
+
+
+        请求体：``model_pairs``（``[{execution_model, lead_model}]``，必填且非空）、
+
+        可选 ``reason`` / ``expires_at``（RFC 3339）。**不接受任何凭据**。'
+      operationId: grantTokenRoute
+      parameters:
+      - name: node_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Node Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                properties:
+                  type: object
+                  additionalProperties: true
+                type:
+                  type: object
+                  additionalProperties: true
+                title:
+                  type: object
+                  additionalProperties: true
+    delete:
+      tags:
+      - node
+      summary: 撤销节点的 token 路由申报授权（需 step-up；行保留）
+      operationId: revokeTokenRoute
+      parameters:
+      - name: node_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Node Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                properties:
+                  type: object
+                  additionalProperties: true
+                type:
+                  type: object
+                  additionalProperties: true
+                title:
+                  type: object
+                  additionalProperties: true
+
+  /api/v1/admin/supply/token-route/grants:
+    get:
+      tags:
+      - node
+      summary: token 路由白名单清单（只读）
+      operationId: listTokenRouteGrants
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+
+  /api/v1/user/nodes/{node_id}/token-route:
+    get:
+      tags:
+      - node
+      summary: 我的节点的 token 路由：授权状态 + 每个模型对的标定采信结论
+      description: '用户态只读：能不能申报、能申报哪些 pair、每个 pair 是否被标定采信（含原因）。
+
+
+        只读、不触发申报、不含凭据；申报本身由节点心跳携带 ``capacity[].token_route``。'
+      operationId: getUserNodeTokenRoute
+      parameters:
+      - name: node_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Node Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                properties:
+                  type: object
+                  additionalProperties: true
+                type:
+                  type: object
+                  additionalProperties: true
+                title:
+                  type: object
+                  additionalProperties: true
+
+  
+  
+  /api/v1/admin/config/publish-requests:
+    get:
+      tags:
+      - admin
+      summary: List Config Publish Requests
+      description: '发布单列表（**只读**，WP5 F15 加性）：状态过滤 + 游标分页（requested_at DESC）。
+
+
+        读发布单只需读权限面（principal 解析器统一把关）；返回体不含任何密文，
+
+        `secret_ref` 一律不回，`versions` 只给 key→version 映射。'
+      operationId: listConfigPublishRequests
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+      - name: key
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Key
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 50
+          title: Limit
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                properties:
+                  type: object
+                  additionalProperties: true
+                type:
+                  type: object
+                  additionalProperties: true
+                title:
+                  type: object
+                  additionalProperties: true
+
+  /api/v1/admin/treasury/sweeps:
+    get:
+      operationId: listChainSweeps
+      summary: 归集单列表（管理面）
+      tags: [Treasury, Chain]
+      security: [{adminBearer: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [proposed, approved, executed, cancelled, expired]}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+      responses:
+        "200":
+          description: 归集单列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: "#/components/schemas/ChainSweep"}}
+                  page: {$ref: "#/components/schemas/ChainPage"}
+        "403": {description: "40301 缺少 treasury.sweep.read"}
+    post:
+      operationId: actOnChainSweep
+      summary: 归集动作（propose / approve / execute）
+      description: |
+        状态机单向：``proposed → approved → executed``，另有 ``expired``（30 分钟窗口超时）。
+        - **propose**：scope ``treasury.sweep.propose``；只写库、不动链不动账本；
+          小于尘埃阈值（默认 1 USDT）的地址不进提案。
+        - **approve**：scope ``treasury.sweep.approve``；SoD 强制 ``checker != proposer``（40912）。
+        - **execute**：scope ``treasury.sweep.execute`` + step-up；mock 链真实移动余额并写
+          E9 两对分录；**真链执行 → 409 chain_execution_unavailable**（本服务无私钥、不广播）。
+      tags: [Treasury, Chain]
+      security: [{adminBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: {type: string, enum: [propose, approve, execute]}
+                sweep_id: {type: string, format: uuid, description: "approve / execute 必填"}
+                gas_fee_minor: {type: integer, minimum: 0, default: 0, description: "propose：预置 gas 消耗（micro-USD）"}
+                target_address: {type: string, pattern: "^0x[0-9a-fA-F]{40}$", description: "propose：默认取平台温钱包地址"}
+                policy_version: {type: string}
+      responses:
+        "201": {description: "propose 命中：返回提案单与明细"}
+        "200": {description: "approve / execute / 无提案（no_sweep_needed）"}
+        "400": {description: "40001 action 非法或字段缺失"}
+        "403": {description: "40301 缺少对应 scope"}
+        "404": {description: "40401 归集单不存在"}
+        "409":
+          description: |
+            40912 sod_violation（复核人=制单人）、40913 illegal_transition（状态不允许）、
+            40919 xpub_missing / sweep_expired / insufficient_source_balance；
+            **chain_execution_unavailable**：真链执行不可用（无签名服务）。
+            后者是**预期**答复，不是故障：不得重试、不得改走 500。
+        "424": {description: "42401 需要 step-up 复核"}
+        "429": {description: "42901 rate_limited"}
+
+  /api/v1/internal/chain/mock/fund:
+    post:
+      operationId: mockFundChainAddress
+      summary: mock 链打款（**仅测试网 / mock provider**）
+      description: |
+        让验收脚本能在没有真链的情况下跑通闭环。真链 provider 下返回
+        ``503 chain_provider_unavailable``（本服务不广播任何交易）。
+      tags: [Chain, Internal]
+      security: [{internalMTLS: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address, amount]
+              properties:
+                address: {type: string, pattern: "^0x[0-9a-fA-F]{40}$"}
+                amount: {type: string, description: "十进制 USDT，最多 6 位小数（如 \"12.5\"）"}
+                confirmations: {type: integer, minimum: 0, maximum: 1000, default: 0}
+                status: {type: string, enum: [success, reverted], default: success}
+      responses:
+        "201": {description: 已打款，返回 tx_hash / log_index / qty_minor}
+        "400": {description: "40001 金额精度超 6 位 / 地址非法"}
+        "401": {description: "40101 服务令牌无效"}
+        "403": {description: "40301 非 test 环境"}
+        "503": {description: "50001 真链 provider 下不可用"}
+
+  /api/v1/internal/chain/scan:
+    post:
+      operationId: runChainScan
+      summary: 触发一轮增量扫描（**仅测试网 / 内部**）
+      description: |
+        三重门：``DJB_ENV=test`` + 服务令牌 ``X-DJB-Service-Token``（常量时间比较）+ 请求来源必须
+        回环（``DJB_CHAIN_ALLOW_REMOTE_INTERNAL=1`` 才放开）。窗口 = ``max(游标+1, head-200)``，
+        保证 reorg 后 200 块内可重扫；游标单调不回退。
+      tags: [Chain, Internal]
+      security: [{internalMTLS: []}]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                addresses: {type: array, items: {type: string}, description: "缺省=全部活跃地址"}
+                refresh_blocks: {type: integer, minimum: 1, maximum: 5000, default: 200}
+      responses:
+        "200":
+          description: 本轮扫描摘要（transfers / actions / below_min_deposit / cursor）
+        "401": {description: "40101 服务令牌缺失或不匹配"}
+        "403": {description: "40301 非 test 环境或非回环来源"}
+        "503": {description: "50001 provider 不可用（已留痕 last_error，游标不前进）"}
+
+  /api/v1/treasury/deposit-address:
+    get:
+      operationId: getChainDepositAddress
+      summary: 读取当前主体的 USDT 收款地址
+      description: 每主体只有一个活跃地址；未分配时返回 404（用 POST 分配）。
+      tags: [Treasury, Chain]
+      security: [{userBearer: []}]
+      responses:
+        "200":
+          description: 已有活跃地址
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChainDepositAddress"}
+        "404": {description: "40401 还没有收款地址"}
+        "429": {description: "42901 频率超限（分配接口 10 次 / 60 秒）"}
+    post:
+      operationId: assignChainDepositAddress
+      summary: 分配（或取回）USDT 收款地址
+      description: |
+        幂等：已有活跃地址直接返回 ``created=false``（不换地址，避免用户扫到旧地址不到账）。
+        服务端只从 xpub 派生地址，派生路径 ``m/44'/60'/0'/0/{index}``；
+        ``min_deposit_minor`` 是**提示阈值**，低于阈值的小额充值仍会入账（不吞用户的钱）。
+      tags: [Treasury, Chain]
+      security: [{userBearer: []}]
+      responses:
+        "201":
+          description: 新建地址
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChainDepositAddress"}
+        "200":
+          description: 已有地址（幂等命中），返回体同上且 created=false
+        "401": {description: "40101 未认证"}
+        "429": {description: "42901 rate_limited：10 次 / 60 秒，带 Retry-After"}
+        "503": {description: "50001 chain_provider_unavailable / 40919 xpub_missing"}
+
+  /api/v1/treasury/deposits:
+    get:
+      operationId: listChainDeposits
+      summary: 我的 USDT 充值列表
+      tags: [Treasury, Chain]
+      security: [{userBearer: []}]
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: 充值列表（含确认数 / 阈值提示）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/ChainDeposit"}
+                  page: {$ref: "#/components/schemas/ChainPage"}
+                  min_deposit_minor: {type: integer, description: "提示阈值，默认 1000000（1 USDT）"}
+        "400": {description: "40001 参数非法（limit 非数字等）"}
+        "401": {description: "40101 未认证"}
+
+  /api/v1/user/email/change:
+    post:
+      tags: [identity]
+      summary: 申请更换登录邮箱（先 pending，未确认前登录邮箱不变）
+      operationId: changeUserEmail
+      description: |
+        **不假装已生效**：只写 pending（`state=pending`），`users.email_hash` 不变。
+        当前没有邮件通道（归 M12），因此 `confirm_available=false`、
+        `confirm_blocked_reason=email_channel_not_available`——调用方据此如实展示「待验证」。
+        已启用 MFA 时需 step-up。新邮箱只存 `sha256`，响应只回**掩码**。
+      security: [{userBearer: []}]
+      parameters:
+        - name: X-User-Step-Up
+          in: header
+          required: false
+          description: 已启用 MFA 时必填。
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_email]
+              properties:
+                new_email: {type: string, format: email, maxLength: 254}
+      responses:
+        '200':
+          description: 已登记待确认（登录邮箱未变）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EmailChangeAck'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '424': {$ref: '#/components/responses/StepUpRequired'}
+    delete:
+      tags: [identity]
+      summary: 取消待确认的换邮箱申请（幂等；登录邮箱不变）
+      operationId: cancelUserEmailChange
+      description: |
+        只撤销 pending 申请，不改 users.email_hash；没有待确认申请时按幂等成功返回。
+        已启用 MFA 时需 step-up（X-User-Step-Up 或 5 分钟窗口），否则 424。
+      security: [{userBearer: []}]
+      parameters:
+        - name: X-User-Step-Up
+          in: header
+          required: false
+          description: 已启用 MFA 时必填。
+          schema: {type: string}
+      responses:
+        '200':
+          description: 已取消（或本来就没有待确认申请）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EmailChangeAck'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '424': {$ref: '#/components/responses/StepUpRequired'}
+
+  /api/v1/user/mfa/disable:
+    post:
+      tags: [identity]
+      summary: 关闭 MFA（带当前因子，或已通过 step-up）
+      operationId: disableUserMfa
+      description: |
+        两条路径：请求体带 `code`（当前因子）→ 直接关闭；
+        不带 `code` → **必须**已通过 step-up（`X-User-Step-Up` 或 5 分钟窗口），否则 424。
+      security: [{userBearer: []}]
+      parameters:
+        - name: X-User-Step-Up
+          in: header
+          required: false
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                code: {type: string, pattern: '^[0-9]{6}$'}
+      responses:
+        '200':
+          description: 已关闭
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MfaStateAck'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '424': {$ref: '#/components/responses/StepUpRequired'}
+
+  /api/v1/user/mfa/enroll:
+    post:
+      tags: [identity]
+      summary: 登记 MFA 因子（因子只显示一次）
+      operationId: enrollUserMfa
+      description: |
+        不传 `method`（或 `method=pin`）：服务端生成 6 位因子（与 `POST /api/v1/auth/step-up`
+        的 `mfa_code` 同一因子），**只在本次响应里出现一次**；库中只有 scrypt 派生串 + salt。
+        状态机：`none → pending`；需再调 `/user/mfa/verify` 才算启用。
+        已启用时重复登记 → 409（先关闭再登记）。
+        `method=totp`（加性，2026-11-02）：改为登记 TOTP 因子，响应带 `secret` / `otpauth_uri` /
+        `recovery_codes`（同样只出现一次）；TOTP 的启用状态在 `identity_totp_factors`，
+        **不改** `users.mfa_state` 语义；`/user/mfa/verify` 提交动态码即完成绑定。
+        开关 `identity.mfa_totp` 关闭时 `method=totp` 返回 404（reason=totp_disabled）。
+      security: [{userBearer: []}]
+      requestBody:
+        required: false
+        description: 可选；缺省 = pin（与历史行为逐字一致）。
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                method: {type: string, enum: [pin, totp], default: pin}
+      responses:
+        '200':
+          description: 因子已生成（pending）
+          headers:
+            Cache-Control: {schema: {type: string, enum: [no-store]}}
+            Pragma: {schema: {type: string, enum: [no-cache]}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MfaEnrollAck'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+
+  /api/v1/user/mfa/verify:
+    post:
+      tags: [identity]
+      summary: 校验因子并启用 MFA
+      operationId: verifyUserMfa
+      security: [{userBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: {type: string, pattern: '^[0-9]{6}$'}
+      responses:
+        '200':
+          description: 已启用
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MfaStateAck'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /api/v1/user/mfa/totp/enroll:
+    post:
+      tags: [identity]
+      summary: 登记 TOTP（密钥/恢复码只回一次）
+      operationId: enrollUserTotp
+      description: |
+        `identity.mfa_totp` 开关打开时可用；关闭时路径不存在（404）。
+        状态 `none → pending`，需再调 `/user/mfa/totp/confirm` 才算启用。
+        `secret` / `otpauth_uri` / `recovery_codes` 只在本次响应出现，服务端只存密文/哈希。
+      security: [{userBearer: []}]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                account_name: {type: string, maxLength: 64}
+      responses:
+        '200':
+          description: 已生成（pending）
+          headers:
+            Cache-Control: {schema: {type: string, enum: [no-store]}}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state, secret, otpauth_uri, account_name, recovery_codes, digits, period]
+                properties:
+                  state: {type: string, enum: [pending]}
+                  secret: {type: string, description: Base32 密钥，只出现一次}
+                  otpauth_uri: {type: string, description: otpauth:// 配对链接，只出现一次}
+                  account_name: {type: string}
+                  recovery_codes:
+                    type: array
+                    items: {type: string}
+                  digits: {type: integer, enum: [6]}
+                  period: {type: integer, enum: [30]}
+                  status: {$ref: '#/components/schemas/TotpStatus'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {description: 未配置 MFA 加密密钥（fail-closed）}
+
+  /api/v1/user/mfa/totp/confirm:
+    post:
+      tags: [identity]
+      summary: 确认 TOTP 绑定
+      operationId: confirmUserTotp
+      security: [{userBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: {type: string, minLength: 6, maxLength: 16}
+      responses:
+        '200':
+          description: 已启用
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state, confirmed_at, recovery_codes_left]
+                properties:
+                  state: {type: string, enum: [enabled]}
+                  confirmed_at: {type: string, format: date-time}
+                  recovery_codes_left: {type: integer, minimum: 0}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {description: 尚未登记 TOTP}
+        '409': {$ref: '#/components/responses/Conflict'}
+
+  /api/v1/user/mfa/totp/disable:
+    post:
+      tags: [identity]
+      summary: 解绑 TOTP（口令 + 动态码/恢复码）
+      operationId: disableUserTotp
+      description: 双因子确认；成功后删除因子与全部恢复码，已启用 MFA 的登录回到无 TOTP 状态。
+      security: [{userBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password, code]
+              properties:
+                password: {type: string, maxLength: 128}
+                code: {type: string, minLength: 6, maxLength: 16}
+      responses:
+        '200':
+          description: 已解绑
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state, disabled_at]
+                properties:
+                  state: {type: string, enum: [none]}
+                  disabled_at: {type: string, format: date-time}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {description: 尚未登记 TOTP}
+
+  /api/v1/user/mfa/totp:
+    get:
+      tags: [identity]
+      summary: TOTP 绑定状态（不回密钥）
+      operationId: getUserTotp
+      security: [{userBearer: []}]
+      responses:
+        '200':
+          description: 当前状态
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TotpStatus'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /api/v1/user/password/change:
+    post:
+      tags: [identity]
+      summary: 修改口令（旧口令；已启用 MFA 时还需 step-up）
+      operationId: changeUserPassword
+      description: |
+        两道因子：**旧口令**必填（证明知道当前口令）；账户已启用 MFA 时**另需 step-up**
+        （`X-User-Step-Up` 头或 5 分钟内的会话 step-up 窗口）。
+        成功后**撤销除当前会话外**的全部活跃会话（返回 `revoked_sessions` 条数）。
+        旧口令错误返回 **400/40001**（不是 401：401 会被门户当成会话过期而跳登录）。
+      security: [{userBearer: []}]
+      parameters:
+        - name: X-User-Step-Up
+          in: header
+          required: false
+          description: step-up 令牌（`POST /api/v1/auth/step-up` 的返回值）；已启用 MFA 时必填。
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, new_password]
+              properties:
+                old_password: {type: string, minLength: 1, maxLength: 128}
+                new_password: {type: string, minLength: 10, maxLength: 128}
+      responses:
+        '200':
+          description: 已改密
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/RequestId'}
+            Cache-Control: {schema: {type: string, enum: [no-store]}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PasswordChangeAck'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '424': {$ref: '#/components/responses/StepUpRequired'}
+
+  /api/v1/user/requests/{request_id}:
+    get:
+      tags: [identity]
+      summary: 自助诊断：这条请求走了哪个节点 / 是否计费 / 为什么失败
+      operationId: getUserRequestTrace
+      description: |
+        只读聚合三张既有表：`api_request_log`（M03，保留 7 天）、`usage_records`（M05）、
+        `routing_decisions`（M04，保留 12 个月）。
+        **404 不泄漏**：不存在 / 不属于本人 / request_id 格式非法 → 一律 40401 + `reason=not_found`。
+        **脱敏**：不含 prompt/response（本就没存）、密钥、候选集与评分明细（INV-12）；
+        `route` / `billing` / `failure_reason` 为**人可读字符串**（门户直接渲染），
+        `route_detail` / `billing_detail` 为结构化明细。
+        **不编造**：缺哪张表就少哪块，并在 `notes` 里写清原因（未采集 / 已过保留期）。
+      security: [{userBearer: []}]
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_.:\-]+$'}
+      responses:
+        '200':
+          description: 诊断视图
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RequestTrace'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/user/sessions:
+    get:
+      tags: [identity]
+      summary: 本人的活跃会话（安全中心「可信设备」）
+      operationId: listUserSessions
+      description: |
+        只回本人、未撤销、未过期的会话；按最近活跃倒序，最多 50 条。
+        **不含**令牌材料与明文 IP：`ip_masked` 是掩码（`192.168.***.***`），`user_agent` 截断 200 字符。
+        当前请求所在会话带 `current=true`。
+      security: [{userBearer: []}]
+      responses:
+        '200':
+          description: 会话列表
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UserSessionPage'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /api/v1/user/sessions/{session_id}:
+    delete:
+      tags: [identity]
+      summary: 撤销本人的某个会话
+      operationId: revokeUserSession
+      description: |
+        幂等语义：已撤销 / 不存在 / 不属于本人 / id 非法 → **一律 404/40401**
+        （不泄漏存在性，A6 口径）。撤销当前会话会让本次令牌立即失效。
+      security: [{userBearer: []}]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 已撤销
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionRevokeAck'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
   # ---------------------------------------------------------------- 网关
   /v1/chat/completions:
     post:
@@ -509,6 +1803,27 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
 
+    get:
+      tags:
+      - metering
+      summary: List Node Receipts
+      description: 节点控制台：本节点双签收据列表（只读；``hash`` 只给前 8 位）。
+      operationId: list_node_receipts_api_v1_node_receipts_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: [array]
+                    description: 收据行（receipt_id/task_id/state/revenue_micro/tokens/hash 前 8 位/issued_at；非受理行 revenue_micro=null）
+                  page:
+                    type: object
+                    description: cursor/has_more/next_cursor
+
   /api/v1/node/policy:
     get:
       tags: [node]
@@ -873,7 +2188,7 @@ paths:
         '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
-  /api/v1/admin/config/publish-requests/{id}/approve:
+  /api/v1/admin/config/publish-requests/{request_id}/approve:
     post:
       tags: [admin]
       summary: 复核配置发布（复核人 ≠ 发起人）
@@ -1182,6 +2497,52 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /api/v1/user/provider/quote-settings:
+    get:
+      tags: [quote-settings]
+      summary: 读取本账户的供方报价设置（作用于已绑定节点）
+      operationId: getUserProviderQuoteSettings
+      description: |
+        账户级供方报价：与节点维 `/provider/quote-settings` 不同，按账户聚合，
+        并返回 `applies_to_nodes`（当前已绑定节点）。未设置时 `min_price/max_price` 为 null。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 账户级报价设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountQuoteSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [quote-settings]
+      summary: 覆盖式更新本账户的供方报价设置（作用于已绑定节点）
+      operationId: updateUserProviderQuoteSettings
+      description: 区间整体替换；受开关 `quote.settings.put_step_up` 控制，开关打开时需 424/step-up。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteSettings' }
+      responses:
+        '200':
+          description: 更新后的设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountQuoteSettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ----------------------------------------------------------------------
   # 报表中心 5 条（附录 C.5 / v4 §23，只读）
   # ----------------------------------------------------------------------
@@ -1338,6 +2699,78 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /api/v1/auth/register/request:
+    post:
+      tags: [identity-registration]
+      summary: 自助注册：第一步（校验口令并发送邮箱验证码）
+      operationId: requestUserRegistration
+      description: |
+        开关 `identity.self_registration` 默认关（404）。口令先校验；已注册邮箱 409；
+        新邮箱发 6 位码（10 分钟有效，限流 3/10 分钟）。响应不区分后续失败细节。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegistrationRequest' }
+      responses:
+        '202':
+          description: 验证码已发送
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegistrationAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/register/confirm:
+    post:
+      tags: [identity-registration]
+      summary: 自助注册：第二步（校验验证码、建号并签发会话）
+      operationId: confirmUserRegistration
+      description: |
+        验证码错误/过期 400；连错 5 次作废。成功建 users + personal account（邮箱已验证），
+        直接签发与登录同构的令牌，并可选记录受信设备。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegistrationConfirmRequest' }
+      responses:
+        '201':
+          description: 注册成功并签发会话
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegistrationConfirmResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/security/reminders:
+    get:
+      tags: [identity-registration]
+      summary: 安全提醒（可关闭、不阻塞；TOTP 为可选二因子）
+      operationId: listUserSecurityReminders
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 提醒项（不阻塞任何操作）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SecurityReminders' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /api/v1/auth/step-up:
     post:
       tags: [user]
@@ -1380,6 +2813,46 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/auth/mfa/verify:
+    post:
+      tags: [user]
+      summary: 完成 MFA（mfa_pending 半认证令牌 → 正式会话）
+      operationId: verifyAuthMfa
+      description: |
+        `mfa_pending` 是「口令 / 邮箱验证码已通过、第二因子未验」的 5 分钟半认证令牌
+        （登录返回 `mfa_required=true` 时给出，不能访问业务端点）。此前没有任何端点能把它换成
+        正式会话，登录只能反复拿到新的 pending —— 本接口补上这一步。
+        请求体与 `POST /api/v1/auth/step-up` 同形，`mfa_code` 为账户已配置的因子（PIN 或 TOTP 动态码）。
+        成功后签发与登录同构的令牌对（`AuthTokens`），并**撤销**该半认证会话（不叠加两条可用令牌）。
+        非 `mfa_pending` 会话调用 → 401 / 40102（reason=mfa_not_pending），不重复签发令牌；
+        因子错误 → 401 / 40110（reason=invalid_mfa_code），与 step-up 同码同文案，不泄漏因子类型。
+        不做幂等回放：每次都必须重新验一次因子。所有响应带 Cache-Control: no-store；
+        请求因子与响应令牌不得记录到日志、事件或幂等表。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StepUpRequest' }
+      responses:
+        '200':
+          description: MFA 完成，返回正式会话令牌对
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+            Cache-Control:
+              schema: { type: string, enum: [no-store] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /api/v1/auth/refresh:
     post:
@@ -1583,6 +3056,45 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+    patch:
+      tags: [user]
+      summary: 修改 API Key 限额 / 标签（null = 清除该限制）
+      operationId: updateApiKey
+      description: |
+        可改 qps / daily_usd_minor / monthly_usd_minor / label；null = 清除该限制，
+        未出现在请求体的字段保持原值。需 step-up（X-User-Step-Up 或 5 分钟窗口），缺失 424。
+        别人的 Key / 不存在 → 404（防枚举）；已撤销 → 400。响应与列表项同形（key_summary）。
+        本端点只存限额；超限拦截的执行点在网关（M03）。
+      security: [{userBearer: []}]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                qps: {type: [integer, 'null'], minimum: 0}
+                daily_usd_minor: {type: [integer, 'null'], minimum: 0}
+                monthly_usd_minor: {type: [integer, 'null'], minimum: 0}
+                label: {type: [string, 'null'], maxLength: 64}
+      responses:
+        '200':
+          description: 更新后的 Key 摘要
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiKeySummary'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '424': {$ref: '#/components/responses/StepUpRequired'}
 
   /api/v1/user/api-keys/{id}/rotate:
     post:
@@ -2157,7 +3669,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
-  /api/v1/admin/supply/integrity/canary/runs/{id}/result:
+  /api/v1/admin/supply/integrity/canary/runs/{run_id}/result:
     post:
       tags: [admin]
       summary: 回填 canary 响应（只比对；正文不落库）
@@ -2300,7 +3812,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
-  /api/v1/admin/supply/integrity/sampling/epochs/{id}:
+  /api/v1/admin/supply/integrity/sampling/epochs/{epoch_id}:
     get:
       tags: [admin]
       summary: 轮次详情（含 draws）
@@ -2325,7 +3837,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /api/v1/admin/supply/integrity/sampling/epochs/{id}/reveal:
+  /api/v1/admin/supply/integrity/sampling/epochs/{epoch_id}/reveal:
     post:
       tags: [admin]
       summary: 揭晓 seed 并生成 draws（幂等重放）
@@ -2358,7 +3870,7 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
-  /api/v1/admin/supply/integrity/sampling/draws/{id}/result:
+  /api/v1/admin/supply/integrity/sampling/draws/{draw_id}/result:
     post:
       tags: [admin]
       summary: 回填抽检结果（复用 C12 证据；L3→passed）
@@ -2476,7 +3988,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
-  /api/v1/node/notifications/{id}/ack:
+  /api/v1/node/notifications/{notification_id}/ack:
     post:
       tags: [node]
       summary: 确认收到（幂等）
@@ -2501,7 +4013,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /api/v1/node/notifications/{id}/read:
+  /api/v1/node/notifications/{notification_id}/read:
     post:
       tags: [node]
       summary: 标记已读（隐含 ack；幂等）
@@ -2691,7 +4203,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
-  /api/v1/admin/model-sync/bundles/{id}/publish:
+  /api/v1/admin/model-sync/bundles/{bundle_id}/publish:
     post:
       tags: [admin]
       summary: 发布 bundle（HMAC 签名；需 model_sync.write）
@@ -2718,7 +4230,7 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
-  /api/v1/admin/model-sync/bundles/{id}/rollback:
+  /api/v1/admin/model-sync/bundles/{bundle_id}/rollback:
     post:
       tags: [admin]
       summary: 回滚到上一 published（发布副本，不改历史）
@@ -2951,7 +4463,7 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
-  /api/v1/admin/supply/integrity/holds/{id}:
+  /api/v1/admin/supply/integrity/holds/{hold_id}:
     get:
       tags: [admin]
       summary: 冻结详情（含事件流水）
@@ -2976,7 +4488,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /api/v1/admin/supply/integrity/holds/{id}/release:
+  /api/v1/admin/supply/integrity/holds/{hold_id}/release:
     post:
       tags: [admin]
       summary: 解除冻结（I0/I1 一人；I2 双人；I3/I4 双人 + 高权限 scope）
@@ -3675,7 +5187,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
-  /api/v1/admin/config/publish-requests/{id}/promote:
+  /api/v1/admin/config/publish-requests/{request_id}/promote:
     post:
       tags: [admin]
       summary: 推进发布单（灰度桶前进 / 全量）
@@ -4650,6 +6162,38 @@ paths:
         '424': { $ref: '#/components/responses/StepUpRequired' }
 
   /api/v1/admin/risk/appeals:
+    get:
+      tags: [admin]
+      operationId: listRiskAppeals
+      summary: 申诉列表
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: case_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [submitted, in_review, upheld, overturned, closed]
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 申诉分页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RiskAppealPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
     post:
       tags: [admin]
       operationId: createRiskAppeal
@@ -4749,6 +6293,39 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+    get:
+      tags: [treasury]
+      summary: 本人的支付订单列表（游标分页）
+      operationId: listPaymentOrders
+      description: |
+        只回**本人**订单（`account_id` 来自鉴权主体，不接受客户端传）。
+        游标分页（`created_at DESC, order_id DESC`），默认 50 / 上限 200；`limit` 非法 → 400。
+        `status` 走白名单（created/pending/paid/credited/failed/closed/expired），其他值 → 400。
+        每条与 `GET /api/v1/pay/orders/{id}` 的 `PaymentOrder` **同形**（不漂移）。
+      security: [{userBearer: []}]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [created, pending, paid, credited, failed, closed, expired]
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: cursor
+          in: query
+          required: false
+          schema: {type: string, maxLength: 512}
+      responses:
+        '200':
+          description: 订单页
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PaymentOrderPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
   /api/v1/pay/orders/{id}:
     get:
       tags: [pay]
@@ -5140,6 +6717,36 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /api/v1/admin/treasury/payouts:
+    get:
+      tags: [admin]
+      operationId: listTreasuryPayoutBatches
+      summary: 分润批次列表（管理面；只读，不含明细）
+      description: |
+        按创建时间倒序分页；`status` 缺省返回全部合法状态。只返回批次头，
+        明细走 `GET /api/v1/provider/payouts` 或后续详情接口。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [draft, prepared, checked, signed, broadcast, settled, partial, failed]
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 批次页
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutBatchPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
       tags: [admin]
       operationId: createTreasuryPayoutBatch
@@ -5244,6 +6851,161 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SigningRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/payouts/{id}/sign-events:
+    post:
+      tags: [admin]
+      operationId: recordTreasuryPayoutSigningEvent
+      summary: 记录签名设备 / HSM 回传的签名事件（服务只记录，不签名）
+      description: |
+        六事件按序推进：`requested → presented → signed → verified → co_signed → broadcast`。
+        本服务**不签名、不读私钥**：`signature_hash` 是设备回传的摘要（可选），服务只落库并推进状态。
+        阶段回退 → `409` + `signing_stage_out_of_order`；请求已是终态 → `409` + `signing_closed`；
+        批次还没有签名请求 → `409` + `signature_missing`。2/3 齐（owner `signed` + `verified`
+        + `co_signed`，签名人 ≥ 门限）时 `complete=true` 并把批次推到 `signed`。
+        审计只记 `event` / `signer_type` / `complete` / `signed_count`，**不记摘要原文**。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 分润批次号 `batch_no`。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutSignEventRequest' }
+      responses:
+        '201':
+          description: 事件已记录（返回签名请求视图 + 本次事件 + 是否签齐 + 聚合推进结果）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutSignEventResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/payouts/{id}/signing:
+    get:
+      tags: [admin]
+      operationId: getTreasuryPayoutSigning
+      summary: 查批次的签名请求视图（只读）
+      description: |
+        回签名请求状态、门限、已签数、事件流水与 `complete`；便于 E2E / 运维核对 2/3 进度。
+        批次还没起签名请求 → `409` + `signature_missing`；批次不存在 → `404`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 分润批次号 `batch_no`。
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 签名视图
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutSigningView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/payouts/{id}/broadcast:
+    post:
+      tags: [admin]
+      operationId: broadcastTreasuryPayoutBatch
+      summary: 广播已联签的出款批次（2/3 门槛后；只更新状态与交易号）
+      description: |
+        HSM 联签（`signing_request.status=signed`，2/3 门槛）后才允许广播；未齐 → `409`
+        （`signature_incomplete` / `signature_missing`）。广播**不重复付款**：只把批次
+        `checked/signed → broadcast`、明细 `pending → sent` 并落 `chain_tx_id`。
+
+        交易号来源优先级：请求体 `txid` → 注入的链上执行器 → 两者都没有则 `409` + `txid_missing`
+        （**不伪造**交易号）。`confirmations` 仅 E2E 用（1–64 整数）。已广播再广播 →
+        `409` + `already_broadcast`。响应为批次详情（spec 1.2.5 `PayoutBatch`）。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 分润批次号 `batch_no`。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutBroadcastRequest' }
+      responses:
+        '200':
+          description: 已广播（`status=broadcast`；明细 `status=sent` 且带 `chain_tx_id`）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutBatch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/payouts/{id}/settle:
+    post:
+      tags: [admin]
+      operationId: settleTreasuryPayoutBatch
+      summary: 出款达确认（broadcast → settled / partial）
+      description: |
+        只在 `broadcast` 之后允许；未广播 → `409` + `illegal_transition`；已是终态 →
+        `409` + `batch_terminal`。有明细 `failed` → `partial`，否则 `settled`；同时发
+        `payout.paid` 事件（E8 由 M06 消费记账，本层不记账）。请求体 `txid` 可空，
+        空则沿用批次已保存的 `chain_tx_id`。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 分润批次号 `batch_no`。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutSettleRequest' }
+      responses:
+        '200':
+          description: 已结算（`status=settled/partial`）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutBatch' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -5862,6 +7624,43 @@ paths:
         '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /api/v1/user/nodes/{node_id}/binding-code:
+    post:
+      tags: [user]
+      operationId: issueNodeBindingCode
+      summary: 为我签发一次性绑定码（账户级；首次绑定不要求 step-up）
+      description: |
+        网页端在登录态下为自己签发一枚一次性绑定码，作为 `POST /api/v1/node/binding` 的前置
+        （M02 §6.5 / INV-08）。**账户级 Bearer 即可，不要求 step-up** —— 首次绑定节点的用户
+        可能还没有绑定 MFA/因子，要求 step-up 会让新用户永远走不完绑定流程（BUG-05）。
+
+        口径：节点不存在 → 404 + `40401`（不泄露存在性）；节点非 `active`
+        （`pending` 未准入 / `frozen` / `retired`）→ 403 + `40305`；节点**已绑定**（他人或本人）
+        → 409（`40903`，`reason=node_already_bound` / `node_already_bound_by_self`），
+        响应体**不包含**绑定方账户标识。
+
+        绑定码明文只在本响应出现一次，平台只存 `sha256(code)`；有效期等于响应里的 `ttl_seconds`。
+      security: [{ userBearer: [] }]
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '201':
+          description: 绑定码（明文只此一次）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeBindingCodeIssued' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ---------------------------------------------------------------- 代理授权（M07-TR1）
   /api/v1/user/nodes/{node_id}/proxy-authorization:
     get:
@@ -6043,6 +7842,244 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /api/v1/user/nodes/{node_id}/upstreams:
+    get:
+      tags:
+      - node
+      summary: 我的节点的上游接入（请求链接 / 协议 / 模型）
+      description: '用户态只读：网页端据此显示「请求链接配在哪、协议是哪种」。
+
+
+        凭据**不下发**（只回 ``credential_registered`` 布尔），密钥始终只在客户端本机。'
+      operationId: listUserNodeUpstreams
+      parameters:
+      - name: node_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Node Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                properties:
+                  type: object
+                  additionalProperties: true
+                type:
+                  type: object
+                  additionalProperties: true
+                title:
+                  type: object
+                  additionalProperties: true
+    post:
+      tags:
+      - node
+      summary: 登记我的节点的上游接入（需 step-up）
+      description: '用户态登记上游：``access_type`` / ``base_url``（请求链接）/ ``models`` /
+
+        ``protocol``（``openai-chat`` 或 ``anthropic-messages``）/ ``upstream_kind``。
+
+
+        **不接受上游密钥**：凭据由客户端本机 0600 文件持有，这里只登记引用
+
+        （``credential_handle``）。登记含出网地址，属敏感操作 → 需 step-up。'
+      operationId: declareUserNodeUpstream
+      parameters:
+      - name: node_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Node Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                properties:
+                  type: object
+                  additionalProperties: true
+                type:
+                  type: object
+                  additionalProperties: true
+                title:
+                  type: object
+                  additionalProperties: true
+
+  /api/v1/node/token-route:
+    post:
+      operationId: declareNodeTokenRoute
+      summary: 申报本节点的 token-route 声明（严格校验）
+      description: |
+        幂等写入：内容相同 → 200（不刷新 revision、不失效授权）；内容变化 → 201 且
+        **授权自动失效**（``authorization_reset=true``），需重新授权。
+      tags: [Node, TokenRoute]
+      security: [{ nodeKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token_route]
+              properties:
+                node_id:
+                  type: string
+                  description: 可省略；给了就必须等于本凭据的节点 id，否则 404。
+                token_route:
+                  $ref: '#/components/schemas/TokenRouteDeclaration'
+      responses:
+        '200':
+          description: 声明未变化（幂等重报）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenRouteView'}
+        '201':
+          description: 声明已建立或内容更新（授权失效）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenRouteView'}
+        '400':
+          $ref: '#/components/responses/TokenRouteInvalid'
+        '401':
+          $ref: '#/components/responses/TokenRouteUnauthenticated'
+        '404':
+          $ref: '#/components/responses/TokenRouteNodeNotFound'
+    get:
+      operationId: getNodeTokenRoute
+      summary: 读本节点的 token-route 声明与生效状态（诊断）
+      description: |
+        ``token_route_authorized`` 是「已授权 **且** 开关开」的合取结果；
+        未授权或开关关时恒为 false，``annotation`` 为 null。
+      tags: [Node, TokenRoute]
+      security: [{ nodeKey: [] }]
+      parameters:
+        - name: node_id
+          in: query
+          required: false
+          schema: {type: string}
+          description: 可省略；给了就必须等于本凭据的节点 id，否则 404。
+      responses:
+        '200':
+          description: 当前声明与生效状态
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenRouteView'}
+        '401':
+          $ref: '#/components/responses/TokenRouteUnauthenticated'
+        '404':
+          $ref: '#/components/responses/TokenRouteNodeNotFound'
+    delete:
+      operationId: withdrawNodeTokenRoute
+      summary: 撤回本节点的 token-route 声明（连带授权失效）
+      description: |
+        删除声明行并留痕 ``token_route_withdrawn``。**授权随之消失**——否则节点本地清空后
+        服务端仍留着一份已授权声明，「清空」就成了假清空。重复撤回归 200 + ``withdrawn=false``。
+      tags: [Node, TokenRoute]
+      security: [{ nodeKey: [] }]
+      parameters:
+        - name: node_id
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: 已撤回（或本来就没有）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenRouteView'}
+        '401':
+          $ref: '#/components/responses/TokenRouteUnauthenticated'
+        '404':
+          $ref: '#/components/responses/TokenRouteNodeNotFound'
+  /api/v1/admin/nodes/{node_id}/token-route:
+    get:
+      operationId: getAdminNodeTokenRoute
+      summary: 后台读节点 token-route 声明与生效状态
+      description: 只读；不需要 scope（有后台角色 + step-up 即可），用于授权前后对比。
+      tags: [Admin, TokenRoute]
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: 声明与生效状态
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenRouteView'}
+        '401':
+          $ref: '#/components/responses/TokenRouteUnauthenticated'
+        '404':
+          $ref: '#/components/responses/TokenRouteNodeNotFound'
+        '424':
+          $ref: '#/components/responses/TokenRouteStepUpRequired'
+  /api/v1/admin/nodes/{node_id}/token-route/authorize:
+    post:
+      operationId: authorizeNodeTokenRoute
+      summary: 授权 / 撤销节点的 token-route 声明
+      description: |
+        只写授权列，**不改声明**（声明是节点的事实）。无声明时授权 → 404（不预建空壳行）。
+
+        `authorization_effective` 明确回答「授权后是否真生效」：开关关着时为 false。
+      tags: [Admin, TokenRoute]
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: X-Admin-Step-Up
+          in: header
+          required: true
+          schema: {type: string}
+          description: M01 step-up 凭据（或 5 分钟内已完成 step-up 的会话）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [authorized]
+              additionalProperties: false
+              properties:
+                authorized: {type: boolean}
+                note:
+                  type: string
+                  maxLength: 500
+                  description: 备注（进留痕；不要写凭据）。
+      responses:
+        '200':
+          description: 决策已生效（授权或撤销）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenRouteView'}
+        '400':
+          $ref: '#/components/responses/TokenRouteInvalid'
+        '401':
+          $ref: '#/components/responses/TokenRouteUnauthenticated'
+        '403':
+          $ref: '#/components/responses/TokenRouteForbidden'
+        '404':
+          $ref: '#/components/responses/TokenRouteNodeNotFound'
+        '424':
+          $ref: '#/components/responses/TokenRouteStepUpRequired'
 components:
 
   securitySchemes:
@@ -6061,6 +8098,13 @@ components:
         节点客户端密钥，由 `/api/v1/node/pair` 生成、可轮换（重叠 ≤24h）
         与撤销（立即停单，在途不受影响）。只存哈希（字段 client_key），
         平台不回显明文。
+    hostedAgentBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: DJB-HostedAgent
+      description: |
+        供方托管 Agent 的一次性 scoped token（`djb_ha_` 前缀，仅在 `/api/v1/hosted/*` 生效）。
+        服务端只存 sha256 + 前缀；撤销或轮换后旧 token 立即 401。
     internalMTLS:
       type: mutualTLS
       description: |
@@ -6073,6 +8117,11 @@ components:
       description: |
         后台会话（强制 MFA；敏感动作 step-up ≤5 分钟；break-glass 只读模式见）。管理面仅内网/VPN，公网不可达。
 
+    nodeKey:
+      type: apiKey
+      in: header
+      name: X-Client-Key
+      description: 既有节点密钥（复用 M02 凭据体系，F6 不新开鉴权路径）。
   parameters:
     RequestId:
       name: X-Request-Id
@@ -6319,7 +8368,467 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
 
+    TokenRouteInvalid:
+      description: 非法声明（400 / 40001）
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                required: [type, code, message, request_id]
+                properties:
+                  type: {type: string, enum: [invalid_request_error]}
+                  code: {type: integer, enum: [40001]}
+                  message: {type: string}
+                  request_id: {type: string}
+                  reason:
+                    type: string
+                    enum: [overlap_out_of_range, vocab_out_of_range, same_model,
+                           shape_conflict, unknown_field]
+                  field: {type: string, description: 出错的字段路径，如 token_route.overlap}
+    TokenRouteUnauthenticated:
+      description: 未认证（401 / 40101）
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  type: {type: string, enum: [authentication_error]}
+                  code: {type: integer, enum: [40101]}
+                  message: {type: string}
+                  request_id: {type: string}
+    TokenRouteForbidden:
+      description: 缺 scope（403 / 40301）
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  type: {type: string, enum: [permission_error]}
+                  code: {type: integer, enum: [40301]}
+                  message: {type: string}
+                  reason: {type: string, enum: [forbidden]}
+                  request_id: {type: string}
+    TokenRouteNodeNotFound:
+      description: 节点不存在 / 越权（404 / 40401，不泄露存在性）
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  type: {type: string, enum: [not_found_error]}
+                  code: {type: integer, enum: [40401]}
+                  message: {type: string}
+                  node_id: {type: string}
+                  request_id: {type: string}
+    TokenRouteStepUpRequired:
+      description: 缺 step-up 二次认证（424 / 42401）
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  type: {type: string, enum: [permission_error]}
+                  code: {type: integer, enum: [42401]}
+                  message: {type: string}
+                  request_id: {type: string}
   schemas:
+
+
+
+    HostedAgent:
+      type: object
+      description: 库里只存 sha256 与前缀；本对象永不含明文/哈希
+      required: [id, node_id, display_name, endpoint_url, token_prefix, state, scopes, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        node_id: {type: string}
+        tenant_id: {type: [string, 'null'], format: uuid}
+        display_name: {type: string}
+        endpoint_url: {type: string}
+        token_prefix: {type: string, description: 'djb_ha_ + 随机段前 8 位'}
+        state: {type: string, enum: [active, revoked]}
+        scopes: {type: array, items: {type: string}}
+        created_at: {type: string, format: date-time}
+        revoked_at: {type: [string, 'null'], format: date-time}
+    HostedAgentEnvelope:
+      type: object
+      required: [agent]
+      properties:
+        agent: {$ref: '#/components/schemas/HostedAgent'}
+    HostedAgentToken:
+      allOf:
+        - $ref: '#/components/schemas/HostedAgentEnvelope'
+        - type: object
+          required: [token, token_prefix, created, rotated, notice]
+          properties:
+            token: {type: string, description: '明文，只返回这一次；丢失只能轮换'}
+            token_prefix: {type: string}
+            created: {type: boolean}
+            rotated: {type: boolean}
+            notice: {type: string}
+    HostedPing:
+      type: object
+      required: [ok, agent]
+      properties:
+        ok: {type: boolean}
+        agent:
+          type: object
+          required: [agent_id, node_id, display_name, scopes]
+          properties:
+            agent_id: {type: string, format: uuid}
+            node_id: {type: string}
+            display_name: {type: string}
+            scopes: {type: array, items: {type: string}}
+
+    TicketState:
+      type: string
+      enum: [open, pending, resolved, closed]
+    TicketPriority:
+      type: string
+      enum: [low, normal, high, urgent]
+    TicketCategory:
+      type: string
+      enum: [billing, technical, account, compliance, other]
+    Ticket:
+      type: object
+      required: [id, tenant_id, account_id, subject, category, priority, state, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string}
+        account_id: {type: string}
+        subject: {type: string, maxLength: 200}
+        category: {$ref: "#/components/schemas/TicketCategory"}
+        priority: {$ref: "#/components/schemas/TicketPriority"}
+        state: {$ref: "#/components/schemas/TicketState"}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        closed_at: {type: [string, "null"], format: date-time, description: "仅 state=closed 时非空"}
+        message_count:
+          type: integer
+          minimum: 0
+          description: "仅后台列表下发：会话条数（含内部备注）"
+        last_message_at: {type: [string, "null"], format: date-time, description: "仅后台列表下发"}
+    TicketMessage:
+      type: object
+      required: [id, ticket_id, author_role, body, created_at, internal_note]
+      properties:
+        id: {type: string, format: uuid}
+        ticket_id: {type: string, format: uuid}
+        author_role: {type: string, enum: [customer, agent, system]}
+        author_id:
+          type: [string, "null"]
+          description: "客户侧响应里，非客户作者为 null（不回显客服工号）"
+        body: {type: string, maxLength: 8000, description: "用户正文：不进日志 / 不进审计"}
+        created_at: {type: string, format: date-time}
+        internal_note: {type: boolean, description: "true = 内部备注，客户侧不可见"}
+    TicketPage:
+      type: object
+      required: [has_more]
+      properties:
+        has_more: {type: boolean}
+        next_cursor: {type: [string, "null"], description: "has_more=true 时给下一页游标；不透明"}
+        cursor: {type: [string, "null"], description: "本次请求带上的游标（回显）"}
+    TicketCreateRequest:
+      type: object
+      required: [subject, body]
+      properties:
+        subject: {type: string, minLength: 1, maxLength: 200}
+        body: {type: string, minLength: 1, maxLength: 8000}
+        category: {$ref: "#/components/schemas/TicketCategory"}
+        priority: {$ref: "#/components/schemas/TicketPriority"}
+    TicketMessageCreateRequest:
+      type: object
+      required: [body]
+      properties:
+        body: {type: string, minLength: 1, maxLength: 8000}
+        internal_note: {type: boolean, description: "客户侧只允许 false（传 true → 400）"}
+    TicketReplyRequest:
+      type: object
+      required: [body]
+      properties:
+        body: {type: string, minLength: 1, maxLength: 8000}
+        internal_note: {type: boolean, default: false, description: "true = 内部备注（客户不可见）"}
+    TicketStateChangeRequest:
+      type: object
+      required: [state]
+      properties:
+        state: {$ref: "#/components/schemas/TicketState"}
+    TicketCreated:
+      type: object
+      required: [request_id, ticket, message]
+      properties:
+        request_id: {type: string}
+        ticket: {$ref: "#/components/schemas/Ticket"}
+        message: {$ref: "#/components/schemas/TicketMessage"}
+    TicketDetail:
+      type: object
+      required: [request_id, ticket, messages]
+      properties:
+        request_id: {type: string}
+        ticket: {$ref: "#/components/schemas/Ticket"}
+        messages:
+          type: array
+          description: "客户侧：仅 internal_note=false，按 created_at 升序"
+          items: {$ref: "#/components/schemas/TicketMessage"}
+    TicketMessageCreated:
+      type: object
+      required: [request_id, message]
+      properties:
+        request_id: {type: string}
+        message: {$ref: "#/components/schemas/TicketMessage"}
+    TicketList:
+      type: object
+      required: [request_id, data, page]
+      properties:
+        request_id: {type: string}
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Ticket"}
+        page: {$ref: "#/components/schemas/TicketPage"}
+    TicketAdminList:
+      type: object
+      required: [request_id, data, page]
+      properties:
+        request_id: {type: string}
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Ticket"}
+        page: {$ref: "#/components/schemas/TicketPage"}
+    TicketStateChanged:
+      type: object
+      required: [request_id, ticket, changed]
+      properties:
+        request_id: {type: string}
+        ticket: {$ref: "#/components/schemas/Ticket"}
+        changed: {type: boolean, description: "false = 同态幂等（未写库、未改 updated_at）"}
+
+
+
+
+    ChainDepositAddress:
+      type: object
+      required: [address, account_id, purpose, derivation_path, asset, asset_decimals, created]
+      properties:
+        address: {type: string, pattern: "^0x[0-9a-fA-F]{40}$"}
+        account_id: {type: string}
+        purpose: {type: string, enum: [user_deposit, platform]}
+        derivation_path: {type: string, description: "m/44'/60'/0'/0/{index}（私钥永不入库）"}
+        xpub_fingerprint: {type: string, description: "watch-only 母公钥指纹（16 hex）"}
+        asset: {type: string, enum: [USDT]}
+        asset_contract: {type: string}
+        asset_decimals: {type: integer, enum: [6]}
+        chain_id: {type: string, enum: [polygon]}
+        confirmations: {type: object, properties: {normal: {type: integer}, large: {type: integer}}}
+        min_deposit_minor: {type: integer, description: "提示阈值（micro-USD），低于仍入账"}
+        created: {type: boolean, description: "false = 幂等命中已有地址"}
+        expires_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+
+    ChainDeposit:
+      type: object
+      properties:
+        chain_tx_id: {type: string, format: uuid}
+        tx_hash: {type: string}
+        log_index: {type: integer}
+        block_number: {type: integer}
+        amount_minor: {type: integer, description: "micro-USD"}
+        amount_usdt: {type: string, description: "十进制字符串，6 位小数"}
+        confirmations: {type: integer}
+        required_confirmations: {type: integer}
+        confirmed: {type: boolean}
+        voided: {type: boolean}
+        rejected: {type: boolean}
+        status: {type: string}
+        detected_at: {type: string, format: date-time}
+        confirmed_at: {type: string, format: date-time, nullable: true}
+
+    ChainSweep:
+      type: object
+      properties:
+        sweep_id: {type: string, format: uuid}
+        sweep_no: {type: string, example: CS-20261101-000001}
+        chain_id: {type: string}
+        asset: {type: string}
+        status: {type: string, enum: [proposed, approved, executed, cancelled, expired]}
+        total_amount_minor: {type: integer, description: "micro-USD"}
+        gas_fee_minor: {type: integer, description: "micro-USD（预置 gas 消耗）"}
+        dust_minor: {type: integer, description: "因低于尘埃阈值留在原地址的合计"}
+        source_count: {type: integer}
+        target_address: {type: string}
+        sources_hash: {type: string, description: "提案明细指纹（执行幂等键组成部分）"}
+        policy_version: {type: string}
+        proposer: {type: string}
+        checker: {type: string, nullable: true}
+        checked_at: {type: string, format: date-time, nullable: true}
+        executor: {type: string, nullable: true}
+        executed_at: {type: string, format: date-time, nullable: true}
+        tx_hash: {type: string, nullable: true}
+        expires_at: {type: string, format: date-time, description: "提案后 30 分钟内必须复核"}
+        created_at: {type: string, format: date-time}
+
+    ChainPage:
+      type: object
+      properties:
+        has_more: {type: boolean}
+        next_cursor: {type: string, nullable: true}
+        cursor: {type: string, nullable: true}
+
+    PasswordChangeAck:
+      type: object
+      required: [changed_at, revoked_sessions]
+      properties:
+        changed_at: {type: string, format: date-time}
+        revoked_sessions: {type: integer, minimum: 0}
+        revoked_session_ids: {type: array, items: {type: string}}
+        other_sessions_signed_out: {type: boolean}
+    EmailChangeAck:
+      type: object
+      required: [state, requested_at, expires_at, login_email_changed]
+      properties:
+        state: {type: string, enum: [pending]}
+        requested_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        new_email_masked: {type: string, description: 掩码邮箱，不含完整地址}
+        confirm_available: {type: boolean}
+        confirm_blocked_reason: {type: string}
+        login_email_changed:
+          type: boolean
+          description: 恒为 false——确认前登录邮箱不变
+    TotpStatus:
+      type: object
+      required: [state, enrolled_at, confirmed_at, recovery_codes_left]
+      properties:
+        state: {type: string, enum: [none, pending, enabled]}
+        enrolled_at: {type: [string, 'null'], format: date-time}
+        confirmed_at: {type: [string, 'null'], format: date-time}
+        recovery_codes_left: {type: integer, minimum: 0}
+
+    MfaEnrollAck:
+      type: object
+      required: [method, state, show_once]
+      description: |
+        `method=pin` 返回 6 位数字因子；`method=totp` 返回 Base32 密钥与 otpauth URI。
+        两条分支的明文都**只在本响应出现一次**，不得记录到日志、事件或幂等表。
+      properties:
+        method: {type: string, enum: [pin, totp]}
+        digits: {type: integer, enum: [6], description: pin 分支的位数；totp 分支取 TOTP 标准位数}
+        secret: {type: string, description: 一次性因子 / TOTP 密钥，只在本响应出现}
+        otpauth_url: {type: string, description: PIN 口径下为空串；totp 分支与 otpauth_uri 同值}
+        otpauth_uri: {type: string, description: totp 分支的 otpauth:// 配对链接（只在本响应出现）}
+        recovery_codes:
+          type: array
+          items: {type: string}
+          description: totp 分支的恢复码（一次性；服务端只存加盐哈希）
+        period: {type: integer, description: totp 分支的动态码周期（秒）}
+        algorithm: {type: string, description: totp 分支的算法名}
+        state: {type: string, enum: [pending]}
+        show_once: {type: boolean}
+        enrolled_at: {type: string, format: date-time}
+        note: {type: string}
+    MfaStateAck:
+      type: object
+      required: [mfa_state]
+      properties:
+        mfa_state: {type: string, enum: [none, pending, enabled]}
+        method: {type: string, enum: [pin, totp], description: 刚完成校验的因子类型（加性字段）}
+        enabled_at: {type: string, format: date-time}
+        disabled_at: {type: string, format: date-time}
+    UserSession:
+      type: object
+      required: [session_id, created_at, last_seen_at, current]
+      properties:
+        session_id: {type: string, format: uuid}
+        kind: {type: string, enum: [user, admin, step_up, mfa_pending]}
+        mfa: {type: boolean}
+        created_at: {type: string, format: date-time}
+        last_seen_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        ip_masked: {type: string, description: 掩码 IP；未采集为空串}
+        user_agent: {type: string}
+        current: {type: boolean}
+        once_verified: {type: boolean}
+    UserSessionPage:
+      type: object
+      required: [data, count]
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/UserSession'}}
+        count: {type: integer}
+        limit: {type: integer}
+    PaymentOrderPage:
+      type: object
+      required: [data, page]
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/PaymentOrder'}}
+        page:
+          type: object
+          required: [has_more]
+          properties:
+            cursor: {type: string}
+            has_more: {type: boolean}
+            next_cursor: {type: [string, 'null']}
+    RequestTrace:
+      type: object
+      required: [request_id, found, redacted, model, node_id, route, billing, notes]
+      properties:
+        request_id: {type: string}
+        found: {type: boolean, enum: [true]}
+        redacted: {type: boolean, enum: [true], description: 恒为 true：内容已脱敏}
+        account_scoped: {type: boolean, enum: [true], description: 恒为 true：只回本人数据}
+        created_at: {type: [string, 'null'], format: date-time}
+        model: {type: string}
+        node_id: {type: string, description: 未进入路由时为空串}
+        route: {type: string, description: 人可读：结果 + 是否回退 + 原因码}
+        route_detail: {type: [object, 'null']}
+        billing: {type: string, description: 人可读计费结论}
+        billing_detail:
+          type: [object, 'null']
+          description: '{usage_id, amount:{amount,currency,amount_minor}, state, attempt_no, ...}'
+        failure_reason: {type: [string, 'null'], description: 成功请求为 null}
+        failure_detail: {type: [object, 'null']}
+        timing:
+          type: object
+          properties:
+            latency_ms: {type: [integer, 'null']}
+            first_byte_ms: {type: [integer, 'null']}
+        tokens:
+          type: object
+          properties:
+            tokens_in: {type: [integer, 'null']}
+            tokens_out: {type: [integer, 'null']}
+            usage_source: {type: [string, 'null']}
+        notes: {type: array, items: {type: string}}
+        window:
+          type: object
+          properties:
+            request_log_days: {type: integer, enum: [7]}
+            log_expired: {type: boolean}
+        checked_at: {type: string, format: date-time}
+    SessionRevokeAck:
+      type: object
+      required: [session_id, revoked, revoked_at]
+      properties:
+        session_id: {type: string, format: uuid}
+        revoked: {type: boolean}
+        revoked_at: {type: string, format: date-time}
+        was_current: {type: boolean}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 既有操作的**加性**参数 / 响应字段（不新增路径，合并时在原有 operation 上就地插入）
 
     # ------------------------------------------------------------ 通用
     Error:
@@ -7116,7 +9625,20 @@ components:
             不存储、不回显；凭据本体永不上行（H1）。
         protocol:
           type: string
-          description: 上游协议（如 openai-chat）。未知值按适配器容错处理。
+          description: |
+            上游协议标识。当前两种通用形态：
+            - `openai-chat`（缺省）：`POST {base_url}/v1/chat/completions`
+            - `anthropic-messages`：`POST {base_url}/v1/messages`（官方 Anthropic；
+              请求体/响应/SSE 由客户端本机转换，平台侧仍只认 OpenAI 兼容抽象）
+            未知值按适配器容错处理（回落 `openai-chat`）。
+        upstream_kind:
+          type: string
+          enum: [official_api, local_agent, enterprise_gateway, third_party_relay]
+          description: |
+            上游类型标签（加性可选，M17 §4.1）。用于证明策略分流：`third_party_relay`
+            默认更严格（可签发受限探针凭据由服务端直连验证）。**未知值按未标注处理**
+            （服务端忽略，不报错）；缺省时服务端按 `access_type` 推默认
+            （A1→official_api / A2→local_agent / B→enterprise_gateway）。
 
     NodeUpstreamResponse:
       type: object
@@ -7125,6 +9647,11 @@ components:
       properties:
         upstream_id:
           type: string
+        base_url:
+          type: string
+          format: uri
+          maxLength: 2000
+          description: 申报时的上游请求链接（客户自填；不含凭据）
         state:
           type: string
           enum: [declared, probing, verified, rejected]
@@ -7203,6 +9730,38 @@ components:
               type: array
               items:
                 type: string
+            # ---- R2-1 加性透传（缺省不出现；老客户端的到期请求体逐字节不变）
+            tools:
+              type: array
+              description: 工具定义（OpenAI tools 形态）；客户端负责按上游协议转换。
+              items:
+                type: object
+                additionalProperties: true
+            tool_choice:
+              description: 工具选择（字符串或对象，OpenAI 形态）。
+              oneOf:
+                - type: string
+                - type: object
+                  additionalProperties: true
+            response_format:
+              type: object
+              additionalProperties: true
+              description: 输出格式（如 {"type":"json_object"}）。
+            top_p:
+              type: number
+              minimum: 0
+              maximum: 1
+            seed:
+              type: integer
+              description: 随机种子（尽力而为，不承诺跨上游可复现）。
+            frequency_penalty:
+              type: number
+              minimum: -2
+              maximum: 2
+            presence_penalty:
+              type: number
+              minimum: -2
+              maximum: 2
         timeout_s:
           type: number
           minimum: 1
@@ -7886,6 +10445,22 @@ components:
               type: string
               description: 签名密钥，**仅创建时返回一次**；服务端只存哈希。
 
+    AccountQuoteSettings:
+      type: object
+      additionalProperties: true
+      required: [min_price, max_price, currency, is_default, applies_to_nodes]
+      properties:
+        min_price: { type: [string, 'null'], pattern: '^[0-9]+(\.[0-9]+)?$' }
+        max_price: { type: [string, 'null'], pattern: '^[0-9]+(\.[0-9]+)?$' }
+        currency: { type: string, enum: [USD] }
+        updated_at: { type: [string, 'null'], format: date-time }
+        is_default: { type: boolean }
+        version: { type: integer }
+        scope: { type: string, enum: [account_provider] }
+        applies_to_nodes:
+          type: array
+          items: { type: string }
+
     QuoteSettings:
       type: object
       additionalProperties: true
@@ -8000,6 +10575,11 @@ components:
         secret:
           type: string
           description: 口令或一次性验证码；失败不区分「账号不存在 / 口令错误」。
+        password:
+          type: string
+          description: |
+            兼容注册接口的 `password` 别名（P3-6）。与 `secret` 同时提供时必须一致；
+            两者冲突返回 400。新客户端仍建议使用 `secret`。
         provider:
           type: string
           description: OAuth 提供方（`method=oauth` 时必填）。
@@ -8007,6 +10587,76 @@ components:
         mfa_code:
           type: string
           description: 二次认证码（账号启用 MFA 时必填）。
+
+    RegistrationRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password:
+          type: string
+          minLength: 10
+          maxLength: 128
+          writeOnly: true
+
+    RegistrationConfirmRequest:
+      type: object
+      additionalProperties: false
+      required: [email, code, password]
+      properties:
+        email: { type: string, format: email }
+        code: { type: string, minLength: 1, maxLength: 16 }
+        password: { type: string, minLength: 10, maxLength: 128, writeOnly: true }
+
+    RegistrationAccepted:
+      type: object
+      additionalProperties: true
+      required: [message]
+      properties:
+        message: { type: string }
+        retry_after_s: { type: integer, minimum: 0 }
+
+    RegistrationConfirmResponse:
+      type: object
+      additionalProperties: true
+      required: [tokens, account, mfa_required]
+      properties:
+        mfa_required: { type: boolean }
+        tokens: { $ref: '#/components/schemas/AuthTokens' }
+        account:
+          type: object
+          additionalProperties: true
+          required: [account_id, type, state]
+          properties:
+            account_id: { type: string }
+            type: { type: string }
+            state: { type: string }
+        device_id: { type: [string, 'null'] }
+        device_expires_at: { type: [string, 'null'], format: date-time }
+
+    SecurityReminders:
+      type: object
+      additionalProperties: true
+      required: [data, blocking]
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            required: [id, severity, dismissible, recommended, enrolled, title]
+            properties:
+              id: { type: string }
+              severity: { type: string, enum: [info, warning] }
+              dismissible: { type: boolean }
+              recommended: { type: boolean }
+              enrolled: { type: boolean }
+              title: { type: string }
+              body: { type: string }
+              action: { type: [string, 'null'] }
+        blocking: { type: boolean, enum: [false] }
+        note: { type: string }
 
     LoginResponse:
       type: object
@@ -8406,6 +11056,22 @@ components:
           type: [string, 'null']
           format: date-time
 
+    NodeBindingCodeIssued:
+      type: object
+      additionalProperties: true
+      required: [code, code_id, node_id, expires_at, ttl_seconds]
+      description: |
+        一次性绑定码签发结果（BUG-05）。`code` **只在本响应出现一次**，平台只存
+        `sha256(code)`；`ttl_seconds` 是本次码的实际有效期（秒）。
+      properties:
+        code:
+          type: string
+          description: 绑定码明文（一次性；用 `POST /api/v1/node/binding` 消费）。
+        code_id: { type: string }
+        node_id: { type: string }
+        expires_at: { type: string, format: date-time }
+        ttl_seconds: { type: integer, minimum: 1 }
+
     NodeBindingRequest:
       type: object
       additionalProperties: true
@@ -8445,6 +11111,12 @@ components:
               model: { type: string }
               ok: { type: boolean }
               error_class: { type: string }
+        vocab_ok:
+          type: boolean
+          description: |
+            词表指纹标定结论（加性可选，M17 §8.4）。`false` → 上游判 `rejected`，
+            `rejected_reason_code=vocab_mismatch`，该上游退出调度候选（自动切到其他供应方）。
+            省略 = 未标定，按原口径处理（不因缺省拒绝）。
         checked_at: { type: string, format: date-time }
 
     NodeProbeAck:
@@ -10259,6 +12931,26 @@ components:
         payable_total_minor: { type: integer, minimum: 0 }
         batch_hash: { type: string }
         signature_ref: { type: string }
+        maker_id:
+          type: [string, 'null']
+          description: HSM 模式下必须与签名原文 `maker_id` 一致；不传时服务端按期间取 run 的 maker。
+        signature_alg:
+          type: string
+          enum: [ed25519]
+          description: 配置 `DJB_ATTESTATION_PUBKEY_FILE` 时必填；当前只支持 Ed25519。
+        signature_b64:
+          type: string
+          writeOnly: true
+          maxLength: 2048
+          description: 64 字节 detached 签名的 base64；只用于提交时验签，不落库。
+        signed_payload_b64:
+          type: string
+          writeOnly: true
+          maxLength: 32768
+          description: |
+            HSM 签名的 canonical JSON 原文的 base64。字段必须恰为
+            `period_start/period_end/ledger_root/batch_hash/payable_total_minor/maker_id`；
+            服务端验签后再逐项比对，防止把 A 批次签名贴到 B 批次。
 
     ReconAttestation:
       type: object
@@ -10276,7 +12968,10 @@ components:
         reviewer_id: { type: [string, 'null'] }
         reviewer_pubkey_ref: { type: [string, 'null'] }
         signature_ref: { type: string }
-        hsm_verified_at: { type: [string, 'null'], format: date-time }
+        hsm_verified_at:
+          type: [string, 'null']
+          format: date-time
+          description: HSM 验签通过时间；配置公钥后出款 validate/binder 要求非空。
         status:
           type: string
           enum: [valid, superseded, revoked]
@@ -10682,6 +13377,16 @@ components:
         sla_due: { type: string, format: date-time }
         outcome: { type: [string, 'null'] }
 
+    RiskAppealPage:
+      type: object
+      additionalProperties: true
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/RiskAppeal' }
+        page: { $ref: '#/components/schemas/Page' }
+
     RiskAppealRequest:
       type: object
       additionalProperties: true
@@ -10990,6 +13695,125 @@ components:
           type: [string, 'null']
           maxLength: 512
           description: 复核备注（人类可读）；不含签名字节。复核人 ≠ 制单人。
+
+    PayoutSignEventRequest:
+      type: object
+      additionalProperties: false
+      required: [event, signer_type]
+      properties:
+        event:
+          type: string
+          enum: [requested, presented, signed, verified, co_signed, broadcast]
+          description: 六事件之一；阶段不得回退。
+        signer_type:
+          type: string
+          enum: [owner, reviewer, company]
+          description: 签名人类型（2-of-3 按类型区分）。
+        signer_ref:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: 签名人标识（管理员 id / `company-hsm` 等）。
+        signature_hash:
+          type: [string, 'null']
+          minLength: 16
+          maxLength: 128
+          description: 设备回传的签名摘要（hex）；服务不验签、不落原文到审计。
+        device_id:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: 设备标识（如 `hsm:<vendor>:<serial>`）。
+        auth_hash:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: 设备侧授权对象摘要。
+        txid:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: 仅 `broadcast` 事件可带。
+        error_code:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 64
+          description: 失败原因码（`event=failed` 语义扩展时用）。
+        occurred_at:
+          type: [string, 'null']
+          format: date-time
+          description: 设备发生时间；缺省用服务端时间。
+
+    PayoutSignEventResult:
+      type: object
+      additionalProperties: false
+      required: [signing_request, event, complete, signed_count, advanced]
+      properties:
+        signing_request: { $ref: '#/components/schemas/SigningRequest' }
+        event:
+          type: object
+          additionalProperties: true
+          description: 刚落库的事件行（`signing_event_payload`）。
+        complete:
+          type: boolean
+          description: 是否已满足 2/3 门槛（owner signed + verified + co_signed）。
+        signed_count:
+          type: integer
+          minimum: 0
+          maximum: 3
+          description: 已签数（`signed` + `co_signed`）。
+        advanced:
+          type: [object, 'null']
+          additionalProperties: true
+          description: 聚合推进结果（owner_type / batch_id / status），未推进为 null。
+
+    PayoutSigningView:
+      type: object
+      additionalProperties: false
+      required: [signing_request, events, complete]
+      properties:
+        signing_request:
+          type: object
+          additionalProperties: true
+          description: 签名请求概要（id / intent_id / kind / status / threshold / signer_count / signed_count / expires_at）。
+        intent:
+          type: [object, 'null']
+          additionalProperties: true
+          description: 关联资金意图（`intent_payload`），不存在为 null。
+        events:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: 事件流水（按发生时间）。
+        complete:
+          type: boolean
+          description: 是否已满足 2/3 门槛。
+
+    PayoutBroadcastRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        txid:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: 链上交易号；空 = 交给注入的链上执行器，两者都没有则 `409` + `txid_missing`（不伪造）。
+        confirmations:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 64
+          description: 仅 E2E：向执行器请求的确认数；不进账本。
+
+    PayoutSettleRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        txid:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: 达确认的交易号；空则沿用批次已保存的 `chain_tx_id`。
 
     SigningRequest:
       type: object
@@ -11896,3 +14720,85 @@ components:
         active:
           type: boolean
           description: 是否处于可用授权态（`proxy_serve=true` 且未撤销）。
+
+    TokenRouteDeclaration:
+      type: object
+      additionalProperties: false
+      required: [pair, vocab_size, overlap]
+      properties:
+        pair:
+          type: object
+          additionalProperties: false
+          required: [from, to]
+          properties:
+            from: {type: string, minLength: 1, maxLength: 128}
+            to: {type: string, minLength: 1, maxLength: 128}
+          description: from ≠ to；两个不同的模型/词表标识。
+        vocab_size:
+          type: integer
+          minimum: 1
+          description: 词表大小（> 0；bool 不算整数）。
+        overlap:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: |
+            词表重叠比例 [0,1] 浮点。**不是** M04 的 overlap 枚举（shared_gpu|dedicated）。
+        declared_at:
+          type: string
+          format: date-time
+          description: 可省略（服务端按上报时刻补）；给了必须是 ISO8601，不带时区按 UTC。
+    TokenRouteDecision:
+      type: object
+      properties:
+        note: {type: [string, 'null'], maxLength: 500}
+        decided_at: {type: [string, 'null'], format: date-time}
+        decided_by: {type: [string, 'null']}
+        revision: {type: [integer, 'null'], minimum: 1}
+      description: 最近一次授权决策（撤销后仍保留，便于审计「谁授权过 / 谁撤销过」）。
+    TokenRouteView:
+      type: object
+      required: [node_id, declared, token_route, token_route_authorized, switch_enabled,
+                 declaration_authorized, effective, annotation, decision, switch]
+      properties:
+        node_id: {type: string}
+        declared: {type: boolean, description: 是否有声明行。}
+        token_route:
+          oneOf:
+            - $ref: '#/components/schemas/TokenRouteDeclaration'
+            - type: 'null'
+        token_route_authorized:
+          type: boolean
+          description: |
+            【诊断字段】已授权 **且** 开关打开才为 true；未授权或开关关一律 false
+            （读路径当「没有声明」处理）。
+        declaration_authorized:
+          type: boolean
+          description: 仅「后台已授权」（不含开关）。
+        switch_enabled:
+          type: boolean
+          description: 开关 token_route.authorized 当前是否打开（默认 false）。
+        effective:
+          type: boolean
+          description: 唯一生效判定 = declared ∧ declaration_authorized ∧ switch_enabled。
+        annotation:
+          type: [string, 'null']
+          description: 生效时的标注文本（"已授权 token-route（from→to / overlap x）"）；不生效为 null。
+        decision:
+          $ref: '#/components/schemas/TokenRouteDecision'
+        switch:
+          type: object
+          properties:
+            name: {type: string, enum: [token_route.authorized]}
+            default: {type: boolean, enum: [false]}
+            rollback_rule: {type: string}
+        withdrawn:
+          type: boolean
+          description: 仅 DELETE 响应带：本次是否真的删了行。
+        authorization_reset:
+          type: boolean
+          description: 仅 POST 声明响应带：本次声明变化是否把授权清掉了。
+        authorization_effective:
+          type: boolean
+          description: 仅授权响应带：授权后是否**真的**生效（开关关着时为 false）。
