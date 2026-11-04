@@ -1,5 +1,5 @@
 import os, sys
-sys.path.insert(0, '/vol2/@appdata/deepseek.harness/home/DJB联脑/repos/djb-node')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from djb_node.desktop.app import make_controller
 from djb_node.desktop.nodecloud import NodeCloudClient
 from djb_node.desktop.views import VIEW_KEYS

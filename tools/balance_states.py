@@ -9,7 +9,7 @@
 """
 import json, os, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-sys.path.insert(0, '/vol2/@appdata/deepseek.harness/home/DJB联脑/repos/djb-node')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from djb_node.desktop.datasource import LocalDataSource, ProviderError
 from djb_node.desktop.nodecloud import NodeCloudClient
 from djb_node.desktop.views import build_view
