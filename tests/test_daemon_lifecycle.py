@@ -11,8 +11,10 @@ import time
 import pytest
 
 from djb_node.cli import main
+from djb_node.config import Paths
 from djb_node.daemon import ControlClient
 from djb_node.errors import NotRunningError
+from tests import process_tree
 from tests.mock_m02 import MockServer
 
 
@@ -46,6 +48,10 @@ def _force_stop(paths):
 def test_cli_start_stop_subprocess(home, capsys):
     server = MockServer().start()
     port = _free_port()
+    # paths 必须在 `main(["start"])` **之前**构造：start 会真的 spawn daemon，
+    # 而它失败（Windows 上 "控制不可用" 超时返回 4）时后面的 `paths = Paths(...)`
+    # 根本执行不到 —— 之前的实现就是这样漏出整棵进程树的（task-8）。
+    paths = Paths(str(home))
     try:
         assert main(["init", "--no-env", "--gateway", server.base_url,
                      "--port", str(port), "--cpu", "100", "--gpu", "100",
@@ -63,8 +69,6 @@ def test_cli_start_stop_subprocess(home, capsys):
         assert payload["started"] is True
         token = payload["local_token"]
         assert len(token) >= 32
-        from djb_node.config import Paths
-        paths = Paths(str(home))
         try:
             # daemon 已在运行：状态 + 只绑回环 + 令牌可用
             response = ControlClient(paths).call({"cmd": "status"}, timeout=5.0)
@@ -98,4 +102,10 @@ def test_cli_start_stop_subprocess(home, capsys):
         with pytest.raises(NotRunningError):
             ControlClient(paths).call({"cmd": "ping"})
     finally:
+        # 必然执行：先试优雅停，再按**进程树**整体回收（幂等；已退出则空转）。
+        # 不能只依赖 `djb stop`：start 失败时没有 pid 句柄，且内层 daemon 会留在树里。
+        try:
+            process_tree.reap_daemon_tree(paths.home)
+        except Exception:                                  # noqa: BLE001 - teardown 不许抛
+            pass
         server.stop()
