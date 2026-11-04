@@ -286,12 +286,56 @@ def test_saving_an_unknown_theme_is_refused(tmp_path):
 
 
 # ────────────────────────────────────────────────────────────── 切换（真窗口）
+def _desktop_available() -> tuple[bool, str]:
+    """**确定性**判据：这台机器有没有可用的图形桌面（不看 Tk 能不能临时建起来）。
+
+    为什么不用"试着建一个 Tk 根"当判据：``tkinter.Tk()`` 会在同一进程里偶发
+    ``TclError: invalid command name "tcl_findLibrary"``（Tcl 初始化偶发失败）。
+    拿它当判据 ⇒ skip 数在 71↔72 之间漂；skip 必须表示"本环境测不了"这个**确定事实**，
+    不能是运行时抖动，否则基线永远对不齐，而且真把用例改坏了也会以"skip 了"消失。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            # SM_CXSCREEN/SM_CYSCREEN：会话 0（无交互桌面）时是 0
+            if ctypes.windll.user32.GetSystemMetrics(0) > 0 and \
+                    ctypes.windll.user32.GetSystemMetrics(1) > 0:
+                return True, ""
+        except Exception:                              # pragma: no cover - 极端环境
+            pass
+        return False, "无交互桌面（Windows session 0 / 无显示器）"
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return True, ""
+    return False, "DISPLAY/WAYLAND_DISPLAY 均未设置（无 X/Wayland 会话）"
+
+
+TK_AVAILABLE, TK_REASON = _desktop_available()
+#: 真窗口用例的统一闸门：**本运行期恒定**，理由带具体事实（不写"环境问题"）
+needs_tk = pytest.mark.skipif(
+    not TK_AVAILABLE, reason="真窗口用例需要可用图形桌面：" + TK_REASON)
+
+
+def _new_root():
+    """建一个 Tk 根；``tcl_findLibrary`` 这类初始化失败是**瞬时**的，重试而不是 skip。
+
+    重试不掩盖缺陷：真的建不起来时，三次之后仍然 ``pytest.fail`` 并带上原始异常文本；
+    断言该跑的照跑。skip 只留给"本机没有桌面"这个确定事实。
+    """
+    import tkinter
+
+    last = None
+    for _ in range(3):
+        try:
+            return tkinter.Tk()
+        except Exception as exc:                       # pragma: no cover - 瞬时初始化失败
+            last = exc
+            time.sleep(0.2)
+    pytest.fail("Tk 初始化连续 3 次失败（不是 skip，是真问题）：%r" % (last,))
+
+
 def _window_app(tmp_path):
-    tk = pytest.importorskip("tkinter")
-    try:
-        root = tk.Tk()
-    except Exception:                                  # pragma: no cover - 无显示
-        pytest.skip("没有可用的 Tk 显示")
+    pytest.importorskip("tkinter")
+    root = _new_root()
     from djb_node.desktop.app import DesktopApp, _DEMO_SECTIONS
     from djb_node.desktop.controller import DesktopController
     from djb_node.desktop.datasource import FakeDataSource
@@ -302,6 +346,7 @@ def _window_app(tmp_path):
     return app, root
 
 
+@needs_tk
 def test_theme_toggle_switches_palette_persists_and_does_not_raise(tmp_path):
     """点一下 day↔night：样式换过去、偏好写进去、当前视图重画不抛异常。"""
     app, root = _window_app(tmp_path)
@@ -318,6 +363,7 @@ def test_theme_toggle_switches_palette_persists_and_does_not_raise(tmp_path):
         root.destroy()
 
 
+@needs_tk
 def test_animated_toggle_lands_on_the_target_theme(tmp_path):
     """带动画的切换（3 帧背景渐变）跑完后必须停在目标主题，不能卡在中间色。"""
     app, root = _window_app(tmp_path)
@@ -335,6 +381,7 @@ def test_animated_toggle_lands_on_the_target_theme(tmp_path):
         root.destroy()
 
 
+@needs_tk
 def test_switching_theme_does_not_touch_the_data_path(tmp_path):
     """换肤只动样式：视图数据、当前视图 key、快照来源都不该变。"""
     app, root = _window_app(tmp_path)
