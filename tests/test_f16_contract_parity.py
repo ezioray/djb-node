@@ -15,11 +15,22 @@ from pathlib import Path
 
 import pytest
 
+from tests import cross_repo
+
 NODE = Path(__file__).resolve().parents[1]
 CLOUD = NODE.parent / "djb-cloud" / "app" / "metering" / "node_console.py"
 
-pytestmark = pytest.mark.skipif(not CLOUD.exists(),
-                                reason="同仓外的 djb-cloud 不在预期路径，跳过跨仓契约检查")
+#: 缺兄弟仓时**不许静默跳过**（task-15）：登记 ENV-MISSING，严格模式下直接失败。
+#  为什么不用 `pytest.mark.skipif`：skip 是"本环境测不了"的**结论**，不是"通过"；
+#  用 skipif 时它和普通 skip 长得一样 ⇒ 同一 commit 因 stage 布局不同 11/17 两副面孔，
+#  值班侧把 +6 读成"跳过集与基线一致"，delta 建在流沙上（已由 lead 落
+#  ops/release/TEST-BASELINE-CORRECTION-2026-11-05.md 纠正口径）。
+cross_repo.require_file(
+    CLOUD,
+    what="f16 跨仓契约检查（本模块全部用例）",
+    reason="同仓外的 djb-cloud 不在预期路径（缺 ../djb-cloud/app/metering/node_console.py）",
+    module_level=True,
+)
 
 
 def _returned_keys(function: str) -> set[str]:

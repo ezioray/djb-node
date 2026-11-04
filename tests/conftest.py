@@ -28,6 +28,18 @@ class Clock:
         return self.current
 
 
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """把「环境缺失导致未验证」的地方统一打成可 grep 的 ENV-MISSING 行（task-15）。
+
+    有这一行，值班侧就不能把这次结果当基线；没有这一行，缺环境的 skip 会和
+    "本来就不用跑"的 skip 混在一起，delta 全是假的。
+    """
+    from tests import env_missing
+
+    for line in env_missing.format_lines():
+        terminalreporter.write_line(line, yellow=True)
+
+
 @pytest.fixture
 def windows_control_usable():
     """控制通道「本该可用」的前置检查：不可用（到期/元数据变更）时带理由 skip。见 tests/windows_control.py。"""

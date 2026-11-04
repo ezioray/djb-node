@@ -638,7 +638,7 @@ FEATURE_FLAGS["client.ipc.windows.enabled"] = {
     "default": True,
     "owner": "client-seat",
     "expire_at": "2026-12-31",
-    "rollback_rule": "关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好",
+    "rollback_rule": ("关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好。回滚=成对改动：default→False 且 ipc_windows.py 的 tripwire 判据改回 `is not False`（只改一处=半截回滚：tripwire 会 fail closed，所有 Windows 控制用例会以「开关不可用」skip）"),
     "description": "Windows同SID/session/integrity安全命名管道；不解禁GUI托盘控制",
 }
 
