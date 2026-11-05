@@ -164,6 +164,9 @@ class DiagnoseBuilder:
                         "schedule_windows": len(profile.schedule)},
             "upstreams": [{"id": item.id, "access_type": item.access_type,
                            "state": item.state, "models": len(item.models),
+                           # P2：诊断包里也带 kind / protocol（无凭据、无域名之外的隐私）
+                           "upstream_kind": item.upstream_kind,
+                           "protocol": item.protocol,
                            "credential_ref_set": bool(item.credential_ref)}
                           for item in self.store.upstreams()],
             "receipts": {"count": self.store.receipt_count(),

@@ -23,6 +23,11 @@ class UpstreamStub:
     ``no_choices`` / ``bad_json`` / ``error_envelope``。
     流式 `stream_mode`：``sse``（正常，末段带 usage）/ ``sse_no_usage`` /
     ``json``（不支持 SSE，直接回 JSON）/ ``bad_chunk`` / ``no_done``。
+
+    anthropic-messages（P2）：`POST /v1/messages`，形状为
+    ``{"content":[{"type":"text","text":...}],"stop_reason":...,"usage":{input_tokens,
+    output_tokens}}``；流式发 ``message_start`` / ``content_block_delta`` /
+    ``message_delta``（带 usage）/ ``message_stop`` 事件。旋钮见 ``__init__``。
     """
 
     def __init__(self, models: tuple[str, ...] | list[str] = ("probe-model",)) -> None:
@@ -33,6 +38,15 @@ class UpstreamStub:
         self.stream_mode = "sse"
         self.usage: dict[str, int] = {"prompt_tokens": 1, "completion_tokens": 1,
                                       "total_tokens": 2}
+        # ── anthropic-messages（P2：探针协议感知）──
+        # 非流式 `anthropic_mode`：``json``（正常）/ ``no_stop_reason``（只有正文）/
+        # ``no_usage`` / ``error_envelope``（200 但 type=error）/ ``bad_json``。
+        # 流式 `anthropic_stream_mode`：``sse``（含 message_stop + usage）/
+        # ``no_stop``（不给 message_stop，只给 usage）/ ``json``（不支持 SSE）。
+        self.messages_status = 200
+        self.anthropic_mode = "json"
+        self.anthropic_stream_mode = "sse"
+        self.anthropic_usage: dict[str, int] = {"input_tokens": 3, "output_tokens": 1}
         self.requests: list[dict[str, Any]] = []
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -103,6 +117,9 @@ class UpstreamStub:
                 body = self._body()
                 outer.requests.append({"method": "POST", "path": path,
                                        "headers": dict(self.headers), "body": body})
+                if path == "/v1/messages":
+                    self._messages(body)
+                    return
                 if path != "/v1/chat/completions":
                     self._json(404, {"error": {"code": 40401, "message": "not found"}})
                     return
@@ -166,6 +183,68 @@ class UpstreamStub:
                     self.wfile.flush()
                 self.close_connection = True
 
+            # ── anthropic-messages（P2 探针协议感知）───────────────
+            def _messages(self, body: dict[str, Any]) -> None:
+                if outer.messages_status != 200:
+                    self._json(outer.messages_status,
+                               {"type": "error",
+                                "error": {"type": "authentication_error",
+                                          "message": "stub upstream"}})
+                    return
+                if body.get("stream"):
+                    self._messages_stream(body)
+                    return
+                self._messages_completion(body)
+
+            def _messages_completion(self, body: dict[str, Any]) -> None:
+                mode = outer.anthropic_mode
+                if mode == "bad_json":
+                    self._raw(b"{not json")
+                    return
+                if mode == "error_envelope":
+                    self._json(200, {"type": "error",
+                                     "error": {"type": "overloaded_error",
+                                               "message": "stub overloaded"}})
+                    return
+                payload: dict[str, Any] = {
+                    "id": "msg_1", "type": "message", "role": "assistant",
+                    "model": body.get("model"),
+                    "content": [{"type": "text", "text": "ok"}]}
+                if mode != "no_stop_reason":
+                    payload["stop_reason"] = "max_tokens"
+                if mode != "no_usage":
+                    payload["usage"] = dict(outer.anthropic_usage)
+                self._json(200, payload)
+
+            def _messages_stream(self, body: dict[str, Any]) -> None:
+                mode = outer.anthropic_stream_mode
+                if mode == "json":
+                    # 不支持 SSE 的 Anthropic 兼容端点：回普通 JSON（应判 stream_failed 并降级 L2）
+                    self._messages_completion(body)
+                    return
+                self._sse_start()
+
+                def emit(name: str, data: dict[str, Any]) -> None:
+                    self.wfile.write(("event: " + name + "\n").encode("utf-8"))
+                    self._sse(data)
+
+                emit("message_start", {"type": "message_start",
+                                       "message": {"id": "msg_1", "model": body.get("model"),
+                                                   "usage": {"input_tokens":
+                                                             outer.anthropic_usage
+                                                             ["input_tokens"]}}})
+                emit("content_block_start", {"type": "content_block_start", "index": 0,
+                                             "content_block": {"type": "text", "text": ""}})
+                emit("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                             "delta": {"type": "text_delta", "text": "ok"}})
+                emit("message_delta", {"type": "message_delta",
+                                       "delta": {"stop_reason": "max_tokens"},
+                                       "usage": {"output_tokens":
+                                                 outer.anthropic_usage["output_tokens"]}})
+                if mode != "no_stop":
+                    emit("message_stop", {"type": "message_stop"})
+                self.close_connection = True
+
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._server.daemon_threads = True
         self.port = int(self._server.server_address[1])
@@ -195,6 +274,9 @@ class UpstreamStub:
     def chat_requests(self) -> list[dict[str, Any]]:
         return [item for item in self.requests
                 if item.get("path") == "/v1/chat/completions"]
+
+    def messages_requests(self) -> list[dict[str, Any]]:
+        return [item for item in self.requests if item.get("path") == "/v1/messages"]
 
     def models_requests(self) -> list[dict[str, Any]]:
         return [item for item in self.requests if item.get("path") == "/v1/models"]

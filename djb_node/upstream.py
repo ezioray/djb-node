@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
-from . import facts, probe as probe_mod
+from . import facts, probe as probe_mod, upstream_protocols as up
 from .errors import UsageError
 from .httpclient import HttpClient, join_url
 from .secure import CredentialStore
@@ -267,13 +267,18 @@ class ProbeResult:
 
 
 def probe_upstream(base_url: str, models: list[str], *, credential: str | None,
-                   http: HttpClient | None = None, timeout: float = 5.0) -> ProbeResult:
-    """GET {base}/models：只取「可达 + 延迟 + 是否声明」，不读上游正文。"""
+                   http: HttpClient | None = None, timeout: float = 5.0,
+                   protocol: str | None = None) -> ProbeResult:
+    """GET {base}/models：只取「可达 + 延迟 + 是否声明」，不读上游正文。
+
+    ``protocol`` 可选（缺省 = ``openai-chat``，与改前逐字一致）：只影响**鉴权头**
+    —— ``anthropic-messages`` 用 ``x-api-key`` + ``anthropic-version``，
+    OpenAI 兼容仍是 ``Authorization: Bearer``。URL 两个协议都打 ``/models``
+    （Anthropic 也有 ``/v1/models``；Stormesh 这类 base 以 ``/v1`` 结尾的同样通）。
+    """
     client = http or HttpClient()
     started = utcnow()
-    headers = {}
-    if credential:
-        headers["Authorization"] = "Bearer " + credential
+    headers = up.auth_headers(protocol, credential)
     try:
         response = client.request("GET", models_endpoint(base_url), headers=headers,
                                   timeout=timeout)
@@ -375,8 +380,12 @@ class UpstreamManager:
         seconds = float(timeout if timeout is not None else facts.PROBE_TIMEOUT_S)
         record = self.store.upstream(upstream_id)
         secret = self.credentials.upstream_secret(upstream_id)
+        # 协议必须从**记录**传下去（CR-20261106 客户端 P2）：daemon 的周期探针、
+        # 启动探针、CLI `djb upstream probe` 全走这一个入口，所以在这一处接线
+        # 就覆盖了所有调用方；`record.protocol` 缺省即 `openai-chat`，旧上游行为不变。
         result = probe_upstream(record.base_url, record.model_ids(),
-                                credential=secret, http=self.http, timeout=seconds)
+                                credential=secret, http=self.http, timeout=seconds,
+                                protocol=record.protocol)
         checks: list[dict[str, Any]] = [dict(item) for item in result.model_checks]
         outcomes: dict[str, probe_mod.ProbeOutcome] = {}
         if result.reachable:
@@ -384,7 +393,8 @@ class UpstreamManager:
             outcomes = probe_mod.probe_models(
                 record.base_url, listed, credential=secret,
                 level=level or facts.PROBE_DEFAULT_LEVEL, timeout=seconds,
-                http=self.http, deadline=deadline, clock=clock)
+                http=self.http, deadline=deadline, clock=clock,
+                protocol=record.protocol)
         # 逐模型合并：L2/L3 结论优先；未在清单 / 预算内没探到 -> 不 ok。
         for item in checks:
             model_id = str(item.get("model"))

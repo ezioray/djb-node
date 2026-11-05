@@ -789,6 +789,21 @@ def cmd_limits(args: argparse.Namespace) -> int:
 
 
 # ─────────────────────────────────────────────────────────── upstream
+def _upstream_line(item: dict[str, Any]) -> str:
+    """`djb upstream list` 的一行文本。
+
+    P2（CR-20261106 客户端）：有 `upstream_kind` 才多印一段（如 `third_party_relay`），
+    旧上游（A1/A2、未标注 kind）的输出**逐字不变**。
+    """
+    parts = [str(item.get("id")), str(item.get("access_type"))]
+    kind = item.get("upstream_kind")
+    if kind:
+        parts.append(str(kind))
+    parts.extend([str(item.get("base_url")), str(item.get("state"))])
+    models = ",".join(str(model.get("id")) for model in item.get("models") or [])
+    return " · ".join(parts) + " · 模型 " + models
+
+
 def cmd_upstream(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
     credentials = CredentialStore(paths)
@@ -855,10 +870,8 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         records = [item.to_dict() for item in manager.list()]
         _emit({"upstreams": records, "count": len(records)}, as_json=_json_flag(args),
               text=lambda value: "\n".join(
-                  [str(item["id"]) + " · " + str(item["access_type"]) + " · "
-                   + str(item["base_url"]) + " · " + str(item["state"]) + " · 模型 "
-                   + ",".join(str(model.get("id")) for model in item["models"])
-                   for item in value["upstreams"]]) or "（没有上游）")
+                  [_upstream_line(item) for item in value["upstreams"]])
+              or "（没有上游）")
         return 0
     if action == "probe":
         record = store.upstream(args.id)

@@ -1804,6 +1804,10 @@ class Daemon:
             "upstreams": [{"id": item.id, "access_type": item.access_type,
                            "state": item.state, "enabled": item.enabled,
                            "models": len(item.models),
+                           # P2：kind / protocol 也露出来（只加字段），否则中转站与
+                           # 企业网关在 status 里长得一模一样，排障要先猜
+                           "upstream_kind": item.upstream_kind,
+                           "protocol": item.protocol,
                            "credential_ref": item.credential_ref}
                           for item in self.upstreams.list()],
             "receipts": {"count": self.buffer.count(),

@@ -66,6 +66,26 @@ def messages_path(protocol: Any, base_url: str = "") -> str:
     return "/messages" if base.endswith("/v1") else ANTHROPIC_MESSAGES_PATH
 
 
+def auth_headers(protocol: Any, credential: str | None) -> dict[str, str]:
+    """按协议给出上游**鉴权头**（探针与请求链接共用同一口径）。
+
+    * ``anthropic-messages``：``x-api-key`` + ``anthropic-version``（Anthropic 官方要求）；
+    * ``openai-chat``：``Authorization: Bearer <key>``（旧行为，逐字不变）。
+
+    凭据**只进 header**：不进 URL、不进日志、不进返回值（M17 §10 / H1）。
+    无凭据时返回空字典（本地未鉴权端点也要能探）。
+
+    别和 ``relay.auth_headers(profile, credential)`` 混用：那个按中转站
+    ``auth_scheme`` / ``header_name`` / ``auth_prefix`` 自定义，答的是「某个上游怎么鉴权」；
+    本函数是「某个**协议**的默认鉴权头」，两者不是一回事。
+    """
+    if not credential:
+        return {}
+    if is_anthropic(protocol):
+        return {"x-api-key": credential, "anthropic-version": ANTHROPIC_VERSION}
+    return {"Authorization": "Bearer " + credential}
+
+
 # --------------------------------------------------------------------------- 请求
 def _split_system(messages: Iterable[Mapping[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
     """OpenAI messages → (system 文本, Anthropic messages)。
@@ -395,5 +415,5 @@ def _chunk(model: Any = None, *, delta_role: bool = False, delta_text: str | Non
 
 __all__ = ["ANTHROPIC_VERSION", "ANTHROPIC_MESSAGES_PATH", "PROTOCOLS", "DEFAULT_MAX_TOKENS",
            "ProtocolError", "normalize_protocol", "is_anthropic", "messages_path",
-           "to_anthropic_request", "from_anthropic_response", "map_stop_reason",
-           "iter_anthropic_sse"]
+           "auth_headers", "to_anthropic_request", "from_anthropic_response",
+           "map_stop_reason", "iter_anthropic_sse"]

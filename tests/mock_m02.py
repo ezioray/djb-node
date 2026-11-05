@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""mock M02 / M05 / 上游 OpenAI 端点（纯 http.server，无数据库、无外网）。"""
+"""mock M02 / M05 / 上游端点（纯 http.server，无数据库、无外网）。
+
+上游侧同时提供两种协议（P2 探针协议感知用）：
+
+* ``POST /v1/chat/completions`` —— OpenAI 兼容（含 SSE 流式）；
+* ``POST /v1/messages`` —— anthropic-messages 形状（``content`` 块 + ``stop_reason``
+  + ``usage.{input_tokens,output_tokens}``，流式发 ``message_start`` /
+  ``content_block_delta`` / ``message_delta`` / ``message_stop``）；
+* ``GET /v1/models`` —— 模型清单（两个协议都打这一个）。
+"""
 from __future__ import annotations
 
 import json
@@ -69,6 +78,11 @@ class MockServer:
         self.capabilities_override: dict[str, Any] | None = None
         self.chat_status = 200
         self.chat_usage = {"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12}
+        # anthropic-messages（P2 探针协议感知）：`POST /v1/messages`
+        self.messages_status = 200
+        self.messages_usage = {"input_tokens": 7, "output_tokens": 5}
+        # `GET /v1/models` 的清单（None = 原来的单条 mock-model）
+        self.models: list[str] | None = None
         self.extra_headers: dict[str, str] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -159,8 +173,12 @@ class MockServer:
                                      "account_id": "acct-1"})
                     return
                 if path == "/v1/models":
+                    # `models` 旋钮：探针用例要「一个上游挂多个模型」；缺省仍是 mock-model，
+                    # 既有用例的清单不变。
+                    listed = outer.models or ["mock-model"]
                     self._json(200, {"object": "list", "data": [
-                        {"id": "mock-model", "object": "model", "owned_by": "mock"}]})
+                        {"id": model, "object": "model", "owned_by": "mock"}
+                        for model in listed]})
                     return
                 self._error(404, 40401, "not found")
 
@@ -270,6 +288,9 @@ class MockServer:
                 if path == "/v1/chat/completions":
                     outer._chat(self, body)
                     return
+                if path == "/v1/messages":
+                    outer._messages(self, body)
+                    return
                 self._error(404, 40401, "not found")
 
             def do_DELETE(self) -> None:                   # noqa: N802
@@ -351,3 +372,43 @@ class MockServer:
                                                      "content": "你好"},
                                          "finish_reason": "stop"}],
                             "usage": dict(self.chat_usage)})
+
+    def _messages(self, handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
+        """anthropic-messages 形状（P2：探针协议感知；流式 = 事件名 + data 两行一组）。"""
+        if self.messages_status != 200:
+            handler._json(self.messages_status,
+                          {"type": "error",
+                           "error": {"type": "api_error", "message": "mock upstream"}})
+            return
+        if body.get("stream"):
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Cache-Control", "no-cache")
+            handler.end_headers()
+            events: list[tuple[str, dict[str, Any]]] = [
+                ("message_start", {"type": "message_start",
+                                   "message": {"id": "msg_1", "model": body.get("model"),
+                                               "usage": {"input_tokens":
+                                                         self.messages_usage["input_tokens"]}}}),
+                ("content_block_start", {"type": "content_block_start", "index": 0,
+                                         "content_block": {"type": "text", "text": ""}}),
+                ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                         "delta": {"type": "text_delta", "text": "你"}}),
+                ("message_delta", {"type": "message_delta",
+                                   "delta": {"stop_reason": "max_tokens"},
+                                   "usage": {"output_tokens":
+                                             self.messages_usage["output_tokens"]}}),
+                ("message_stop", {"type": "message_stop"}),
+            ]
+            for name, payload in events:
+                handler.wfile.write(("event: " + name + "\n").encode("utf-8"))
+                handler.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False)
+                                     + "\n\n").encode("utf-8"))
+                handler.wfile.flush()
+            handler.close_connection = True
+            return
+        handler._json(200, {"id": "msg_1", "type": "message", "role": "assistant",
+                            "model": body.get("model"),
+                            "content": [{"type": "text", "text": "你好"}],
+                            "stop_reason": "max_tokens",
+                            "usage": dict(self.messages_usage)})

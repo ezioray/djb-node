@@ -282,6 +282,10 @@ class UpstreamRecord:
             "state": self.state,
             "last_probe_at": self.last_probe_at,
             "protocol": self.protocol,
+            # P2 顺手修（2026-11-06）：漏了这个字段 ⇒ `djb upstream list` 的 JSON 与
+            # 文本都看不到 `third_party_relay`，中转站接进来"跟企业网关没区别"。
+            # 只加字段（值可为 None），不重排、不改既有键。
+            "upstream_kind": self.upstream_kind,
             "created_at": self.created_at,
             "enabled": bool(self.enabled),
         }
