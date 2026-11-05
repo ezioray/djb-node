@@ -12,7 +12,9 @@
   本层不做任何计算、换算、四舍五入；字段缺失 / 空值统一显示「—」。
 * **不展开正文**：消息只取未读计数与角标；正文 / payload 不进入托盘模型。
   标题投影在 :mod:`djb_node.tray.notifications`（同样只取标题，不读正文）。
-* **S2 只有六项**：状态、暂停/恢复（按 daemon 状态二选一）、消息中心、诊断、日志、退出。
+* **S2 基础六项**：状态、暂停/恢复（按 daemon 状态二选一）、消息中心、诊断、日志、退出。
+  未绑定账户时额外出现第 7 项「绑定网页端」（``node.bound is False`` 才显示；绑定后回到六项），
+  因此菜单长度是 6 或 6+1，测试断言用 ``S2_MENU_SIZE + S2_BIND_MENU_SIZE``，不写死 7。
   S3 入口（上游、模型同步、抽检等）不在本层出现，也不预留占位项。
 
 状态口径
@@ -53,12 +55,15 @@ __all__ = [
     "TrayModel",
     "EMPTY_VALUE",
     "S2_MENU_SIZE",
+    "S2_BIND_MENU_SIZE",
 ]
 
 #: 缺字段 / 空值时的展示占位（不猜、不补 0）
 EMPTY_VALUE = "—"
-#: S2 菜单项数量（状态 / 暂停恢复 / 消息中心 / 诊断 / 日志 / 退出）
+#: S2 基础菜单项数量（状态 / 暂停恢复 / 消息中心 / 诊断 / 日志 / 退出）
 S2_MENU_SIZE = 6
+#: 未绑定账户时额外出现的条件项数量（「绑定网页端」）；绑定后回到基础 6 项
+S2_BIND_MENU_SIZE = 1
 
 
 class TrayAction(str, Enum):
@@ -69,6 +74,7 @@ class TrayAction(str, Enum):
     RESUME = "resume"
     OPEN_MESSAGES = "open_messages"
     DIAGNOSE = "diagnose"
+    BIND = "bind"
     QUIT = "quit"
     OPEN_LOGS = "open_logs"
 
@@ -143,6 +149,9 @@ INTENTS: dict[TrayAction, TrayIntent] = {
     TrayAction.DIAGNOSE: TrayIntent(
         TrayAction.DIAGNOSE, ("djb", "diagnose", "--json"),
         description="生成脱敏诊断包"),
+    TrayAction.BIND: TrayIntent(
+        TrayAction.BIND, ("djb", "auth", "--bind", "<一次性码>"),
+        description="绑定网页端（一次性码在 网页端 → 账户/节点 → 生成绑定码）"),
     TrayAction.OPEN_LOGS: TrayIntent(
         TrayAction.OPEN_LOGS, ("djb", "logs", "--tail", "200"),
         description="查看脱敏日志（壳也可直接打开日志目录）"),
@@ -208,6 +217,7 @@ class TrayModel:
     today_earnings: str
     unread: int
     p0_unread: int
+    bound: bool | None
     items: tuple[TrayMenuItem, ...]
 
     # ─────────────────────────────────────────────────── 构造
@@ -240,6 +250,12 @@ class TrayModel:
         unread = _count(notifications, "unread", "unread_count")
         p0_unread = _count(notifications, "p0_unread", "p0")
 
+        # 绑定态来自 ``djb status --json`` 的 ``node.bound``（本机有没有客户端密钥）；
+        # 缺字段 / 类型不对 → None（不知道就不显示绑定入口，避免误导已绑定用户）。
+        node = data.get("node") if isinstance(data.get("node"), Mapping) else {}
+        bound_value = node.get("bound")
+        bound = bound_value if isinstance(bound_value, bool) else None
+
         status_label = "状态：" + state_label + (
             "（" + reason_text + "）" if reason_text else "")
 
@@ -252,12 +268,16 @@ class TrayModel:
                 "pause", "暂停接单", TrayAction.PAUSE,
                 enabled=daemon_running and raw_state in _PAUSE_AVAILABLE_STATES)
 
+        # 基础 6 项；仅在**明确未绑定**时插入第 7 项「绑定网页端」（退出保持末位）。
+        bind_items = () if bound is not False else (
+            TrayMenuItem("bind", "绑定网页端", TrayAction.BIND, enabled=True),)
         items = (
             TrayMenuItem("status", status_label, TrayAction.OPEN_STATUS, enabled=True),
             pause_item,
             TrayMenuItem("messages", "消息中心", TrayAction.OPEN_MESSAGES, enabled=True,
                          badge=_badge(unread, p0_unread)),
             TrayMenuItem("diagnose", "生成诊断包", TrayAction.DIAGNOSE, enabled=True),
+            *bind_items,
             TrayMenuItem("logs", "打开日志", TrayAction.OPEN_LOGS, enabled=True),
             TrayMenuItem("quit", "退出", TrayAction.QUIT, enabled=True),
         )
@@ -267,7 +287,7 @@ class TrayModel:
             reason_label=reason_text, next_step=next_step,
             balance=_text(data.get("balance")),
             today_earnings=_text(data.get("today_earnings")),
-            unread=unread, p0_unread=p0_unread, items=items)
+            unread=unread, p0_unread=p0_unread, bound=bound, items=items)
 
     # ─────────────────────────────────────────────────── 查询
     @property
@@ -312,6 +332,7 @@ class TrayModel:
             "today_earnings": self.today_earnings,
             "unread": self.unread,
             "p0_unread": self.p0_unread,
+            "bound": self.bound,
             "items": [item.to_dict() for item in self.items],
         }
 

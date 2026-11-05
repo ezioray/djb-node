@@ -220,6 +220,21 @@ def cmd_env(args: argparse.Namespace) -> int:
 
 
 # ─────────────────────────────────────────────────────────── auth
+def _auth_status_text(value: dict[str, Any]) -> str:
+    """``djb auth --status`` 的人类可读输出；未绑定时给出可照抄的绑定步骤（含网页端地址）。"""
+    lines = [
+        "节点 " + str(value.get("node_id") or "(未注册)")
+        + " · " + ("已绑定" if value.get("bound") else "未绑定（只做离线自测）"),
+        "凭据后端：" + str(value["credentials"].get("storage"))
+        + "（" + str(value["credentials"].get("file_mode")) + "）",
+        "服务端：" + str(value.get("gateway")),
+    ]
+    if not value.get("bound"):
+        lines.append("绑定：网页端 → 账户/节点 → 生成绑定码，然后 djb auth --bind <码>")
+        lines.append("网页端：" + facts.WEB_CONSOLE_URL)
+    return "\n".join(lines)
+
+
 def cmd_auth(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
     credentials = CredentialStore(paths)
@@ -277,12 +292,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
             info["server_binding"] = api.binding(node_id)
     except DjbError as exc:
         info["server_binding_error"] = exc.message
-    _emit(info, as_json=_json_flag(args),
-          text=lambda value: ("节点 " + str(value.get("node_id") or "(未注册)")
-                              + " · " + ("已绑定" if value.get("bound") else "未绑定（只做离线自测）")
-                              + "\n凭据后端：" + str(value["credentials"].get("storage"))
-                              + "（" + str(value["credentials"].get("file_mode")) + "）"
-                              + "\n服务端：" + str(value.get("gateway"))))
+    _emit(info, as_json=_json_flag(args), text=_auth_status_text)
     return 0
 
 

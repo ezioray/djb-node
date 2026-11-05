@@ -600,3 +600,54 @@ def test_tray_cli_runs_with_the_resolved_home(monkeypatch):
     monkeypatch.setattr(tray_app.subprocess, "run", fake_run)
     assert tray_app._run_cli_json(("status", "--json")) == {}
     assert seen["home"] == "/tmp/tray-home-test"
+
+
+def test_bind_intent_prompts_and_runs_auth_bind(monkeypatch):
+    """未绑定时的第 7 项：弹一次码输入框 → 调 ``djb auth --bind`` → 刷新并回报结果。"""
+    class BindBackend:
+        def __init__(self) -> None:
+            self.prompted = 0
+            self.feedback: list[tuple[str, str]] = []
+
+        def ask_bind_code(self) -> str | None:
+            self.prompted += 1
+            return "  code-xyz  "
+
+        def show_feedback(self, title: str, message: str) -> None:
+            self.feedback.append((title, message))
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(app_mod, "_run_cli_command",
+                        lambda args, **kwargs: calls.append(list(args)) or (0, "{}", ""))
+    backend = BindBackend()
+    refreshed: list[int] = []
+    sink = app_mod.desktop_intent_sink(backend, refresh=lambda: refreshed.append(1))
+    model = TrayModel.build({**RUNNING, "node": {"node_id": "n-1", "bound": False}})
+    sink(model.intent_for("bind"))
+    assert calls == [["auth", "--bind", "code-xyz", "--json"]]
+    assert refreshed == [1]
+    assert backend.prompted == 1
+    assert backend.feedback and "成功" in backend.feedback[0][0]
+    assert "code-xyz" not in backend.feedback[0][1]
+
+
+def test_bind_cancel_runs_no_command(monkeypatch):
+    class CancelBackend:
+        def __init__(self) -> None:
+            self.feedback: list[tuple[str, str]] = []
+
+        def ask_bind_code(self) -> None:
+            return None
+
+        def show_feedback(self, title: str, message: str) -> None:
+            self.feedback.append((title, message))
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(app_mod, "_run_cli_command",
+                        lambda args, **kwargs: calls.append(list(args)) or (0, "", ""))
+    backend = CancelBackend()
+    sink = app_mod.desktop_intent_sink(backend, refresh=lambda: None)
+    model = TrayModel.build({**RUNNING, "node": {"bound": False}})
+    sink(model.intent_for("bind"))
+    assert calls == []
+    assert backend.feedback and "取消" in backend.feedback[0][0]

@@ -373,6 +373,8 @@ class TkBackend:
             return label + (" / 确认后执行并回读" if self._control_enabled() else " / 命令指南·未执行")
         if item.action in (TrayAction.DIAGNOSE, TrayAction.OPEN_LOGS):
             return label + " / 命令指南·未执行"
+        if item.action is TrayAction.BIND:
+            return label + " / 一次性码"
         return label
 
     def _render_panel(self):
@@ -430,6 +432,16 @@ class TkBackend:
         window.grab_set()
         self._root.wait_window(window)
         return choice[0]
+
+    def ask_bind_code(self) -> str | None:
+        """一次性绑定码输入框（模态；取消 / 空串返回 None，不执行任何命令）。"""
+        from tkinter import simpledialog
+        from .. import facts
+        message = ("在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里。\n\n"
+                   + facts.WEB_CONSOLE_URL)
+        value = simpledialog.askstring("DJB / 绑定网页端", message, parent=self._root)
+        text = str(value).strip() if value else ""
+        return text or None
 
     def _keyboard_popup(self, _event):
         self._menu.tk_popup(self._root.winfo_rootx() + 20, self._root.winfo_rooty() + 20)
@@ -574,6 +586,27 @@ def desktop_status():
     return dict(payload) if isinstance(payload, Mapping) else {"state": "unknown"}
 
 
+def _run_cli_command(cli_args: Sequence[str], *,
+                     timeout: float = 30.0) -> tuple[int, str, str]:
+    """跑一次**会改本机状态**的 CLI（auth --bind）：返回 (rc, stdout, stderr)，不抛异常。"""
+    command = [sys.executable, "-m", "djb_node", *cli_args]
+    env = dict(os.environ)
+    try:
+        from ..config import resolve_home
+        env["DJB_HOME"] = str(resolve_home())
+    except Exception:                                  # 配置坏了也别炸壳
+        pass
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=timeout, check=False, env=env,
+                                   stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        event("tray.cli_action_failed", level="warning", command=" ".join(cli_args[:2]),
+              error=type(exc).__name__)
+        return 127, "", type(exc).__name__
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
 def desktop_notifications():
     payload = _run_cli_json(("notify", "list", "--json", "--limit", str(FETCH_LIMIT)))
     if not isinstance(payload, Mapping) or not isinstance(payload.get("items"), list):
@@ -617,6 +650,31 @@ def desktop_intent_sink(backend, *, refresh):
             refresh()
             backend.show_feedback("本机控制回读", result.message)
             event("tray.control_result", action=intent.action.value, verified=result.verified)
+            return
+        if intent.action is TrayAction.BIND:
+            ask = getattr(backend, "ask_bind_code", None)
+            code = ask() if callable(ask) else None
+            code = str(code or "").strip()
+            if not code:
+                backend.show_feedback("绑定网页端 / 已取消",
+                                      "没有输入绑定码，未执行任何命令。\n\n"
+                                      "在网页端 → 账户/节点 → 生成绑定码。")
+                event("tray.bind_cancelled")
+                return
+            rc, out, err = _run_cli_command(("auth", "--bind", code, "--json"))
+            refresh()
+            if rc == 0:
+                message = "绑定成功：本机已保存节点凭据，daemon 会用新凭据重新上线。"
+                ok = True
+            else:
+                first = next((line.strip() for line in (err or out).splitlines()
+                              if line.strip()), "退出码 " + str(rc))
+                # 绑定码只进子进程参数：错误消息里若回显，替换掉再上屏
+                detail = first.removeprefix("djb: ").replace(code, "***")[:160]
+                message = "绑定未成功（退出码 " + str(rc) + "）：" + detail
+                ok = False
+            backend.show_feedback("绑定网页端 / " + ("成功" if ok else "失败"), message)
+            event("tray.bind_result", ok=ok)
             return
         backend.show_feedback("命令指南 / 未执行", "此动作未自动执行。\n\n"
                               + " ".join(intent.command) + "\n\n" + intent.description

@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 
 from .datasource import Snapshot, UNAVAILABLE, Unavailable
 from .nodecloud import STATE_TEXT
+from .. import facts
 
 __all__ = [
     "Action", "Card", "Field", "Mark", "Row", "Table", "VIEWS", "VIEW_KEYS", "View",
@@ -727,17 +728,39 @@ def _yield(snapshot: Snapshot) -> View:
     )
 
 
+def _account_bound(profile: Mapping[str, Any], security: Mapping[str, Any],
+                   binding: Mapping[str, Any]) -> bool | None:
+    """账户页的绑定态：服务端 binding 优先，其次 profile.bound，最后看本机有没有节点凭据。
+
+    ``binding.state`` 是网页端/云端口径（bound / active / unbound…）；本机没登录时
+    两者都缺，按「未绑定」处理，这样「绑定网页端」入口才会出现在新用户眼前。
+    """
+    server = _binding_bound(binding) if isinstance(binding, Mapping) else None
+    if server is not None:
+        return server
+    value = profile.get("bound")
+    if isinstance(value, bool):
+        return value
+    if profile.get("node_id") or security.get("node_id"):
+        return True
+    return False if (profile or security) else None
+
+
 def _account(snapshot: Snapshot) -> View:
     account = _section(snapshot, "account")
     profile = account.get("profile") if isinstance(account.get("profile"), Mapping) else {}
     security = account.get("security") if isinstance(account.get("security"), Mapping) else {}
+    access = _section(snapshot, "access")
+    binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
+    unavailable = _missing(snapshot, ("account",))
     # 节点侧接口给的是**节点身份**（node_id/state/region/platform/bound），
     # 旧/演示形状给的是账户（email/role/2FA）；两种都如实展示，缺的字段给「—」。
     node_id = profile.get("node_id")
     email = profile.get("email")
     identity = str(node_id or email or "—")
     identity_meta = str(profile.get("state") or profile.get("role") or "—")
-    bound = profile.get("bound")
+    bound = _account_bound(profile, security, binding)
+    can_bind = bound is not True and not unavailable
     twofa = profile.get("twofa_enabled", profile.get("mfa_enabled"))
     if bound is not None:
         second = Card("节点绑定", _flag(bound, "已绑定", "未绑定"),
@@ -763,7 +786,29 @@ def _account(snapshot: Snapshot) -> View:
         fields.append(Field("角色", str(profile.get("role") or "—"), key="role"))
     if twofa is not None:
         fields.append(Field("2FA 状态", _flag(twofa, "已开启", "未开启"), key="twofa"))
+    if can_bind:
+        fields.append(Field("网页端", facts.WEB_CONSOLE_URL, key="web_console",
+                            hint="在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里"))
     fields.append(Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录"))
+    actions: list[Action] = []
+    if can_bind:
+        actions.append(Action("account.bind", "绑定网页端", primary=True))
+    actions.append(Action("account.enable_2fa", "启用双因素验证",
+                          enabled=twofa is not True,
+                          reason="已开启" if twofa is True else "登录后可用",
+                          primary=not can_bind and twofa is not True))
+    actions.append(Action("account.logout", "登出", enabled=bool(security.get("node_id")),
+                          reason=("尚未登录" if not node_id
+                                  else "本机无凭据（登出要清本机密钥）")))
+    if can_bind:
+        actions.append(Action("account.open_web", "打开网页端"))
+    notes = [str(account.get("note") or "未登录时只显示本机信息。")]
+    if can_bind:
+        notes = [
+            "绑定：在网页端 → 账户/节点 → 生成绑定码，然后点「绑定网页端」粘贴到这里"
+            "（或 djb auth --bind <码>）",
+            "网页端：" + facts.WEB_CONSOLE_URL,
+        ] + notes
     return View(
         key="account", title="账户与安全",
         subtitle="节点身份 · 绑定 · 双因素 · 登出",
@@ -771,15 +816,9 @@ def _account(snapshot: Snapshot) -> View:
                Card("本机凭据", str(security.get("storage") or "—"),
                     str(security.get("node_id") or "本机未保存"), "muted")),
         fields=tuple(fields),
-        actions=(Action("account.enable_2fa", "启用双因素验证",
-                        enabled=twofa is not True,
-                        reason="已开启" if twofa is True else "登录后可用",
-                        primary=True),
-                 Action("account.logout", "登出", enabled=bool(security.get("node_id")),
-                        reason=("尚未登录" if not node_id
-                                else "本机无凭据（登出要清本机密钥）"))),
-        unavailable=_missing(snapshot, ("account",)),
-        notes=(str(account.get("note") or "未登录时只显示本机信息。"),),
+        actions=tuple(actions),
+        unavailable=unavailable,
+        notes=tuple(notes),
     )
 
 

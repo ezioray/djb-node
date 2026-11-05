@@ -708,3 +708,77 @@ def test_today_card_says_utc_boundary_so_local_midnight_does_not_look_like_a_bug
     text = vw.build_view("earnings", snapshot).plain_text()
     card = next(line for line in text.split("\n") if line.startswith("[今日]"))
     assert "0.00" in card and "UTC" in card
+
+
+def _account_snapshot(*, binding_state: str, profile: dict | None = None,
+                      security: dict | None = None):
+    from djb_node.desktop.datasource import FakeDataSource
+
+    return FakeDataSource({
+        "account": {"profile": profile or {}, "security": security or {}, "note": ""},
+        "access": {"binding": {"state": binding_state}},
+    }, source="test").snapshot()
+
+
+def test_unbound_account_shows_bind_entry_with_code_hint_and_web_url():
+    """用户反馈「没看到绑定入口」：未绑定时账户页必须有醒目按钮 + 可照抄的步骤 + 网页地址。"""
+    from djb_node import facts
+
+    view = vw.build_view("account", _account_snapshot(binding_state="unbound"))
+    keys = [action.key for action in view.actions]
+    assert "account.bind" in keys
+    bind = next(action for action in view.actions if action.key == "account.bind")
+    assert bind.primary is True and bind.label == "绑定网页端"
+
+    text = view.plain_text()
+    assert "绑定：在网页端 → 账户/节点 → 生成绑定码" in text
+    assert "djb auth --bind <码>" in text
+    assert facts.WEB_CONSOLE_URL in text
+    assert "account.open_web" in keys                 # 地址在界面上可点开
+
+
+def test_bound_account_hides_bind_entry():
+    """已绑定（binding.state=bound）不再显示绑定按钮，避免误以为没绑。"""
+    view = vw.build_view("account", _account_snapshot(
+        binding_state="bound",
+        profile={"node_id": "n-1", "bound": True, "state": "active"},
+        security={"node_id": "n-1", "storage": "file-0600"}))
+    keys = [action.key for action in view.actions]
+    assert "account.bind" not in keys
+    assert "account.open_web" not in keys
+    assert "绑定网页端" not in view.plain_text()
+
+
+def test_bind_action_passes_code_to_cli_and_refreshes():
+    """controller 的绑定动作：一次性码只进 CLI 参数，不进消息；成功后刷新快照。"""
+    calls: list[list[str]] = []
+
+    def cli(argv):
+        calls.append(list(argv))
+        return {"ok": True}
+
+    controller = DesktopController(
+        ds.FakeDataSource({"account": {"profile": {}, "security": {}, "note": ""}},
+                          source="test"),
+        cli=cli, ask_code=lambda: "  bind-code-1  ")
+    result = controller.action("account.bind")
+    assert calls == [["auth", "--bind", "bind-code-1"]]
+    assert result.ok is True and result.effect == "refresh"
+    assert "bind-code-1" not in result.message
+
+
+def test_bind_action_cancel_and_failure_do_not_touch_credentials():
+    calls: list[list[str]] = []
+    controller = DesktopController(
+        ds.FakeDataSource({"account": {"profile": {}, "security": {}, "note": ""}},
+                          source="test"),
+        cli=lambda argv: calls.append(list(argv)) or {"ok": True},
+        ask_code=lambda: "   ")
+    cancelled = controller.action("account.bind")
+    assert calls == [] and cancelled.ok is False
+    assert "已取消" in cancelled.message
+
+    controller.ask_code = lambda: "bad-code"
+    controller.cli = lambda argv: {"ok": False, "error": "invalid_or_expired"}
+    failed = controller.action("account.bind")
+    assert failed.ok is False and "invalid_or_expired" in failed.message

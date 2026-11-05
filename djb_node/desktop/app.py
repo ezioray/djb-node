@@ -81,6 +81,8 @@ class DesktopApp:
         self._controller = controller
         if getattr(controller, "save_path", None) is None:
             controller.save_path = _make_save_path(lambda: self._root)
+        if getattr(controller, "ask_code", None) is None:
+            controller.ask_code = self._ask_bind_code
         self._bus = bus
         self._on_quit = on_quit
         self._unsubscribe = None
@@ -735,6 +737,8 @@ class DesktopApp:
             self._copy(result.payload)
         elif result.effect == "open_dir":
             self._open_dir(result.payload)
+        elif result.effect == "open_url":
+            self._open_url(result.payload)
         elif result.effect in ("refresh", "access", "bench", "control", "reload"):
             self._render(self._controller.current())
         self._update_status()
@@ -752,6 +756,27 @@ class DesktopApp:
         """只做「显示路径」：不自动调用系统文件管理器（避免在无桌面环境弹错）。"""
         if path:
             self._toast("日志目录：" + path, ok=True)
+
+    def _ask_bind_code(self) -> str | None:
+        """一次性绑定码输入框（模态；Esc/取消返回 None，不执行任何命令）。"""
+        from tkinter import simpledialog
+        from .. import facts
+        message = ("在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里。\n\n"
+                   + facts.WEB_CONSOLE_URL)
+        value = simpledialog.askstring("DJB / 绑定网页端", message, parent=self._root)
+        return str(value).strip() if value else None
+
+    def _open_url(self, url: str) -> None:
+        """用系统浏览器打开网页端；打不开就把地址留在状态栏（不静默失败）。"""
+        if not url:
+            return
+        try:
+            import webbrowser
+            opened = bool(webbrowser.open(url))
+        except Exception:
+            opened = False
+        self._toast(("已在浏览器打开：" if opened else "浏览器未能自动打开，请手动访问：") + url,
+                    ok=opened)
 
     def _toast(self, message: str, *, ok: bool = True) -> None:
         self._status.configure(text=("✓ " if ok else "! ") + message)

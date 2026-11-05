@@ -13,6 +13,7 @@ from djb_node.errors import UsageError
 from djb_node.tray import TrayAction, TrayIntent, TrayMenuItem, TrayModel
 from djb_node.tray import model as model_mod
 from djb_node.tray import notifications as tray_notify
+from djb_node.tray.model import S2_BIND_MENU_SIZE, S2_MENU_SIZE
 from djb_node.tray.notifications import from_store, summarize, title_of
 
 RUNNING = {"state": "online", "daemon_running": True, "accepting": True,
@@ -24,13 +25,26 @@ ERROR = {"state": "error", "daemon_running": True, "reason": "credential_invalid
 
 
 # ─────────────────────────────────────────────────────────── 菜单结构
-def test_menu_has_exactly_six_s2_items():
-    tray = TrayModel.build(RUNNING)
-    assert len(tray.items) == 6
-    assert tray.menu_keys == ("status", "pause", "messages", "diagnose", "logs", "quit")
-    assert [item.action for item in tray.items] == [
-        TrayAction.OPEN_STATUS, TrayAction.PAUSE, TrayAction.OPEN_MESSAGES,
-        TrayAction.DIAGNOSE, TrayAction.OPEN_LOGS, TrayAction.QUIT]
+def test_menu_is_six_base_items_plus_conditional_bind():
+    """基础 6 项固定；只有明确未绑定时才插入第 7 项「绑定网页端」（退出保持末位）。"""
+    base_keys = ("status", "pause", "messages", "diagnose", "logs", "quit")
+    unknown = TrayModel.build(RUNNING)                 # 没有 node.bound：不猜，不显示
+    assert unknown.bound is None
+    assert len(unknown.items) == S2_MENU_SIZE
+    assert unknown.menu_keys == base_keys
+
+    bound = TrayModel.build({**RUNNING, "node": {"node_id": "n-1", "bound": True}})
+    assert len(bound.items) == S2_MENU_SIZE
+    assert bound.menu_keys == base_keys
+
+    unbound = TrayModel.build({**RUNNING, "node": {"node_id": "n-1", "bound": False}})
+    assert len(unbound.items) == S2_MENU_SIZE + S2_BIND_MENU_SIZE
+    assert unbound.menu_keys == ("status", "pause", "messages", "diagnose", "bind",
+                                 "logs", "quit")
+    assert unbound.item("bind").action is TrayAction.BIND
+    intent = unbound.intent_for("bind")
+    assert intent is not None and intent.command == ("djb", "auth", "--bind", "<一次性码>")
+    assert "网页端" in intent.description
 
 
 def test_s3_entries_are_absent():

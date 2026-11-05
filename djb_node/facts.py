@@ -51,6 +51,11 @@ def _detect_platform() -> str:
 PLATFORM = _detect_platform()
 USER_AGENT = "djb-node/" + CLIENT_VERSION + " (" + PLATFORM + ")"
 
+# ─────────────────────────────────────────────────────────── 对外地址
+#: 网页端控制台地址（唯一来源）：桌面 / 托盘 / CLI 的「绑定网页端」提示都取这里，
+#: 不在各模板里散写；换域名只改这一处。
+WEB_CONSOLE_URL = "https://djb.aitokenmall.ai"
+
 # ─────────────────────────────────────────────────────────── 状态机（M15 §3 / §5.9）
 DAEMON_STATES: tuple[str, ...] = ("stopped", "starting", "online", "paused", "error", "updating")
 """daemon 运行态（M15 §3 状态机的运行侧投影）。"""

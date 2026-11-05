@@ -28,6 +28,7 @@ from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPP
 from .datasource import (SECTIONS, DataSource, LocalDataSource, ProviderError, Snapshot,
                          Unavailable, benchmark)
 from .views import VIEW_KEYS, VIEW_TITLES, View, build_view
+from .. import facts
 
 __all__ = ["ActionResult", "ControlOutcome", "DesktopController", "LocalControlChannel",
            "SUB_CONTROL", "SUB_RECEIPTS", "SUB_TASKS"]
@@ -101,6 +102,8 @@ class DesktopController:
     bus: Any | None = None
     benchmark_runner: Callable[..., Mapping[str, Any]] = benchmark
     cli: Callable[[Sequence[str]], Any] | None = None
+    #: 一次性绑定码输入通道（GUI 注入 simpledialog；无输入通道时动作返回「暂不可用」）
+    ask_code: Callable[[], str | None] | None = None
     save_path: Callable[[str], str | None] | None = None
     selected: dict[str, str] = field(default_factory=dict)
     log_level: str = "all"
@@ -351,6 +354,39 @@ class DesktopController:
         self.refresh()
         return ActionResult("已登出：节点已解绑、本机密钥已清除；重新配对后才能接单。",
                             effect="refresh")
+
+    def _act_account_bind(self, code: str | None = None, *, confirm=None) -> ActionResult:
+        """绑定网页端：取一次性码 → ``djb auth --bind <码>`` → 刷新快照。
+
+        ``code`` 可显式传入（测试 / 调用方已有码）；为 ``None`` 时走 ``ask_code`` 输入框。
+        绑定码只进子进程参数，不进日志、不回显到状态栏。
+        """
+        if code is None:
+            if self.ask_code is None:
+                return ActionResult("暂不可用（没有绑定码输入通道）", ok=False)
+            code = self.ask_code()
+        code = str(code or "").strip()
+        if not code:
+            return ActionResult("已取消绑定（没有输入绑定码）。", ok=False, effect="cancelled")
+        if self.cli is None:
+            return ActionResult("暂不可用（本机命令通道未接通）；绑定未执行。", ok=False)
+        try:
+            payload = self.cli(["auth", "--bind", code])
+        except ProviderError as exc:
+            return ActionResult("绑定未成功：" + exc.reason + "；本机凭据未改动。", ok=False)
+        except Exception as exc:
+            return ActionResult("绑定未成功（" + type(exc).__name__ + "）；本机凭据未改动。",
+                                ok=False)
+        if isinstance(payload, Mapping) and payload.get("ok") is False:
+            return ActionResult("绑定未成功：" + str(payload.get("error") or "服务端拒绝")
+                                + "；本机凭据未改动。", ok=False)
+        self.refresh()
+        return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。", effect="refresh")
+
+    def _act_account_open_web(self, *, confirm=None) -> ActionResult:
+        """在系统浏览器打开网页端（只给地址与动作，不在 controller 里碰 GUI）。"""
+        return ActionResult("网页端：" + facts.WEB_CONSOLE_URL, effect="open_url",
+                            payload=facts.WEB_CONSOLE_URL)
 
     def select_row(self, view_key: str, key: str) -> None:
         """记住当前视图选中的行（第一列文本）；动作据此作用于「这一条」。"""

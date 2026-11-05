@@ -5,7 +5,7 @@ import zipfile
 
 import pytest
 
-from djb_node import __version__
+from djb_node import __version__, facts
 from djb_node.cli import build_parser, main
 
 
@@ -82,6 +82,11 @@ def test_auth_status_and_missing_key(home, capsys):
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["bound"] is False
     assert payload["credentials"]["storage"] == "file-0600"
+    # 未绑定时文本输出要给出「网页端 → 账户/节点 → 生成绑定码」的可照抄下一步
+    assert main(["auth", "--status"]) == 0
+    text = capsys.readouterr().out
+    assert "绑定：网页端 → 账户/节点 → 生成绑定码，然后 djb auth --bind <码>" in text
+    assert facts.WEB_CONSOLE_URL in text
     assert main(["upstream", "add", "--access", "A2",
                  "--base-url", "http://127.0.0.1:11434/v1",
                  "--models", "m1"]) == 0
