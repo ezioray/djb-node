@@ -88,13 +88,36 @@ jobs:
 
   dco:
     name: DCO（Signed-off-by）
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 0 }
-      - run: |
+      - name: 逐个提交检查 Signed-off-by
+        run: |
           set -e
-          msg="$(git log -1 --pretty=%B)"; echo "$msg" | head -5
-          echo "$msg" | grep -qiE '^Signed-off-by: .+ <.+@.+>' || { echo "::error::缺 Signed-off-by"; exit 1; }
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            before="${{ github.event.before }}"
+            after="${{ github.event.after }}"
+            if [ -z "$before" ] || printf '%s' "$before" | grep -qE '^0+$'; then
+              range="$after~1..$after"
+            else
+              range="$before..$after"
+            fi
+          fi
+          echo "检查区间: $range"
+          fail=0
+          for c in $(git rev-list "$range"); do
+            who="$(git log -1 --pretty='%an <%ae>' "$c")"
+            if git log -1 --pretty=%B "$c" | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "ok   $c  $who"
+            else
+              echo "::error::commit $c ($who) 缺 Signed-off-by"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] && echo "✅ 区间内每个提交都有 Signed-off-by"
+          exit $fail
