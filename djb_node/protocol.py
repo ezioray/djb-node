@@ -32,6 +32,9 @@ PATHS: dict[str, str] = {
     "capabilities": "/api/v1/protocol/capabilities",
     "deprecations": "/api/v1/protocol/deprecations",
     "receipts": "/api/v1/node/receipts",
+    # 供方区间报价（CR-20261106-OFFICIAL-SUPPLY-01）：云端早已存在、
+    # 但客户端一直没有这条路径 ⇒ 客户端永远进不了候选集（F5 no_quote）。
+    "quotes": "/api/v1/schedule/quotes",
     # 本机回环（非开放契约，M15 §4.1 / CR-1）
     "local_models": "/v1/models",
     "local_chat": "/v1/chat/completions",
@@ -41,7 +44,11 @@ PATHS: dict[str, str] = {
 #: 客户端能力（与服务端能力取交集；未知 capability 忽略不报错）
 CLIENT_CAPABILITIES: tuple[str, ...] = (
     "chat_completions", "receipts", "policy", "capacity_announcement",
-    "upstream_probe", "protocol_negotiation")
+    "upstream_probe", "protocol_negotiation",
+    # 报价能力位（CR-20261106-OFFICIAL-SUPPLY-01）**追加在末尾**，老服务端忽略未知位。
+    # 服务端 `POST /api/v1/schedule/quotes` 不校验能力位（`app/scheduling/router.py`
+    # 只看 X-Client-Key），所以即使服务端未公告 quotes、交集为空也不影响调用。
+    "quotes")
 
 #: 接入方式（spec NodeRegisterRequest.access_modes）
 ACCESS_MODES: tuple[str, ...] = facts.ACCESS_TYPES

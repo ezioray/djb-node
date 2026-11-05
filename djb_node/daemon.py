@@ -27,7 +27,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from . import facts, machine_profile, pidfile, plan_router, policy as policy_mod, protocol
+from . import (facts, machine_profile, pidfile, plan_router, policy as policy_mod,
+               protocol)
+from . import quotes as quotes_mod
 from .api import NodeApi, PolicyFetch
 from .channel import ChannelClient, channel_enabled
 from .config import ClientConfig, Paths, feature_flag, load_config, load_config_strict
@@ -220,6 +222,16 @@ class ControlClient:
         return response
 
 
+def quotes_enabled(config: Any) -> bool:
+    """报价发布开关（``client.quotes.publish.enabled``，默认关闭）。
+
+    口径与其它子系统一致：只登记在 ``facts.FEATURE_FLAGS``，取值统一走
+    ``config.feature_flag``（到期强制关）。关闭时 daemon **不建线程、不发任何请求**，
+    行为与无报价能力的版本完全一致。
+    """
+    return feature_flag(config, facts.QUOTES_FLAG)
+
+
 # ─────────────────────────────────────────────────────────── Daemon
 class Daemon:
     def __init__(self, paths: Paths, *, config: ClientConfig | None = None,
@@ -273,6 +285,12 @@ class Daemon:
         self._notifications: NotificationStore | None = None
         self._notifications_thread: threading.Thread | None = None
         self._notifications_stop: threading.Event | None = None
+        # CR-20261106-OFFICIAL-SUPPLY-01 报价发布（默认关闭：关闭时不建线程、不发送）
+        self._quotes_thread: threading.Thread | None = None
+        self._quotes_stop: threading.Event | None = None
+        self._quotes_period_s = facts.QUOTES_PERIOD_DEFAULT_S
+        self._last_quotes: dict[str, Any] = {}
+        self._quotes_error_logged = ""
         # 运行态
         self._user_paused = bool(self.store.get_kv("user_paused", False))
         self._consecutive_failures = 0
@@ -370,6 +388,7 @@ class Daemon:
         self._start_channel()
         self._start_model_sync()
         self._start_notifications()
+        self._start_quotes()
         if self._user_paused:
             self._transition_pause("user_paused")
         return self.status()
@@ -463,6 +482,7 @@ class Daemon:
         self._start_channel()
         self._start_model_sync()
         self._start_notifications()
+        self._start_quotes()
         if self._user_paused:
             self._transition_pause("user_paused")
         return self.status()
@@ -594,6 +614,7 @@ class Daemon:
         self._stop_channel()
         self._stop_model_sync()
         self._stop_notifications()
+        self._stop_quotes()
         try:
             self.server.shutdown()
         except Exception:                                  # pragma: no cover - 防御
@@ -641,7 +662,8 @@ class Daemon:
     def _subsystem_running(self, name: str) -> bool:
         thread = {"channel": self._channel_thread,
                   "model_sync": self._model_sync_thread,
-                  "notifications": self._notifications_thread}.get(name)
+                  "notifications": self._notifications_thread,
+                  "quotes": self._quotes_thread}.get(name)
         return bool(thread is not None and thread.is_alive())
 
     def _apply_subsystem_toggles(self, fresh: ClientConfig) -> list[str]:
@@ -651,7 +673,9 @@ class Daemon:
                 ("model_sync", model_sync_enabled, self._start_model_sync,
                  self._stop_model_sync),
                 ("notifications", notifications_enabled, self._start_notifications,
-                 self._stop_notifications))
+                 self._stop_notifications),
+                # 报价发布（CR-20261106-OFFICIAL-SUPPLY-01）：开关热切换，不碰在途请求
+                ("quotes", quotes_enabled, self._start_quotes, self._stop_quotes))
         was = self.config
         for name, enabled, starter, stopper in plan:
             before, after = bool(enabled(was)), bool(enabled(fresh))
@@ -951,6 +975,117 @@ class Daemon:
                         "last_error": None, "cursor": None, "syncs": 0}
         snapshot.update({"enabled": enabled, "running": running,
                          "interval_s": facts.NOTIFICATIONS_INTERVAL_S})
+        return snapshot
+
+    # ── CR-20261106-OFFICIAL-SUPPLY-01 报价发布（默认关闭；与 channel / model_sync 同构）
+    def _quotes_period(self) -> int | None:
+        """当前发布周期（秒）。配置非法时返回 ``None``（fail-closed：本轮不发）。"""
+        try:
+            return quotes_mod.resolve_period(self.config)
+        except DjbError as exc:
+            message = str(getattr(exc, "message", None) or exc)
+            if message != self._quotes_error_logged:
+                # 同一份坏配置只记一次，避免每轮刷日志
+                self._quotes_error_logged = message
+                event("quotes.period_invalid", level="warning", error=message)
+            return None
+
+    def _start_quotes(self) -> None:
+        """开关打开时起报价线程（关闭 = 不建线程、不发任何请求）。
+
+        周期配置非法时**也起线程**，但每一轮都 fail-closed 不发（`_quotes_period()`
+        返回 ``None``）：这样（1）线程状态与「开关已开」一致，reload 回执不撒谎；
+        （2）改好配置 `djb daemon reload` 后下一轮自动恢复，不用再开关一次。
+        """
+        if not quotes_enabled(self.config):
+            return
+        if self._quotes_thread is not None and self._quotes_thread.is_alive():
+            return
+        period = self._quotes_period()
+        if period is None:
+            self._quotes_period_s = facts.QUOTES_PERIOD_DEFAULT_S
+            period = self._quotes_period_s
+        self._quotes_period_s = period
+        self._quotes_error_logged = ""
+        self._quotes_stop = threading.Event()
+        self._quotes_thread = threading.Thread(target=self._quotes_runner,
+                                               name="djb-quotes", daemon=True)
+        self._quotes_thread.start()
+        event("quotes.thread_started", period_s=period,
+              ttl_s=facts.QUOTE_TTL_MULTIPLE * period)
+
+    def _quotes_runner(self) -> None:
+        """线程体：**永不抛出**（一轮失败只记事件，不影响心跳主环与接单）。"""
+        stop = self._quotes_stop
+        if stop is None:                                       # pragma: no cover - 防御
+            return
+        while not stop.is_set():
+            period = self._quotes_period()
+            try:
+                if period is not None:
+                    self._publish_quotes(period, reason="periodic")
+            except Exception as exc:                           # pragma: no cover - 防御
+                event("quotes.publish_error", level="warning", error=type(exc).__name__)
+            interval = period if period is not None else facts.QUOTES_PERIOD_DEFAULT_S
+            if stop.wait(max(1.0, float(interval))):
+                break
+
+    def _publish_quotes(self, period_s: Any, *, reason: str = "manual") -> dict[str, Any]:
+        """发布一轮报价：生成行 → 逐行发送 → 记**一行**计数日志。
+
+        日志只有数字：本轮行数 / created / reused / failed / 跳过原因计数 / 失败分类。
+        **不记价格明细，也不记模型清单**（模型名属于供方商业信息）。
+        """
+        # 走 resolve_period 而不是只看入参：配置里 `quotes.ttl_s` 与周期不自洽时
+        # 必须 fail-closed（抛 UsageError，由调用方拦住这一轮），不能带病上行。
+        period = quotes_mod.resolve_period(self.config, period_s=period_s)
+        plan = quotes_mod.plan_quotes(self.upstreams, now=self._now(), period_s=period)
+        self._quotes_period_s = period
+        key = self.credentials.client_key()
+        result = quotes_mod.PublishResult()
+        withheld = ""
+        if not key:
+            # 未注册 = 还没有节点身份，报价一定 401：不刷请求，只记一次原因
+            withheld = "no_client_key"
+        else:
+            api = (self.api if (self.api is not None and self.api.client_key == key)
+                   else self._api_factory(self.config.gateway_url, key))
+            result = quotes_mod.publish(api, plan.rows,
+                                        node_id=self.credentials.node_id() or None)
+        self._last_quotes = {
+            "at": iso(self._now()), "reason": reason, "period_s": period,
+            "ttl_s": facts.QUOTE_TTL_MULTIPLE * period, "rows": len(plan.rows),
+            "created": result.created, "reused": result.reused, "failed": result.failed,
+            "skipped_total": plan.skipped_total, "skipped": dict(plan.skipped),
+            "error_classes": sorted({str(item.get("error")) for item in result.errors}),
+        }
+        if withheld:
+            event("quotes.publish_skipped", reason=withheld, rows=len(plan.rows))
+        else:
+            event("quotes.publish", **self._last_quotes)
+        return dict(self._last_quotes)
+
+    def _stop_quotes(self) -> None:
+        if self._quotes_stop is not None:
+            self._quotes_stop.set()
+        thread = self._quotes_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=facts.QUOTES_STOP_JOIN_S)
+        if thread is not None:
+            event("quotes.thread_joined", alive=thread.is_alive())
+        self._quotes_thread = None
+
+    def _quotes_status(self) -> dict[str, Any]:
+        """status / 诊断用：开关 / 线程 / 周期 / 上一轮计数（不含价格明细）。"""
+        enabled = quotes_enabled(self.config)
+        running = bool(self._quotes_thread is not None and self._quotes_thread.is_alive())
+        snapshot = dict(self._last_quotes or {"at": None, "rows": 0, "created": 0,
+                                              "reused": 0, "failed": 0,
+                                              "skipped_total": 0, "skipped": {},
+                                              "error_classes": []})
+        snapshot.update({"enabled": enabled, "running": running,
+                         "period_s": self._quotes_period_s,
+                         "ttl_s": facts.QUOTE_TTL_MULTIPLE * self._quotes_period_s})
         return snapshot
 
     # ── tick
@@ -1695,6 +1830,8 @@ class Daemon:
             "model_sync": self._model_sync_status(),
             # C16 消息中心（默认关闭；只暴露未读/同步/队列计数）
             "notifications": self._notifications_status(),
+            # CR-20261106-OFFICIAL-SUPPLY-01 报价发布（默认关闭；只暴露计数，不含价格）
+            "quotes": self._quotes_status(),
             "flags": {name: {"enabled": feature_flag(self.config, name), **spec}
                       for name, spec in facts.FEATURE_FLAGS.items()},
             "update": self.update.status(),

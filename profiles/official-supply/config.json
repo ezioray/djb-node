@@ -1,0 +1,17 @@
+{
+  "gateway_url": "https://gateway.example.invalid",
+  "mirror_port": 1717,
+  "update_channel": "stable",
+  "update_source": "https://update.example.invalid",
+  "log_level": "info",
+  "yield_enabled": false,
+  "extra": {
+    "feature_flags": {
+      "client.relay.enabled": true,
+      "client.probe.periodic.enabled": true,
+      "client.quotes.publish.enabled": true
+    },
+    "quotes.period_s": 60,
+    "quotes.ttl_s": 120
+  }
+}

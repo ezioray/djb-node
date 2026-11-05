@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+# 官方特供版（B 端多模型供方）· systemd 单元
+#
+# 装法见同目录 install.sh；人工装：把本文件放到 /etc/systemd/system/ 后
+#   systemctl daemon-reload && systemctl enable --now djb-official-supply
+#
+# 约定：
+#   * 运行身份 djb-supply（**非 root**），家目录 = 状态目录（SQLite / 日志 / 凭据 0600）
+#   * 入站端口：只有 127.0.0.1:1717（本机回环），不对外监听
+#   * 凭据：只在 $DJB_HOME/credentials（0600），unit 里不出现任何密钥/域名
+# ─────────────────────────────────────────────────────────────────────────────
+[Unit]
+Description=DJB 联脑 官方特供版节点（供方：报价发布）
+Documentation=https://example.invalid/djb/official-supply
+After=network-online.target
+Wants=network-online.target
+# 状态目录不存在就不启动（避免以空身份跑起来被服务端判未注册）
+ConditionPathExists=/var/lib/djb-official-supply
+
+[Service]
+Type=simple
+User=djb-supply
+Group=djb-supply
+Environment=DJB_HOME=/var/lib/djb-official-supply
+Environment=PYTHONUNBUFFERED=1
+# --no-token：不把一次性 local_token 打进 journal（需要时 djb status --show-token 读）
+ExecStart=/opt/djb-official-supply/venv/bin/djb start --foreground --no-token
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# 加固（最小权限）：只读系统、只写自己的状态目录
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/djb-official-supply
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

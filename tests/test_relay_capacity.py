@@ -56,7 +56,9 @@ def test_mapped_relay_model_enters_capacity(store, credentials, clock):
     assert entries[0]["max_qps"] > 0
     assert entries[0]["access"] == "B"
     assert entries[0]["canonical"] == "openai/gpt-4o"
-    assert entries[0]["unit"] == facts.DEFAULT_MIN_PRICE_UNIT
+    # P6（CR-20261106-OFFICIAL-SUPPLY-01）：公告的 unit 是计量单位 token，
+    # 不是价格单位 min_price_unit（云端按 (node_id, access, unit) 对齐报价）
+    assert entries[0]["unit"] == facts.CAPACITY_UNIT
 
 
 def test_unmapped_relay_model_is_not_announced(store, credentials, clock):

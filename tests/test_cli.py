@@ -10,8 +10,8 @@ from djb_node.cli import build_parser, main
 
 
 COMMANDS = ["init", "env", "auth", "start", "stop", "status", "pause", "resume",
-            "limits", "upstream", "token", "flags", "attest", "announce", "update",
-            "logs", "diagnose", "tray", "uninstall", "model-sync", "notify",
+            "limits", "upstream", "token", "flags", "attest", "announce", "quotes",
+            "update", "logs", "diagnose", "tray", "uninstall", "model-sync", "notify",
             "proxy", "gui", "plan", "daemon", "reload", "machine"]
 
 

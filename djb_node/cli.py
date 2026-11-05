@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 from typing import Any, Callable
 
 from . import __version__, facts, pidfile
@@ -41,6 +42,7 @@ from .secure import CredentialStore
 from .state import StateMachine, Snapshot
 from .store import ProfileRecord, Store, UpstreamRecord
 from . import plan_router
+from . import quotes as quotes_mod
 from . import store as store_module
 from . import tokens as tokens_mod
 from .update import UpdateManager
@@ -793,6 +795,13 @@ def cmd_upstream(args: argparse.Namespace) -> int:
     manager = UpstreamManager(store, credentials)
     action = getattr(args, "upstream_action", "list") or "list"
     if action == "add":
+        # P3（CR-20261106-OFFICIAL-SUPPLY-01）：`access=B` 不显式给 `--kind` 时，服务端会
+        # 把 kind 默认推成 `enterprise_gateway`（`app/supply/facts.py:31-32`）——中转站随即
+        # 被当成「企业网关」，`ignored_kinds` / 策略分流全部判错。所以这里**拒绝静默套默认值**。
+        if validate_access_type(args.access) == "B" and not getattr(args, "kind", None):
+            raise UsageError("B 类接入必须显式 --kind（中转站用 " + facts.RELAY_KIND
+                             + "）：不显式指定会被默认当成 enterprise_gateway，"
+                             "策略分流与 ignored_kinds 会全部判错（本次未创建上游）")
         secret = getattr(args, "secret", None)
         if getattr(args, "secret_stdin", False):
             secret = sys.stdin.readline().strip()
@@ -1394,6 +1403,120 @@ def cmd_announce(args: argparse.Namespace) -> int:
                               + ("服务端受理" if value["response"].get("accepted", True)
                                  else "服务端未受理")))
     return 0
+
+
+# ─────────────────────────────────────────────────────────── quotes（报价发布）
+#: `djb quotes show / publish` 的人读表头（只有本地可见字段）
+_QUOTES_COLUMNS = ("上游", "access", "模型", "单价(USD分/1M)", "TTL(s)", "unit")
+
+
+def _display_width(text: str) -> int:
+    """终端显示宽度（东亚全角按 2 列算，只为表格对得齐）。"""
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+               for char in text)
+
+
+def _pad_cell(text: str, width: int) -> str:
+    return text + " " * max(0, width - _display_width(text))
+
+
+def _quotes_table(value: dict[str, Any]) -> str:
+    """报价行的人读表格 + 一行脚注（周期 / TTL / 跳过原因计数）。"""
+    rows = list(value.get("rows") or [])
+    table: list[list[str]] = []
+    for row in rows:
+        table.append([str(row.get("upstream_id") or ""), str(row.get("access") or ""),
+                      str(row.get("model") or ""), str(row.get("price_min")),
+                      str(row.get("ttl_s")), str(row.get("unit") or "")])
+    header = list(_QUOTES_COLUMNS)
+    widths = [max([_display_width(header[index])]
+                  + [_display_width(item[index]) for item in table])
+              for index in range(len(header))]
+    lines = ["  ".join(_pad_cell(cell, widths[index]) for index, cell in enumerate(header)),
+             "  ".join("-" * width for width in widths)]
+    for item in table:
+        lines.append("  ".join(_pad_cell(cell, widths[index])
+                              for index, cell in enumerate(item)))
+    footer = ("周期 " + str(value.get("period_s")) + "s · TTL " + str(value.get("ttl_s"))
+              + "s · unit " + str(value.get("unit")) + " · 共 " + str(len(rows)) + " 行")
+    skipped = value.get("skipped") or {}
+    if skipped:
+        footer += " · 跳过：" + "，".join(name + "=" + str(count)
+                                        for name, count in sorted(skipped.items()))
+    lines.append(footer)
+    return "\n".join(lines)
+
+
+def _quotes_skip_summary(plan: Any) -> str:
+    skipped = dict(getattr(plan, "skipped", None) or {})
+    if not skipped:
+        return "本机没有启用中的上游模型"
+    return "跳过原因 " + "，".join(name + "=" + str(count)
+                                  for name, count in sorted(skipped.items()))
+
+
+def cmd_quotes(args: argparse.Namespace) -> int:
+    """报价能力（CR-20261106-OFFICIAL-SUPPLY-01）：`show` 看将发送的行，`publish` 真发。
+
+    * `show` / `--dry-run` **不联网**、不需要开关、不需要凭据；
+    * `publish` 需要（1）开关 `client.quotes.publish.enabled` 打开、
+      （2）本机已用 `djb auth` 拿到节点密钥 —— 报价必须挂在**自己的**节点身份上；
+    * TTL 一律 = 2 × 发布周期（P2），周期取 `--period-s` > config `quotes.period_s` > 60。
+    """
+    paths, config, store = _context(args)
+    credentials = CredentialStore(paths)
+    manager = UpstreamManager(store, credentials)
+    action = getattr(args, "quotes_action", None) or "show"
+    period_s = quotes_mod.resolve_period(config, period_s=getattr(args, "period_s", None))
+    plan = quotes_mod.plan_quotes(manager, now=utcnow(), period_s=period_s,
+                                  upstream_id=getattr(args, "id", None))
+    if action == "show":
+        _emit(plan.to_dict(), as_json=_json_flag(args), text=_quotes_table)
+        return 0
+    if action != "publish":
+        raise UsageError("未知 quotes 动作：" + str(action))
+    if not plan.rows:
+        raise UsageError("没有可报价的模型：" + _quotes_skip_summary(plan)
+                         + "；先 djb upstream probe 体检，"
+                         "再用 djb upstream price --id <id> --model <model> "
+                         "--min-price <USD/1M> 定价")
+    if getattr(args, "dry_run", False):
+        payload = dict(plan.to_dict())
+        payload["dry_run"] = True
+        payload["requests"] = [row.payload() for row in plan.rows]
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: _quotes_table(value) + "\n（--dry-run：只打印，未发送）")
+        return 0
+    if not feature_flag(config, facts.QUOTES_FLAG):
+        raise UsageError("报价发布开关关闭（默认关闭）：先 djb flags --enable "
+                         + facts.QUOTES_FLAG + "（本次未发送任何报价）")
+    api = NodeApi(config.gateway_url, client_key=credentials.require_client_key(),
+                  http=HttpClient(timeout=20.0))
+    result = quotes_mod.publish(api, plan.rows, node_id=credentials.node_id() or None)
+    payload = dict(plan.to_dict())
+    payload["result"] = result.to_dict()
+    payload["dry_run"] = False
+
+    def _publish_text(value: dict[str, Any]) -> str:
+        outcome = value.get("result") or {}
+        text = ("已发布 " + str(outcome.get("total")) + " 行：新建 "
+                + str(outcome.get("created")) + " · 复用 " + str(outcome.get("reused"))
+                + " · 失败 " + str(outcome.get("failed"))
+                + "（周期 " + str(value.get("period_s")) + "s · TTL "
+                + str(value.get("ttl_s")) + "s）")
+        errors = list(outcome.get("errors") or [])
+        if errors:
+            text += "\n失败明细：" + "；".join(
+                str(item.get("upstream_id")) + "/" + str(item.get("model")) + " → "
+                + str(item.get("error")) + "(" + str(item.get("code")) + ")"
+                for item in errors[:5])
+            if len(errors) > 5:
+                text += " …（共 " + str(len(errors)) + " 条，用 --json 看全量）"
+        return text
+
+    _emit(payload, as_json=_json_flag(args), text=_publish_text)
+    # 单行失败不影响其它行（已在 publish 内隔离），但退出码要如实反映「有失败」
+    return 0 if result.ok else facts.EXIT_ERROR
 
 
 # ─────────────────────────────────────────────────────────── update
@@ -2012,6 +2135,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     announce = add_common(cmd_announce, "announce", "手动公告容量（带模型 / 价格 / QPS）")
     announce.add_argument("--dry-run", action="store_true", help="只打印公告内容")
+
+    quotes_cmd = add_common(cmd_quotes, "quotes",
+                            "报价发布（供方）：show 看将发送的行 / publish 发布（TTL = 2 × 周期）")
+    quotes_sub = quotes_cmd.add_subparsers(dest="quotes_action", metavar="<action>")
+    quotes_show = quotes_sub.add_parser("show", help="列出将发送的报价行（不联网、不发送）")
+    quotes_show.add_argument("--id", help="只看一个上游")
+    quotes_show.add_argument("--period-s", type=int,
+                             help="发布周期（秒，默认 60；TTL = 2 × 周期）")
+    quotes_show.set_defaults(quotes_action="show")
+    quotes_publish = quotes_sub.add_parser(
+        "publish", help="发布报价（内容不变时服务端复用；需要报价开关）")
+    quotes_publish.add_argument("--id", help="只发一个上游")
+    quotes_publish.add_argument("--period-s", type=int,
+                                help="发布周期（秒，默认 60；TTL = 2 × 周期）")
+    quotes_publish.add_argument("--dry-run", action="store_true",
+                                help="只打印请求体，不发送")
+    quotes_publish.set_defaults(quotes_action="publish")
+    for child in quotes_sub.choices.values():
+        _sub_flags(child)
 
     update = add_common(cmd_update, "update", "检查 / 安装 / 回滚更新（S1 骨架，mock 源）")
     update.add_argument("--check", action="store_true", help="只检查（默认）")

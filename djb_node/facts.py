@@ -438,6 +438,47 @@ PROBE_PASS_BUDGET_S = 10
 PROBE_NOT_PROBED = "not_probed"
 """预算内没来得及探的模型：不算失败，但不进容量公告。"""
 
+# ─────────────────────────────────────────────────────────── 报价发布（CR-20261106-OFFICIAL-SUPPLY-01）
+# 口径：`design/17-官方供给与价格配置-设计方案-v1.md` §15 + CR 第 3 节 P1/P2/P4/P6。
+# 只加不改：本段不修改任何既有常量；`DEFAULT_MIN_PRICE_UNIT`（价格单位）语义不变。
+CAPACITY_UNIT = "token"
+"""容量公告与报价共用的**计量单位**（P6 单一口径；唯一出口 `upstream.capacity_unit()`）。
+
+云端口径：种子示范 `unit="token"`（cloud `app/wiring/scheduling.py:63-65`），候选集按
+`(node_id, access, unit)` 对齐报价与容量公告（`app/scheduling/matching.py:147`、
+`app/scheduling/candidates.py:238`）。写成别的值 ⇒ 节点「看不见」，F5 直接 `no_quote`。
+
+`DEFAULT_MIN_PRICE_UNIT`（`usd_per_1m_tokens`）是**价格**单位，只用于本地成本估算
+（`daemon.plan_charge` / `plan_router.estimate_cost_minor`），**不再**写进容量公告的 `unit`。
+"""
+
+QUOTES_PERIOD_DEFAULT_S = 60
+"""报价发布周期默认值（秒）：P=60 → TTL=120（见 `QUOTE_TTL_MULTIPLE`）。"""
+QUOTES_PERIOD_MIN_S = 10
+"""周期下限（秒）：比这更密只是空转（内容不变时云端原样复用、不续期）。"""
+QUOTES_PERIOD_MAX_S = 43200
+"""周期上限（12 h）：TTL = 2 × P 必须 ≤ 86400，否则云端 `quotes.register` 直接拒绝。"""
+QUOTE_TTL_MULTIPLE = 2
+"""TTL 必须 = 2 × 发布周期（P2）。
+
+云端 `app/scheduling/quotes.py:127-135`：内容指纹相同就**原样返回、不延长**
+`expires_at`。TTL 只比周期大一点点，就会出现「每到周期末尾节点掉出候选集」的空档；
+TTL 远大于周期又会让停供后仍被调度（回滚不干净）。取 2 倍是唯一安全档。
+"""
+QUOTE_TTL_MAX_S = 86400
+"""云端 `ttl_s` 硬上限（必须是 1–86400 的整数）。"""
+QUOTE_CURRENCY = "USD"
+"""报价币种（S1 仅 USD；云端 `check_currency` 对非 USD 直接拒绝，INV-13）。"""
+QUOTES_STOP_JOIN_S = 5.0
+"""停报价线程时 join 的上限（秒），与其它子系统同口径。"""
+
+PROBE_FRESH_AFTER_S = 600
+"""报价门控的探针新鲜窗口（秒），**比 `PROBE_FRESH_S`(900) 更保守**。
+
+云侧候选门控是 900 s（`app/supply/facts.py` 的 verified_at 口径）。客户端提前 300 s
+就停止为该模型报价，避免「本地算新鲜、云侧已判过期」的半窗口掉档（P4：探针失败即停发）。
+"""
+
 # ─────────────────────────────────────────────────────────── 特性开关（默认关闭 + 三字段）
 # 口径（Lead 集成）：FEATURE_FLAGS 是共享登记表；本卡只追加 client.token.compare.enabled。
 # 条目形状统一为 default / owner / expire_at / rollback_rule / description。
@@ -485,6 +526,19 @@ FEATURE_FLAGS["client.probe.periodic.enabled"] = {
     "description": "客户端周期复探（L2/L3），默认关闭",
 }
 PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
+
+# ── 报价发布开关（CR-20261106-OFFICIAL-SUPPLY-01；默认关闭 + 三字段）
+# 回滚路径就是这一条：置 false → daemon 报价环停发、CLI publish 拒发，
+# 已发报价 ≤ TTL（2 × 周期）自然过期，无残留、无需迁移。
+FEATURE_FLAGS["client.quotes.publish.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "关闭 → 停发新报价（daemon 报价环不启动、CLI publish 拒发）；"
+                     "已发报价 ≤ TTL 自然过期，不改账本、无残留",
+    "description": "客户端周期报价发布（design/17 §15；TTL=2×周期），默认关闭",
+}
+QUOTES_FLAG = "client.quotes.publish.enabled"
 
 # ─────────────────────────────────────────────────────────── C10c 出站长轮询通道
 # 口径：客户端不开放入站端口，主动长轮询平台取 job → 调本机 127.0.0.1 镜像端点执行 →

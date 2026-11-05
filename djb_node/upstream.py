@@ -12,7 +12,9 @@
 * 申报只上行 access_type / base_url / models / protocol / credential_handle；**凭据永不上行**
   （H1 / INV-02），credential_handle 只是本地引用名。
 * 统一端点形态：base_url + /chat/completions、/models（base 以 /v1 结尾时不再重复拼）；
-* 逐模型开关与最低价（min_price）保存在本地；价格只作公告输入，不作为结算依据。
+* 逐模型开关与最低价（min_price / min_price_unit）保存在本地；价格只作公告输入，
+  不作为结算依据。公告 / 报价的 **计量单位** 一律走 :func:`capacity_unit`
+  （= ``token``，P6）；``min_price_unit`` 只留给本地成本估算（``daemon.plan_charge``）。
 * A2 五字段 = endpoint / model / credential_ref / concurrency_limit / receipt_sample
   （M02 CR-6 裁决）；A2 prompt 模板五段 = 目标 / 约束 / 输入 / 输出 / 验收（03-facts §11）。
 """
@@ -305,6 +307,21 @@ def _error_class(exc: BaseException) -> str:
     return "unreachable"
 
 
+def capacity_unit() -> str:
+    """容量公告与报价共用的**计量单位**（P6 单一来源，CR-20261106-OFFICIAL-SUPPLY-01）。
+
+    返回固定值 ``"token"``（``facts.CAPACITY_UNIT``）。云端候选集按
+    ``(node_id, access, unit)`` 对齐报价与容量公告，两边只要有一个字不同，
+    节点就永远进不了候选集（F5 ``no_quote``），所以这里**只有这一个出口**。
+
+    历史上的缺陷：容量公告把**价格单位** ``entry.min_price_unit``
+    （默认 ``usd_per_1m_tokens``）写进了 ``unit``。``min_price_unit`` 从此只作
+    本地成本估算口径（``daemon.plan_charge`` → ``plan_router.estimate_cost_minor``），
+    不再出现在任何上行公告里。
+    """
+    return facts.CAPACITY_UNIT
+
+
 # ─────────────────────────────────────────────────────────── 管理
 class UpstreamManager:
     def __init__(self, store: Store, credentials: CredentialStore, *,
@@ -502,7 +519,8 @@ class UpstreamManager:
                         "max_qps": (per_model_qps
                                     if (record.id, entry.id) in live_relay else 0.0),
                         "ask_price": str(entry.min_price or "0"),
-                        "unit": entry.min_price_unit,
+                        # P6：公告的 unit 是**计量单位**（token），不是价格单位
+                        "unit": capacity_unit(),
                         "resource_level": str(profile.preset),
                         "canonical": str(target.get("canonical") or ""),
                     })
@@ -517,7 +535,8 @@ class UpstreamManager:
                     "model": entry.id,
                     "max_qps": per_model_qps if (record.id, entry.id) in live else 0.0,
                     "ask_price": str(entry.min_price or "0"),
-                    "unit": entry.min_price_unit,
+                    # P6：同 relay 分支，公告 unit 一律走单一来源（token）
+                    "unit": capacity_unit(),
                     "resource_level": str(profile.preset),
                 })
         return entries

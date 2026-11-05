@@ -42,6 +42,7 @@ S2 P1 增量（2026-10-24，默认开关关闭）：平台抽象层（Windows/ma
 | djb flags | 查看 / 设置本机特性开关（登记表见 facts.FEATURE_FLAGS，默认关闭） | --enable NAME / --disable NAME |
 | djb attest | 查看本地模型身份证明记录（客户端线索，不自我宣称 verified） | --id --model |
 | djb announce | 手动公告容量（模型 / 价格 / QPS） | --dry-run |
+| djb quotes | 供方报价：`show` 看将发送的行（不联网）/ `publish` 发一轮（TTL 恒 = 2 × 周期） | show / publish [--id] [--period-s N] [--dry-run] |
 | djb update | 更新骨架：检查 / 安装 / 回滚 / 状态 | --check --apply --rollback --status --source --channel |
 | djb logs | 查看脱敏日志（7 天保留） | --tail N --follow --level info\|debug\|warning\|error |
 | djb diagnose | 生成脱敏诊断包（无凭据 / 无正文） | --output PATH |
@@ -58,12 +59,14 @@ S2 P1 增量（2026-10-24，默认开关关闭）：平台抽象层（Windows/ma
 | 公告门控 | 只有 `verified` + 15 min 内新鲜 + 启用的模型拿正 QPS；未验证/过期模型 `max_qps=0` | 无（随探针） | — |
 | token 计数 | `djb token count --model M --text ...`；返回 tokens / tokenizer / estimated；无 tiktoken 时启发式（中文 ≈1 token/字） | `client.token.compare.enabled`（差异检测） | 关闭 → 只记录上游 usage，不比较 |
 | 第三方中转站 | `djb upstream add --kind third_party_relay --auth bearer --secret-stdin` → `discover` → `map`；未映射不公告 | `client.relay.enabled` | 关闭 → 隐藏写路径；已有配置只读、不删除 |
+| 报价发布（供方） | `djb quotes show / publish`；daemon 按 `quotes.period_s`（默认 60 s）周期报价，`ttl_s` 恒 = 2 × 周期；0 价 / 未定价 / 探针不新鲜（> 600 s）/ 未验证一律不发；同一 `(access, model, unit)` 只发最低价一条 | `client.quotes.publish.enabled` | 关闭 → 停发新报价（daemon 报价环不启动、CLI publish 拒发）；已发报价 ≤ TTL 自然过期，不改账本 |
 | 模型身份证明 | 客户端产出 L0–L5 证据线索，`djb attest` 查看；本地不宣称 verified | `supply.attestation.enabled` | 关闭 → 回退 L2 可达性；已存证明只读 |
 | 多 plan 组 | `djb plan group add --name main --day 1.00 --month 30.00` → `add-upstream --group main --id <upstream>`；请求按组 priority → 成员 priority → 同档 weight 选一个上游，429/401/403/5xx/超时会换下一个（最多 3 次），组预算（日/月，USD，minor 整数）耗尽整组跳过 | `plan.groups` | 关闭（默认即关）→ 退回单上游 `route()` 路径，库表与 spent_* 只读保留；库版本只前进（v4） |
 | 平台抽象层 | `platform.paths` / `service` / `credentials`；Linux 路径与 S1 逐字一致，macOS/Windows 默认目录按系统约定 | 无 | — |
 
 开关三字段（owner / expire_at / rollback_rule）登记在 `djb_node/facts.py`；`djb flags` 只能改登记过的开关，
-到期强制关。开关改动写 `config.json` 的 `extra.feature_flags`，**重启 daemon 生效**。
+到期强制关。开关改动写 `config.json` 的 `extra.feature_flags`；`djb daemon reload` 可热启停
+`channel` / `model_sync` / `notifications` / `quotes` 四个子系统线程，其余开关**重启 daemon 生效**。
 
 **尚未接线**：`LocalApiServer(settings=...)` 已由 daemon 注入用于 token 差异检测；relay 发现结果进入容量公告、
 服务端 L3+ 定级、真实出站长连接（C10）、托盘消息中心（C15/C16）在 P2。

@@ -46,6 +46,12 @@ class MockServer:
         self.requests: list[dict[str, Any]] = []
         self.heartbeats: list[dict[str, Any]] = []
         self.receipts: list[dict[str, Any]] = []
+        # CR-20261106-OFFICIAL-SUPPLY-01 报价：内容指纹命中即复用（created=false，
+        # 与云端 quotes.register 一致：不升版本、不延长 expires_at）
+        self.quotes: list[dict[str, Any]] = []
+        self.quote_keys: dict[tuple, str] = {}
+        self.quote_fail_models: set[str] = set()
+        self.quote_status = 201
         self.policy_version = POLICY_VERSION
         self.policy_issued_at: str | None = None
         self.policy_updated = True
@@ -218,6 +224,30 @@ class MockServer:
                 if path == "/api/v1/node/upstream/probe":
                     self._json(200, {"upstream_id": body.get("upstream_id"),
                                      "state": "verified", "recorded_at": _iso_now()})
+                    return
+                if path == "/api/v1/schedule/quotes":
+                    # 云端契约：X-Client-Key 鉴权；body {node_id?, access, model, unit,
+                    # price_min, price_max?, ttl_s, currency?}；201 + 扁平 QuoteAck
+                    if not outer._authed(self):
+                        return
+                    outer.quotes.append(body)
+                    model = body.get("model")
+                    if model in outer.quote_fail_models:
+                        self._error(400, 40001, "mock quote rejected")
+                        return
+                    if outer.quote_status != 201:
+                        self._error(outer.quote_status, 50001, "mock quote failure")
+                        return
+                    fingerprint = (body.get("node_id") or NODE_ID, body.get("access"),
+                                   model, body.get("unit"), body.get("price_min"),
+                                   body.get("price_max"), body.get("ttl_s"),
+                                   body.get("currency"))
+                    created = fingerprint not in outer.quote_keys
+                    quote_id = outer.quote_keys.setdefault(
+                        fingerprint, "q-" + str(len(outer.quote_keys) + 1))
+                    self._json(201, {"quote_id": quote_id, "state": "active",
+                                     "quote_version": 1 if created else 1,
+                                     "expires_at": _iso_now(), "created": created})
                     return
                 if path == "/api/v1/node/receipts":
                     if not outer._authed(self):

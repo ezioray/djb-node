@@ -10,6 +10,7 @@
     POST /api/v1/node/heartbeat           200  心跳 + 容量公告
     POST /api/v1/node/upstream            200  申报 A1/A2/B（只报 credential_handle）
     POST /api/v1/node/upstream/probe      200  上报**本地**体检结论（服务端不探测）
+    POST /api/v1/schedule/quotes          201  供方区间报价（内容不变时复用，不延长 TTL）
     GET  /api/v1/node/policy              200 / 304（If-None-Match = policy_version）
     GET  /api/v1/protocol/capabilities    200
     GET  /api/v1/protocol/deprecations    200
@@ -167,6 +168,26 @@ class NodeApi:
                               timeout=20)
         body = response.json()
         return body if isinstance(body, dict) else {}
+
+    # ─────────────────────────────────────────────────────── 报价（CR-20261106-OFFICIAL-SUPPLY-01）
+    def publish_quote(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST /api/v1/schedule/quotes 发布一条区间报价（201；内容不变时服务端复用）。
+
+        请求体**照云端契约抄，字段名不要改**：``{node_id?, access, model, unit,
+        price_min, price_max?, ttl_s, currency?}``；``price_min`` / ``price_max`` 是
+        **USD 分的整数**（每 1M tokens）。响应 ``{quote_id, state, quote_version,
+        expires_at, created}``。
+
+        错误分类与既有方法一致（:func:`raise_for_response`）：401 凭据 / 403 状态 /
+        404 节点不存在 / 409 冲突 / 429 限流 / 5xx 网络。**故意不带幂等键**：
+        幂等键会在账本侧回放旧响应，导致过期报价永远不再登记（见 `quotes.py` 注释）。
+        """
+        response = self._call("POST", protocol.PATHS["quotes"], json_body=payload,
+                              timeout=20)
+        body = response.json()
+        if not isinstance(body, dict) or not body.get("quote_id"):
+            raise NetworkError("报价响应缺少 quote_id（契约不匹配）", code=50001)
+        return body
 
     # ─────────────────────────────────────────────────────── 策略
     def policy(self, *, if_none_match: str | None = None) -> PolicyFetch:
