@@ -17,9 +17,10 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
-  # 2026-11-05 定版（决策人 ezio）：1.4.0 之后落地 14 条加性路径（199→213）一直没升
-  # 版本号，现按 MINOR 定为 1.5.0；1.4.0 的可复现内容固定为提交 2343a35（199 路径）。
-  version: 1.5.0
+  # 2026-11-05 二次发布：加性新增 `GET /api/v1/auth/captcha`（防撞库验证码）与
+  # LoginRequest 两个可选字段 `captcha_id`/`captcha_answer`、错误码 40111/40112，
+  # 按 MINOR 定为 1.6.0（213→214 路径；1.5.0 固定为提交 5e65b32）。
+  version: 1.6.0
   # 2026-11-04 审计：此处原先硬编码「157 路径 / 181 操作」——那是 node 快照期的数字，
   # 与文件实测（213/252）不符，且每次加性变更都会让它更假。规模数字一律由
   # `reports/RC-2026-11-03/audit/tools/check-spec-single-source.py` 现算，不写进正文。
@@ -2665,6 +2666,9 @@ paths:
         **不区分**「账号不存在」与「口令错误」（防枚举）；失败锁定与风控只给
         429 / 403 + 粗粒度原因码，不含阈值与名单。扫码登录的**轮询中间态**复用本条端点：
         票据未确认时返回 `202` + `ScanStatus`，确认后返回 `200` 令牌。
+        401 除 `40110`（凭据错误）外，另有：`40111 captcha_required`（阈值触发但请求未带
+        验证码，响应体 `error.captcha_required=true`）与 `40112 captcha_invalid`
+        （验证码不存在/过期/已用/次数用尽/答案错，同一码不泄露分支）。
       security: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -2698,6 +2702,35 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/captcha:
+    get:
+      tags: [user]
+      summary: 获取登录防撞库验证码（自绘 SVG）
+      operationId: createAuthCaptcha
+      description: |
+        公开端点（登录前可调，`security: []`）。签发一次性验证码：4 位、大小写不敏感、
+        TTL 300 秒、单张最多校验 5 次（第 5 次失败即作废）。答案**只以** sha256(salt:answer)
+        落库，响应与日志都不含明文。图片为服务端自绘 SVG（无 `<text>` 节点，不受字体影响）。
+        `Cache-Control: no-store` 必须由客户端/网关原样透传（一次性凭证不得进任何缓存）。
+        开关 `identity.captcha` 关闭时整条端点 404（`40401 captcha_disabled`），
+        客户端应按「该端点不存在」处理（降级为不带验证码的登录）。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 签发成功（`expires_in` 固定 300 秒）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+            Cache-Control:
+              description: '固定 `no-store`（同时给 `Pragma: no-cache`）'
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaptchaChallenge' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /api/v1/auth/register/request:
     post:
@@ -8944,6 +8977,12 @@ components:
                 `50000` 为「内部错误」。客户端应按 `code` 区分是否可重试；按 HTTP 状态分流的实现不受影响。
 
                 未登记的码一律不返回；新增码先改本 spec 与 04 码段表。其余以产品设计 §6.3 与附录 C.4 为准。
+            captcha_required:
+              type: boolean
+              description: |
+                仅登录防撞库场景出现（HTTP 401 / `40111`、`40112`）：`true` 表示客户端应
+                先取 `GET /api/v1/auth/captcha` 并带 `captcha_id` + `captcha_answer` 重试。
+                其他错误不返回该字段。
             message:
               type: string
               description: 人类可读，不含内部堆栈/规则细节/凭据。
@@ -10587,6 +10626,35 @@ components:
         mfa_code:
           type: string
           description: 二次认证码（账号启用 MFA 时必填）。
+        captcha_id:
+          type: string
+          maxLength: 64
+          description: |
+            服务端要求人机验证时必填。触发条件：同一 `identifier` + 客户端 IP 在 10 分钟内
+            登录失败 ≥3 次 → 后续登录返回 `401 / 40111`（`captcha_required=true`），
+            客户端取图后带 `captcha_id` + `captcha_answer` 重试同一端点。
+            未触发时传了也被忽略（不报错）。
+        captcha_answer:
+          type: string
+          maxLength: 32
+          description: 验证码答案（大小写不敏感；一次性；单张最多 5 次；300 秒过期）。
+
+    CaptchaChallenge:
+      type: object
+      additionalProperties: false
+      required: [captcha_id, svg, expires_in]
+      properties:
+        captcha_id:
+          type: string
+          minLength: 8
+          maxLength: 64
+          description: 一次性验证码 id（登录时回传）。
+        svg:
+          type: string
+          description: 自绘 SVG 文本（`<svg` 开头，宽 168 / 高 62，viewBox 同尺寸）。
+        expires_in:
+          type: integer
+          description: 有效期（秒），固定 300。
 
     RegistrationRequest:
       type: object

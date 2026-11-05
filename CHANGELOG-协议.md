@@ -3,6 +3,30 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.6.0 · 2026-11-05 · MINOR
+
+**类型**：MINOR（纯加性：+1 路径、+2 可选请求字段、+1 错误字段、+2 数字错误码；无删除/无类型更改）。
+
+**新增路径（1）**
+- `GET /api/v1/auth/captcha`（`createAuthCaptcha`，`security: []`）：登录防撞库图形验证码。
+  响应 `{captcha_id, svg, expires_in}`，`Cache-Control: no-store`；开关 `identity.captcha` 关闭时 404。
+
+**加性字段**
+- `LoginRequest` 追加可选 `captcha_id` / `captcha_answer`（不传时语义与 1.5.0 完全一致）。
+- `Error.error` 追加可选 `captcha_required: boolean`（仅 40111/40112 返回）。
+
+**错误码登记**
+- `40111 captcha_required`、`40112 captcha_invalid`（均 HTTP 401；不泄露失败分支）。
+
+**影响面**
+- 客户端：可忽略新字段；需要处理验证码时按 40111 → 取图 → 带两字段重试。
+- 云端：实现先行（cloud `0de874a`），本版为契约追认；老客户端零影响。
+- 管理面：无变化。
+
+**兼容矩阵**：v1 未发布，N/N-1/N-2 不适用；1.5.0 客户端可直接对接 1.6.0 服务端。
+
+**复核人**：lead（制单/实现）· cloud-auth（安全实现）
+
 ## 1.5.0 · 2026-11-05 · MINOR
 
 **类型**：MINOR（纯加性 + 路径参数改名；**无删除、无操作删除、无 schema 删除、无类型更改**）。
