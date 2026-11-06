@@ -34,6 +34,8 @@ NEXT_STEP: dict[str, str] = {
     "receipt_backlog": "收据积压超过 24 小时：已停止接单；恢复网络后自动补传（djb status 查看）",
     "upstream_invalid": "上游不可用：djb upstream probe 后修正端点/模型",
     "credential_invalid": "凭据失效：djb auth --set-key 更换密钥，或重新绑定",
+    "account_pending": "等待平台审核（通常 1 个工作日内）：审核通过后自动上线，"
+                       "无需重新绑定；进度见网页端「账户 / 节点」",
     "account_frozen": "账户/节点被冻结：查看平台通知并申诉；本地配置与在途收据保留",
     "retired": "节点已清退：不再接单；如需继续请重新注册",
     "update_failed": "更新失败已回滚：djb update --status 查看原因，修复后重试",
@@ -178,6 +180,7 @@ def reason_label(reason: str | None) -> str:
         "receipt_backlog": "收据积压",
         "upstream_invalid": "上游失效",
         "credential_invalid": "凭据失效",
+        "account_pending": "等待平台审核",
         "account_frozen": "账户冻结",
         "retired": "已清退",
         "update_failed": "更新失败已回滚",

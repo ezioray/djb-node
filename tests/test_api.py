@@ -124,6 +124,25 @@ def test_raise_for_response_mapping():
     assert generic.code == 50000
 
 
+def test_raise_for_response_lifts_forbidden_state():
+    """40305 的 error.state 要进 details：上层文案靠它分流（pending ≠ frozen）。"""
+    import json
+
+    def response(body):
+        return HttpResponse(status=403, headers={},
+                            body=json.dumps(body).encode())
+
+    exc = raise_for_response(response({"error": {
+        "type": "invalid_request_error", "code": 40305, "message": "节点状态不允许该动作",
+        "request_id": "r", "state": "pending", "action": "wait_approval"}}), what="x")
+    assert exc.details["state"] == "pending"
+    # 老服务端不带 state：不加字段，也不编一个
+    legacy = raise_for_response(response({"error": {
+        "type": "invalid_request_error", "code": 40305, "message": "frozen",
+        "request_id": "r"}}), what="x")
+    assert "state" not in legacy.details
+
+
 def test_protocol_compatibility():
     assert protocol.is_protocol_compatible("1.0.0")
     assert not protocol.is_protocol_compatible("2.0.0")
