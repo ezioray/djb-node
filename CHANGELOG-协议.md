@@ -3,88 +3,125 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
-## 1.6.0 · 2026-11-05 · MINOR
+## 1.7.0 · 2026-11-07 · MINOR（实现先行 / spec 补登）
 
-**类型**：MINOR（纯加性：+1 路径、+2 可选请求字段、+1 错误字段、+2 数字错误码；无删除/无类型更改）。
+> 背景：邮箱验证码登录与「可信设备免码」在 2026-11-04 就已实现并上线（`app/identity/email_otp.py`
+> 的 2 条路由、`app/identity/trusted_devices.py` 的 3 个操作），但 spec 一直没登记。
+> 2026-11-07 治理审计（`reports/GOV-20261107/`）把「实现先行、契约缺登记」列为契约缺口，
+> 本条目按**只加不改**把已上线的能力补登进契约，不动任何既有字段语义。
 
-**新增路径（1）**
-- `GET /api/v1/auth/captcha`（`createAuthCaptcha`，`security: []`）：登录防撞库图形验证码。
-  响应 `{captcha_id, svg, expires_in}`，`Cache-Control: no-store`；开关 `identity.captcha` 关闭时 404。
+**类型**：纯加性（0 删除、0 类型更改、0 既有 path / schema 语义变更）
 
-**加性字段**
-- `LoginRequest` 追加可选 `captcha_id` / `captcha_answer`（不传时语义与 1.5.0 完全一致）。
-- `Error.error` 追加可选 `captcha_required: boolean`（仅 40111/40112 返回）。
+**实测规模**（同一计数器：`reports/RC-2026-11-03/audit/tools/check-spec-single-source.py`）
 
-**错误码登记**
-- `40111 captcha_required`、`40112 captcha_invalid`（均 HTTP 401；不泄露失败分支）。
+| 节点 | 路径 | 操作 | schema | `info.version` |
+| --- | --- | --- | --- | --- |
+| `f408cbf`（最后一次标 1.6.0 的提交） | 214 | 253 | 340 | 1.6.0 |
+| 本提交 | **218** | **258** | **348** | **1.7.0** |
 
-**影响面**
-- 客户端：可忽略新字段；需要处理验证码时按 40111 → 取图 → 带两字段重试。
-- 云端：实现先行（cloud `0de874a`），本版为契约追认；老客户端零影响。
-- 管理面：无变化。
+**变更**（4 条路径 / 5 个操作 / 8 个 schema，全部为新增）
 
-**兼容矩阵**：v1 未发布，N/N-1/N-2 不适用；1.5.0 客户端可直接对接 1.6.0 服务端。
+1. `POST /api/v1/auth/login/email-otp/request` — 邮箱验证码登录第一步（发码；可信设备命中时免码直登，200 直接给会话）
+2. `POST /api/v1/auth/login/email-otp/verify` — 第二步（校验并签发会话）
+3. `GET /api/v1/user/trusted-devices` — 本人可信设备列表（只回哈希前缀，原始 IP/UA 不可回读）
+4. `DELETE /api/v1/user/trusted-devices` — 撤销全部（退出所有设备）
+5. `DELETE /api/v1/user/trusted-devices/{device_id}` — 撤销单台（他人/不存在/已撤销统一 404）
+6. 新 schema：`EmailOtpLoginRequest`、`EmailOtpLoginVerifyRequest`、`EmailOtpLoginAccepted`、
+   `EmailOtpLoginSession`、`TrustedDevice`、`TrustedDeviceList`、`TrustedDeviceRevoked`、
+   `TrustedDevicesRevokedAll`
 
-**复核人**：lead（制单/实现）· cloud-auth（安全实现）
+**兼容矩阵**：旧客户端不受影响（新路径不在任何旧调用面上）；新客户端按 `trusted`/`skip_otp`
+判断是否走了免码路径。两条端点与三条设备端点均受开关控制，关闭时 404（客户端应按「端点不存在」降级）。
 
-## 1.5.0 · 2026-11-05 · MINOR
+**已知边界**：`cloud` CI 仍从 `djb-node@b199610` 拉契约当真相源（第 4 份副本），
+要等 node 推送新提交 + 改 `SPEC_REF` 才对齐（`reports/GOV-20261107/06-ACTIONS.md` P1-1）。
 
-**类型**：MINOR（纯加性 + 路径参数改名；**无删除、无操作删除、无 schema 删除、无类型更改**）。
-本条同时把仓库里落后的 1.3.0 副本补齐到 1.4.0/1.5.0 的实际契约面：
-**157 → 213 路径（+56）/ 181 → 252 操作（+71）/ 289 → 339 schema（+50）**。
+**复核人**：lead（自审）；待 release-manager 在发布窗口内一并确认。
 
-**背景（为什么一次跳两个版本）**
-- 1.4.0 定版内容为提交 `2343a35`（199 路径），但仓库副本一直停在 1.3.0/157 路径；
-- 1.4.0 之后又落了 **14 条加性路径**（199 → 213），提交信息用的是 `spec(1.2.10)` 这类
-  与文件头两套编号 —— 版本号与提交信息都对不上（2026-11-04 审计 `D-SPEC-01`）；
-- 2026-11-05 定版（决策人 ezio）：按 MINOR 统一为 **1.5.0**，1.4.0 的可复现内容固定为
-  提交 `2343a35`。本条把两个版本的账一起记，此后以本文件为唯一真相源。
+## 1.6.0 · 2026-11-05 · MINOR（补记：发布时漏写本文件）
 
-**新增路径 56 条（+71 操作）**
-| 前缀 | 条数 | 归属 |
-|---|---|---|
-| `/api/v1/admin` | 18 | 后台：账户、节点、配置发布（approve/promote）、账本摘要、模型同步（publish/rollback）、供应完整性（holds/canary/sampling）、工单、token-route 授权 |
-| `/api/v1/user` | 19 | 用户面：节点代理授权、托管、工单、账本、用量 |
-| `/api/v1/node` | 7 | 节点面：公告、通知 ack/read、能力上报 |
-| `/api/v1/auth` | 3 | 认证：step-up 等 |
-| `/api/v1/tickets` | 3 | 工单 |
-| `/api/v1/hosted` | 2 | 托管 |
-| `/api/v1/internal` | 2 | 内部面 |
-| `/api/v1/treasury` | 2 | 资金 |
+**类型**：纯加性（1 条路径 + `LoginRequest` 2 个可选字段 + 2 个错误码）
 
-**路径参数改名 12 条**（URL 形状不变，只把 `{id}` 改成具名参数，便于 SDK 生成与契约测试定位）
-- `config/publish-requests/{id}/{approve,promote}` → `{request_id}`
-- `model-sync/bundles/{id}/{publish,rollback}` → `{bundle_id}`
-- `supply/integrity/holds/{id}`、`/release` → `{hold_id}`
-- `supply/integrity/canary/runs/{id}/result` → `{run_id}`
-- `supply/integrity/sampling/draws/{id}/result` → `{draw_id}`
-- `supply/integrity/sampling/epochs/{id}`、`/reveal` → `{epoch_id}`
-- `node/notifications/{id}/{ack,read}` → `{notification_id}`
+**变更**
 
-**影响面**
-- cloud：契约测试、admin 路由、配置发布链路（本节新增键均为已实现路径的登记）；
-- node：`daemon` 的节点面/通知面路径参数名变化，只影响 SDK 生成的形参名，不影响 URL；
-- SDK / 文档站：新增 56 条路径与 50 个 schema；`{id}` → 具名参数属**签名改名**，
-  已按 tolerant 方式处理（同一 URL 仍匹配）。
+1. `GET /api/v1/auth/captcha` — 防撞库验证码（自绘 SVG、一次性、4 位大小写不敏感）
+2. `LoginRequest.captcha_id` / `captcha_answer` — 可选，未开验证码时不传
+3. 错误码 `40111` / `40112` — 验证码缺失/错误（只给粗粒度原因码，不写阈值）
 
-**兼容矩阵**
-- v1 未发布（无 tag）→ N / N-1 / N-2 不适用；无存量客户端。
-- 破坏性变更：**无删除**；12 条路径参数改名不改变 URL 与请求体，客户端按 URL 调用不受影响。
-- 老请求：不带新增可选字段 → 行为不变。
-- 老节点：不实现新增路径 → cloud 侧对应路由返回既有错误码，不静默降级。
+**规模**：213 → 214 路径（`info.version` 1.5.0 → 1.6.0，定版提交 `f408cbf`）。
 
-**门禁与证据**
-- 逐条比对（2026-11-05）：按方法级核对，`node 157 条路径 / 181 操作`在 1.5.0 中**全部存在**
-  （缺失 0 / 操作缺失 0），新增均为加性。
-- `reports/RC-2026-11-03/audit/AUDIT-2026-11-04-FULL.md` §3（版本混乱实测）
-- `reports/RC-2026-11-03/audit/GAP-CLOSURE-20261104.md` §C2
+## 1.5.0 · 2026-11-05 · MINOR（2026-11-02 落地 / 2026-11-04 补记 / 2026-11-05 定版）
 
-**复核人**：lead（提议 / 实现）· release-manager（发布窗口内复核并打 tag `spec-1.5.0`）
+> 2026-11-04 全量审计（`D-SPEC-VER-01`）发现：`spec/openapi.yaml` 的 `info.version` 停在
+> **1.4.0**，但 1.4.0 之后又加进来 **14 条路径**，既没升版本号，也没有本文件的条目。
+> 下面照实补记（只记事实；不改历史条目、不改已发布的数字）。
+> **2026-11-05 定版**：决策人 ezio 定为 **1.5.0（MINOR）**——14 条是**新增路径**（能力增长），
+> 不按 errata（1.4.1）记账；1.4.0 的可复现内容固定为 `2343a35`（199 路径），历史不重写。
 
-**备注**
-- 本仓库包版本（`pyproject.toml`）**不动**：协议版本与守护进程包版本是两套编号，本次只补协议面。
-- 缺 tag 台账：`spec-1.2.12` / `spec-1.2.13` 当时未打 tag、`1.3.0` / `1.4.0` 从未打 tag，
-  由 release-manager 在打 `spec-1.5.0` 时一并注记。
+**类型**：纯加性（0 删除、0 类型更改、0 既有 path / schema 语义变更）
+
+**实测规模**（同一计数器：`reports/RC-2026-11-03/audit/tools/check-spec-single-source.py`）
+
+| 节点 | 路径 | 操作 | schema | `info.version` |
+| --- | --- | --- | --- | --- |
+| `2343a35`（最后一次标 1.4.0 的提交） | 199 | 235 | 325 | 1.4.0 |
+| 定版提交（2026-11-05） | **213** | **252** | **339** | **1.5.0** |
+
+**变更**（按落地提交；这些提交信息写的是 `spec(1.2.10)`，与文件头的 1.4.0 是两套编号）
+
+1. `5efcc0c` `POST /api/v1/user/nodes/{node_id}/binding-code`（BUG-05）
+2. `ffe5305` `POST /api/v1/auth/mfa/verify`（TOTP pending 完成）
+3. `d895d4e` TOTP 四条：`GET|POST /api/v1/user/mfa/totp`、`/totp/enroll`、`/totp/confirm`、`/totp/disable`
+4. `8511f3a` 出款签名面四条：`/api/v1/admin/treasury/payouts/{id}/signing`、`/sign-events`、
+   `/broadcast`、`/settle`
+5. `905eac7` `GET /api/v1/user/provider/quote-settings`、`POST /api/v1/auth/register/request`、
+   `POST /api/v1/auth/register/confirm`、`GET /api/v1/user/security/reminders`
+
+**兼容矩阵**：全部为新增路径 / 新增可选字段 ⇒ 老客户端不受影响（未知字段必须忽略）。
+
+**需要谁做什么**
+* ~~release-manager：定版本号为 1.4.1 或 1.5.0~~ → **已定：1.5.0**（2026-11-05，决策人 ezio）。
+* release-manager（批准窗口内）：① 在本条复核人处签"复核签名："；② 在 `djb-node` 打并推
+  tag `spec-1.5.0`（指向"逐字节等于权威 `spec/openapi.yaml`"的那次提交）；③ 把
+  `repos/djb-cloud/.github/workflows/{ci.yml:89, design-gates.yml:34}` 两处 `SPEC_REF` 换成该提交 sha。
+  在此之前对外统一口径「**1.5.0 = 213 路径**」，**不得**再使用「1.4.0 = 213 路径」。
+* lead：已修 `info.summary` 里硬编码的过期计数（原「157 路径 / 181 操作」），新增单一真相源检查脚本；
+  2026-11-05 按决策把 `info.version` 升到 1.5.0 并同步 cloud 副本，未 touch 任何路径 / schema。
+
+**复核人**：lead（审计口径复核，2026-11-05）；**release-manager 签待补**（窗口内完成）。
+
+---
+
+## 1.4.0 · 2026-11-01 · MINOR
+
+**类型**：MINOR（纯加性：路径 171 → 189、操作 225、schema 302 → 315；
+无删除、无类型更改、无既有 path / schema 语义变更）
+
+**变更**
+1. **F9 工单域（7 条，默认关闭）**：`POST/GET /api/v1/tickets`、`GET /api/v1/tickets/{ticket_id}`、
+   `POST /api/v1/tickets/{ticket_id}/messages`；后台 `GET /api/v1/admin/tickets`、
+   `POST /api/v1/admin/tickets/{ticket_id}/messages`、`POST /api/v1/admin/tickets/{ticket_id}/state`。
+   跨租户/不存在统一 404；关闭态追加 409 `ticket_closed`；内部备注客户侧不可见。
+2. **F6 token-route 声明与授权（5 条，默认关闭）**：`POST/GET/DELETE /api/v1/node/token-route`、
+   `GET /api/v1/admin/nodes/{node_id}/token-route`、
+   `POST /api/v1/admin/nodes/{node_id}/token-route/authorize`。
+   只声明与授权，**不**改变定价与路由决策；未授权声明一律不生效。
+3. **F8 供方托管 Agent（6 条，默认关闭）**：`POST/GET /api/v1/node/hosted-agent`、
+   `DELETE /api/v1/node/hosted-agent/{id}`、`GET /api/v1/user/hosted-agents`、
+   `/api/v1/hosted/health`。新增 securityScheme `hostedAgentBearer`（`djb_ha_` 一次性 scoped token，
+   仅 `/api/v1/hosted/*` 生效；服务端只存 sha256 + 前缀）。
+4. **F15a 配置过期时间**：配置草稿新增可选字段 `expire_at`（RFC3339，须晚于 `effective_at`）；
+   仅作「该版本不应再被采用」的判断依据，**不自动改 state**。
+5. **F16 节点只读面字段口径（加性）**：`/node/earnings` 新增 `settled_micro/pending_micro/corrected_micro/today_micro`
+   （micro-USD，UTC 日界；旧 `*_minor` 同值保留并标 deprecated），`rows[]` 补 `receipt_id/tokens`；
+   `/node/receipts` 行补 `revenue_micro`（旧 `revenue_minor` 同值 deprecated）与 `rejected_code/reject_reason`，
+   列表时间字段为 `issued_at`（≡ 详情 `received_at`，同值不同名，不改名）。
+   同时修复分页游标假定 UUID 的缺陷（`rcpt_*` 等字符串主键可正常翻页；跨端点游标仍 400）。
+6. **securityScheme 口径统一**：早期片段里的 `adminSession` / `serviceToken` / `clientKey` / `hostedToken`
+   分别归一到 `adminBearer` / `internalMTLS` / `nodeClientKey` / `hostedAgentBearer`（均为既有或本次新增定义）。
+
+**兼容矩阵**：老客户端不受影响（新路径均为独立资源；新字段可选；未知字段必须忽略）。
+**复核人**：lead（D-08 测试网窗口内；生产发布仍需 release-manager 批准）。
 
 ## 1.3.0 · 2026-10-30 · MINOR
 

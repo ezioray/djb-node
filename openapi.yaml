@@ -17,10 +17,15 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: DJB Protocol API
+  # 2026-11-07 加性登记（实现先行、spec 补登，见 changes/REL-2026-11-07-CONTRACT-REG.md）：
+  # 新增 4 条路径 / 5 个操作：邮箱验证码登录 2 条（`/auth/login/email-otp/{request,verify}`）+
+  # 可信设备 3 个操作落在 2 条路径（`/user/trusted-devices` GET/DELETE、
+  # `/user/trusted-devices/{device_id}` DELETE）；新增 schema 8 个，**无删改**。
+  # 按 MINOR 定为 1.7.0（214→218 路径；1.6.0 固定为提交 f408cbf）。
   # 2026-11-05 二次发布：加性新增 `GET /api/v1/auth/captcha`（防撞库验证码）与
   # LoginRequest 两个可选字段 `captcha_id`/`captcha_answer`、错误码 40111/40112，
   # 按 MINOR 定为 1.6.0（213→214 路径；1.5.0 固定为提交 5e65b32）。
-  version: 1.6.0
+  version: 1.7.0
   # 2026-11-04 审计：此处原先硬编码「157 路径 / 181 操作」——那是 node 快照期的数字，
   # 与文件实测（213/252）不符，且每次加性变更都会让它更假。规模数字一律由
   # `reports/RC-2026-11-03/audit/tools/check-spec-single-source.py` 现算，不写进正文。
@@ -2732,6 +2737,79 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
+  /api/v1/auth/login/email-otp/request:
+    post:
+      tags: [identity]
+      summary: 邮箱验证码登录：第一步（发码；可信设备可免码直登）
+      operationId: requestEmailOtpLogin
+      description: |
+        公开端点（登录前可调，`security: []`）。响应文案**不区分**邮箱是否已注册（防枚举），
+        因此 202 只表示「已受理」，不代表账号存在。已注册邮箱签发一次性 6 位码（TTL 600 秒，
+        连错 5 次即作废）；SMTP 投递在事务外、线程池内执行，不阻塞事件循环。
+        命中**未过期可信设备**且账号存在时：不发码，直接 200 返回会话（`trusted=true`、
+        `skip_otp=true`）。`Cache-Control: no-store` 必须由客户端/网关原样透传。
+        反作弊（频控/黑名单）只表现为 429 + `Retry-After`，不写阈值。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailOtpLoginRequest' }
+      responses:
+        '200':
+          description: 可信设备命中，免码直接签发会话
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+            Cache-Control:
+              description: '固定 `no-store`（同时给 `Pragma: no-cache`）'
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailOtpLoginSession' }
+        '202':
+          description: 已受理（不论邮箱是否存在，文案一致）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailOtpLoginAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/auth/login/email-otp/verify:
+    post:
+      tags: [identity]
+      summary: 邮箱验证码登录：第二步（校验并签发会话）
+      operationId: verifyEmailOtpLogin
+      description: |
+        校验一次性验证码并签发会话。失败不区分「码错 / 已过期 / 已作废」；
+        连续失败达上限后该码作废（重新发码）。成功后按需登记/续期可信设备，
+        `device_id`/`device_expires_at` 回传该设备状态（开关关闭时为 `null`）。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailOtpLoginVerifyRequest' }
+      responses:
+        '200':
+          description: 登录成功
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+            Cache-Control:
+              description: '固定 `no-store`'
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailOtpLoginSession' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
   /api/v1/auth/register/request:
     post:
       tags: [identity-registration]
@@ -2945,6 +3023,65 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/trusted-devices:
+    get:
+      tags: [identity]
+      summary: 本人的可信设备（可免邮箱验证码的设备）
+      operationId: listUserTrustedDevices
+      description: |
+        只列**有效**设备（未撤销且未过期），按最近活跃倒序。库里只存 IP/UA 的不可逆哈希，
+        因此 `ip_masked`/`ua_family` 返回的是 `hash:<前 8 位>…` 形式的不可再识别前缀——
+        这是隐私换来的代价，不是数据错误。`Cache-Control: no-store`。
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 设备列表
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrustedDeviceList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [identity]
+      summary: 撤销全部可信设备（退出所有设备）
+      operationId: revokeAllUserTrustedDevices
+      description: |
+        撤销本人全部有效设备，返回撤销条数。**不需要** step-up：收紧权限不加摩擦。
+        别人的设备、不存在的设备、已撤销的设备一律 404（不泄漏"有没有这台"）。
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已全部撤销
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrustedDevicesRevokedAll' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/user/trusted-devices/{device_id}:
+    delete:
+      tags: [identity]
+      summary: 撤销单台可信设备
+      operationId: revokeUserTrustedDevice
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已撤销
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrustedDeviceRevoked' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /api/v1/user/profile:
     get:
@@ -10702,6 +10839,106 @@ components:
             state: { type: string }
         device_id: { type: [string, 'null'] }
         device_expires_at: { type: [string, 'null'], format: date-time }
+
+    EmailOtpLoginRequest:
+      type: object
+      additionalProperties: true
+      required: [email]
+      description: 邮箱验证码登录第一步入参。验证码**不得**进日志、事件或 fixtures。
+      properties:
+        email: { type: string, format: email }
+
+    EmailOtpLoginVerifyRequest:
+      type: object
+      additionalProperties: true
+      required: [email, code]
+      properties:
+        email: { type: string, format: email }
+        code:
+          type: string
+          maxLength: 16
+          description: 一次性验证码；失败不区分「码错 / 过期 / 作废」。
+
+    EmailOtpLoginAccepted:
+      type: object
+      additionalProperties: true
+      required: [trusted, skip_otp, message, expires_in]
+      properties:
+        trusted: { type: boolean }
+        skip_otp: { type: boolean }
+        message: { type: string }
+        expires_in:
+          type: integer
+          minimum: 1
+          description: 验证码有效期（秒）；`trusted=false` 时有意义。
+
+    EmailOtpLoginSession:
+      type: object
+      additionalProperties: true
+      required: [access_token, refresh_token, token_type, expires_in, trusted, skip_otp]
+      description: |
+        邮箱验证码登录成功后的会话。可信设备免码直登时 `trusted=true`、`skip_otp=true`；
+        正常校验路径两者均为 `false`。`device_id`/`device_expires_at` 为该设备本次登记/续期
+        后的状态；可信设备开关关闭时为 `null`。
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer, minimum: 1 }
+        session_id: { type: string }
+        refresh_expires_at: { type: string, format: date-time }
+        trusted: { type: boolean }
+        skip_otp: { type: boolean }
+        device_id: { type: [string, 'null'] }
+        device_expires_at: { type: [string, 'null'], format: date-time }
+
+    TrustedDevice:
+      type: object
+      additionalProperties: true
+      required: [id, ip_masked, ua_family, created_at, last_seen_at, expires_at]
+      description: 可信设备视图。只有哈希前缀，原始 IP/UA 不可回读。
+      properties:
+        id: { type: string, format: uuid }
+        ip_masked: { type: string }
+        ua_family: { type: string }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+
+    TrustedDeviceList:
+      type: object
+      additionalProperties: true
+      required: [data, count]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/TrustedDevice' }
+        count: { type: integer, minimum: 0 }
+        ttl_days:
+          type: integer
+          minimum: 1
+          description: 首次信任的有效期（天）。
+        renew_cap_days:
+          type: integer
+          minimum: 1
+          description: 滚动续期的绝对上限（自 `created_at` 起算，天）。
+
+    TrustedDeviceRevoked:
+      type: object
+      additionalProperties: true
+      required: [revoked, device_id, revoked_at]
+      properties:
+        revoked: { type: boolean }
+        device_id: { type: string, format: uuid }
+        revoked_at: { type: string, format: date-time }
+
+    TrustedDevicesRevokedAll:
+      type: object
+      additionalProperties: true
+      required: [revoked, revoked_at]
+      properties:
+        revoked: { type: integer, minimum: 0, description: 被撤销的设备条数。 }
+        revoked_at: { type: string, format: date-time }
 
     SecurityReminders:
       type: object
