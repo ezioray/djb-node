@@ -39,6 +39,40 @@ def test_check_system_matrix(monkeypatch):
     assert check_system(now).status == "fail"
 
 
+# ───────────────────────────── 内存探测：Windows 上不再恒为 0.0 GB（任务 B4）
+def test_windows_mem_total_reads_global_memory_status_ex(monkeypatch):
+    """ctypes 结构体接线：kernel32 填 ullTotalPhys → 32.0 GB（不依赖真跑在 Windows 上）。"""
+    import ctypes
+
+    class _Kernel:
+        def GlobalMemoryStatusEx(self, pointer):       # noqa: N802 - Win32 名字
+            pointer._obj.ullTotalPhys = 32 * 1024 ** 3
+            return 1
+
+    class _Windll:
+        kernel32 = _Kernel()
+
+    monkeypatch.setattr(ctypes, "windll", _Windll(), raising=False)
+    assert envcheck._windows_mem_total_gb() == 32.0
+
+
+def test_windows_mem_total_failure_returns_zero_and_falls_back(monkeypatch):
+    """调用失败 / 非 Windows（没有 windll）都不能抛，只能回落。"""
+    monkeypatch.setattr(envcheck, "_windows_mem_total_gb", lambda: 0.0)
+    monkeypatch.setattr(envcheck.sys, "platform", "win32")
+    assert envcheck._mem_total_gb() >= 0.0             # 回落 /proc/meminfo（没有就是 0.0）
+    monkeypatch.setattr(envcheck.sys, "platform", "linux")
+    monkeypatch.setattr(envcheck, "_windows_mem_total_gb",
+                        lambda: pytest.fail("Linux 上不该调 Windows 分支"))
+    assert envcheck._mem_total_gb() >= 0.0
+
+
+def test_windows_mem_total_is_used_when_available(monkeypatch):
+    monkeypatch.setattr(envcheck, "_windows_mem_total_gb", lambda: 63.9)
+    monkeypatch.setattr(envcheck.sys, "platform", "win32")
+    assert envcheck._mem_total_gb() == 63.9
+
+
 def test_each_check_has_next_step():
     config = ClientConfig()
     checks = [check_system(None), check_kernel(None), check_runtime(None, __import__(

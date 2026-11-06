@@ -5,7 +5,7 @@ import zipfile
 
 import pytest
 
-from djb_node import __version__, facts
+from djb_node import __version__, cli, facts
 from djb_node.cli import build_parser, main
 
 
@@ -21,6 +21,61 @@ def test_every_command_has_help(capsys):
             main([command, "--help"])
         assert info.value.code == 0
         assert command in capsys.readouterr().out
+
+
+# ───────────────────────────── Windows 控制台中文乱码（任务 B3）
+class _FakeStream:
+    """只记录 reconfigure 调用的替身流：不需要真控制台。"""
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.calls: list[dict] = []
+        self._explode = explode
+
+    def reconfigure(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._explode:
+            raise OSError("no console")
+        return None
+
+
+def test_stdio_is_reconfigured_to_utf8(monkeypatch):
+    """CLI 输出 UTF-8、控制台按 GBK 解码 → 「鑱旇剳」；这里把输出编码对齐 UTF-8。"""
+    out, err = _FakeStream(), _FakeStream()
+    monkeypatch.setattr(cli.sys, "stdout", out, raising=False)
+    monkeypatch.setattr(cli.sys, "stderr", err, raising=False)
+    cli._enable_utf8_stdio()
+    assert out.calls == [{"encoding": "utf-8", "errors": "replace"}]
+    assert err.calls == [{"encoding": "utf-8", "errors": "replace"}]
+
+
+def test_stdio_reconfigure_never_raises(monkeypatch):
+    """reconfigure 抛错 / 流没有 reconfigure（StringIO、被替换的捕获流）都必须静默。"""
+    import io
+
+    monkeypatch.setattr(cli.sys, "stdout", _FakeStream(explode=True), raising=False)
+    monkeypatch.setattr(cli.sys, "stderr", _FakeStream(explode=True), raising=False)
+    cli._enable_utf8_stdio()                       # 不抛
+    monkeypatch.setattr(cli.sys, "stdout", io.StringIO(), raising=False)
+    monkeypatch.setattr(cli.sys, "stderr", io.StringIO(), raising=False)
+    cli._enable_utf8_stdio()                       # 没有 reconfigure 也不抛
+    # 真跑一次 main（流不支持 reconfigure）也不能因为编码问题炸掉
+    stream = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", stream, raising=False)
+    monkeypatch.setattr(cli.sys, "stderr", io.StringIO(), raising=False)
+    with pytest.raises(SystemExit) as info:        # --version 走 argparse 的 exit(0)
+        main(["--version"])
+    assert info.value.code == 0
+    assert __version__ in stream.getvalue()
+
+
+def test_stdio_fix_never_touches_console_codepage():
+    """不许用 ``chcp``：改代码页会连带影响调用方同一窗口里的其它程序。"""
+    import inspect
+
+    # 只看可执行部分（docstring 里正是解释「为什么不用 chcp」，不能算进来源）
+    body = inspect.getsource(cli._enable_utf8_stdio).split('"""')[-1].lower()
+    assert "chcp" not in body
+    assert "subprocess" not in body and "os.system" not in body
 
 
 def test_parser_lists_all_commands():
