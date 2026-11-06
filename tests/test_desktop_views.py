@@ -883,3 +883,32 @@ def test_bind_action_cancel_and_failure_do_not_touch_credentials():
     controller.cli = lambda argv: {"ok": False, "error": "invalid_or_expired"}
     failed = controller.action("account.bind")
     assert failed.ok is False and "invalid_or_expired" in failed.message
+
+
+# ───────────── 日志页：两行同一时间戳不许把窗口打死（0.2.3 实拍崩溃）
+def test_logs_rows_have_unique_keys_even_with_identical_timestamps():
+    """同一微秒的两行日志（init 与 daemon 各写一遍同一事件）→ Treeview iid 撞车
+    会抛 TclError「Item ... already exists」，整个窗口直接死。行 key 必须唯一。"""
+    ts = "2026-11-06T17:01:16.072172Z"
+    snapshot = ds.Snapshot({"logs": {"rows": [
+        {"ts": ts, "level": "info", "event": "daemon.start"},
+        {"ts": ts, "level": "info", "event": "daemon.start"},
+        {"ts": ts, "level": "warning", "event": "daemon.heartbeat_forbidden"},
+    ], "path": "x.log", "levels": ["all", "info"], "note": ""}})
+    view = vw.build_view("logs", snapshot)
+    keys = [row.key for row in view.table.rows]
+    assert len(keys) == 3
+    assert len(set(keys)) == 3
+    assert all(keys)                       # 空 key 会让 Tk 自动编号，等于放弃可控性
+
+
+def test_unique_iid_never_repeats_and_keeps_plain_key():
+    from djb_node.desktop.app import unique_iid
+
+    used: set[str] = set()
+    assert unique_iid("a", used) == "a"
+    used.add("a")
+    assert unique_iid("a", used) == "a#2"
+    used.add("a#2")
+    assert unique_iid("a", used) == "a#3"
+    assert unique_iid("", used) == ""      # 空 key 交给 Tk 自动编号

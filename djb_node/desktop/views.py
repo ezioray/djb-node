@@ -984,7 +984,7 @@ def _account(snapshot: Snapshot) -> View:
 def _logs(snapshot: Snapshot) -> View:
     logs = _section(snapshot, "logs")
     rows = []
-    for row in logs.get("rows") if isinstance(logs.get("rows"), list) else []:
+    for index, row in enumerate(logs.get("rows") if isinstance(logs.get("rows"), list) else []):
         if not isinstance(row, Mapping):
             continue
         level = str(row.get("level") or "unknown")
@@ -994,8 +994,11 @@ def _logs(snapshot: Snapshot) -> View:
         tone = ("red" if level in ("error", "critical") else
                 "amber" if level == "warning" else
                 "muted" if level == "unknown" else "default")
+        # key 必须唯一：日志里同一微秒可能被写两次（init 与 daemon 各写一遍同一事件），
+        # 用 ts 当 iid 会让 Treeview 抛 TclError「Item ... already exists」把整个窗口打死。
         rows.append(Row((mark + " " + level, str(row.get("ts") or "—"),
-                         str(row.get("event") or "—")), key=str(row.get("ts") or ""),
+                         str(row.get("event") or "—")),
+                        key="logs-%04d-%s" % (index, row.get("ts") or ""),
                         tone=tone))
     return View(
         key="logs", title="日志",

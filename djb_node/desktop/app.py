@@ -565,11 +565,14 @@ class DesktopApp:
             tree.tag_configure("tone-" + name, foreground=color)
         self._row_notes = {}
         self._row_cells = {}
+        used_iids: set[str] = set()
         for row in table.rows:
             tags = ["tone-" + (row.tone or "default")]
             if row.disabled:
                 tags.append("disabled")          # 标灰优先于语义色
-            iid = row.key or ""
+            iid = unique_iid(row.key or "", used_iids)
+            if iid:
+                used_iids.add(iid)
             values = row.cells
             if narrow and getattr(row, "narrow", ()) and len(row.narrow) == len(row.cells):
                 values = row.narrow              # 窄窗用紧凑文案，详情抽屉仍看完整字段
@@ -947,6 +950,24 @@ def _make_save_path(root_getter):
             return None
         return str(path) if path else None
     return ask
+
+
+def unique_iid(key: str, used: set[str]) -> str:
+    """Treeview 的行 id 必须唯一。
+
+    撞 key 时 Tk 抛 ``TclError: Item ... already exists``，而它是从
+    ``tree.insert()`` 里抛出来的——一旦冒泡，整个窗口直接死（0.2.3 实拍里
+    「日志」页就是这么崩的：同一微秒的两行日志用了同一个 ts 当 key）。
+    这里统一去重：``a`` / ``a#2`` / ``a#3``……空 key 交给 Tk 自动编号。
+    """
+    if not key:
+        return ""
+    candidate = key
+    suffix = 1
+    while candidate in used:
+        suffix += 1
+        candidate = "%s#%d" % (key, suffix)
+    return candidate
 
 
 def _make_cli_runner(home):
