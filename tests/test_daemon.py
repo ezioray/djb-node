@@ -264,6 +264,82 @@ def test_heartbeat_forbidden_keeps_frozen(paths, store, credentials, mock, clock
         daemon.stop()
 
 
+def test_heartbeat_forbidden_backs_off_instead_of_busy_loop(paths, store, credentials,
+                                                            mock, clock):
+    """P0（2026-11-07）：403 分支原来只暂停、不推进下次心跳 → tick 循环 ~110ms 重发。
+
+    实测证据：节点停在 pending 时 ``daemon.heartbeat_forbidden`` 一分钟刷 184 条
+    （``reports/DEPLOY-20261107/evidence/client-heartbeat-storm.txt``）。
+    """
+    _add_upstream(store, mock)
+    mock.heartbeat_status = 403
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        sent = len(mock.heartbeats)
+        assert sent >= 1
+        for _ in range(20):                     # 同一时刻连续 tick 20 次 = 忙等场景
+            daemon.tick(clock())
+        assert len(mock.heartbeats) == sent, "403 之后不许立刻重发心跳"
+        # 退避下限 = facts.HEARTBEAT_MIN_S（服务端 5s 限流，客户端不得抢跑）
+        clock.advance(facts.HEARTBEAT_MIN_S - 1)
+        daemon.tick(clock())
+        assert len(mock.heartbeats) == sent
+        clock.advance(1)
+        daemon.tick(clock())
+        assert len(mock.heartbeats) == sent + 1
+    finally:
+        daemon.stop()
+
+
+def test_pending_forbidden_is_pending_not_frozen(paths, store, credentials, mock, clock):
+    """P0：pending（等审核）被兜底成 account_frozen，界面显示「被冻结：申诉」——误导客户。"""
+    _add_upstream(store, mock)
+    mock.heartbeat_status = 403
+    mock.heartbeat_error_state = "pending"      # 云端 40305 的 error.state
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        snapshot = daemon.machine.snapshot
+        assert snapshot.reason == "account_pending"
+        assert "审核" in (snapshot.next_step or "")
+        assert "申诉" not in (snapshot.next_step or "")
+        assert daemon.admit("mock-model").ok is False       # 等审核期间不接单
+    finally:
+        daemon.stop()
+
+
+def test_frozen_forbidden_still_says_frozen(paths, store, credentials, mock, clock):
+    """对照：真冻结还得说冻结（新分流不能把冻结也说成审核）。"""
+    _add_upstream(store, mock)
+    mock.heartbeat_status = 403
+    mock.heartbeat_error_state = "frozen"
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        snapshot = daemon.machine.snapshot
+        assert snapshot.reason == "account_frozen"
+        assert "申诉" in (snapshot.next_step or "")
+    finally:
+        daemon.stop()
+
+
+def test_forbidden_reason_prefers_state_over_message(paths, store, credentials, mock, clock):
+    """分流只看服务端状态字段；文案里恰好写着别的状态也不许盖过它。"""
+    from djb_node.errors import ForbiddenError
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    pending = ForbiddenError("节点状态不允许该动作", code=40305,
+                             details={"state": "pending"})
+    assert daemon._forbidden_reason(pending) == "account_pending"
+    retired = ForbiddenError("frozen", code=40305, details={"state": "retired"})
+    assert daemon._forbidden_reason(retired) == "retired"
+    # 老服务端不带 state：仍然按文案兜底，不猜
+    legacy = ForbiddenError("node is frozen", code=40305)
+    assert daemon._forbidden_reason(legacy) == "account_frozen"
+    text_only = ForbiddenError("节点当前状态 pending 不允许 heartbeat", code=40305)
+    assert daemon._forbidden_reason(text_only) == "account_pending"
+
+
 def test_policy_refresh_and_directive(paths, store, credentials, mock, clock):
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock, clock=clock)

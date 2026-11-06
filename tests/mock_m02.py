@@ -72,6 +72,9 @@ class MockServer:
         self.fail_heartbeat_count = 0
         self.fail_receipts_count = 0
         self.heartbeat_status = 200
+        # 40305 的响应体里可以带「节点当前状态」（云 app/supply/router.py::_fail 平铺 details）。
+        # None = 老形状（只有 message），用来覆盖「不猜状态」的兜底路径。
+        self.heartbeat_error_state: str | None = None
         self.receipts_status = 200
         self.policy_status = 200
         self.capabilities_status = 200
@@ -117,10 +120,11 @@ class MockServer:
                 self.end_headers()
                 self.wfile.write(data)
 
-            def _error(self, status: int, code: int, message: str) -> None:
+            def _error(self, status: int, code: int, message: str,
+                       **extra: Any) -> None:
                 self._json(status, {"error": {"type": "invalid_request_error",
                                               "code": code, "message": message,
-                                              "request_id": "mock"}})
+                                              "request_id": "mock", **extra}})
 
             def do_GET(self) -> None:                      # noqa: N802
                 path = self.path.split("?", 1)[0]
@@ -220,8 +224,12 @@ class MockServer:
                     if outer.heartbeat_status != 200:
                         code = {403: 40305, 429: 42901, 426: 42601}.get(
                             outer.heartbeat_status, 50001)
+                        extra = ({"state": outer.heartbeat_error_state}
+                                 if (outer.heartbeat_status == 403
+                                     and outer.heartbeat_error_state) else {})
                         self._error(outer.heartbeat_status, code,
-                                    "frozen" if outer.heartbeat_status == 403 else "err")
+                                    "frozen" if outer.heartbeat_status == 403 else "err",
+                                    **extra)
                         return
                     updated = outer.policy_updated
                     outer.policy_updated = False

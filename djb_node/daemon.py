@@ -294,6 +294,9 @@ class Daemon:
         # 运行态
         self._user_paused = bool(self.store.get_kv("user_paused", False))
         self._consecutive_failures = 0
+        # 403 的退避计数单独一份：403 不是网络失败，混进 _consecutive_failures 会让
+        # 「等审核」被升格成「保守模式」，把原因换成更误导的那一条。
+        self._forbidden_failures = 0
         self._next_heartbeat_at = self._now()
         self._heartbeat_interval_s = facts.HEARTBEAT_DEFAULT_S
         self._policy_updated = False
@@ -1202,6 +1205,7 @@ class Daemon:
             self._on_failure(now, exc, kind="heartbeat")
             return
         self._consecutive_failures = 0
+        self._forbidden_failures = 0
         interval = result.get("next_heartbeat_seconds")
         if not isinstance(interval, int) or isinstance(interval, bool):
             interval = facts.HEARTBEAT_DEFAULT_S
@@ -1226,17 +1230,51 @@ class Daemon:
             self._evaluate(now)
 
     def _on_heartbeat_forbidden(self, exc: ForbiddenError, now: datetime) -> None:
+        """403（40305 等）：暂停 + **必须退避**，否则 tick 循环会以 ~110ms 间隔重发心跳。
+
+        P0（2026-11-07）：原来这里只 ``machine.pause()``，不推进 ``_next_heartbeat_at``，
+        而 ``_on_failure`` 会退避 —— 节点停在 ``pending`` 时日志以 ~110ms 间隔刷
+        ``daemon.heartbeat_forbidden``（实测一分钟内 184 条）。现在复用同一套
+        :class:`~djb_node.backoff.Backoff`，下限 ``facts.HEARTBEAT_MIN_S``（服务端 5s 限流）。
+        """
         reason = self._forbidden_reason(exc)
         self.machine.pause(reason, next_step=NEXT_STEP_FOR(reason),
                            detail={"code": exc.code})
+        delay = self._backoff_heartbeat_after_forbidden(now)
         self._persist()
         event("daemon.heartbeat_forbidden", level="warning", reason=reason,
-              code=exc.code)
+              code=exc.code, retry_in_s=delay)
+
+    def _backoff_heartbeat_after_forbidden(self, now: datetime) -> int:
+        """403 后的下一次心跳时间：用独立计数走 Backoff，绝不「立刻重试」。"""
+        from .backoff import Backoff
+        self._forbidden_failures += 1
+        decision = Backoff(now=self._now).after_failure(self._forbidden_failures)
+        delay = decision.delay_s if decision.delay_s is not None else facts.RETRY_DELAYS_S[-1]
+        delay = int(max(facts.HEARTBEAT_MIN_S, delay))
+        self._next_heartbeat_at = now + timedelta(seconds=delay)
+        return delay
 
     def _forbidden_reason(self, exc: ForbiddenError) -> str:
+        """403 → 暂停原因：**先读服务端下发的 state**，再退回文案关键词。
+
+        P0（2026-11-07）：云端 40305 的响应把节点当前状态平铺在 ``error.state``
+        （``app/supply/router.py::_fail`` + ``NodeStateForbidden``）。以前只按异常文本猜，
+        ``pending``（等审核）落到兜底 ``account_frozen``，界面显示
+        「账户/节点被冻结：查看平台通知并申诉」——把「等审核」说成了「被封」。
+        """
+        state = str((exc.details or {}).get("state") or "").strip().lower()
+        if state == "pending":
+            return "account_pending"
+        if state in ("frozen", "suspended"):
+            return "account_frozen"
+        if state == "retired":
+            return "retired"
         text = (exc.message or "").lower()
         if "retired" in text or "清退" in text:
             return "retired"
+        if "pending" in text or "审核" in text:
+            return "account_pending"
         if "frozen" in text or "冻结" in text:
             return "account_frozen"
         if "license" in text or "credential" in text or "key" in text:
@@ -1574,7 +1612,7 @@ class Daemon:
             return Decision(False, "user_paused", "user_paused",
                             "用户已暂停：djb resume 恢复接单")
         snapshot = self.machine.snapshot
-        if snapshot.reason in ("account_frozen", "retired"):
+        if snapshot.reason in ("account_frozen", "account_pending", "retired"):
             return Decision(False, str(snapshot.reason), str(snapshot.reason),
                             NEXT_STEP_FOR(str(snapshot.reason)))
         if self._backlog_block or self.buffer.must_stop_accepting(now=now):
@@ -1889,6 +1927,7 @@ class Daemon:
             self.store.set_kv("receipt_backlog_block", False)
             if self._consecutive_failures >= facts.HEARTBEAT_FAIL_CONSERVATIVE_AFTER:
                 self._consecutive_failures = 0
+            self._forbidden_failures = 0
             self._next_heartbeat_at = self._now()
             self._evaluate(self._now())
             self._persist()

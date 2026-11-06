@@ -364,6 +364,13 @@ def raise_for_response(response: HttpResponse, *, what: str) -> DjbError:
                      500: 50000, 502: 50001, 503: 50001, 504: 50001}
     code = code if code not in (None, 0) else default_codes.get(status, 50000)
     details = {"status": status, "what": what}
+    # 40305（节点状态不允许该动作）把「节点当前状态」平铺在 error.state
+    # （云 app/supply/router.py::_fail ← NodeStateForbidden(state=...)）。
+    # 只搬运服务端已经给了的字段：没给就不加，兜底文案保持原样。
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        raw_state = payload["error"].get("state")
+        if isinstance(raw_state, str) and raw_state.strip():
+            details["state"] = raw_state.strip()
     if status == 401:
         return AuthError(message, code=code, details=details, reason=reason)
     if status == 403:

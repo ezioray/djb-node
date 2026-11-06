@@ -73,7 +73,7 @@ LIFECYCLE_STATES: tuple[str, ...] = (
 PAUSE_REASONS: tuple[str, ...] = (
     "user_paused", "yield_paused", "resource_limited", "quota_exhausted", "schedule_paused",
     "unbound", "conservative", "receipt_backlog", "upstream_invalid", "credential_invalid",
-    "account_frozen", "retired", "update_failed")
+    "account_pending", "account_frozen", "retired", "update_failed")
 """暂停原因（INV-01：任何「不在赚」的状态都必须给出原因 + 下一步）。"""
 
 RUNTIME_STATE_MAP: dict[str, str] = {
@@ -88,6 +88,9 @@ RUNTIME_STATE_MAP: dict[str, str] = {
     "paused:receipt_backlog": "error",
     "paused:upstream_invalid": "error",
     "paused:credential_invalid": "error",
+    # 等审核 ≠ 被封：原因分开（account_pending），但上报的 runtime_state 保持 "error"，
+    # 不改变服务端已习惯的取值（接口只加不改）；pending 节点本来就会被云端 403 拒绝心跳。
+    "paused:account_pending": "error",
     "paused:account_frozen": "error",
     "paused:retired": "error",
     "paused:update_failed": "error",
