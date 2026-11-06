@@ -745,8 +745,9 @@ def _token_plan(snapshot: Snapshot) -> View:
     budget_meta = "周 " + (str(limits.get("weekly_tokens")) if limits.get("weekly_tokens")
                           else "未启用") + " · 月 " + (
         str(limits.get("monthly_tokens")) if limits.get("monthly_tokens") else "未启用")
-    if not snapshot.ok("token_plan"):
+    if not limits:
         # 限额读不到时不许说「周/月未启用」—— 那是把缺数据编成配置结论
+        # （daemon 没起时 status 只回 state、不带 profile，这一支就是常态）
         budget, budget_meta = UNAVAILABLE, ""
     shared_value = (_num(used) + " tokens") if snapshot.ok("token_plan") else UNAVAILABLE
     shared_meta = ((str(len(receipt_rows)) + " 张收据 · 今日上限 " + _num(daily_limit))
