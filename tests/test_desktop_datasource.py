@@ -215,6 +215,7 @@ def test_token_plan_lists_store_upstreams_when_status_has_none(tmp_path):
     assert "1 条上游" in text
     assert "0 条上游" not in text
     assert "你还没有接入任何 Token Plan" not in text
+    assert "未启用" not in text                    # 限额读不到 ≠ 周/月没开
 
 
 def test_status_ok(tmp_path):
