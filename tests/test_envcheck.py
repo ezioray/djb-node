@@ -137,3 +137,49 @@ def test_authorize_and_rollback(paths, store, monkeypatch):
     assert profile.mem_pct == 70
     assert checker.rollback()["rolled_back"] is False
     assert checker.state().get("authorized_at") is None
+
+
+# ───────────────────── Windows 首屏误报：架构名 / 「内核：Linux」（0.2.3 回归）
+def test_check_system_accepts_windows_arch_names(monkeypatch):
+    """Windows 的 ``platform.machine()`` 返回 ``AMD64`` / ``ARM64``。
+
+    0.2.2/0.2.3 直接拿它跟支持矩阵 ``("x86_64", "aarch64")`` 比，于是每台 Windows
+    客户机第一屏都是红字「[FAIL] 系统与架构：不支持的架构：AMD64」。
+    归一化之后必须是「不失败」。
+    """
+    monkeypatch.setattr(envcheck, "_read_os_release", lambda: {})
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
+    result = check_system(None)
+    assert result.status != "fail"
+    assert "不支持的架构" not in result.conclusion
+    assert "x86_64" in result.conclusion
+    assert result.evidence["arch"] == "x86_64"
+    assert result.evidence["raw_arch"] == "AMD64"
+
+    monkeypatch.setattr(platform, "machine", lambda: "ARM64")
+    result = check_system(None)
+    assert result.status != "fail"
+    assert result.evidence["arch"] == "aarch64"
+    assert result.evidence["raw_arch"] == "ARM64"
+
+
+def test_normalize_arch_keeps_unknown_architectures_unknown(monkeypatch):
+    """未知架构不许被归一化「洗白」成受支持：riscv64 仍然要判 fail。"""
+    assert envcheck.normalize_arch("") == "unknown"
+    assert envcheck.normalize_arch("riscv64") == "riscv64"
+    monkeypatch.setattr(envcheck, "_read_os_release", lambda: {})
+    monkeypatch.setattr(platform, "machine", lambda: "riscv64")
+    assert check_system(None).status == "fail"
+
+
+def test_check_kernel_on_windows_reports_windows_version(monkeypatch):
+    """Windows 上没有「Linux 内核」：标题/结论都不许写成 Linux，也不许拿 5.10 评它。"""
+    monkeypatch.setattr(envcheck, "_platform_os_name", lambda: "nt")
+    monkeypatch.setattr(platform, "release", lambda: "10")
+    monkeypatch.setattr(platform, "version", lambda: "10.0.26100")
+    result = check_kernel(None)
+    assert result.status == "ok"
+    assert "Linux" not in result.title
+    assert "Linux" not in result.conclusion
+    assert "10.0.26100" in result.conclusion
+    assert result.evidence["os"] == "windows"

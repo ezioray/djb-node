@@ -166,18 +166,39 @@ def _mem_total_gb() -> float:
     return 0.0
 
 
+#: ``platform.machine()`` 的平台叫法 → 支持矩阵里的规范名
+_ARCH_ALIASES: dict[str, str] = {
+    "amd64": "x86_64", "x86_64": "x86_64", "x64": "x86_64", "i386": "x86_64",
+    "arm64": "aarch64", "aarch64": "aarch64",
+}
+
+
+def normalize_arch(raw: str) -> str:
+    """架构名归一化：``platform.machine()`` 各平台叫法不同，先对齐再判支持。
+
+    Windows 返回 ``AMD64`` / ``ARM64``（大写），Linux 返回 ``x86_64`` / ``aarch64``，
+    macOS 还可能给 ``x64``。不归一化就会把 Windows 机器判成
+    「不支持的架构：AMD64」—— 0.2.2/0.2.3 客户第一眼看到的红字就是这个。
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        return "unknown"
+    return _ARCH_ALIASES.get(text, text)
+
+
 def check_system(now: datetime) -> Check:
     values = _read_os_release()
     distro = (values.get("ID") or "").lower()
     version = values.get("VERSION_ID") or ""
     pretty = values.get("PRETTY_NAME") or (distro + " " + version).strip() or "未知发行版"
-    arch = platform.machine() or "unknown"
+    raw_arch = platform.machine() or "unknown"
+    arch = normalize_arch(raw_arch)
     if arch not in facts.SUPPORTED_ARCHES:
         return Check("system", "系统与架构", "fail",
                      "不支持的架构：" + arch + "（S1 只支持 "
                      + " / ".join(facts.SUPPORTED_ARCHES) + "）",
                      "换 x86_64 / aarch64 机器，或等待对应架构的安装包",
-                     {"arch": arch})
+                     {"arch": arch, "raw_arch": raw_arch})
     if distro == "ubuntu":
         pair = _version_pair(version)
         ok = pair >= facts.MIN_UBUNTU
@@ -185,7 +206,7 @@ def check_system(now: datetime) -> Check:
                      pretty + " · " + arch + ("（受支持）" if ok else "（低于最低版本）"),
                      "无需处理" if ok else "升级到 Ubuntu "
                      + _fmt_version(facts.MIN_UBUNTU) + "+ 后再安装",
-                     {"distro": distro, "version": version, "arch": arch})
+                     {"distro": distro, "version": version, "arch": arch, "raw_arch": raw_arch})
     if distro == "debian":
         pair = _version_pair(version)
         ok = pair >= facts.MIN_DEBIAN
@@ -193,24 +214,49 @@ def check_system(now: datetime) -> Check:
                      pretty + " · " + arch + ("（受支持）" if ok else "（低于最低版本）"),
                      "无需处理" if ok else "升级到 Debian "
                      + _fmt_version(facts.MIN_DEBIAN) + "+ 后再安装",
-                     {"distro": distro, "version": version, "arch": arch})
+                     {"distro": distro, "version": version, "arch": arch, "raw_arch": raw_arch})
     if distro == "fedora":
         return Check("system", "系统与架构", "ok", pretty + " · " + arch + "（受支持）",
-                     "无需处理", {"distro": distro, "version": version, "arch": arch})
+                     "无需处理", {"distro": distro, "version": version, "arch": arch, "raw_arch": raw_arch})
     return Check("system", "系统与架构", "warn", pretty + " · " + arch + "（未在支持矩阵内）",
                  "可在 Ubuntu 22.04+ / Debian 12+ / Fedora 最近两版上获得完整支持；"
                  "继续使用需自行承担兼容性风险",
-                 {"distro": distro, "version": version, "arch": arch})
+                 {"distro": distro, "version": version, "arch": arch, "raw_arch": raw_arch})
+
+
+def _platform_os_name() -> str:
+    """平台族：``posix`` / ``nt``。
+
+    单独抽一个函数是为了可测：直接 patch 全局 ``os.name`` 会让 ``pathlib`` 在 POSIX 上
+    去实例化 ``WindowsPath``（pytest 自己的 tmp 目录清理会当场 INTERNALERROR），所以
+    测试只 patch 这个入口。
+    """
+    return os.name
 
 
 def check_kernel(now: datetime) -> Check:
     release = platform.release() or "unknown"
+    if _platform_os_name() == "nt":
+        # Windows 没有「Linux 内核」这个东西：`platform.release()` 给的是 NT 版本号
+        # （10 / 11），`platform.version()` 给 10.0.26100 这种 build 串。
+        # 拿 5.10 这种 Linux 判据去评 Windows，客户第一屏就会看到
+        # 「[OK] 内核：Linux 10」—— 既错又显得简陋。
+        version = platform.version() or "unknown"
+        return Check("kernel", "Windows 版本", "ok",
+                     release + "（" + version + "）",
+                     "无需处理",
+                     {"os": "windows", "release": release, "version": version})
+    if _platform_os_name() != "posix":
+        # 既不是 Windows 也不是 POSIX：不猜，按「不评」处理（na 不算失败）
+        return Check("kernel", "系统版本", "na", release, "无需处理",
+                     {"os": _platform_os_name(), "release": release})
     pair = _version_pair(release)
     ok = pair >= facts.MIN_KERNEL
     return Check("kernel", "内核", "ok" if ok else "warn",
                  "Linux " + release + ("（≥5.10）" if ok else "（低于 5.10）"),
                  "无需处理" if ok else "升级内核到 5.10+（容器/WSL 环境可能显示宿主内核）",
                  {"release": release})
+
 
 
 def machine_profile_or_none(home: str | None = None) -> dict[str, Any] | None:
