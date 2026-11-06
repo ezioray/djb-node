@@ -14,6 +14,8 @@
   endpoint / model / credential_ref / concurrency_limit / receipt_sample。
 """
 
+import os
+
 # ─────────────────────────────────────────────────────────── 模块 / 版本
 MODULE_ID = "M15"
 #: 对外申报的客户端版本 = 包版本（单一事实来源）。
@@ -54,7 +56,11 @@ USER_AGENT = "djb-node/" + CLIENT_VERSION + " (" + PLATFORM + ")"
 # ─────────────────────────────────────────────────────────── 对外地址
 #: 网页端控制台地址（唯一来源）：桌面 / 托盘 / CLI 的「绑定网页端」提示都取这里，
 #: 不在各模板里散写；换域名只改这一处。
-WEB_CONSOLE_URL = "https://djb.aitokenmall.ai"
+#:
+#: 2026-11-06：默认从 **产品域名** 取（与 :data:`djb_node.bootstrap.DEFAULT_GATEWAY_URL` 同源），
+#: 自建/预发用 ``DJB_WEB_CONSOLE`` 覆盖。此前默认指到 RC 域名 ``djb.aitokenmall.ai``，
+#: 客户在生产包里点「打开网页端」会落到预发站。
+WEB_CONSOLE_URL = (os.environ.get("DJB_WEB_CONSOLE") or "").strip() or "https://tkbank.ai"
 
 # ─────────────────────────────────────────────────────────── 状态机（M15 §3 / §5.9）
 DAEMON_STATES: tuple[str, ...] = ("stopped", "starting", "online", "paused", "error", "updating")
