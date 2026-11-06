@@ -88,6 +88,23 @@ def _gateway_is_placeholder(url: str | None) -> bool:
     return (not text) or text.endswith("example.invalid") or "example.invalid" in text
 
 
+# ─────────────────────────────────────────────────────────── bootstrap
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    """首启自举（幂等）：建目录/写配置/建库 + 可选拉起 daemon。
+
+    桌面端启动时自动调用同一套逻辑（``djb_node.bootstrap``）；这里给
+    CLI / 机房批量部署 / 自动化测试一个显式入口。
+    """
+    from .bootstrap import ensure_ready, start_daemon, summary_text
+    home = getattr(args, "home", None)
+    boot = ensure_ready(home=home, gateway=getattr(args, "gateway", None),
+                        preset=getattr(args, "preset", None))
+    daemon = None if getattr(args, "no_daemon", False) else start_daemon(home=home)
+    payload = {"bootstrap": boot, "daemon": daemon, "summary": summary_text(boot, daemon)}
+    _emit(payload, as_json=_json_flag(args), text=lambda value: value["summary"] or "无需处理")
+    return 0 if not boot.get("errors") else 1
+
+
 # ─────────────────────────────────────────────────────────── init
 def cmd_init(args: argparse.Namespace) -> int:
     paths = _paths(args)
@@ -1898,6 +1915,12 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--json", action="store_true", help="输出 JSON")
         item.set_defaults(handler=handler)
         return item
+
+    boot = add_common(cmd_bootstrap, "bootstrap",
+                      "首启自举：建目录/写真实云端地址/建库，并拉起节点（幂等）")
+    boot.add_argument("--gateway", help="覆盖云端地址（默认取构建默认或已有配置）")
+    boot.add_argument("--preset", choices=facts.PRESETS, help="本机预设（默认 省心）")
+    boot.add_argument("--no-daemon", action="store_true", help="只自举，不拉起 daemon")
 
     init = add_common(cmd_init, "init", "初始化本机数据目录 / 预设 / 限额，并做一次环境检测")
     init.add_argument("--gateway", help="服务端地址（默认占位 api.example.invalid）")

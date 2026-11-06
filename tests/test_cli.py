@@ -9,7 +9,7 @@ from djb_node import __version__, facts
 from djb_node.cli import build_parser, main
 
 
-COMMANDS = ["init", "env", "auth", "start", "stop", "status", "pause", "resume",
+COMMANDS = ["init", "bootstrap", "env", "auth", "start", "stop", "status", "pause", "resume",
             "limits", "upstream", "token", "flags", "attest", "announce", "quotes",
             "update", "logs", "diagnose", "tray", "uninstall", "model-sync", "notify",
             "proxy", "gui", "plan", "daemon", "reload", "machine"]
