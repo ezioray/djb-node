@@ -961,7 +961,11 @@ def _make_cli_runner(home):
         if "--json" not in argv:
             command.append("--json")
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=20,
+            # 与 datasource._cli_runner 同一条规矩：子进程是我们自己的 CLI，它按 UTF-8
+            # 写 stdout（cli.main()._enable_utf8_stdio），这里必须显式按 UTF-8 解，
+            # 否则中文 Windows 上按 cp936 解会 UnicodeDecodeError → 动作区报错。
+            completed = subprocess.run(command, capture_output=True,
+                                       encoding="utf-8", errors="replace", timeout=20,
                                        env=env, stdin=subprocess.DEVNULL, check=False)
         except subprocess.TimeoutExpired:
             raise ProviderError("本地命令超时（20s）") from None

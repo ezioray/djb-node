@@ -426,7 +426,15 @@ class LocalDataSource:
         if env.get("DJB_HOME", "") != expected:
             raise ProviderError("本机命令的 home 不一致（拒绝执行）")
         try:
-            completed = subprocess.run(command, capture_output=True, text=True,
+            # 编码必须显式钉成 UTF-8：子进程是**我们自己**的 CLI，`cli.main()` 会
+            # `_enable_utf8_stdio()` 强制以 UTF-8 写 stdout（0.2.3 修的 Windows 控制台
+            # 乱码）。父进程若沿用本地代码页（中文 Windows = cp936）解码，UTF-8 中文
+            # 三字节被判非法 → ``UnicodeDecodeError`` → payload 拿不到 → ``status()``
+            # 报「状态回显不完整」→ 依赖 status 的 token_plan / access / account 一起
+            # 变成「暂不可用」。``errors="replace"`` 是兜底：宁可屏幕上出现一个 U+FFFD，
+            # 也不许因为一个坏字节把整个视图打成不可用。
+            completed = subprocess.run(command, capture_output=True,
+                                       encoding="utf-8", errors="replace",
                                        timeout=self._cli_timeout, check=False,
                                        env=env, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
