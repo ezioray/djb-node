@@ -20,7 +20,7 @@
 
 数据域
 ======
-:data:`SECTIONS` 的 12 项对应 12 个视图的数据来源（视图映射见 :mod:`djb_node.desktop.views`）。
+:data:`SECTIONS` 的 13 项对应 13 个视图的数据来源（视图映射见 :mod:`djb_node.desktop.views`）。
 """
 from __future__ import annotations
 
@@ -49,10 +49,10 @@ UNAVAILABLE = "暂不可用"
 #: 无数据时的下一步提示
 DATA_SOURCE_HINT = "稍后刷新；仍未恢复请查看日志或运行 djb diagnose"
 
-#: 12 个数据域（顺序即视图顺序，见 :mod:`djb_node.desktop.views`）
+#: 13 个数据域（顺序即视图顺序，见 :mod:`djb_node.desktop.views`）
 SECTIONS: tuple[str, ...] = (
     "status", "bench", "gpu", "models", "tasks", "receipts",
-    "earnings", "agent", "access", "yield", "account", "logs",
+    "earnings", "agent", "token_plan", "access", "yield", "account", "logs",
 )
 #: 日志级别（与 :data:`djb_node.facts.LOG_LEVELS` 一致 + warning/error）
 LOG_LEVELS: tuple[str, ...] = ("debug", "info", "warning", "error", "critical")
@@ -473,7 +473,8 @@ class LocalDataSource:
         loader = {
             "status": self._status, "bench": self._bench_section, "gpu": self._gpu,
             "models": self._models, "tasks": self._tasks, "receipts": self._receipts,
-            "earnings": self._earnings, "agent": self._agent, "access": self._access_section,
+            "earnings": self._earnings, "agent": self._agent,
+            "token_plan": self._token_plan_section, "access": self._access_section,
             "yield": self._yield, "account": self._account, "logs": self._logs_section,
         }
         collected: dict[str, Any] = {}
@@ -769,6 +770,100 @@ class LocalDataSource:
                          "token": mask_secret(config.scoped_token)},
             "note": "下行令牌只读展示；轮换请到服务端控制台。",
         }
+
+    def _upstream_capacity_detail(self) -> dict[str, Mapping[str, Any]]:
+        """逐上游的「模型数 / 已验证模型数 / 最大 QPS」——与公告同一套门控。
+
+        口径说明（避免两处公式漂移）：
+
+        * 「已验证」= :meth:`UpstreamManager.announceable_models` 的口径（模型级 L2 通过 +
+          结论新鲜 + 模型与上游都启用 + 上游不是 ``rejected``）；
+        * 「最大 QPS」= ``announce_capacity`` 分摊出来的**同一个** per-model 值 × 该上游的
+          已验证模型数 —— per-model 值直接读 ``announce_capacity`` 的结果，不在这里重算。
+
+        返回的行是本机库里的**全部**上游（含停用），这才是「我接入了哪些」的权威清单：
+        状态子进程偶尔只回 ``state`` 而不带 ``upstreams``（daemon 没起时就是如此），
+        只信它会把已有上游显示成「0 条」。
+        """
+        from ..config import Paths
+        from ..secure import CredentialStore
+        from ..upstream import UpstreamManager
+        from ..util import utcnow
+
+        store = self._store()
+        manager = UpstreamManager(store, CredentialStore(Paths(str(self._home))))
+        moment = utcnow()
+        live = {(record.id, entry.id) for record, entry in manager.announceable_models(moment)}
+        entries = manager.announce_capacity(store.profile(), now=moment)
+        per_model = max([float(entry.get("max_qps") or 0.0) for entry in entries], default=0.0)
+        detail: dict[str, Mapping[str, Any]] = {}
+        for record in manager.list():
+            approved = [model for model in record.model_ids() if (record.id, model) in live]
+            detail[record.id] = {"access_type": record.access_type,
+                                 "state": record.state,
+                                 "enabled": bool(record.enabled),
+                                 "upstream_kind": record.upstream_kind,
+                                 "model_count": len(record.models),
+                                 "verified_models": len(approved),
+                                 "max_qps": round(per_model * len(approved), 2),
+                                 "last_probe_at": record.last_probe_at}
+        return detail
+
+    def _token_plan_section(self) -> Mapping[str, Any]:
+        """「共享 Token Plan」的聚合数据域（**只读，且只用既有取数路径**）。
+
+        来源只有两处，都不新造接口：
+
+        * ``djb status --json``（与状态栏同一条只读子进程）：``profile.limits``（每日/并发上限）、
+          ``limits``（日/周/月窗口的 used/limit）、``upstreams``（申报过的上游）、``node``；
+        * 本机状态库 + :class:`UpstreamManager`（与公告同源）：每条上游的已验证模型数 / 最大 QPS。
+
+        降级口径：daemon 没跑（status 取不到）但本机库可读时，只给上游清单并如实说明
+        「预算/在线状态读不到」；两边都读不到才整域「暂不可用」——绝不把缺数据说成 0 条上游。
+        """
+        status = self._safe("status", self._status)
+        info: Mapping[str, Any] = status if isinstance(status, Mapping) else {}
+        profile = info.get("profile") if isinstance(info.get("profile"), Mapping) else {}
+        limits = profile.get("limits") if isinstance(profile.get("limits"), Mapping) else {}
+        node = info.get("node") if isinstance(info.get("node"), Mapping) else {}
+        usage = [row for row in (info.get("limits") or []) if isinstance(row, Mapping)]
+        base_rows = [row for row in (info.get("upstreams") or []) if isinstance(row, Mapping)]
+        detail: dict[str, Mapping[str, Any]] = {}
+        store_error = ""
+        try:
+            detail = self._upstream_capacity_detail()
+        except Exception as exc:                    # 库没初始化 / 版本不符：页面照样能开
+            store_error = type(exc).__name__
+        if isinstance(status, Unavailable):
+            if not detail:
+                raise ProviderError(status.reason, hint=status.hint)
+            note = ("daemon 状态暂不可用（" + status.reason
+                    + "）：在线状态与预算读不到，上游清单来自本机库。")
+        elif store_error:
+            note = ("上游明细暂不可用（" + store_error + "）：只显示申报记录，"
+                    "已验证模型数与 QPS 缺省。")
+        else:
+            note = ""
+        rows: list[dict[str, Any]] = []
+        if detail:
+            # 库里有清单 → 以库为准（状态子进程可能压根没带 upstreams 字段）
+            for identifier, item in detail.items():
+                rows.append(dict(item, id=identifier))
+        else:
+            for row in base_rows:
+                rows.append({"id": str(row.get("id") or ""),
+                             "access_type": str(row.get("access_type") or ""),
+                             "state": str(row.get("state") or ""),
+                             "enabled": bool(row.get("enabled", True)),
+                             "upstream_kind": row.get("upstream_kind"),
+                             # 状态里只给「申报了几个模型」；库里才有「已验证几个」
+                             "model_count": row.get("models"),
+                             "verified_models": None, "max_qps": None,
+                             "last_probe_at": None})
+        return {"upstreams": rows, "limits": dict(limits), "usage": usage,
+                "preset": str(profile.get("preset") or ""),
+                "node": {"node_id": node.get("node_id"), "bound": node.get("bound")},
+                "note": note}
 
     def _access_section(self) -> Mapping[str, Any]:
         config = self._access.load()

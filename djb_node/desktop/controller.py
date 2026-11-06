@@ -94,7 +94,7 @@ class LocalControlChannel:
 
 @dataclass
 class DesktopController:
-    """12 视图的状态机：唯一入口 ``show`` / ``action`` / ``refresh``。"""
+    """13 视图的状态机：唯一入口 ``show`` / ``action`` / ``refresh``。"""
 
     source: DataSource
     access: AccessService | None = None
@@ -314,6 +314,16 @@ class DesktopController:
 
     def _act_access_reload(self, *, confirm=None) -> ActionResult:
         return self.probe_reload()
+
+    # 共享 Token Plan 页：主操作只是「换视图 + 复用接入配置页的保存/回读」，
+    # 不发新请求、不写真机配置 —— 真正的写入仍走 access.save 的那条老路。
+    def _act_token_plan_open_access(self, *, confirm=None) -> ActionResult:
+        return ActionResult("已切到「接入配置」：在那里添加上游凭据、或完成节点绑定。",
+                            effect="goto", payload="access")
+
+    def _act_token_plan_refresh(self, *, confirm=None) -> ActionResult:
+        self.refresh(sections=("status", "token_plan", "receipts"))
+        return ActionResult(self.message, effect="refresh")
 
     def _act_yield_pause(self, *, confirm=None) -> ActionResult:
         return self._control("pause", confirm)
