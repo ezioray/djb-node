@@ -1031,7 +1031,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="启动时打开的视图")
     parser.add_argument("--demo", action="store_true", help="用确定性演示数据（截图/培训用）")
     parser.add_argument("--shot", metavar="DIR", help="构造后逐视图截图到目录（需要 ImageMagick import）")
+    parser.add_argument("--no-auto", action="store_true",
+                        help="关闭首启自举（测试/离线环境：不建目录、不起节点）")
     args = parser.parse_args(list(argv) if argv is not None else None)
+    boot_line = ""
+    if not args.demo and not args.no_auto:
+        # 首启自举（2026-11-06 外部客户实测：装完只看到「云端未接通/本机未初始化」）
+        from ..bootstrap import ensure_ready, start_daemon, summary_text
+        boot = ensure_ready(home=args.home)
+        daemon = start_daemon(home=args.home)
+        boot_line = summary_text(boot, daemon)
     controller = make_controller(home=args.home, demo=args.demo)
     try:
         # prefs_home 必须显式给：demo 数据源没有 home，不给就会把主题偏好写到真实 ~/.djb
@@ -1044,6 +1053,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(HEADLESS_HINT + "（" + type(exc).__name__ + "）")
         return EXIT_HEADLESS
     app.show_view(args.view)
+    if boot_line:
+        # 自举结果写进状态栏：用户看得到"已自动初始化/已修正云端地址/节点已启动"
+        try:
+            app._toast(boot_line)                         # noqa: SLF001 - 同模块私有状态栏
+        except Exception:                                # pragma: no cover - 纯展示
+            pass
     if args.shot:
         _shoot(app, args.shot)
         app.stop()

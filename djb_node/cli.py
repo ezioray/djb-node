@@ -82,12 +82,22 @@ def _json_flag(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "json", False))
 
 
+def _gateway_is_placeholder(url: str | None) -> bool:
+    """地址是否还没配过（空 / 占位符 / example.invalid 系）。"""
+    text = (url or "").strip().lower()
+    return (not text) or text.endswith("example.invalid") or "example.invalid" in text
+
+
 # ─────────────────────────────────────────────────────────── init
 def cmd_init(args: argparse.Namespace) -> int:
     paths = _paths(args)
     config = load_config(paths)
     if getattr(args, "gateway", None):
         config.gateway_url = str(args.gateway).strip()
+    elif _gateway_is_placeholder(config.gateway_url):
+        # 没显式给地址就用构建期默认（2026-11-06：占位符发到客户手里 = 装完连不上）
+        from .bootstrap import DEFAULT_GATEWAY_URL
+        config.gateway_url = DEFAULT_GATEWAY_URL
     if getattr(args, "port", None):
         config.mirror_port = int(args.port)
     if getattr(args, "channel", None):
