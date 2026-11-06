@@ -739,6 +739,8 @@ class DesktopApp:
             self._open_dir(result.payload)
         elif result.effect == "open_url":
             self._open_url(result.payload)
+        elif result.effect == "goto" and result.payload:
+            self.show_view(str(result.payload))       # 例如「共享 Token Plan」→「接入配置」
         elif result.effect in ("refresh", "access", "bench", "control", "reload"):
             self._render(self._controller.current())
         self._update_status()
@@ -897,6 +899,22 @@ _DEMO_SECTIONS = {
                               "scoped_token": "djb_sc_…9f2c"},
                    "valid": True, "binding": {"state": "bound", "node_id": "node-7c31"},
                    "note": "", "path": "~/.djb/desktop/access-config.json"},
+        # 共享 Token Plan（第 9 项）：演示数据必须给「有上游」的形状，
+        # 否则截图里只有空态，客户看不到「我的 Token Plan」长什么样。
+        "token_plan": {"upstreams": [
+            {"id": "up_moonshot_01", "access_type": "A1", "state": "verified",
+             "enabled": True, "upstream_kind": "official", "model_count": 3,
+             "verified_models": 2, "max_qps": 1.0, "last_probe_at": "2026-11-01T04:30:00Z"},
+            {"id": "up_local_agent", "access_type": "A2", "state": "declared",
+             "enabled": True, "upstream_kind": "third_party_relay", "model_count": 1,
+             "verified_models": 0, "max_qps": 0.0, "last_probe_at": None}],
+            "limits": {"daily_tokens": 200000, "weekly_tokens": 0, "monthly_tokens": 0,
+                       "concurrent": 4},
+            "usage": [{"name": "daily", "limit": 200000, "used": 41892, "remaining": 158108,
+                       "window_seconds": 86400}],
+            "preset": "balanced",
+            "node": {"node_id": "node-7c31", "bound": True},
+            "note": ""},
         "yield": {"state": "online", "reason": None, "reason_label": None, "accepting": True,
                   "mode": "balanced", "yield_enabled": True},
         "account": {"profile": {"email": "node@example.com", "role": "共享方",

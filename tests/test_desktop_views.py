@@ -16,9 +16,10 @@ from djb_node.desktop.controller import ControlOutcome, DesktopController
 
 SECRET = "djb_sk_live_9f2c41aa77be"
 SPEC_ORDER = ["overview", "bench", "models", "gpu", "tasks", "receipts", "earnings",
-              "agent", "access", "yield", "account", "logs"]
+              "agent", "token_plan", "access", "yield", "account", "logs"]
 SPEC_TITLES = ["总览", "性能基准", "可提供模型", "GPU 监控", "任务队列", "收据", "收益",
-               "Agent 接入", "接入配置", "让路/节能", "账户与安全", "日志"]
+               "Agent 接入", "共享 Token Plan", "接入配置", "让路/节能", "账户与安全",
+               "日志"]
 #: 合规红线：不许出现「许愿式」金融承诺；「不可提现」这类否定式免责声明是允许的
 FORBIDDEN_PROMISES = ("充值", "APY", "保本", "固定收益", "储值账户", "稳赚", "保证收益")
 
@@ -28,7 +29,7 @@ def snapshot_all_unavailable(reason="测试：数据源未接线"):
 
 
 # ─────────────────────────────────────────────────────────────── 结构
-def test_twelve_views_in_spec_order():
+def test_thirteen_views_in_spec_order():
     assert list(vw.VIEW_KEYS) == SPEC_ORDER
     for (key, title), expected_key, expected_title in zip(vw.VIEWS, SPEC_ORDER, SPEC_TITLES):
         assert key == expected_key
@@ -149,6 +150,106 @@ def test_unwired_views_say_unavailable_not_fake_success():
         assert action in {a.key for a in view.actions}, key
 
 
+# ─────────────────────────────── 共享 Token Plan（第 13 个导航页，任务 A）
+def _token_plan_snapshot(*, upstreams, bound=True, usage=None):
+    """三种状态共用的一份快照：上游清单 / 绑定态 / 今日用量都可调。"""
+    sections = dict(demo_snapshot().sections)
+    sections["token_plan"] = {
+        "upstreams": list(upstreams),
+        "limits": {"daily_tokens": 200000, "weekly_tokens": 0, "monthly_tokens": 0,
+                   "concurrent": 4},
+        "usage": list(usage or []), "preset": "balanced",
+        "node": {"node_id": "node-7c31" if bound else None, "bound": bound},
+        "note": ""}
+    sections["access"] = {"config": {"node_id": "node-7c31"},
+                          "valid": True, "saved": True,
+                          "binding": {"state": "bound" if bound else "unbound"},
+                          "note": "", "path": "~/.djb/desktop/access-config.json"}
+    return ds.Snapshot(sections)
+
+
+def test_token_plan_nav_item_sits_right_before_access():
+    """客户找不到入口 = 导航表里根本没有；这条钉住「第 9 项、标题、在接入配置之前」。"""
+    assert ("token_plan", "共享 Token Plan") in vw.VIEWS
+    order = list(vw.VIEW_KEYS)
+    assert order.index("token_plan") == 8                     # 第 9 项
+    assert order.index("token_plan") < order.index("access")
+    assert len(vw.VIEWS) == 13
+
+
+def test_token_plan_key_is_showable_and_renders_plain_text(tmp_path):
+    """tools/live_views.py 与无显示环境验收都走 controller.show(key).plain_text()。"""
+    controller = make_controller(tmp_path)
+    view = controller.show("token_plan")
+    assert view.key == "token_plan" and view.title == "共享 Token Plan"
+    text = view.plain_text()
+    assert text.startswith("# 共享 Token Plan")
+    assert controller.view == "token_plan"
+
+
+def test_token_plan_lists_upstreams_with_state_models_and_qps():
+    view = vw.build_view("token_plan", demo_snapshot())
+    text = view.plain_text()
+    assert view.table is not None
+    assert [row.cells[0] for row in view.table.rows] == ["up_moonshot_01", "up_local_agent"]
+    assert "✓ 已验证" in text and "◐ 已申报（待验证）" in text
+    assert "3 个（已验证 2）" in text                          # 申报数 ≠ 已验证数
+    assert "最大 QPS" in text
+
+
+def test_token_plan_empty_state_tells_customer_what_to_do():
+    snapshot = _token_plan_snapshot(upstreams=[])
+    view = vw.build_view("token_plan", snapshot)
+    text = view.plain_text()
+    assert "你还没有接入任何 Token Plan" in text
+    assert "去接入配置" in text                                # 空态必须给下一步，不是只说暂无
+    assert view.table is not None and not view.table.rows
+
+
+def test_token_plan_unbound_state_points_at_binding():
+    snapshot = _token_plan_snapshot(upstreams=[], bound=False)
+    text = vw.build_view("token_plan", snapshot).plain_text()
+    assert "✕ 未绑定" in text
+    assert "还没绑定" in text and "接入配置" in text
+
+
+def test_token_plan_says_unavailable_instead_of_zero_when_data_missing():
+    snapshot = ds.Snapshot({name: ds.Unavailable("测试：数据源未接线") for name in ds.SECTIONS})
+    text = vw.build_view("token_plan", snapshot).plain_text()
+    assert "暂不可用" in text
+    assert "0 条上游" not in text                              # 缺数据 ≠ 零上游
+    assert "未启用" not in text                                # 限额读不到时不许编「周/月未启用」
+
+
+def test_token_plan_today_card_uses_limiter_usage_and_receipts():
+    usage = [{"name": "daily", "limit": 200000, "used": 41892, "remaining": 158108}]
+    snapshot = _token_plan_snapshot(
+        upstreams=[{"id": "u1", "access_type": "A1", "state": "verified", "enabled": True,
+                    "model_count": 1, "verified_models": 1, "max_qps": 1.0}],
+        usage=usage)
+    text = vw.build_view("token_plan", snapshot).plain_text()
+    assert "41892 tokens" in text
+    assert "2 张收据" in text                                  # 演示数据里的两张收据
+
+
+def test_token_plan_open_access_is_a_goto_action_without_network(tmp_path):
+    """主操作只换视图：不发请求、不写配置（写入仍走 access.save 那条老路）。"""
+    controller = make_controller(tmp_path)
+    calls = controller.source.calls
+    result = controller.action("token_plan.open_access")
+    assert result.ok and result.effect == "goto" and result.payload == "access"
+    assert controller.source.calls == calls                    # 没有触发任何取数/网络
+
+
+def test_token_plan_disabled_upstream_is_labelled_not_hidden():
+    snapshot = _token_plan_snapshot(
+        upstreams=[{"id": "u1", "access_type": "A1", "state": "verified", "enabled": False,
+                    "model_count": 2, "verified_models": 2, "max_qps": 0.0}])
+    view = vw.build_view("token_plan", snapshot)
+    assert view.table is not None and len(view.table.rows) == 1
+    assert "已停用" in view.plain_text()
+
+
 # ─────────────────────────────────────────────────────────────── 控制器
 def make_controller(tmp_path, *, sections=None, store=None, control=None, bus=None):
     sections = sections if sections is not None else dict(demo_snapshot().sections)
@@ -162,7 +263,7 @@ def test_controller_starts_on_overview_and_switches(tmp_path):
     controller = make_controller(tmp_path)
     assert controller.view == "overview"
     assert controller.show("logs").key == "logs"
-    assert controller.next_view().key == "overview"          # 12 项循环
+    assert controller.next_view().key == "overview"          # 13 项循环
     assert controller.next_view(-1).key == "logs"
     with pytest.raises(ValueError):
         controller.show("nope")

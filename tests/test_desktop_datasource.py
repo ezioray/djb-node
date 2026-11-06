@@ -33,9 +33,10 @@ def test_snapshot_projection_helpers():
     assert snapshot.text_of("status", "missing", "—") == "—"
 
 
-def test_sections_cover_twelve_domains():
-    assert len(ds.SECTIONS) == 12
+def test_sections_cover_thirteen_domains():
+    assert len(ds.SECTIONS) == 13
     assert ds.SECTIONS[0] == "status" and ds.SECTIONS[-1] == "logs"
+    assert "token_plan" in ds.SECTIONS
 
 
 # ─────────────────────────────────────────────────────────────── 假实现
@@ -186,6 +187,34 @@ def make_source(tmp_path, **kwargs):
                     store_factory=lambda _path: (_ for _ in ()).throw(OSError("no db")))
     defaults.update(kwargs)
     return ds.LocalDataSource(**defaults)
+
+
+def test_token_plan_lists_store_upstreams_when_status_has_none(tmp_path):
+    """回归（任务 A）：daemon 没起时状态子进程只回 ``state``、不带 ``upstreams``，
+    这时不许把本机库里已经接入的上游显示成「0 条上游 / 你还没有接入任何 Token Plan」。"""
+    from djb_node.config import Paths
+    from djb_node.secure import CredentialStore
+    from djb_node.store import Store
+    from djb_node.upstream import UpstreamManager
+
+    paths = Paths(str(tmp_path))
+    paths.prepare()
+    store = Store.create(paths.db_file, version="0.1.0")
+    record = UpstreamManager(store, CredentialStore(paths)).add(
+        access_type="A1", base_url="https://api.example.invalid/v1",
+        models="m1,m2", secret="sk-test")
+    source = make_source(tmp_path, runner=lambda argv: {"state": "stopped"},
+                         store_factory=Store)
+    section = source.snapshot(sections=("token_plan",)).get("token_plan")
+    assert [row["id"] for row in section["upstreams"]] == [record.id]
+    assert section["upstreams"][0]["model_count"] == 2
+    assert section["upstreams"][0]["verified_models"] == 0      # 没探过就是 0，不说已验证
+    from djb_node.desktop.views import build_view
+
+    text = build_view("token_plan", source.snapshot(sections=("token_plan",))).plain_text()
+    assert "1 条上游" in text
+    assert "0 条上游" not in text
+    assert "你还没有接入任何 Token Plan" not in text
 
 
 def test_status_ok(tmp_path):

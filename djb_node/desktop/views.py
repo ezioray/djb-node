@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""12 个视图的**纯投影**：:class:`Snapshot` → :class:`View`（无 Tk、无 IO、可快照断言）。
+"""13 个视图的**纯投影**：:class:`Snapshot` → :class:`View`（无 Tk、无 IO、可快照断言）。
 
 为什么单独一层
 ==============
 
 * 视图口径（三冗余状态、`暂不可用`、金额不换算、秘密掩码）全部在这里定，
-  Tk 层只按 :class:`View` 的字段画，不重新解释数据 —— 因此无图形环境也能断言 12 个视图。
+  Tk 层只按 :class:`View` 的字段画，不重新解释数据 —— 因此无图形环境也能断言 13 个视图。
 * :meth:`View.plain_text` 给「文本快照」：既是 `ops/uta/evidence/wp6/views.txt` 的来源，
   也是无显示环境下的验收替代物。
 * 状态语义（基准 §3）：`完成/已验证` = 薄荷 + 勾 + 文案；`等待` = 琥珀 + 半环 + 文案；
@@ -44,7 +44,12 @@ class Mark:
     IDLE = MARK_IDLE
 
 
-#: 12 视图（key, 侧栏标题）——顺序即 IA 顺序
+#: 13 视图（key, 侧栏标题）——顺序即 IA 顺序
+#:
+#: 第 9 项「共享 Token Plan」（键名 ``token_plan``）回应「客户找不到共享 Token Plan 入口」：
+#: 它**聚合**已有数据域（access/account 的绑定态 + 上游清单 + 限额预算 + 今日用量），
+#: 不新造后端接口；放在「接入配置」之前，客户第一眼就能看到「共享了什么、还能共享多少」，
+#: 主操作一步跳到「接入配置」去加第一条上游。
 VIEWS: tuple[tuple[str, str], ...] = (
     ("overview", "总览"),
     ("bench", "性能基准"),
@@ -54,6 +59,7 @@ VIEWS: tuple[tuple[str, str], ...] = (
     ("receipts", "收据"),
     ("earnings", "收益"),
     ("agent", "Agent 接入"),
+    ("token_plan", "共享 Token Plan"),
     ("access", "接入配置"),
     ("yield", "让路 / 节能"),
     ("account", "账户与安全"),
@@ -231,7 +237,7 @@ def _section(snapshot: Snapshot, name: str) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-# ─────────────────────────────────────────────────────────────── 12 个构建器
+# ─────────────────────────────────────────────────────────────── 13 个构建器
 def _overview(snapshot: Snapshot) -> View:
     status, earnings = _section(snapshot, "status"), _section(snapshot, "earnings")
     receipts = _section(snapshot, "receipts")
@@ -631,6 +637,158 @@ def _binding_bound(binding: Mapping[str, Any]) -> bool | None:
     return None
 
 
+#: 上游验证状态 → （前缀，中文，语义色）。没登记的状态原样显示 + 「未知状态」，不猜。
+_TOKEN_STATE = {
+    "verified": (MARK_DONE, "已验证", "mint"),
+    "declared": (MARK_WAIT, "已申报（待验证）", "amber"),
+    "probing": (MARK_WAIT, "验证中", "amber"),
+    "rejected": (MARK_FAIL, "验证未通过", "red"),
+}
+
+#: 空态文案（客户投诉的正是「找不到入口」，所以这句必须给出下一步而不是只说「暂无数据」）
+TOKEN_PLAN_EMPTY = "你还没有接入任何 Token Plan，点下面「去接入配置」开始"
+
+
+def _token_plan_rate(value: Any) -> str:
+    """QPS 原样展示（整数值不带 .0）；None/缺字段给「—」，绝不补 0。"""
+    if value is None or value == "" or isinstance(value, (bool, Mapping, list, tuple)):
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return str(int(number)) if number.is_integer() else str(number)
+
+
+def _token_plan_rows(rows: Any) -> list[Row]:
+    """上游行：``id | 接入 | 验证状态 | 模型 | 最大 QPS | 最近验证``。
+
+    「模型」列给 ``总数（已验证 n）``——只有探针 L2 通过且新鲜、且上游启用的模型才会进容量，
+    所以「总数」和「已验证」必须分开，不能把申报过的模型说成已共享。
+    """
+    result: list[Row] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        identifier = str(row.get("id") or "")
+        state = str(row.get("state") or "")
+        mark, label, tone = _TOKEN_STATE.get(
+            state, (MARK_UNKNOWN, (state + "（未知状态）") if state else "状态未知", "muted"))
+        if row.get("enabled") is False:
+            label += " · 已停用"                     # 停用 = 不公告，别让客户以为还在共享
+            tone = "muted"
+        total, verified = row.get("model_count"), row.get("verified_models")
+        models = _num(total) + " 个" if isinstance(total, int) else "—"
+        if isinstance(verified, int) and isinstance(total, int):
+            models += "（已验证 " + str(verified) + "）"
+        last = str(row.get("last_probe_at") or "—")
+        result.append(Row((_short_id(identifier, 12) or "—", str(row.get("access_type") or "—"),
+                           mark + " " + label, models, _token_plan_rate(row.get("max_qps")),
+                           last),
+                          key=identifier, tone=tone,
+                          narrow=(_short_id(identifier, 6) or "—",
+                                  str(row.get("access_type") or "—"),
+                                  mark + " " + label.split("（")[0], models.split("（")[0],
+                                  _token_plan_rate(row.get("max_qps")), last)))
+    return result
+
+
+def _token_plan_usage(plan: Mapping[str, Any], window: str) -> Mapping[str, Any]:
+    """限额窗口（daily/weekly/monthly）的 ``used / limit``；缺了就是 {}（不编 0）。"""
+    for item in plan.get("usage") or []:
+        if isinstance(item, Mapping) and str(item.get("name") or "") == window:
+            return item
+    return {}
+
+
+def _token_plan(snapshot: Snapshot) -> View:
+    """共享 Token Plan：共享状态 + 我的上游 + 预算 + 今日用量 + 一个去配置的入口。"""
+    plan = _section(snapshot, "token_plan")
+    access = _section(snapshot, "access")
+    config = access.get("config") if isinstance(access.get("config"), Mapping) else {}
+    binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
+    account = _section(snapshot, "account")
+    profile = account.get("profile") if isinstance(account.get("profile"), Mapping) else {}
+    security = account.get("security") if isinstance(account.get("security"), Mapping) else {}
+    status = _section(snapshot, "status")
+    receipts = _section(snapshot, "receipts")
+    receipt_rows = [row for row in (receipts.get("rows") or []) if isinstance(row, Mapping)]
+    # 绑定态直接复用账户/接入页的判定（服务端 binding → profile.bound → 本机凭据）
+    bound = _account_bound(profile, security, binding)
+    online = str(status.get("state") or "") == "online"
+    state = str(status.get("state") or "")
+    state_text, state_tone = (
+        (MARK_DONE + " 已上线", "mint") if online else
+        (MARK_WAIT + " 启动中", "amber") if state in ("starting", "updating") else
+        (MARK_WAIT + " 已暂停", "amber") if state == "paused" else
+        (MARK_IDLE + " 未运行", "muted") if state == "stopped" else
+        (MARK_FAIL + " 错误", "red") if state == "error" else
+        (MARK_UNKNOWN + " 状态未知", "muted"))
+    if not snapshot.ok("status"):
+        state_text, state_tone = MARK_UNKNOWN + " 暂不可用", "muted"
+    bound_text, bound_tone = (
+        (_flag(True, "已绑定", "未绑定"), "mint") if bound is True else
+        (_flag(False, "已绑定", "未绑定"), "amber") if bound is False else
+        (_flag(None, "已绑定", "未绑定"), "muted"))
+    node_id = str(profile.get("node_id") or binding.get("node_id")
+                  or config.get("node_id") or "—")
+    rows = _token_plan_rows(plan.get("upstreams"))
+    verified_upstreams = sum(1 for row in (plan.get("upstreams") or [])
+                             if isinstance(row, Mapping)
+                             and str(row.get("state") or "") == "verified")
+    limits = plan.get("limits") if isinstance(plan.get("limits"), Mapping) else {}
+    daily = _token_plan_usage(plan, "daily")
+    used = daily.get("used")
+    daily_limit = daily.get("limit", limits.get("daily_tokens"))
+    budget = ("并发 " + _num(limits.get("concurrent")) + " · 每日 "
+              + _num(limits.get("daily_tokens")) + " tokens")
+    budget_meta = "周 " + (str(limits.get("weekly_tokens")) if limits.get("weekly_tokens")
+                          else "未启用") + " · 月 " + (
+        str(limits.get("monthly_tokens")) if limits.get("monthly_tokens") else "未启用")
+    if not snapshot.ok("token_plan"):
+        # 限额读不到时不许说「周/月未启用」—— 那是把缺数据编成配置结论
+        budget, budget_meta = UNAVAILABLE, ""
+    shared_value = (_num(used) + " tokens") if snapshot.ok("token_plan") else UNAVAILABLE
+    shared_meta = ((str(len(receipt_rows)) + " 张收据 · 今日上限 " + _num(daily_limit))
+                   if snapshot.ok("receipts") else UNAVAILABLE)
+    notes: list[str] = []
+    if bound is False:
+        notes.append("节点还没绑定：先在「接入配置」用网页端一次性绑定码完成绑定，"
+                     "再把 Token Plan 共享出去。")
+    if snapshot.ok("token_plan") and not rows:
+        notes.append(TOKEN_PLAN_EMPTY + "（A1 直填 Key / A2 本机代理，都在「接入配置」里）。")
+    notes.append("验证状态来自本机探针（L2 推理通过 + 结论新鲜）；"
+                 "未验证 / 已过期的模型不进容量，也不会产生共享收益。")
+    notes.append("「最大 QPS」是本机按并发上限分摊给已验证模型的数值（公告口径），不是实测吞吐。")
+    if not (snapshot.ok("access") and snapshot.ok("account")):
+        notes.append("接入配置 / 账户数据暂不可用：绑定状态暂时无法确认，点「刷新」重试。")
+    if plan.get("note"):
+        notes.append(str(plan.get("note")))
+    return View(
+        key="token_plan", title="共享 Token Plan",
+        subtitle="节点与绑定 · 我的上游 · 共享预算 · 今日用量",
+        cards=(
+            Card("共享状态", state_text, bound_text + " · 节点 " + node_id,
+                 "amber" if bound is False else state_tone),
+            Card("我的 Token Plan（上游）",
+                 _count(snapshot, "token_plan", str(len(rows)) + " 条上游"),
+                 (("已验证 " + str(verified_upstreams) + " 条 · 详见下表") if rows
+                  else "点下面「去接入配置」添加上游") if snapshot.ok("token_plan") else "",
+                 "mint" if rows else "amber"),
+            Card("共享预算", budget, budget_meta + "（本机限额设置）", "default"),
+            Card("今日已共享", shared_value, shared_meta, "mint" if used else "muted"),
+        ),
+        table=Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
+                    narrow_hide=("最近验证",),
+                    note="验证通过且新鲜的模型才会进入共享容量",
+                    empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE)),
+        actions=(Action("token_plan.open_access", "去接入配置（添加上游 / 绑定节点）", primary=True),
+                 Action("token_plan.refresh", "刷新")),
+        unavailable=_missing(snapshot, ("token_plan",)),
+        notes=tuple(notes),
+    )
+
+
 def _access(snapshot: Snapshot) -> View:
     access = _section(snapshot, "access")
     config = access.get("config") if isinstance(access.get("config"), Mapping) else {}
@@ -856,7 +1014,8 @@ def _logs(snapshot: Snapshot) -> View:
 _BUILDERS = {
     "overview": _overview, "bench": _bench, "models": _models, "gpu": _gpu,
     "tasks": _tasks, "receipts": _receipts, "earnings": _earnings, "agent": _agent,
-    "access": _access, "yield": _yield, "account": _account, "logs": _logs,
+    "token_plan": _token_plan, "access": _access, "yield": _yield, "account": _account,
+    "logs": _logs,
 }
 
 
@@ -869,5 +1028,5 @@ def build_view(key: str, snapshot: Snapshot) -> View:
 
 
 def build_views(snapshot: Snapshot) -> dict[str, View]:
-    """一次构建 12 个视图（顺序同 :data:`VIEWS`）。"""
+    """一次构建 13 个视图（顺序同 :data:`VIEWS`）。"""
     return {key: _BUILDERS[key](snapshot) for key in VIEW_KEYS}
