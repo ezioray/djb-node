@@ -2247,7 +2247,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _enable_utf8_stdio() -> None:
+    """Windows 控制台默认 GBK：中文输出会变成「鑱旇剳」。只对齐输出编码，**不改代码页**。
+
+    P1（2026-11-07 实测）：Windows 上 ``djb init`` / ``djb env`` 的中文全乱码，因为 CLI 输出
+    UTF-8 而控制台按 cp936（GBK）解码。这里把 ``sys.stdout`` / ``sys.stderr`` 的编码改成
+    UTF-8 + ``errors="replace"``（宁可显示 '?' 也不抛 UnicodeEncodeError 打断命令）。
+
+    为什么不用 ``chcp 65001``：那是改**调用方**（cmd / PowerShell 窗口）的全局代码页，
+    会连带影响用户同一窗口里的其它程序，而且 CLI 无权替用户改终端设置。
+
+    任何失败（流被替换成不支持 ``reconfigure`` 的替身、控制台不可写…）都静默跳过：
+    乱码是显示问题，不能让它变成命令失败。
+    """
+    for stream in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:                       # pragma: no cover - 平台差异，失败即跳过
+            continue
+
+
 def main(argv: list[str] | None = None) -> int:
+    _enable_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     handler = getattr(args, "handler", None)

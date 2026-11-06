@@ -19,6 +19,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
@@ -117,7 +118,43 @@ def _fmt_version(pair: tuple[int, int]) -> str:
     return str(pair[0]) + "." + format(pair[1], "02d")
 
 
+def _windows_mem_total_gb() -> float:
+    """Windows 物理内存总量（GB）：``GlobalMemoryStatusEx``（stdlib ``ctypes``，无新依赖）。
+
+    P1（2026-11-07）：``envcheck`` 原来只读 ``/proc/meminfo``，Windows 上恒为 0.0 GB，
+    硬件结论变成「内存 0.0 GB」。失败（非 Windows / 调用被拒 / 字段异常）一律返回 0.0，
+    由 :func:`_mem_total_gb` 回落到原实现 —— 探测失败不能变成异常。
+    """
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return 0.0
+        total = int(status.ullTotalPhys)
+        return round(total / 1024 ** 3, 1) if total > 0 else 0.0
+    except Exception:                            # 非 Windows / ctypes 不可用 / 调用失败
+        return 0.0
+
+
 def _mem_total_gb() -> float:
+    """物理内存总量（GB）：Windows 走 kernel32，其余平台读 ``/proc/meminfo``。"""
+    if sys.platform.startswith("win"):
+        measured = _windows_mem_total_gb()
+        if measured > 0:
+            return measured
     try:
         with open("/proc/meminfo", "r", encoding="ascii") as handle:
             for line in handle:
