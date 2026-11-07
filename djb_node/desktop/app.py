@@ -1388,10 +1388,12 @@ class DesktopApp:
             row, column = divmod(index, per_row)
             block = tk.Frame(grid, background=surface)
             block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
+            # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
+            block.columnconfigure(0, minsize=104)
             block.columnconfigure(1, weight=1)
             tk.Label(block, text=field.label, font=fonts.sans(kit.PX_MICRO_CJK),
                      foreground=dual.color("muted_text"), background=surface,
-                     width=12, anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
+                     anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
             if field.editable:
                 variable = tk.StringVar(value="" if field.secret else field.value)
                 entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
