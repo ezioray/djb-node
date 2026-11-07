@@ -30,6 +30,7 @@ from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
+from . import platform_ui
 from .views import (NAV_SECTIONS, VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
                     Metric, RailCard, Row, Table, View, page_kicker)
 
@@ -182,6 +183,11 @@ class DesktopApp:
                  tk: Any = None, title: str = "DJB 联脑 · 桌面控制台",
                  bus: Any | None = None, on_quit: Any = None,
                  prefs_home: Any = None) -> None:
+        # DPI：必须在 Tk() 之前开感知（PMv2 → per-monitor → system 三级回退，幂等）
+        try:
+            platform_ui.enable_high_dpi()
+        except Exception:                          # pragma: no cover - 非 Windows 无副作用
+            pass
         self._tk = tk if tk is not None else _import_tk()
         try:
             self._root = root if root is not None else self._tk.Tk()
@@ -189,6 +195,14 @@ class DesktopApp:
             raise HeadlessError("窗口创建失败：" + type(exc).__name__) from None
         from tkinter import ttk
         self._ttk = ttk
+        # 倍率：DJB_UI_SCALE 覆盖（测试/回滚）→ 否则按 Tk 实际 DPI（aqua 恒 1.0）
+        try:
+            self._scale = float(os.environ.get("DJB_UI_SCALE") or platform_ui.ui_scale(self._root))
+        except Exception:                          # pragma: no cover - 无 Tk/非法值
+            self._scale = 1.0
+        if not (0.5 <= self._scale <= 4.0):
+            self._scale = 1.0
+        self._px = lambda n: int(round(float(n) * self._scale))
         self._controller = controller
         if getattr(controller, "save_path", None) is None:
             controller.save_path = _make_save_path(lambda: self._root)
@@ -205,8 +219,16 @@ class DesktopApp:
         self._detail_columns: tuple[str, ...] = ()
         self._vars: dict[str, Any] = {}
         self._root.title(title)
-        self._root.geometry("1180x780")
-        self._root.minsize(900, 620)
+        # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
+        try:
+            screen_w = int(self._root.winfo_screenwidth())
+            screen_h = int(self._root.winfo_screenheight())
+        except Exception:                          # pragma: no cover - 无窗口
+            screen_w = screen_h = 0
+        self._root.geometry(platform_ui.initial_geometry(
+            self._root, self._px(1180), self._px(780)))
+        self._root.minsize(*platform_ui.fit_minsize(
+            self._px(900), self._px(620), screen_w, screen_h))
         # 偏好落在数据源自己的 home（临时 home 的窗口不会写真实 ~/.djb）
         self._prefs_home = prefs_home if prefs_home is not None else getattr(
             getattr(controller, "source", None), "_home", None)
@@ -245,13 +267,20 @@ class DesktopApp:
         self._geom = geom
         self._kit = kit
         tk = self._tk
+        # fonts_for 缓存按 root 键「先到先得」：必须先按 scale 播种，再 apply_kit_styles
+        self._fonts = kit.fonts_for(self._root, scale=self._scale)
         kit.apply_kit_styles(self._root, self._ttk)
-        self._fonts = kit.fonts_for(self._root)
+        if self._scale != 1.0:
+            try:                                   # 行高跟着字号一起放大（26 → 32@125%）
+                self._ttk.Style().configure("Kit.Treeview", rowheight=self._px(26))
+                kit.NavItem.HEIGHT = self._px(kit.NavItem.HEIGHT)
+            except Exception:                      # pragma: no cover - 主题缺样式
+                pass
         self._root.rowconfigure(1, weight=1)
         self._root.columnconfigure(1, weight=1)
         self._build_header()
         side = tk.Frame(self._root, background=dual.color("surface3"),
-                        width=self.SIDEBAR_W, bd=0, highlightthickness=0)
+                        width=self._px(self.SIDEBAR_W), bd=0, highlightthickness=0)
         side.grid(row=1, column=0, sticky="nsew")
         side.grid_propagate(False)                     # 固定 208：内容再长也不许撑宽
         side.pack_propagate(False)                     # 子控件是 pack 的：这条才是真正生效的那条
@@ -278,7 +307,7 @@ class DesktopApp:
         # 滚轮直接可用（ttk 的 Scrollbar 只在指针悬停时才滚）；单一派发器：
         # 指针在侧栏导航上滚导航、在内容区滚内容（B2：矮窗要能翻到最后一项）
         self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        padding = (26, 18) if not self._is_narrow() else (12, 12)
+        padding = (self._px(26), self._px(18)) if not self._is_narrow() else (self._px(12), self._px(12))
         self._content = tk.Frame(self._canvas, background=dual.color("bg"), bd=0,
                                  highlightthickness=0)
         self._content_id = self._canvas.create_window((0, 0), window=self._content, anchor="nw")
@@ -304,7 +333,7 @@ class DesktopApp:
         """
         kit, tk = self._kit, self._tk
         fonts = self._fonts
-        head = tk.Frame(self._root, background=dual.color("surface"), height=self.HEADER_H,
+        head = tk.Frame(self._root, background=dual.color("surface"), height=self._px(self.HEADER_H),
                         bd=0, highlightthickness=0)
         head.grid(row=0, column=0, columnspan=2, sticky="ew")
         head.grid_propagate(False)                     # 固定 43：子控件不改变条高
@@ -313,13 +342,14 @@ class DesktopApp:
         brand = tk.Frame(head, background=dual.color("surface"))
         brand.pack(side="left", padx=(14, 0))
         self._brand = brand
-        logo = tk.Canvas(brand, width=24, height=24, background=dual.color("surface"),
+        logo = tk.Canvas(brand, width=self._px(24), height=self._px(24), background=dual.color("surface"),
                          bd=0, highlightthickness=0, takefocus=0)
-        logo.pack(side="left", pady=9)
-        logo.create_polygon(self._geom.round_rect_points(0.5, 0.5, 23.5, 23.5, 6), smooth=True,
-                            splinesteps=12, fill=dual.chart("mint_bright"),
-                            outline=dual.chart("mint_bright"))
-        logo.create_text(12, 12, text="D", fill=dual.color("ink"),
+        logo.pack(side="left", pady=self._px(9))
+        logo.create_polygon(self._geom.round_rect_points(
+            0.5, 0.5, self._px(24) - 0.5, self._px(24) - 0.5, self._px(6)), smooth=True,
+            splinesteps=12, fill=dual.chart("mint_bright"),
+            outline=dual.chart("mint_bright"))
+        logo.create_text(self._px(12), self._px(12), text="D", fill=dual.color("ink"),
                          font=fonts.sans(kit.PX_CARD, bold=True))
         tk.Label(brand, text="DJB 联脑", font=fonts.sans(kit.PX_CARD, bold=True),
                  foreground=dual.color("ink"), background=dual.color("surface")).pack(
@@ -336,23 +366,23 @@ class DesktopApp:
         self._header_right = right
         self._refresh_button = kit.Button(right, "刷新", self.refresh, kind="ghost",
                                           ground=dual.color("surface"), px=kit.PX_SMALL,
-                                          height=26, pad=10)
+                                          height=self._px(26), pad=self._px(10))
         self._theme_button = kit.Button(right, self._theme_button_text(), self.toggle_theme,
                                         kind="ghost", ground=dual.color("surface"),
-                                        px=kit.PX_SMALL, height=26, pad=10)
+                                        px=kit.PX_SMALL, height=self._px(26), pad=self._px(10))
         self._log_button = kit.Button(right, "打开日志", lambda: self.show_view("logs"),
                                       kind="ghost", ground=dual.color("surface"),
-                                      px=kit.PX_SMALL, height=26, pad=10)
+                                      px=kit.PX_SMALL, height=self._px(26), pad=self._px(10))
         self._tune_button = kit.Button(right, "调整贡献", lambda: self.show_view("yield"),
                                        kind="primary", ground=dual.color("surface"),
-                                       px=kit.PX_SMALL, height=26, pad=12)
+                                       px=kit.PX_SMALL, height=self._px(26), pad=self._px(12))
         self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.PX_MICRO),
                                     foreground=dual.color("muted_text"),
                                     background=dual.color("surface"))
         self._pack_header_right(narrow=False)
         # 头下沿一条 1px 分隔线（挂在头里，换肤重建时一起销毁）：无阴影，只靠描边分层
         tk.Frame(head, background=dual.color("line"), height=1).place(
-            x=0, y=self.HEADER_H - 1, relwidth=1.0)
+            x=0, y=self._px(self.HEADER_H) - 1, relwidth=1.0)
 
     def _pack_header_right(self, *, narrow: bool) -> None:
         """右侧控件顺序固定：SYNC · 打开日志 · 调整贡献 · 主题 · 刷新（窄窗只留后两个）。"""
@@ -552,14 +582,14 @@ class DesktopApp:
         """68px 页头：左「眉标 + 18px 标题」，右「数据时刻 + 刷新」。"""
         kit, tk = self._kit, self._tk
         fonts = self._fonts
-        head = tk.Frame(self._main, background=dual.color("bg"), height=self.PAGEHEAD_H,
+        head = tk.Frame(self._main, background=dual.color("bg"), height=self._px(self.PAGEHEAD_H),
                         bd=0, highlightthickness=0)
         head.grid(row=0, column=0, sticky="ew")
         head.grid_propagate(False)
         head.columnconfigure(0, weight=1)
         self._pagehead = head
         left = tk.Frame(head, background=dual.color("bg"))
-        left.grid(row=0, column=0, sticky="w", padx=(26, 0), pady=(12, 12))
+        left.grid(row=0, column=0, sticky="w", padx=(self._px(26), 0), pady=(self._px(12), self._px(12)))
         self._page_kicker = tk.Label(left, text="OVERVIEW", font=fonts.for_text("OVERVIEW", kit.PX_MICRO),
                                      foreground=dual.color("muted_text"),
                                      background=dual.color("bg"), anchor="w")
@@ -570,7 +600,7 @@ class DesktopApp:
                                     anchor="w")
         self._view_title.pack(anchor="w")
         right = tk.Frame(head, background=dual.color("bg"))
-        right.grid(row=0, column=1, sticky="e", padx=(0, 26))
+        right.grid(row=0, column=1, sticky="e", padx=(0, self._px(26)))
         self._page_actions = right
         self._snapshot_label = tk.Label(right, text="数据截至 —", font=fonts.sans(kit.PX_MICRO),
                                         foreground=dual.color("muted_text"),
@@ -581,7 +611,7 @@ class DesktopApp:
         """30px 状态条：左「消息」，右「GPU · 显存 · 版本 · 主题」（高度见 ``STATUS_H``）。"""
         kit, tk = self._kit, self._tk
         fonts = self._fonts
-        bar = tk.Frame(self._root, background=dual.color("surface3"), height=self.STATUS_H,
+        bar = tk.Frame(self._root, background=dual.color("surface3"), height=self._px(self.STATUS_H),
                        bd=0, highlightthickness=0)
         bar.grid(row=2, column=0, columnspan=2, sticky="ew")
         bar.grid_propagate(False)
@@ -590,11 +620,11 @@ class DesktopApp:
         self._status = tk.Label(bar, text=DEFAULT_MESSAGE, font=fonts.sans(kit.PX_MICRO),
                                 foreground=dual.color("muted_text"),
                                 background=dual.color("surface3"), anchor="w")
-        self._status.pack(side="left", padx=(14, 0), pady=4)
+        self._status.pack(side="left", padx=(self._px(14), 0), pady=self._px(4))
         self._status_right = tk.Label(bar, text="—", font=fonts.sans(kit.PX_MICRO),
                                       foreground=dual.color("muted_text"),
                                       background=dual.color("surface3"), anchor="e")
-        self._status_right.pack(side="right", padx=(0, 14), pady=4)
+        self._status_right.pack(side="right", padx=(0, self._px(14)), pady=self._px(4))
 
     def _sync_content_width(self) -> None:
         """把内容列宽钉回画布宽（B4：**任何时刻**内容宽 ≤ 画布宽）。
@@ -1135,7 +1165,7 @@ class DesktopApp:
             return 620
         if width <= 1:
             return 620
-        side = 0 if self._is_narrow() else self.SIDEBAR_W
+        side = 0 if self._is_narrow() else self._px(self.SIDEBAR_W)
         return max(220, width - side - 2 * self._content_pad[0] - 40)
 
     def _two_col(self) -> bool:
