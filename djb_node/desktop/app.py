@@ -867,7 +867,8 @@ class DesktopApp:
         if view.chart is not None:
             self._render_chart(left, view.chart)
         if view.table is not None:
-            self._render_table(view.table, parent=left)
+            # 总览只放「最近几张」：整页要一屏装下（G-16），完整列表在「收据」页
+            self._render_table(view.table, parent=left, max_rows=6)
         for card in view.rail:
             self._render_rail_card(right, card)
         if view.actions:
@@ -1142,7 +1143,8 @@ class DesktopApp:
                      foreground=dual.color("muted_text"), background=base).pack(
                          side="left", padx=(0, 10))
 
-    def _render_table(self, table: Table, parent: Any = None) -> None:
+    def _render_table(self, table: Table, parent: Any = None,
+                      max_rows: int = 12) -> None:
         """表格：保留 ttk.Treeview（``_tree`` / ``_row_cells`` 是既有契约），只换外观。"""
         self._table = table
         narrow = self._is_narrow()
@@ -1154,7 +1156,8 @@ class DesktopApp:
         body = card.body
         tree = ttk.Treeview(body, columns=list(table.columns), show="headings",
                             style="Kit.Treeview",
-                            height=min(12, max(3, len(table.rows) + 1)), selectmode="browse")
+                            height=min(max_rows, max(3, len(table.rows) + 1)),
+                            selectmode="browse")
         for column in table.columns:
             tree.heading(column, text=column, anchor="w")
             tree.column(column, anchor="w", width=120, stretch=True)

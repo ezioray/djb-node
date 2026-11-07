@@ -229,3 +229,20 @@ def test_overview_only_builds_the_dashboard_for_the_overview_view():
     for key in ("bench", "receipts", "logs"):
         view = vw.build_view(key, demo_snapshot())
         assert view.hero is None and view.chart is None and view.rail == ()
+
+
+def test_overview_table_lists_the_newest_receipts_first():
+    """「最近收据」= 最新几条在前（只改展示顺序，字段与口径不变）。"""
+    rows = overview().table.rows
+    stamps = [row.cells[1] for row in rows]
+    assert 0 < len(stamps) <= 5
+    assert stamps == sorted(stamps, reverse=True)
+
+
+def test_recorded_receipts_read_as_in_flight_not_unknown():
+    """``recorded``（服务端已记录、尚未校验）不许显示成「未知状态」。"""
+    rows = ({"receipt_id": "a", "state": "recorded", "state_text": "已记录",
+             "created_at": "2026-11-01T02:00:00Z", "tokens": 10},)
+    row = overview(patched(receipts=receipts(*rows))).table.rows[0]
+    assert row.cells[3].startswith(vw.MARK_WAIT)
+    assert "未知" not in row.cells[3]

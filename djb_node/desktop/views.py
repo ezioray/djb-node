@@ -708,11 +708,13 @@ def _overview(snapshot: Snapshot) -> View:
              "暂停后与托盘一致", "muted"),
     )
     rows = _receipt_rows(receipts.get("rows"))
+    # 「最近收据」按时间倒序取最新几条（列表语义；不改任何字段与口径）
+    recent = list(reversed(rows))[:5]
     return View(
         key="overview", title="总览",
         subtitle="今日贡献 · 当前任务 · 资源 · 让路 · 收据",
         cards=cards,
-        table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(rows[:5]),
+        table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(recent),
                     narrow_hide=("时间", "Tokens"),
                     narrow_headers=(("本机校验", "校验"),),
                     note=str(receipts.get("note") or ""),
@@ -782,8 +784,9 @@ def _receipt_rows(rows: Any) -> list[Row]:
         identifier = str(row.get("receipt_id") or row.get("id") or "")
         state = str(row.get("state") or row.get("status") or "")
         chinese = str(row.get("state_text") or STATE_TEXT.get(state, ""))
+        # recorded = 服务端已记录但尚未校验：算「进行中」，不算「未知」也算不上「已通过」
         mark = (MARK_DONE if state in ("accepted", "verified", "ok", "done")
-                else MARK_WAIT if state in ("pending", "buffered")
+                else MARK_WAIT if state in ("pending", "buffered", "recorded")
                 else MARK_FAIL if state in ("rejected", "expired", "failed", "error")
                 else MARK_UNKNOWN)
         if state in ("rejected", "expired"):
