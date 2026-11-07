@@ -352,3 +352,30 @@ def test_legacy_keys_still_present():
                 "amber", "red", "red_text", "focus", "white", "violet_text", "pink",
                 "pink_text"):
         assert key in theme.COLORS, key
+
+
+# ── 偏好落盘（功能测试 F2 的回归：换肤能存住、坏文件不拖垮启动）
+def test_theme_pref_roundtrip(tmp_path) -> None:
+    from djb_node.desktop import theme as desktop_theme
+
+    desktop_theme.save("night", tmp_path)
+    assert desktop_theme.load(tmp_path) == "night"
+    mode = (tmp_path / desktop_theme.PREFS_FILE).stat().st_mode & 0o777
+    assert mode == 0o600, f"偏好文件权限 {oct(mode)}，应 0600"
+
+
+def test_theme_pref_corrupt_or_unknown_falls_back(tmp_path) -> None:
+    from djb_node.desktop import theme as desktop_theme
+
+    path = tmp_path / desktop_theme.PREFS_FILE
+    path.write_text("{not json", encoding="utf-8")
+    assert desktop_theme.load(tmp_path) == desktop_theme.DEFAULT_THEME
+    path.write_text('{"theme": "neon"}', encoding="utf-8")
+    assert desktop_theme.load(tmp_path) == desktop_theme.DEFAULT_THEME
+
+
+def test_theme_save_rejects_unknown(tmp_path) -> None:
+    from djb_node.desktop import theme as desktop_theme
+
+    with pytest.raises(ValueError):
+        desktop_theme.save("neon", tmp_path)
