@@ -214,6 +214,7 @@ class DesktopApp:
                         bd=0, highlightthickness=0)
         head.grid(row=0, column=0, columnspan=2, sticky="ew")
         head.grid_propagate(False)                     # 固定 43：子控件不改变条高
+        head.pack_propagate(False)                     # 子控件用 pack：这条才是真正生效的那条
         self._header = head
         brand = tk.Frame(head, background=dual.color("surface"))
         brand.pack(side="left", padx=(14, 0))
@@ -359,15 +360,16 @@ class DesktopApp:
                        bd=0, highlightthickness=0)
         bar.grid(row=2, column=0, columnspan=2, sticky="ew")
         bar.grid_propagate(False)
+        bar.pack_propagate(False)
         self._statusbar = bar
         self._status = tk.Label(bar, text=DEFAULT_MESSAGE, font=fonts.sans(kit.PX_MICRO_CJK),
                                 foreground=dual.color("muted_text"),
                                 background=dual.color("surface3"), anchor="w")
-        self._status.pack(side="left", padx=(14, 0))
+        self._status.pack(side="left", padx=(14, 0), pady=4)
         self._status_right = tk.Label(bar, text="—", font=fonts.mono(kit.PX_MICRO),
                                       foreground=dual.color("muted_text"),
                                       background=dual.color("surface3"), anchor="e")
-        self._status_right.pack(side="right", padx=(0, 14))
+        self._status_right.pack(side="right", padx=(0, 14), pady=4)
 
     def _on_content_resize(self, _event=None) -> None:
         self._canvas.configure(scrollregion=self._canvas.bbox("all"))
@@ -560,9 +562,9 @@ class DesktopApp:
         mode = self._geom.layout_mode(current)
         narrow, two_col = mode == "narrow", mode == "two"
         flipped = (getattr(self, "_narrow", None) not in (None, narrow)
-                   or getattr(self, "_two_col", None) not in (None, two_col))
+                   or getattr(self, "_two_col_mode", None) not in (None, two_col))
         self._narrow = narrow
-        self._two_col = two_col
+        self._two_col_mode = two_col
         if narrow:
             self._side.grid_remove()
             self._nav_combo.pack(side="right")
@@ -583,6 +585,8 @@ class DesktopApp:
             self._pack_header_right(narrow=False)
             self._set_widget_text(self._theme_button, self._theme_button_text())
         self._sync_nav(self._controller.view)
+        if flipped and hasattr(self, "_status"):
+            self._update_status()                    # 状态条文案也分窄/宽两套
         tree = getattr(self, "_tree", None)
         if tree is not None:
             self._apply_narrow_cells(narrow)         # 行文案跟着窄/宽切换
@@ -636,7 +640,7 @@ class DesktopApp:
         self._nav_combo = None
         self._layout_width = None
         self._narrow = None
-        self._two_col = None
+        self._two_col_mode = None
         self._build_shell()
         self._apply_layout(self._root.winfo_width())
 
@@ -682,7 +686,7 @@ class DesktopApp:
     def _update_status(self) -> None:
         """把快照里的状态一次写进四处：状态条消息、状态徽标、身份块、页头「数据截至」。"""
         snapshot = self._controller.snapshot
-        self._status.configure(text=self._controller.status_line())
+        self._status.configure(text=self._status_line())
         pill, tone = self._pill_text()
         try:
             self._state_pill.set_text(pill, tone)
@@ -733,6 +737,14 @@ class DesktopApp:
         self._sync_label.configure(text="SYNC " + stamp)
         self._snapshot_label.configure(text="数据截至 " + stamp)
 
+    def _status_line(self) -> str:
+        """状态条左侧消息：窄窗只留前两段（否则会挤到右侧的 GPU/版本上去）。"""
+        line = self._controller.status_line()
+        if not getattr(self, "_narrow", False):
+            return line
+        parts = [part.strip() for part in line.split("·") if part.strip()]
+        return " · ".join(parts[:2])
+
     def _status_right_text(self) -> str:
         """状态条右侧：GPU 利用率 · 显存 · 版本 · 主题（缺值写「—」，不写 0）。"""
         from ..facts import CLIENT_VERSION
@@ -742,11 +754,15 @@ class DesktopApp:
         device = devices[0] if devices and isinstance(devices[0], Mapping) else {}
         util = device.get("utilization_pct")
         used, total = device.get("memory_used_mb"), device.get("memory_total_mb")
+        theme_name = "日间" if self._theme_name == "day" else "夜间"
+        if getattr(self, "_narrow", False):
+            # 窄窗：GPU/显存留给主卡，状态条只留版本与主题（否则两段文字会叠在一起）
+            return "v" + CLIENT_VERSION + "  ·  " + theme_name
         parts = ["GPU " + (str(int(float(util))) + "%" if is_number(util) else "—"),
                  "显存 " + ("%.1f/%.0f GB" % (float(used) / 1024.0, float(total) / 1024.0)
                           if is_number(used) and is_number(total) else "—"),
                  "v" + CLIENT_VERSION,
-                 "日间" if self._theme_name == "day" else "夜间"]
+                 theme_name]
         return "  ·  ".join(parts)
 
     def _clear(self) -> None:
@@ -775,7 +791,7 @@ class DesktopApp:
             self._page_kicker.configure(text=PAGE_KICKERS.get(view.key, view.key.upper()))
         except Exception:                              # pragma: no cover - 控件已销毁
             pass
-        pad = (12, 12) if self._rendered_narrow else (26, 18)
+        pad = (12, 6) if self._rendered_narrow else (26, 6)
         self._content_pad = pad
         body = tk.Frame(self._content, background=dual.color("bg"), bd=0, highlightthickness=0)
         body.pack(fill="both", expand=True, padx=pad[0], pady=pad[1])
@@ -784,7 +800,7 @@ class DesktopApp:
             self._wrap(tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.PX_BODY_S),
                               foreground=dual.color("muted_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
-                                  anchor="w", pady=(0, 10))
+                                  anchor="w", pady=(0, 4))
         for text in view.unavailable:
             self._wrap(tk.Label(body, text="! " + text, font=self._fonts.sans(kit.PX_BODY_S),
                               foreground=dual.color("amber_text"), background=dual.color("bg"),
@@ -800,7 +816,7 @@ class DesktopApp:
             self._wrap(tk.Label(body, text="· " + note, font=self._fonts.sans(kit.PX_MICRO_CJK),
                               foreground=dual.color("muted_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
-                                  anchor="w", pady=(6, 0))
+                                  anchor="w", pady=(2, 0))
         self._in_render = False
 
     def _wrap(self, label: Any) -> Any:
@@ -859,7 +875,7 @@ class DesktopApp:
         left.grid(row=0, column=0, sticky="nsew")
         right = tk.Frame(grid, background=dual.color("bg"), bd=0, highlightthickness=0)
         if two_col:
-            right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+            right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         else:
             right.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         if view.hero is not None:
@@ -868,7 +884,7 @@ class DesktopApp:
             self._render_chart(left, view.chart)
         if view.table is not None:
             # 总览只放「最近几张」：整页要一屏装下（G-16），完整列表在「收据」页
-            self._render_table(view.table, parent=left, max_rows=6)
+            self._render_table(view.table, parent=left, max_rows=4)
         for card in view.rail:
             self._render_rail_card(right, card)
         if view.actions:
@@ -882,8 +898,8 @@ class DesktopApp:
         kit, tk = self._kit, self._tk
         fonts = self._fonts
         surface = dual.color("surface")
-        card = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(16, 14))
-        card.pack(fill="x", pady=(0, 12))
+        card = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 10))
+        card.pack(fill="x", pady=(0, 10))
         body = card.body
         top = tk.Frame(body, background=surface)
         top.pack(fill="x")
@@ -905,9 +921,9 @@ class DesktopApp:
         body_label = tk.Label(text, text=hero.body, font=fonts.sans(kit.PX_BODY_S),
                               foreground=dual.color("ink2"), background=surface, anchor="w",
                               justify="left")
-        body_label.pack(fill="x", pady=(6, 0))
+        body_label.pack(fill="x", pady=(4, 0))
         runtime = tk.Frame(text, background=surface)
-        runtime.pack(fill="x", pady=(6, 0))
+        runtime.pack(fill="x", pady=(3, 0))
         tk.Label(runtime, text=hero.runtime_label, font=fonts.sans(kit.PX_MICRO_CJK),
                  foreground=dual.color("muted_text"), background=surface).pack(side="left")
         tk.Label(runtime, text=hero.runtime, font=fonts.mono(kit.PX_NUM, bold=True),
@@ -926,7 +942,7 @@ class DesktopApp:
         card.bind("<Configure>", _fit, add="+")
         if hero.metrics:
             metrics = tk.Frame(body, background=surface)
-            metrics.pack(fill="x", pady=(12, 0))
+            metrics.pack(fill="x", pady=(7, 0))
             for index, metric in enumerate(hero.metrics):
                 metrics.columnconfigure(index, weight=1, uniform="metric")
                 cell = kit.StatCell(metrics, label=metric.label, value=metric.value,
@@ -935,7 +951,7 @@ class DesktopApp:
                 cell.grid(row=0, column=index, sticky="nsew", padx=(0, 10))
         if hero.actions or hero.hint:
             foot = tk.Frame(body, background=surface)
-            foot.pack(fill="x", pady=(12, 0))
+            foot.pack(fill="x", pady=(7, 0))
             for action in hero.actions:
                 self._render_action(foot, action, ground=surface)
             if hero.hint:
@@ -948,8 +964,8 @@ class DesktopApp:
         kit, tk = self._kit, self._tk
         fonts = self._fonts
         surface = dual.color("surface")
-        card = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(16, 14))
-        card.pack(fill="x", pady=(0, 12))
+        card = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 10))
+        card.pack(fill="x", pady=(0, 10))
         body = card.body
         head = tk.Frame(body, background=surface)
         head.pack(fill="x")
@@ -968,11 +984,11 @@ class DesktopApp:
                      foreground=dual.color("amber_text"), background=surface, anchor="w",
                      justify="left", wraplength=520).pack(anchor="w", pady=(12, 4))
             return
-        bars = kit.Bars(body, bars=max(1, len(chart.values)), height=84, gap=4, ground=surface)
-        bars.pack(fill="x", pady=(10, 0))
+        bars = kit.Bars(body, bars=max(1, len(chart.values)), height=78, gap=4, ground=surface)
+        bars.pack(fill="x", pady=(8, 0))
         bars.set(chart.values, axis=chart.labels)
         foot = tk.Frame(body, background=surface)
-        foot.pack(fill="x", pady=(4, 0))
+        foot.pack(fill="x", pady=(2, 0))
         tk.Label(foot, text=chart.peak, font=fonts.mono(kit.PX_MICRO),
                  foreground=dual.color("mint_text"), background=surface).pack(side="left")
         tk.Label(foot, text=chart.foot, font=fonts.sans(kit.PX_MICRO_CJK),
@@ -983,8 +999,8 @@ class DesktopApp:
         kit, tk = self._kit, self._tk
         fonts = self._fonts
         surface = dual.color("surface")
-        box = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(16, 14))
-        box.pack(fill="x", pady=(0, 12))
+        box = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 10))
+        box.pack(fill="x", pady=(0, 10))
         body = box.body
         head = tk.Frame(body, background=surface)
         head.pack(fill="x")
@@ -1002,20 +1018,20 @@ class DesktopApp:
                      px=kit.PX_MICRO_CJK, height=18).pack(side="right")
         if card.kind == "stats" and card.stats:
             grid = tk.Frame(body, background=surface)
-            grid.pack(fill="x", pady=(12, 0))
+            grid.pack(fill="x", pady=(6, 0))
             for index, stat in enumerate(card.stats):
                 row, column = divmod(index, 2)
                 grid.columnconfigure(column, weight=1, uniform="today")
                 kit.StatCell(grid, label=stat.label, value=stat.value, unit=stat.unit,
                              note=stat.note, ground=surface, value_px=kit.PX_NUM_L,
                              mono_value=True).grid(row=row, column=column, sticky="nsew",
-                                                  padx=(0, 10), pady=(0, 12))
+                                                  padx=(0, 10), pady=(0, 2))
         if card.kind == "setup" and card.fields:
             form = tk.Frame(body, background=surface)
-            form.pack(fill="x", pady=(10, 0))
+            form.pack(fill="x", pady=(8, 0))
             for field in card.fields:
                 line = tk.Frame(form, background=surface)
-                line.pack(fill="x", pady=(0, 7))
+                line.pack(fill="x", pady=(0, 5))
                 tk.Label(line, text=field.label, font=fonts.sans(kit.PX_MICRO_CJK),
                          foreground=dual.color("muted_text"), background=surface,
                          anchor="w", width=12).pack(side="left")
@@ -1024,10 +1040,10 @@ class DesktopApp:
                          anchor="w").pack(side="left", fill="x", expand=True)
         if card.kind == "throttle":
             box_rows = tk.Frame(body, background=surface)
-            box_rows.pack(fill="x", pady=(10, 0))
+            box_rows.pack(fill="x", pady=(8, 0))
             for label, value, tone in card.rows:
                 line = tk.Frame(box_rows, background=surface)
-                line.pack(fill="x", pady=(0, 6))
+                line.pack(fill="x", pady=(0, 2))
                 tk.Label(line, text=label, font=fonts.sans(kit.PX_MICRO_CJK),
                          foreground=dual.color("muted_text"), background=surface,
                          anchor="w").pack(side="left")
@@ -1044,14 +1060,40 @@ class DesktopApp:
                 kit.Switch(line, on=bool(card.toggle[1]), ground=surface,
                            command=lambda _on: self.show_view("yield")).pack(
                                side="right")
+        if card.progress is not None:
+            # 进度轨（设计 G-05）：一行标签 + 6px 圆角轨，比例直接来自服务端用量
+            label, ratio, value_text = card.progress
+            head_row = tk.Frame(body, background=surface)
+            head_row.pack(fill="x", pady=(4, 0))
+            tk.Label(head_row, text=label, font=fonts.sans(kit.PX_MICRO_CJK),
+                     foreground=dual.color("muted_text"), background=surface).pack(side="left")
+            tk.Label(head_row, text=value_text, font=fonts.mono(kit.PX_MICRO),
+                     foreground=dual.color("muted_text"), background=surface).pack(side="right")
+            track = tk.Canvas(body, width=1, height=6, background=surface, bd=0,
+                              highlightthickness=0, takefocus=0)
+            track.pack(fill="x", pady=(3, 0))
+
+            def _draw_track(_event: Any = None, canvas: Any = track,
+                            share: float = float(ratio or 0.0)) -> None:
+                width = max(1, int(canvas.winfo_width()))
+                canvas.delete("all")
+                canvas.create_polygon(
+                    self._geom.round_rect_points(0, 1, width, 5, 2), smooth=True,
+                    splinesteps=6, fill=dual.chart("ring_track"), outline="")
+                filled = max(4, int((width - 2) * max(0.0, min(1.0, share))))
+                canvas.create_polygon(
+                    self._geom.round_rect_points(1, 1, 1 + filled, 5, 2), smooth=True,
+                    splinesteps=6, fill=dual.chart("bar_peak"), outline="")
+
+            track.bind("<Configure>", _draw_track)
         foot = tk.Frame(body, background=surface)
-        foot.pack(fill="x", pady=(10, 0))
+        foot.pack(fill="x", pady=(7, 0))
         for action in card.actions:
             self._render_action(foot, action, ground=surface)
         if card.foot:
             tk.Label(body, text=card.foot, font=fonts.sans(kit.PX_MICRO_CJK),
                      foreground=dual.color("muted_text"), background=surface, anchor="w",
-                     justify="left", wraplength=300).pack(anchor="w", pady=(8, 0))
+                     justify="left", wraplength=300).pack(anchor="w", pady=(5, 0))
 
     # ── 其余 12 视图：通用卡片 + 表格 + 字段
     def _render_generic(self, view: View) -> None:
@@ -1249,20 +1291,18 @@ class DesktopApp:
             weights.append(float(max(4, longest)))
         total = sum(weights) or 1.0
         floor = 40
-        remaining = available
         headers = dict(getattr(table, "narrow_headers", ()) or ())
         # 末列右对齐（设计 G-07）：数字/结论靠右，整列读起来是一条线
         for index, column in enumerate(shown):
             text = headers.get(column, column) if narrow else column
             anchor = "e" if index == len(shown) - 1 else "w"
             tree.heading(column, text=text, anchor=anchor)
-        widths: list[int] = []
-        for index, column in enumerate(shown):
-            share = max(floor, int(available * weights[index] / total))
-            if index == len(shown) - 1:
-                share = max(floor, remaining)
-            widths.append(share)
-            remaining -= share
+        # 按权重分配，舍入误差给最宽的一列（别让末列只剩「剩余」而被挤扁）
+        widths: list[int] = [max(floor, int(available * weight / total)) for weight in weights]
+        slack = available - sum(widths)
+        if slack:
+            widest = max(range(len(widths)), key=lambda i: widths[i])
+            widths[widest] = max(floor, widths[widest] + slack)
         # 短列也要放得下表头 + 典型值（「校验」列被压到 43px 时只剩「无副」两个字）
         for index, column in enumerate(shown):
             header = headers.get(column, column) if narrow else column
@@ -1545,7 +1585,7 @@ _DEMO_SECTIONS = {
                               "next_step": "无需处理"},
                              {"id": "acceleration", "level": "warn",
                               "summary": "未检测到 GPU 加速",
-                              "next_step": "CPU 模式可运行，收益按 CPU 计"}]},
+                              "next_step": "CPU 模式可运行，收益按 CPU 单价计"}]},
         # 演示数据里的 GPU：与 parse_nvidia_smi 的字段形状**完全一致**（不新增字段），
         # 真机没有 GPU 时仍走 present=False 那条真话路径（见 test_gpu_absent_says_so）。
         "gpu": {"present": True,

@@ -169,3 +169,50 @@ def test_narrow_rows_are_compact_but_detail_keeps_full_text(tmp_path):
         assert any("收据签名不匹配" in text for text in texts)
     finally:
         root.destroy()
+
+
+# ───────────────────────────────────────── 实例属性不许遮蔽方法（真实崩溃回归）
+def test_no_instance_attribute_shadows_a_class_method():
+    """``self._two_col = <bool>`` 会把同名方法遮蔽，下一次调用就是 TypeError。
+
+    这曾经让「先算过布局、再渲染」的路径直接崩（改窗口大小 / 切第二个视图必现）。
+    用 AST 静态扫一遍，比只测一条路径更能兜住同类错误。
+    """
+    import ast
+    import inspect
+    from djb_node.desktop.app import DesktopApp
+
+    module = ast.parse(inspect.getsource(DesktopApp))
+    for node in ast.walk(module):
+        if isinstance(node, ast.ClassDef) and node.name == "DesktopApp":
+            cls = node
+            break
+    else:                                            # pragma: no cover - 源码结构变了
+        pytest.fail("没找到 DesktopApp 类")
+    methods = {item.name for item in cls.body
+               if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assigned = set()
+    for node in ast.walk(cls):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        for target in targets:
+            if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"):
+                assigned.add(target.attr)
+    clash = sorted(assigned & methods)
+    assert not clash, "实例属性遮蔽了同类方法：" + ", ".join(clash)
+
+
+def test_apply_layout_then_render_does_not_explode(tmp_path):
+    """先布局（写宽度状态）再渲染，不许抛异常——真实窗口 resize / 切视图都走这条路。"""
+    app, root = _window_app(tmp_path, 900)
+    try:
+        app._apply_layout()                           # noqa: SLF001 - 断言用
+        app._render(app._controller.current())        # noqa: SLF001 - 断言用
+        root.update()
+        assert app._tree is not None                  # noqa: SLF001 - 渲染确实跑完了
+    finally:
+        root.destroy()

@@ -210,6 +210,7 @@ class RailCard:
     fields: tuple[Field, ...] = ()
     rows: tuple[tuple[str, str, str], ...] = ()
     toggle: tuple[str, bool] | None = None
+    progress: tuple[str, "float | None", str] | None = None   # (标签, 比例, 值文案)
     actions: tuple[Action, ...] = ()
     foot: str = ""
 
@@ -334,6 +335,8 @@ def _rail_text(rail: tuple[RailCard, ...]) -> list[str]:
             lines.append("  " + label + "：" + value)
         if card.toggle is not None:
             lines.append("  " + card.toggle[0] + "：" + ("开" if card.toggle[1] else "关"))
+        if card.progress is not None:
+            lines.append("  " + card.progress[0] + "：" + card.progress[2])
         for action in card.actions:
             state = "" if action.enabled else ("（置灰：" + (action.reason or "当前不可用") + "）")
             lines.append("  [" + action.label + "]" + state)
@@ -630,7 +633,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
                                                                           else "amber"),
                      note=str(done) + " / 3", fields=setup_fields,
                      actions=(Action("", "去接入配置", nav="access", primary=done < 3),),
-                     foot="编辑请到「接入配置」页；配置只在服务端与本机各存一份。")
+                     foot="编辑请到「接入配置」页。")
     daily = None
     for item in plan.get("usage") or ():
         mapping = _mapping(item)
@@ -646,16 +649,15 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
         kicker="TODAY / 今日算力", title="今日收益",
         badge="进行中" if str(yield_state.get("state") or "") == "online" else "",
         badge_tone="mint",
+        # 四宫格只留「标签 + 数值」：口径写进卡脚一行，格子高度才装得进一屏（G-16）
         stats=(Metric("今日收益", _num(earnings.get("today") or status.get("today_earnings")),
-                      unit=str(earnings.get("currency") or "USDT"), note="服务端下发值"),
-               Metric("今日 tokens", "—" if today_tokens is None else f"{today_tokens:,}",
-                      note="共享 Token Plan 用量"),
-               Metric("收据数", (str(total_receipts) if snapshot.ok("receipts") else "—"),
-                      note="本机已生成"),
+                      unit=str(earnings.get("currency") or "USDT")),
+               Metric("今日 tokens", "—" if today_tokens is None else f"{today_tokens:,}"),
+               Metric("收据数", (str(total_receipts) if snapshot.ok("receipts") else "—")),
                Metric("验证通过", ("—" if not snapshot.ok("receipts")
-                                 else f"{verified} / {total_receipts}"), note="服务端校验"),
+                                 else f"{verified} / {total_receipts}")),
                ),
-        foot="收益按服务端记账口径，本机不换算、不四舍五入。")
+        foot="服务端记账口径；tokens 取共享用量；收据＝本机行数。")
     throttle_rows = (
         ("并发上限", _num(limits.get("concurrent")) + " 路", "default"),
         ("每日 tokens 上限", "—" if limits.get("daily_tokens") in (None, 0)
@@ -663,12 +665,21 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
         ("让路模式", YIELD_MODE_SUMMARY.get(str(yield_state.get("mode") or ""),
                                             str(yield_state.get("mode") or "未设置")), "muted"),
     )
+    daily_cap = limits.get("daily_tokens")
+    used_today = today_tokens
+    ratio = None
+    if _is_number(daily_cap) and float(daily_cap) > 0 and used_today is not None:
+        ratio = min(1.0, float(used_today) / float(daily_cap))
+    progress = None
+    if ratio is not None:
+        progress = ("今日 tokens 已用", ratio,
+                    f"{used_today:,} / {int(float(daily_cap)):,}（{ratio * 100:.0f}%）")
     throttle = RailCard(kicker="THROTTLE / 让路规则", title="让路规则",
                         badge="生效中" if yield_state.get("yield_enabled") else "已关闭",
                         badge_tone="mint" if yield_state.get("yield_enabled") else "muted",
                         kind="throttle", rows=throttle_rows,
                         toggle=("自动让路", bool(yield_state.get("yield_enabled"))),
-                        actions=(Action("", "调整让路", nav="yield"),),
+                        progress=progress,
                         foot="只会用你让出来的算力；全屏游戏与会议期间自动让路。")
     return (setup, today, throttle)
 

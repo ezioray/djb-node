@@ -708,7 +708,7 @@ class StatCell(tk.Frame):
                  foreground=theme.color("muted_text"), background=self.ground,
                  anchor=align).pack(anchor=align, fill="x")
         line = tk.Frame(self, background=self.ground)
-        line.pack(anchor=align, fill="x", pady=(3, 0))
+        line.pack(anchor=align, fill="x", pady=(2, 0))
         value_font = fonts.mono(value_px, bold=not mono_value) if mono_value else \
             fonts.sans(value_px, bold=True)
         tk.Label(line, text=str(value), font=value_font,
@@ -721,7 +721,7 @@ class StatCell(tk.Frame):
         if note:
             tk.Label(self, text=note, font=fonts.sans(PX_MICRO_CJK),
                      foreground=theme.color("muted_text"), background=self.ground,
-                     anchor=align, justify="left").pack(anchor=align, fill="x", pady=(2, 0))
+                     anchor=align, justify="left").pack(anchor=align, fill="x", pady=(1, 0))
 
 
 class SectionHead(tk.Frame):
