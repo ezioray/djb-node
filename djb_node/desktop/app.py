@@ -384,7 +384,12 @@ class DesktopApp:
             self._rewrap()
 
     def _sync_scrollbar(self) -> None:
-        """只在内容真的溢出时才露出滚动条（一屏装得下就没有，G-16）。"""
+        """只在内容真的溢出时才露出滚动条（一屏装得下就没有，G-16）。
+
+        2px 磁滞（P0）：显示要 ``need > have + 2``，收起要 ``need <= have - 2``。
+        没有磁滞时，1px 的请求高摆动会让滚动条反复 grid/grid_remove，自己把自己
+        卷进 Configure 回环（1180 宽死循环的另一半）。
+        """
         bar = getattr(self, "_scrollbar", None)
         if bar is None:
             return
@@ -396,10 +401,10 @@ class DesktopApp:
         if have <= 1:                                # 还没 map：别猜
             return
         try:
-            if need > have + 1:
+            if need > have + 2:
                 if not bar.winfo_ismapped():
                     bar.grid()
-            elif bar.winfo_ismapped():
+            elif need <= have - 2 and bar.winfo_ismapped():
                 bar.grid_remove()
         except Exception:                            # pragma: no cover
             pass
@@ -889,9 +894,12 @@ class DesktopApp:
         grid = tk.Frame(self._body, background=dual.color("bg"), bd=0, highlightthickness=0)
         grid.pack(fill="both", expand=True)
         if two_col:
-            # 设计栅格 798 : 360（69 : 31），右栏最小 340：卡片再挤就换单列
-            grid.columnconfigure(0, weight=69, minsize=420)
-            grid.columnconfigure(1, weight=31, minsize=340)
+            # 设计栅格 798 : 360，右栏固定 340（最小可读宽）。
+            # **右栏绝不能写 weight>0 + minsize**：Tk 会在「按权重重分」和「按 reqwidth 撑开」
+            # 之间来回切（实测 1180 宽时右栏 330↔368、左栏 596↔558，Bars 宽 567↔568 无限
+            # 重绘 → update_idletasks 永不返回）。左栏吃掉剩余宽度即可。
+            grid.columnconfigure(0, weight=1, minsize=420)
+            grid.columnconfigure(1, weight=0, minsize=340)
         else:
             grid.columnconfigure(0, weight=1)
         left = tk.Frame(grid, background=dual.color("bg"), bd=0, highlightthickness=0)
