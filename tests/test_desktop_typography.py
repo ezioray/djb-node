@@ -18,8 +18,6 @@
 from __future__ import annotations
 
 import gc
-import os
-import time
 from pathlib import Path
 
 import pytest
@@ -152,47 +150,10 @@ def test_source_has_no_hand_written_cjk_in_mono_call():
 
 
 # ────────────────────────────────────────────────────────────── 真窗口
-def _desktop_available() -> tuple[bool, str]:
-    """**确定性**判据（同 ``test_desktop_dual_theme``）：本机到底有没有图形桌面。"""
-    if os.name == "nt":
-        try:
-            import ctypes
-            if ctypes.windll.user32.GetSystemMetrics(0) > 0 and \
-                    ctypes.windll.user32.GetSystemMetrics(1) > 0:
-                return True, ""
-        except Exception:                              # pragma: no cover - 极端环境
-            pass
-        return False, "无交互桌面（Windows session 0 / 无显示器）"
-    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-        return True, ""
-    return False, "DISPLAY/WAYLAND_DISPLAY 均未设置（无 X/Wayland 会话）"
-
-
-_TK_OK, _TK_REASON = _desktop_available()
-needs_tk = pytest.mark.skipif(not _TK_OK, reason="真窗口用例需要可用图形桌面：" + _TK_REASON)
-
-
-def _new_root():
-    """建一个 Tk 根；``tcl_findLibrary`` 那种瞬时初始化失败重试，真失败就 fail（不是 skip）。"""
-    import tkinter
-
-    last = None
-    for _ in range(3):
-        try:
-            return tkinter.Tk()
-        except Exception as exc:                       # pragma: no cover - 瞬时失败
-            last = exc
-            time.sleep(0.2)
-    pytest.fail("Tk 初始化连续 3 次失败（不是 skip，是真问题）：%r" % (last,))
-
-
-def _configured_px(root, spec) -> int:
-    """字体**配置值**的像素数。
-
-    不能用 ``font actual``：Tk 会把像素字号换算成点再返回（-13px → 9pt），
-    13/18/30 这类不是 4 的倍数的档位会被读成 12/17/29，看起来像「字阶没落地」。
-    """
-    return int(root.tk.call("font", "configure", spec, "-size"))
+# 跳板（确定性 skip 判据 / 建根重试 / 读字体配置值）在 ``tests/tk_support.py``，见那里的注释。
+from tests.tk_support import configured_px as _configured_px
+from tests.tk_support import needs_tk
+from tests.tk_support import new_root as _new_root
 
 
 @needs_tk
