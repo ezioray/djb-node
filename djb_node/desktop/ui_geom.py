@@ -14,14 +14,18 @@ Tk 只负责把算好的坐标画出来。
 """
 from __future__ import annotations
 
+import sys
 from typing import Iterable, Sequence
 
 __all__ = [
-    "MONO_CHAIN", "SANS_CHAIN", "bar_heights", "bar_points", "bar_slots", "clamp01",
-    "gauge_arc", "pick_family", "round_rect_points",
+    "CJK_NAME_HINTS", "MONO_CHAIN", "MONO_CHAINS", "SANS_CHAIN", "SANS_CHAINS",
+    "bar_heights", "bar_points", "bar_slots", "clamp01", "gauge_arc",
+    "looks_like_cjk_family", "mono_chain", "pick_family", "pick_mono_family",
+    "pick_sans_family", "platform_key", "round_rect_points", "sans_chain",
 ]
 
 #: 正文/标题字体回退链（01-DESIGN-SPEC §2.1：Windows 统一用雅黑 UI，避免中英混排基线跳）
+#: 这是**跨平台兜底**链（历史调用方与既有断言按它写），按平台分派的链见 :data:`SANS_CHAINS`。
 SANS_CHAIN: tuple[str, ...] = (
     "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "PingFang SC",
     "Noto Sans CJK SC", "WenQuanYi Micro Hei", "DejaVu Sans",
@@ -32,18 +36,179 @@ MONO_CHAIN: tuple[str, ...] = (
     "Cascadia Mono", "Cascadia Code", "Consolas", "Menlo", "DejaVu Sans Mono",
 )
 
+#: 按平台分派的字族链（R2 裁决 01-FONT-DECISION §2.2，逐字照抄那张表）
+#:
+#: * 每一链的**前几项必须是含 CJK 字形的族**——中文只能由 CJK 族承载，
+#:   不许依赖 Tk 的隐式 fallback（隐式 fallback 会跳基线，见 01-FONT-DECISION §1 F1）。
+#: * 链尾的纯拉丁族（``Segoe UI`` / ``Helvetica Neue`` / ``DejaVu Sans``）只作最后兜底：
+#:   系统里连一个 CJK 族都没有时，至少还能把拉丁与数字画出来。
+SANS_CHAINS: dict[str, tuple[str, ...]] = {
+    "windows": ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI"),
+    "darwin": ("PingFang SC", "Hiragino Sans GB", "Helvetica Neue"),
+    "linux": ("Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei", "DejaVu Sans"),
+}
 
-def pick_family(available: Iterable[str] | None, chain: Sequence[str] = SANS_CHAIN) -> str:
+#: 等宽链（**只许 ASCII**：回执号/时间戳/URL/版本/快捷键；中文一律走 sans）
+MONO_CHAINS: dict[str, tuple[str, ...]] = {
+    "windows": ("Cascadia Mono", "Consolas"),
+    "darwin": ("Menlo", "Monaco"),
+    "linux": ("DejaVu Sans Mono", "Noto Sans Mono"),
+}
+
+#: CJK 字体名特征：链上一个都没命中时，用它在「系统里实际装了什么」里做**可证伪的探测**
+#: （只有 Noto Sans CJK JP / 只有文泉驿 这类机器也要选到含中文的族）。
+CJK_NAME_HINTS: tuple[str, ...] = (
+    "cjk", "yahei", "雅黑", "pingfang", "hiragino", "heiti", "黑体", "songti", "宋体",
+    "simhei", "simsun", "jhenghei", "yenhei", "wenquanyi", "文泉驿", "wqy",
+    "source han", "思源", "sarasa", "更纱", "droid sans fallback",
+    "noto sans sc", "noto sans tc", "noto sans jp", "noto sans kr",
+    "noto serif sc", "noto serif jp", "fandol", "ar pl", "uming", "ukai",
+)
+
+#: 名字看起来是等宽/符号/表情的族：不能当正文族（中文会被塞进等宽、数字不对齐）
+_MONO_OR_SYMBOL_HINTS: tuple[str, ...] = (
+    "mono", "courier", "consolas", "menlo", "monaco", "code", "terminal", "typewriter",
+    "emoji", "symbol", "dingbat", "webding", "wingding", "math", "music", "ding",
+)
+
+#: 再放宽一档：衬线族也排除（「有没有字可画」的兜底不该落到 Times 上）
+_NON_TEXT_HINTS: tuple[str, ...] = _MONO_OR_SYMBOL_HINTS + (
+    "serif", "times", "georgia", "book", "school", "ancient", "script", "handwriting",
+)
+
+#: CJK 族内部再排序：同一个族装了多地区版本时，中文界面优先简体
+_CJK_REGION_ORDER: tuple[str, ...] = ("sc", "cn", "gb", "hans", "tc", "tw", "hk", "jp", "kr", "hant")
+
+#: 名字看起来像 CJK 衬线（宋/明朝体）：能兜到就比纯拉丁族好，但排在 CJK 无衬线之后
+_CJK_SERIF_HINTS: tuple[str, ...] = ("song", "宋", "ming", "明朝", "mincho", "batang", "serif", "fangsong", "仿宋")
+
+
+def platform_key(platform: str | None = None) -> str:
+    """``windows`` / ``darwin`` / ``linux``（其余一律 ``linux``）。
+
+    用 ``sys.platform`` 判定、不 import tkinter，因此可以在无图形环境里断言平台分派。
+    """
+    value = (platform if platform is not None else sys.platform) or ""
+    value = str(value).lower()
+    if value.startswith("win"):
+        return "windows"
+    if value.startswith("darwin"):
+        return "darwin"
+    return "linux"
+
+
+def sans_chain(platform: str | None = None) -> tuple[str, ...]:
+    """该平台的正文族回退链（含 CJK 的族在前）。"""
+    return SANS_CHAINS[platform_key(platform)]
+
+
+def mono_chain(platform: str | None = None) -> tuple[str, ...]:
+    """该平台的等宽族回退链（只承载 ASCII）。"""
+    return MONO_CHAINS[platform_key(platform)]
+
+
+def looks_like_cjk_family(name: str) -> bool:
+    """族名里有没有 CJK 特征（``CJK`` / 雅黑 / 苹方 / 冬青 / 文泉驿 / 思源 …）。"""
+    lowered = str(name or "").strip().casefold()
+    return any(hint in lowered for hint in CJK_NAME_HINTS)
+
+
+def _looks_non_text(name: str) -> bool:
+    """看着是等宽/衬线/表情/符号族：不适合承载正文（含中文）。"""
+    lowered = str(name or "").strip().casefold()
+    return any(hint in lowered for hint in _NON_TEXT_HINTS)
+
+
+def _looks_mono_or_symbol(name: str) -> bool:
+    """比 :func:`_looks_non_text` 宽一档：CJK 衬线族在这里**放行**（排在无衬线之后）。"""
+    lowered = str(name or "").strip().casefold()
+    return any(hint in lowered for hint in _MONO_OR_SYMBOL_HINTS)
+
+
+def _cjk_sort_key(name: str) -> tuple[int, int, str]:
+    """CJK 族的优先序：先简体地区 → 无衬线 → 名字（保证同一批字库上结果稳定）。"""
+    lowered = str(name).strip().casefold()
+    region = len(_CJK_REGION_ORDER)
+    for index, token in enumerate(_CJK_REGION_ORDER):
+        if token and token in lowered:
+            region = index
+            break
+    serif = 1 if any(hint in lowered for hint in _CJK_SERIF_HINTS) else 0
+    return region, serif, lowered
+
+
+def _available_map(available: Iterable[str] | None) -> dict[str, str]:
+    """``casefold 名字 → 系统返回的原始写法``（Windows 的族名大小写与 registry 不完全一致）。"""
+    return {str(item).strip().casefold(): str(item).strip()
+            for item in (available or ()) if str(item).strip()}
+
+
+def _known_sans_chains() -> set[tuple[str, ...]]:
+    chains = {tuple(item.casefold() for item in SANS_CHAIN)}
+    chains |= {tuple(item.casefold() for item in chain) for chain in SANS_CHAINS.values()}
+    return chains
+
+
+def pick_family(available: Iterable[str] | None, chain: Sequence[str] = SANS_CHAIN, *,
+                cjk_fallback: bool | None = None) -> str:
     """从系统已装字体里挑第一个命中回退链的族名；都没有就用链首（Tk 会自己再兜一层）。
 
     ``available`` 传 ``tkinter.font.families()``；传 ``None``/空表示「查不到」。
     比较忽略大小写：Windows 返回的族名大小写与 registry 不完全一致。
+
+    ``cjk_fallback``（默认对**已知的正文链**自动开启，等宽链自动关闭）新增三层探测，
+    解决「链上一个都没装」的真实情况（01-FONT-DECISION §2.2 / R2 任务单要求）：
+
+    1. 链上**含 CJK 的族**按链序命中；
+    2. 系统里任何含 CJK 特征的无衬线族（按 简体 → 其它地区 → 无衬线 排序）；
+    3. 链上其余族（纯拉丁兜底，如 ``Segoe UI`` / ``DejaVu Sans``）；
+    4. 系统里任何非等宽/非衬线的族；最后才是链首。
+
+    为什么把「CJK 探测」插在纯拉丁族**前面**：只有 ``DejaVu Sans`` + ``Noto Sans CJK JP``
+    的机器上，选 ``DejaVu Sans`` 会让中文落到 Tk 隐式 fallback（基线跳），
+    而 ``Noto Sans CJK JP`` 至少能自洽地画出中文。
     """
-    names = {str(item).strip().casefold() for item in (available or ()) if str(item).strip()}
-    for family in chain:
-        if family.casefold() in names:
+    by_case = _available_map(available)
+    if cjk_fallback is None:
+        cjk_fallback = tuple(item.casefold() for item in chain) in _known_sans_chains()
+    if cjk_fallback:
+        for family in chain:                    # 1) 链上的 CJK 族
+            if looks_like_cjk_family(family) and family.casefold() in by_case:
+                return family                       # 回链上写法（Tk 族名匹配不分大小写）
+        fuzzy = [name for name in by_case.values()
+                 if looks_like_cjk_family(name) and not _looks_mono_or_symbol(name)]
+        if fuzzy:                               # 2) 系统里别处的 CJK 族（衬线排最后）
+            return min(fuzzy, key=_cjk_sort_key)
+    for family in chain:                        # 3) 链上其它族（纯拉丁兜底）
+        if family.casefold() in by_case and not (cjk_fallback and looks_like_cjk_family(family)):
             return family
+    if cjk_fallback:
+        others = [name for name in by_case.values() if not _looks_non_text(name)]
+        if others:                              # 4) 至少有字可画的族
+            return min(others, key=lambda item: item.casefold())
     return chain[0] if chain else "TkDefaultFont"
+
+
+def pick_sans_family(available: Iterable[str] | None, platform: str | None = None) -> str:
+    """正文族：该平台的链 + CJK 探测（01-FONT-DECISION §2.2）。"""
+    return pick_family(available, sans_chain(platform), cjk_fallback=True)
+
+
+def pick_mono_family(available: Iterable[str] | None, platform: str | None = None) -> str:
+    """等宽族：链序命中；一个都没装时退到系统里名字像等宽的族，最后才是链首。
+
+    不做 CJK 探测——等宽族**只承载 ASCII**，中文由 :meth:`ui_kit.Fonts.for_text` 分派给正文族。
+    """
+    chain = mono_chain(platform)
+    by_case = _available_map(available)
+    for family in chain:
+        if family.casefold() in by_case:
+            return family
+    fuzzy = [name for name in by_case.values()
+             if any(hint in name.casefold() for hint in ("mono", "consolas", "courier", "code"))]
+    if fuzzy:
+        return min(fuzzy, key=lambda item: item.casefold())
+    return chain[0] if chain else "TkFixedFont"
 
 
 #: 侧栏收到下拉的宽度（01 §4.6：< 760 用下拉导航，不做 62px 图标塔）
