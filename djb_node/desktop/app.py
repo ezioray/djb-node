@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from typing import Any, Mapping, Sequence
@@ -29,8 +30,8 @@ from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
-from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero, Metric,
-                    RailCard, Row, Table, View)
+from .views import (NAV_SECTIONS, VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
+                    Metric, RailCard, Row, Table, View, page_kicker)
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
            "demo_snapshot", "main", "make_controller"]
@@ -49,18 +50,107 @@ NAV_ICONS = {
     "logs": "list",
 }
 
-#: 页头眉标（拉丁微标，设计里每个页面左上角都有这么一行）
-PAGE_KICKERS = {
-    "overview": "OVERVIEW / 节点总览", "bench": "BENCH / 性能基准",
-    "models": "MODELS / 可提供模型", "gpu": "GPU / 显卡监控",
-    "tasks": "TASKS / 任务队列", "receipts": "RECEIPTS / 计量收据",
-    "earnings": "EARNINGS / 收益", "agent": "AGENT / 接入",
-    "token_plan": "TOKEN PLAN / 共享预算", "access": "ACCESS / 接入配置",
-    "yield": "YIELD / 让路节能", "account": "ACCOUNT / 账户安全",
-    "logs": "LOGS / 日志",
-}
+#: 页头眉标：**组名 / 页名** 两级（B3），如 ``RUN / OVERVIEW``。
+#:
+#: 数据口径在 :func:`djb_node.desktop.views.page_kicker`（组名来自 ``NAV_SECTIONS``），
+#: 这里只做「13 个视图各一条」的派生，不再手写第二份表；整串 ASCII，走 mono 不会跳基线。
+PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 
 TOP_NAV_KEYS = VIEW_KEYS
+
+#: 视图切换快捷键（B5）：Ctrl+1…9 直达前 9 项，Ctrl+Shift+1…4 直达后 4 项。
+#:
+#: Tk 里 Shift+数字 的 keysym 是**移位后的字符**（! @ # $），绑 ``<Control-Shift-Key-1>``
+#: 永远不触发（Xvfb 实测），必须绑移位后的 keysym；``Ctrl+PageUp/PageDown`` 前后循环
+#: 不依赖键盘布局，作为兜底。macOS 的 Command 版由 xplat 的 platform_ui 提供 modifier 后
+#: 复用同一张表（``view_shortcut_bindings(modifier="Command")``），这里只做 Control。
+SHIFTED_DIGITS = {1: "exclam", 2: "at", 3: "numbersign", 4: "dollar"}
+
+#: 状态栏提示（与绑定表同源；controller 的默认文案由 ``sync_shortcut_hint`` 替换显示）
+VIEW_SHORTCUT_HINT = "Ctrl+1…9 / Ctrl+Shift+1…4 切换视图"
+
+
+def content_item_width(canvas_width: Any) -> int:
+    """内容列宽决策（纯函数，无 Tk）：**任何时刻都不超过画布宽**（B4）。
+
+    单独抽出来是为了无窗口断言：Windows 启动即目标尺寸时，画布先配置、内容后撑宽；
+    旧实现只在画布 ``<Configure>`` 时写 item width，内容就会保持自然请求宽（≈1494）。
+    """
+    try:
+        width = int(canvas_width)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, width)
+
+
+def nav_needs_scroll(content_height: Any, viewport_height: Any) -> bool:
+    """导航区是否真的溢出（B2：滚动条只在溢出时出现，与内容区同一策略）。
+
+    显示阈值留 2px 磁滞，避免 1px 请求高摆动把滚动条自己卷进 Configure 回环。
+    """
+    try:
+        need, have = int(content_height), int(viewport_height)
+    except (TypeError, ValueError):
+        return False
+    if have <= 1:                                    # 还没 map：别猜
+        return False
+    return need > have + 2
+
+
+def view_shortcut_bindings(keys: Sequence[str] = VIEW_KEYS,
+                           modifier: str = "Control") -> tuple[tuple[str, str], ...]:
+    """(Tk 事件序列, 视图 key)：13 个视图各覆盖一次（前 9 项 + 后 4 项）。"""
+    bindings: list[tuple[str, str]] = []
+    for index, key in enumerate(tuple(keys)[:9], start=1):
+        bindings.append(("<" + modifier + "-Key-" + str(index) + ">", key))
+    for index, key in enumerate(tuple(keys)[9:13], start=1):
+        bindings.append(("<" + modifier + "-Shift-" + SHIFTED_DIGITS[index] + ">", key))
+    return tuple(bindings)
+
+
+#: 数字单元格（B7）：去币种/千分位后是纯数字，可带 %/K/M/GB 这类短单位。
+_NUMERIC_CELL = re.compile(
+    r"^[¥￥$€]?\s*[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%|k|K|m|M|x|GB|MB|ms|s)?$")
+
+
+def looks_numeric(value: Any) -> bool:
+    """``"1,234"`` / ``"¥12.00"`` / ``"98%"`` 算数字；``"—"`` / 中文 / 编号不算。"""
+    text = str(value).strip()
+    if not text or text in ("—", "-", "–"):
+        return False
+    return bool(_NUMERIC_CELL.match(text))
+
+
+def numeric_columns(columns: Sequence[str], rows: Sequence[Any]) -> set[str]:
+    """表里哪些列是数字列（B7）。
+
+    判据：该列非空单元格里 ≥80% 是数字（``looks_numeric``）。用于把
+    「Tokens / 用量 / 金额」这类列连同表头一起右对齐；编号、时间、状态保持左对齐。
+    """
+    found: set[str] = set()
+    for index, column in enumerate(columns):
+        values: list[str] = []
+        for row in rows:
+            cells = getattr(row, "cells", ())
+            if index < len(cells):
+                value = str(cells[index]).strip()
+                if value and value not in ("—", "-", "–"):
+                    values.append(value)
+        if not values:
+            continue
+        hits = sum(1 for value in values if looks_numeric(value))
+        if hits >= max(1, int(round(len(values) * 0.8))):
+            found.add(column)
+    return found
+
+
+def sync_shortcut_hint(text: Any) -> str:
+    """状态栏提示与真实绑定同步（B5）：替换 controller 默认文案里的旧说法。
+
+    ``controller.DEFAULT_MESSAGE`` 不在本流的文件所有权内（不改接口/不改文案本体），
+    显示层做同源替换；待 controller 维护者方便时再把默认文案本身更新。
+    """
+    return str(text).replace("Ctrl+1…9 切换视图", VIEW_SHORTCUT_HINT)
 
 
 class HeadlessError(RuntimeError):
@@ -131,11 +221,13 @@ class DesktopApp:
             self._unsubscribe = self._bus.subscribe(self._on_bus)
         self.show_view(controller.view)
 
-    # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 27 状态条）
+    # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
     #: 三段壳的高度（设计值；窗口总高会多出 Windows 原生标题栏 ~31px，见 R6）
     HEADER_H = 43
     PAGEHEAD_H = 68
-    STATUS_H = 27
+    #: 状态条 30（B6 复核）：27 时 11/10px 中文字体行高 22 + 上下留白 8 > 27，
+    #: 13 个视图全都报 ``text-clip-h``（标签 19 vs 需要 22）；30 给足行高。
+    STATUS_H = 30
     #: 侧栏宽度（设计 208）
     SIDEBAR_W = 208
     #: 两列断点：< 这个宽度右栏落到主栏下面（R5/G-11 只做两档，不做图标塔）
@@ -162,6 +254,7 @@ class DesktopApp:
                         width=self.SIDEBAR_W, bd=0, highlightthickness=0)
         side.grid(row=1, column=0, sticky="nsew")
         side.grid_propagate(False)                     # 固定 208：内容再长也不许撑宽
+        side.pack_propagate(False)                     # 子控件是 pack 的：这条才是真正生效的那条
         self._side = side
         self._build_sidebar()
         main = tk.Frame(self._root, background=dual.color("bg"), bd=0, highlightthickness=0)
@@ -182,10 +275,9 @@ class DesktopApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self._scrollbar = scrollbar
         self._canvas.configure(yscrollcommand=scrollbar.set)
-        # 滚轮直接可用（ttk 的 Scrollbar 只在指针悬停时才滚）
-        self._canvas.bind_all("<MouseWheel>",
-                              lambda event: self._canvas.yview_scroll(
-                                  -1 if getattr(event, "delta", 0) > 0 else 1, "units"))
+        # 滚轮直接可用（ttk 的 Scrollbar 只在指针悬停时才滚）；单一派发器：
+        # 指针在侧栏导航上滚导航、在内容区滚内容（B2：矮窗要能翻到最后一项）
+        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
         padding = (26, 18) if not self._is_narrow() else (12, 12)
         self._content = tk.Frame(self._canvas, background=dual.color("bg"), bd=0,
                                  highlightthickness=0)
@@ -193,6 +285,8 @@ class DesktopApp:
         self._content_pad = padding
         self._content.bind("<Configure>", self._on_content_resize)
         self._canvas.bind("<Configure>", self._on_canvas_resize)
+        # B4：首次 map 也要把内容宽钉回画布宽（Windows 启动即目标尺寸时没有额外的 Configure）
+        self._canvas.bind("<Map>", lambda _event: self._sync_content_width(), add="+")
         self._build_statusbar()
         # 窄窗导航下拉（<760 时替代侧栏；一个视图都不少）
         self._nav_combo = self._ttk.Combobox(
@@ -301,14 +395,30 @@ class DesktopApp:
                                     anchor="w", justify="left")
         self._ident_meta.pack(fill="x", pady=(4, 0))
         kit.Divider(side, color=dual.color("line")).pack(fill="x", padx=12)
-        nav = tk.Frame(side, background=ground)
-        nav.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        self._nav_box = nav
-        for key in VIEW_KEYS:
-            item = kit.NavItem(nav, text=VIEW_TITLES[key], icon=NAV_ICONS.get(key, "dot"),
-                               ground=ground, command=lambda name=key: self.show_view(name))
-            item.pack(fill="x", pady=1)
-            self._nav_buttons[key] = item
+        # 导航区可滚动（B2）：13 项 + 4 个分组头在 900×620 放不下，滚动条只在溢出时出现；
+        # 不创建横向滚动条，内层宽永远钉成画布宽。
+        nav_area = tk.Frame(side, background=ground)
+        nav_area.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        nav_area.rowconfigure(0, weight=1)
+        nav_area.columnconfigure(0, weight=1)
+        self._nav_area = nav_area
+        self._nav_canvas = tk.Canvas(nav_area, background=ground, highlightthickness=0,
+                                     borderwidth=0, takefocus=0)
+        self._nav_canvas.grid(row=0, column=0, sticky="nsew")
+        self._nav_scrollbar = self._ttk.Scrollbar(
+            nav_area, orient="vertical", style="Kit.Vertical.TScrollbar",
+            command=self._nav_canvas.yview)
+        self._nav_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._nav_canvas.configure(yscrollcommand=self._nav_scrollbar.set)
+        self._nav_inner = tk.Frame(self._nav_canvas, background=ground)
+        self._nav_inner_id = self._nav_canvas.create_window(
+            (0, 0), window=self._nav_inner, anchor="nw")
+        self._nav_box = self._nav_inner
+        self._nav_inner.bind("<Configure>", self._on_nav_inner_resize)
+        self._nav_canvas.bind("<Configure>", self._on_nav_canvas_resize)
+        self._nav_section_headers: dict[str, Any] = {}
+        for index, section in enumerate(NAV_SECTIONS):
+            self._render_nav_section(section, first=index == 0)
         kit.Divider(side, color=dual.color("line")).pack(fill="x", padx=12)
         foot = tk.Frame(side, background=ground)
         foot.pack(fill="x", padx=16, pady=(8, 10))
@@ -322,6 +432,121 @@ class DesktopApp:
             self._demo_chip = kit.Chip(foot, "演示数据", tone="amber", ground=ground,
                                        px=kit.PX_MICRO, height=17)
             self._demo_chip.pack(side="right")
+
+    def _font_for(self, text: str, px: int, *, bold: bool = False) -> Any:
+        """按文本取字体：纯 ASCII 走 mono、含中文走 sans（分组头 / 页头微标共用）。
+
+        字体流已提供 ``Fonts.for_text(text, px, bold=...)``，这里只做薄封装：
+        少一处判断口径，以后回退链/字阶调整只改 ``Fonts``。
+        """
+        for_text = getattr(self._fonts, "for_text", None)
+        if callable(for_text):
+            try:
+                return for_text(text, px, bold=bold)
+            except TypeError:                       # pragma: no cover - 旧签名（无 bold）
+                return for_text(text, px)
+        if str(text).isascii():
+            return self._fonts.mono(px, bold=bold)
+        return self._fonts.sans(px, bold=bold)
+
+    def _render_nav_section(self, section: Any, *, first: bool = False) -> None:
+        """一个分组：10px 分组头（拉丁微标 + 中文组名）+ 该组导航项。
+
+        只是给既有 :class:`ui_kit.NavItem` 加一层结构；选中态/图标/窄窗下拉都不变。
+        """
+        kit, tk = self._kit, self._tk
+        ground = dual.color("surface3")
+        head = tk.Frame(self._nav_inner, background=ground)
+        head.pack(fill="x", padx=6, pady=(0 if first else 10, 2))
+        tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=ground,
+                 anchor="w").pack(side="left")
+        tk.Label(head, text=section.title, font=self._fonts.sans(kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=ground,
+                 anchor="w").pack(side="left", padx=(6, 0))
+        self._nav_section_headers[section.key] = head
+        for key in section.keys:
+            item = kit.NavItem(self._nav_inner, text=VIEW_TITLES[key],
+                               icon=NAV_ICONS.get(key, "dot"), ground=ground,
+                               command=lambda name=key: self.show_view(name))
+            item.pack(fill="x", pady=1)
+            self._nav_buttons[key] = item
+
+    # ── 侧栏导航滚动（B2：900×620 下 13 项都能点到）
+    def _on_nav_inner_resize(self, _event: Any = None) -> None:
+        """导航内容变大：更新滚动区、把内层宽钉成画布宽、按需露出滚动条。"""
+        canvas = getattr(self, "_nav_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            width = int(canvas.winfo_width())
+            if width > 1:
+                current = canvas.itemcget(self._nav_inner_id, "width")
+                if not str(current).strip() or int(float(current)) != width:
+                    canvas.itemconfigure(self._nav_inner_id, width=width)
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        self._sync_nav_scrollbar()
+
+    def _on_nav_canvas_resize(self, event: Any) -> None:
+        try:
+            width = content_item_width(getattr(event, "width", 0))
+            current = self._nav_canvas.itemcget(self._nav_inner_id, "width")
+            if not str(current).strip() or int(float(current)) != width:
+                self._nav_canvas.itemconfigure(self._nav_inner_id, width=width)
+        except Exception:                            # pragma: no cover
+            pass
+        self._sync_nav_scrollbar()
+
+    def _sync_nav_scrollbar(self) -> None:
+        """滚动条只在 13 项 + 4 分组头真的放不下时出现（与内容区同一策略）。"""
+        canvas = getattr(self, "_nav_canvas", None)
+        bar = getattr(self, "_nav_scrollbar", None)
+        if canvas is None or bar is None:
+            return
+        try:
+            need = int(self._nav_inner.winfo_reqheight())
+            have = int(canvas.winfo_height())
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        if nav_needs_scroll(need, have):
+            if not bar.winfo_ismapped():
+                bar.grid()
+        elif need <= have - 2 and bar.winfo_ismapped():
+            bar.grid_remove()
+
+    def _is_inside(self, widget: Any, ancestor: Any) -> bool:
+        """控件是否在 ancestor 子树里（滚轮派发用；Canvas 内嵌控件也走 master 链）。"""
+        node = widget
+        while node is not None and node is not ancestor:
+            node = getattr(node, "master", None)
+        return node is ancestor
+
+    def _on_mousewheel(self, event: Any) -> None:
+        """滚轮只有一个入口：指针在侧栏导航上滚导航，其它地方滚内容。"""
+        target = None
+        try:
+            target = self._root.winfo_containing(event.x_root, event.y_root)
+        except Exception:                            # pragma: no cover - 无窗口
+            target = None
+        nav_area = getattr(self, "_nav_area", None)
+        if target is not None and nav_area is not None and self._is_inside(target, nav_area):
+            self._nav_scroll(-1 if getattr(event, "delta", 0) > 0 else 1)
+            return
+        self._canvas.yview_scroll(-1 if getattr(event, "delta", 0) > 0 else 1, "units")
+
+    def _nav_scroll(self, units: int) -> None:
+        canvas = getattr(self, "_nav_canvas", None)
+        if canvas is None:
+            return
+        try:
+            first, last = canvas.yview()
+        except Exception:                            # pragma: no cover
+            return
+        if first <= 0.0 and last >= 1.0:             # 没溢出：滚轮不该动任何东西
+            return
+        canvas.yview_scroll(int(units), "units")
 
     def _build_pagehead(self) -> None:
         """68px 页头：左「眉标 + 18px 标题」，右「数据时刻 + 刷新」。"""
@@ -353,7 +578,7 @@ class DesktopApp:
         self._snapshot_label.pack(side="left", padx=(0, 10))
 
     def _build_statusbar(self) -> None:
-        """27px 状态条：左「消息」，右「GPU · 显存 · 版本 · 主题」。"""
+        """30px 状态条：左「消息」，右「GPU · 显存 · 版本 · 主题」（高度见 ``STATUS_H``）。"""
         kit, tk = self._kit, self._tk
         fonts = self._fonts
         bar = tk.Frame(self._root, background=dual.color("surface3"), height=self.STATUS_H,
@@ -371,12 +596,36 @@ class DesktopApp:
                                       background=dual.color("surface3"), anchor="e")
         self._status_right.pack(side="right", padx=(0, 14), pady=4)
 
+    def _sync_content_width(self) -> None:
+        """把内容列宽钉回画布宽（B4：**任何时刻**内容宽 ≤ 画布宽）。
+
+        旧实现只在画布 ``<Configure>`` 里写 item width；内容在画布配置之后才撑宽时
+        （Windows 启动即目标尺寸）内容就保持自然请求宽（≈1494）→ 右侧被窗口裁掉。
+        这里在内容自己变大 / 首次 map / 换视图 / 换主题之后都再写一次，且只在
+        「当前值与目标值不同」时写，避免和内容的 ``<Configure>`` 形成回环。
+        """
+        try:
+            target = content_item_width(self._canvas.winfo_width())
+            current = self._canvas.itemcget(self._content_id, "width")
+            current_width = int(float(current)) if str(current).strip() else 0
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        if current_width != target:
+            try:
+                self._canvas.itemconfigure(self._content_id, width=target)
+            except Exception:                        # pragma: no cover
+                pass
+        try:
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        except Exception:                            # pragma: no cover
+            pass
+
     def _on_content_resize(self, _event=None) -> None:
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        self._sync_content_width()                   # 内容请求宽变了：宽度重新收敛
         self._sync_scrollbar()
 
     def _on_canvas_resize(self, event) -> None:
-        self._canvas.itemconfigure(self._content_id, width=max(1, event.width))
+        self._sync_content_width()                   # 画布宽变了：内容宽跟着收敛
         self._sync_scrollbar()
         width = int(getattr(event, "width", 0) or 0)
         if abs(width - getattr(self, "_rewrap_width", 0)) > 24:
@@ -411,12 +660,21 @@ class DesktopApp:
 
     def _bind_keys(self) -> None:
         self._root.bind("<F5>", lambda _e: self.refresh())
-        for index, key in enumerate(VIEW_KEYS, start=1):
-            if index <= 9:
-                self._root.bind("<Control-Key-" + str(index) + ">",
-                                lambda _e, name=key: self.show_view(name))
+        # B5：13 个视图全部可键盘直达（Ctrl+1…9 / Ctrl+Shift+1…4）+ 前后循环兜底
+        for sequence, key in view_shortcut_bindings():
+            self._root.bind(sequence, lambda _e, name=key: self.show_view(name))
+        self._root.bind("<Control-Prior>", lambda _e: self._step_view(-1))
+        self._root.bind("<Control-Next>", lambda _e: self._step_view(1))
         self._root.bind("<Control-r>", lambda _e: self.refresh())
         self._root.bind("<Escape>", lambda _e: self._canvas.yview_moveto(0))
+
+    def _step_view(self, step: int) -> None:
+        """Ctrl+PageUp/PageDown：按 IA 顺序前后切（13 个视图循环，不依赖键盘布局）。"""
+        try:
+            key = self._controller.next_view(int(step)).key
+        except Exception:                            # pragma: no cover - 控制器异常
+            return
+        self.show_view(key)
 
     # ── 渲染
     def show_view(self, key: str) -> View:
@@ -433,6 +691,7 @@ class DesktopApp:
             self._root.update_idletasks()
         except Exception:
             pass
+        self._sync_content_width()                   # B4：换视图后内容宽仍 ≤ 画布宽
         self._page_fade()
         return view
 
@@ -649,6 +908,7 @@ class DesktopApp:
         self._two_col_mode = None
         self._build_shell()
         self._apply_layout(self._root.winfo_width())
+        self._sync_content_width()                   # B4：换主题重建后宽度不变量仍成立
 
     def _apply_narrow_cells(self, narrow: bool) -> None:
         """窄窗用行级紧凑文案，回宽恢复完整文案（数据两份都在视图里，不丢字段）。"""
@@ -745,7 +1005,7 @@ class DesktopApp:
 
     def _status_line(self) -> str:
         """状态条左侧消息：窄窗只留前两段（否则会挤到右侧的 GPU/版本上去）。"""
-        line = self._controller.status_line()
+        line = sync_shortcut_hint(self._controller.status_line())
         if not getattr(self, "_narrow", False):
             return line
         parts = [part.strip() for part in line.split("·") if part.strip()]
@@ -846,6 +1106,7 @@ class DesktopApp:
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
                                   anchor="w", pady=(2, 0))
         self._in_render = False
+        self._sync_content_width()                   # B4：内容重排后把宽度钉回画布宽
 
     def _wrap(self, label: Any) -> Any:
         """登记一个「按窗口宽度换行」的文本控件（窗口变宽变窄时统一重算，只改 wraplength）。"""
@@ -983,13 +1244,17 @@ class DesktopApp:
                 cell.grid(row=0, column=index, sticky="nsew", padx=(0, 10))
         if hero.actions or hero.hint:
             foot = tk.Frame(body, background=surface)
-            foot.pack(fill="x", pady=(7, 0))
+            # B6：底部留 2px，别让 1px 描边贴着卡片下缘/下一行
+            foot.pack(fill="x", pady=(7, 2))
+            if hero.hint:
+                # B6：提示先 pack（side=right）并限宽换行 —— 旧实现里它排在按钮后面，
+                # 剩余宽度不够时被内容画布右缘裁掉（「已授权 1 个客户端」就是这样丢字的）。
+                tk.Label(foot, text=hero.hint, font=fonts.sans(kit.PX_MICRO),
+                         foreground=dual.color("muted_text"), background=surface,
+                         anchor="e", justify="right", wraplength=240).pack(
+                             side="right", padx=(10, 0))
             for action in hero.actions:
                 self._render_action(foot, action, ground=surface)
-            if hero.hint:
-                tk.Label(foot, text=hero.hint, font=fonts.sans(kit.PX_MICRO),
-                         foreground=dual.color("muted_text"), background=surface).pack(
-                             side="right")
 
     def _render_chart(self, parent: Any, chart: Chart) -> None:
         """贡献节奏柱图：没有时序就只写一句实话，不画假柱子。"""
@@ -1328,10 +1593,11 @@ class DesktopApp:
         total = sum(weights) or 1.0
         floor = 40
         headers = dict(getattr(table, "narrow_headers", ()) or ())
-        # 末列右对齐（设计 G-07）：数字/结论靠右，整列读起来是一条线
+        # 末列右对齐（设计 G-07）+ 数字列右对齐（B7）：数字/结论靠右，整列一条线
+        numeric = numeric_columns(all_columns, rows)
         for index, column in enumerate(shown):
             text = headers.get(column, column) if narrow else column
-            anchor = "e" if index == len(shown) - 1 else "w"
+            anchor = "e" if (index == len(shown) - 1 or column in numeric) else "w"
             tree.heading(column, text=text, anchor=anchor)
         # 按权重分配，舍入误差给最宽的一列（别让末列只剩「剩余」而被挤扁）
         widths: list[int] = [max(floor, int(available * weight / total)) for weight in weights]
@@ -1358,7 +1624,7 @@ class DesktopApp:
                     widths[index] = need
         for index, (column, width) in enumerate(zip(shown, widths)):
             tree.column(column, width=width, stretch=True,
-                        anchor="e" if index == len(shown) - 1 else "w")
+                        anchor="e" if (index == len(shown) - 1 or column in numeric) else "w")
         self._column_widths = tuple(int(tree.column(column, "width")) for column in shown)
         self._column_viewport = available
         self._hidden_columns = tuple(hidden)
@@ -1451,10 +1717,15 @@ class DesktopApp:
                 self._fields[field.key] = field
                 self._vars[field.key] = variable
             else:
-                tk.Label(block, text=field.value,
-                         font=fonts.for_text(field.value, kit.PX_SMALL),
-                         foreground=dual.color("ink"), background=surface,
-                         anchor="w", justify="left").grid(row=0, column=1, sticky="w")
+                # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
+                # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
+                value_label = tk.Label(block, text=field.value,
+                                       font=fonts.for_text(field.value, kit.PX_SMALL),
+                                       foreground=dual.color("ink"), background=surface,
+                                       anchor="w", justify="left",
+                                       wraplength=self._wrap_hint())
+                self._wrap(value_label)
+                value_label.grid(row=0, column=1, sticky="w")
                 if field.hint:
                     self._wrap(tk.Label(
                         block, text=field.hint, font=fonts.sans(kit.PX_MICRO),
