@@ -457,6 +457,15 @@ class Icon:
                            fill=color, outline=color, tags=tags)
 
 
+#: Canvas 上画 1px 描边时的内缩量（B6 的真根因）。
+#:
+#: Tk 的 ``width=1`` 描边是**以路径为中心**向两侧各铺半个线宽：路径贴着画布边缘（0.5）时，
+#: 外侧那半个像素落到画布外被裁掉，剩下的半像素在浅色底上几乎等于背景 ⇒ 底边/右边「看起来
+#: 没有边」（浅色 ghost 按钮最明显）。内缩 1.5 让 1px 描边完整落在 1..2 的像素行内，四条边
+#: 都看得见；再往里的 focus ring 相应放到 3（不压描边、也不留缝）。
+EDGE_INSET = 1.5
+
+
 # ─────────────────────────────────────────────────────────────── 基元
 class Divider(tk.Frame):
     """1px 分隔线（设计里到处是 ``border-top:1px``；不用 Canvas，省一个控件）。"""
@@ -488,7 +497,16 @@ class RoundedCard(tk.Frame):
         self.body = tk.Frame(self, background=self.fill, bd=0, highlightthickness=0)
         self.body.pack(fill="both", expand=True, padx=pad[0], pady=pad[1])
         self._shape = None
-        self.bind("<Configure>", self._redraw, add="+")
+        self._last_size: tuple[int, int] = (0, 0)
+        self.bind("<Configure>", self._on_configure, add="+")
+
+    def _on_configure(self, _event: Any = None) -> None:
+        """尺寸没变就不重画（Canvas 的 1px 抖动不许被 ``_redraw`` 放大成重绘风暴）。"""
+        size = (self.winfo_width(), self.winfo_height())
+        if size == self._last_size:
+            return
+        self._last_size = size
+        self._redraw()
 
     def _redraw(self, _event: Any = None) -> None:
         try:
@@ -499,7 +517,7 @@ class RoundedCard(tk.Frame):
             return
         try:
             self._back.delete("all")
-            inset = self.border / 2.0
+            inset = self.border / 2.0 + (1.0 if self.border else 0.0)   # 见 EDGE_INSET
             self._shape = self._back.create_polygon(
                 ui_geom.round_rect_points(inset, inset, width - inset, height - inset,
                                           self.radius),
@@ -548,7 +566,8 @@ class Chip(tk.Canvas):
         self.delete("all")
         height = int(self.cget("height"))
         width = int(self.cget("width"))
-        self.create_polygon(ui_geom.round_rect_points(0.5, 0.5, width - 0.5, height - 0.5,
+        self.create_polygon(ui_geom.round_rect_points(EDGE_INSET, EDGE_INSET,
+                                                      width - EDGE_INSET, height - EDGE_INSET,
                                                       self._radius),
                             smooth=True, splinesteps=8, fill=fill, outline=stroke, width=1)
         self.create_text(width / 2.0, height / 2.0, text=self.text,
@@ -653,13 +672,16 @@ class Button(tk.Canvas):
                 stroke = fill
             else:
                 stroke = fill
-        self.create_polygon(ui_geom.round_rect_points(0.5, 0.5, width - 0.5, height - 0.5,
+        self.create_polygon(ui_geom.round_rect_points(EDGE_INSET, EDGE_INSET,
+                                                      width - EDGE_INSET, height - EDGE_INSET,
                                                       self._radius),
                             smooth=True, splinesteps=8, fill=fill, outline=stroke,
                             width=1)
         if self.focus_get() is self:
-            self.create_polygon(ui_geom.round_rect_points(2, 2, width - 2, height - 2,
-                                                          max(2, self._radius - 2)),
+            ring = EDGE_INSET + 1.5
+            self.create_polygon(ui_geom.round_rect_points(ring, ring, width - ring,
+                                                          height - ring,
+                                                          max(2, self._radius - ring)),
                                 smooth=True, splinesteps=8, fill="", outline=theme.color("focus"),
                                 width=1)
         self.create_text(width / 2.0, height / 2.0, text=self.text, fill=text_color,
@@ -769,7 +791,16 @@ class Bars(tk.Canvas):
         self._axis: tuple[str, ...] = ()
         super().__init__(master, height=self.chart_height + 14, background=self.ground,
                          bd=0, highlightthickness=0, takefocus=0, **kwargs)
-        self.bind("<Configure>", lambda _e: self._redraw(), add="+")
+        self._last_size: tuple[int, int] = (0, 0)
+        self.bind("<Configure>", self._on_configure, add="+")
+
+    def _on_configure(self, _event: Any = None) -> None:
+        """尺寸没变就不重画（抖动事故防线：1px 抖动 → 重绘 → reqwidth 变 → 再抖动）。"""
+        size = (self.winfo_width(), self.winfo_height())
+        if size == self._last_size:
+            return
+        self._last_size = size
+        self._redraw()
 
     def set(self, values: Sequence[float] = (), *, axis: Sequence[str] = ()) -> None:
         self._values = tuple(ui_geom.clamp01(value) for value in values)
@@ -917,7 +948,7 @@ class NavItem(tk.Canvas):
         self.ground = ground or theme.color("surface3")
         super().__init__(master, width=190, height=self.HEIGHT, background=self.ground,
                          bd=0, highlightthickness=0, takefocus=1, **kwargs)
-        self.bind("<Configure>", lambda _e: self._redraw(), add="+")
+        self.bind("<Configure>", self._on_configure, add="+")
         self.bind("<Button-1>", self._click)
         self.bind("<Return>", self._click)
         self.bind("<space>", self._click)
@@ -926,6 +957,15 @@ class NavItem(tk.Canvas):
         self.bind("<FocusIn>", lambda _e: self._redraw())
         self.bind("<FocusOut>", lambda _e: self._redraw())
         self._hot = False
+        self._last_size: tuple[int, int] = (0, 0)
+
+    def _on_configure(self, _event: Any = None) -> None:
+        """尺寸没变就不重画（同 RoundedCard：1px 抖动不许放大成重绘风暴）。"""
+        size = (self.winfo_width(), self.winfo_height())
+        if size == self._last_size:
+            return
+        self._last_size = size
+        self._redraw()
 
     def set_active(self, active: bool) -> None:
         self.active = bool(active)
@@ -960,7 +1000,9 @@ class NavItem(tk.Canvas):
             fill = self.ground
             outline = ""
         if fill != self.ground or outline:
-            self.create_polygon(ui_geom.round_rect_points(0.5, 0.5, width - 0.5, height - 0.5, 7),
+            self.create_polygon(ui_geom.round_rect_points(EDGE_INSET, EDGE_INSET,
+                                                          width - EDGE_INSET,
+                                                          height - EDGE_INSET, 7),
                                 smooth=True, splinesteps=8, fill=fill,
                                 outline=outline or fill, width=1)
         if self.active:
@@ -986,7 +1028,9 @@ class NavItem(tk.Canvas):
             self.create_text(x0 + badge_w / 2.0, height / 2.0, text=label, anchor="center",
                              fill=theme.color("muted_text"), font=count_font)
         if self.focus_get() is self:
-            self.create_polygon(ui_geom.round_rect_points(1.5, 1.5, width - 1.5, height - 1.5, 6),
+            ring = EDGE_INSET + 1.5
+            self.create_polygon(ui_geom.round_rect_points(ring, ring, width - ring,
+                                                          height - ring, 6),
                                 smooth=True, splinesteps=8, fill="",
                                 outline=theme.color("focus"), width=1)
 
