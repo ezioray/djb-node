@@ -180,6 +180,7 @@ class DesktopApp:
         scrollbar = self._ttk.Scrollbar(wrapper, orient="vertical", style="Kit.Vertical.TScrollbar",
                                         command=self._canvas.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
+        self._scrollbar = scrollbar
         self._canvas.configure(yscrollcommand=scrollbar.set)
         # 滚轮直接可用（ttk 的 Scrollbar 只在指针悬停时才滚）
         self._canvas.bind_all("<MouseWheel>",
@@ -370,9 +371,36 @@ class DesktopApp:
 
     def _on_content_resize(self, _event=None) -> None:
         self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        self._sync_scrollbar()
 
     def _on_canvas_resize(self, event) -> None:
         self._canvas.itemconfigure(self._content_id, width=max(1, event.width))
+        self._sync_scrollbar()
+        width = int(getattr(event, "width", 0) or 0)
+        if abs(width - getattr(self, "_rewrap_width", 0)) > 24:
+            self._rewrap_width = width
+            self._rewrap()
+
+    def _sync_scrollbar(self) -> None:
+        """只在内容真的溢出时才露出滚动条（一屏装得下就没有，G-16）。"""
+        bar = getattr(self, "_scrollbar", None)
+        if bar is None:
+            return
+        try:
+            need = int(self._content.winfo_reqheight())
+            have = int(self._canvas.winfo_height())
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        if have <= 1:                                # 还没 map：别猜
+            return
+        try:
+            if need > have + 1:
+                if not bar.winfo_ismapped():
+                    bar.grid()
+            elif bar.winfo_ismapped():
+                bar.grid_remove()
+        except Exception:                            # pragma: no cover
+            pass
 
     def _bind_keys(self) -> None:
         self._root.bind("<F5>", lambda _e: self.refresh())
@@ -730,6 +758,7 @@ class DesktopApp:
         self._tree = None
         self._detail = None
         self._table = None
+        self._wrap_targets = []
 
     # ── 渲染入口
     def _render(self, view: View) -> None:
@@ -752,15 +781,15 @@ class DesktopApp:
         body.pack(fill="both", expand=True, padx=pad[0], pady=pad[1])
         self._body = body
         if view.subtitle:
-            tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.PX_BODY_S),
-                     foreground=dual.color("muted_text"), background=dual.color("bg"),
-                     anchor="w", justify="left", wraplength=self._wrap_hint()).pack(
-                         anchor="w", pady=(0, 10))
+            self._wrap(tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.PX_BODY_S),
+                              foreground=dual.color("muted_text"), background=dual.color("bg"),
+                              anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
+                                  anchor="w", pady=(0, 10))
         for text in view.unavailable:
-            tk.Label(body, text="! " + text, font=self._fonts.sans(kit.PX_BODY_S),
-                     foreground=dual.color("amber_text"), background=dual.color("bg"),
-                     anchor="w", justify="left", wraplength=self._wrap_hint()).pack(
-                         anchor="w", pady=(0, 4))
+            self._wrap(tk.Label(body, text="! " + text, font=self._fonts.sans(kit.PX_BODY_S),
+                              foreground=dual.color("amber_text"), background=dual.color("bg"),
+                              anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
+                                  anchor="w", pady=(0, 4))
         if view.hero is not None or view.chart is not None or view.rail:
             self._render_dashboard(view)
         else:
@@ -768,11 +797,30 @@ class DesktopApp:
         for note in view.notes:
             if not note:
                 continue
-            tk.Label(body, text="· " + note, font=self._fonts.sans(kit.PX_MICRO_CJK),
-                     foreground=dual.color("muted_text"), background=dual.color("bg"),
-                     anchor="w", justify="left", wraplength=self._wrap_hint()).pack(
-                         anchor="w", pady=(6, 0))
+            self._wrap(tk.Label(body, text="· " + note, font=self._fonts.sans(kit.PX_MICRO_CJK),
+                              foreground=dual.color("muted_text"), background=dual.color("bg"),
+                              anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
+                                  anchor="w", pady=(6, 0))
         self._in_render = False
+
+    def _wrap(self, label: Any) -> Any:
+        """登记一个「按窗口宽度换行」的文本控件（窗口变宽变窄时统一重算，只改 wraplength）。"""
+        try:
+            self._wrap_targets.append(label)
+        except AttributeError:                       # pragma: no cover - 还没渲染过
+            self._wrap_targets = [label]
+        return label
+
+    def _rewrap(self) -> None:
+        """宽度变了但没跨断点：只更新换行宽度，不重建控件。"""
+        if not getattr(self, "_wrap_targets", None):
+            return
+        width = self._wrap_hint()
+        for label in self._wrap_targets:
+            try:
+                label.configure(wraplength=width)
+            except Exception:                        # pragma: no cover - 控件已销毁
+                pass
 
     def _wrap_hint(self) -> int:
         """文本换行宽度（像素）：按当前窗口估，宽窗留出侧栏与内距。"""
@@ -1154,10 +1202,10 @@ class DesktopApp:
                      foreground=dual.color("muted_text"),
                      background=dual.color("surface")).pack(anchor="w", pady=(6, 0))
         if table.note:
-            tk.Label(body, text=table.note, font=self._fonts.sans(kit.PX_MICRO_CJK),
-                     foreground=dual.color("muted_text"),
-                     background=dual.color("surface"), anchor="w",
-                     justify="left", wraplength=self._wrap_hint()).pack(anchor="w", pady=(4, 0))
+            self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.PX_MICRO_CJK),
+                              foreground=dual.color("muted_text"),
+                              background=dual.color("surface"), anchor="w",
+                              justify="left", wraplength=self._wrap_hint())).pack(anchor="w", pady=(4, 0))
 
     def _fit_columns(self, tree: Any) -> None:
         """列宽按可视宽度分配，保证所有可见列都在首屏内（Treeview 没有横向滚动条）。
@@ -1194,9 +1242,11 @@ class DesktopApp:
         floor = 40
         remaining = available
         headers = dict(getattr(table, "narrow_headers", ()) or ())
-        for column in shown:
+        # 末列右对齐（设计 G-07）：数字/结论靠右，整列读起来是一条线
+        for index, column in enumerate(shown):
             text = headers.get(column, column) if narrow else column
-            tree.heading(column, text=text, anchor="w")
+            anchor = "e" if index == len(shown) - 1 else "w"
+            tree.heading(column, text=text, anchor=anchor)
         widths: list[int] = []
         for index, column in enumerate(shown):
             share = max(floor, int(available * weights[index] / total))
@@ -1221,8 +1271,9 @@ class DesktopApp:
                 if donor != index and widths[donor] - gap >= floor:
                     widths[donor] -= gap
                     widths[index] = need
-        for column, width in zip(shown, widths):
-            tree.column(column, width=width, stretch=True)
+        for index, (column, width) in enumerate(zip(shown, widths)):
+            tree.column(column, width=width, stretch=True,
+                        anchor="e" if index == len(shown) - 1 else "w")
         self._column_widths = tuple(int(tree.column(column, "width")) for column in shown)
         self._column_viewport = available
         self._hidden_columns = tuple(hidden)
@@ -1259,11 +1310,11 @@ class DesktopApp:
                            anchor="w").pack(side="left")
         note = self._row_notes.get(selection[0], "")
         if note:
-            self._tk.Label(detail, text="原因：" + note,
-                           font=fonts.sans(self._kit.PX_MICRO_CJK),
-                           foreground=dual.color("amber_text"), background=surface,
-                           anchor="w", justify="left",
-                           wraplength=self._wrap_hint()).pack(anchor="w", padx=10, pady=(4, 6))
+            self._self._wrap(tk.Label(detail, text="原因：" + note,
+                                    font=fonts.sans(self._kit.PX_MICRO_CJK),
+                                    foreground=dual.color("amber_text"), background=surface,
+                                    anchor="w", justify="left",
+                                    wraplength=self._wrap_hint())).pack(anchor="w", padx=10, pady=(4, 6))
 
     def _render_fields(self, fields: Sequence[Field], view_key: str,
                        parent: Any = None) -> None:
@@ -1294,11 +1345,11 @@ class DesktopApp:
                 hint = field.hint or ""
                 if field.secret:
                     hint = ("当前 " + field.value + "｜" + hint).strip("｜")
-                tk.Label(block, text=hint, font=fonts.sans(kit.PX_MICRO_CJK),
-                         foreground=dual.color("muted_text"), background=surface,
-                         anchor="w", justify="left",
-                         wraplength=self._wrap_hint()).grid(row=1, column=1, sticky="w",
-                                                            pady=(3, 0))
+                self._wrap(tk.Label(block, text=hint, font=fonts.sans(kit.PX_MICRO_CJK),
+                                  foreground=dual.color("muted_text"), background=surface,
+                                  anchor="w", justify="left",
+                                  wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
+                                                                     pady=(3, 0))
                 self._fields[field.key] = field
                 self._vars[field.key] = variable
             else:
@@ -1306,11 +1357,11 @@ class DesktopApp:
                          foreground=dual.color("ink"), background=surface,
                          anchor="w", justify="left").grid(row=0, column=1, sticky="w")
                 if field.hint:
-                    tk.Label(block, text=field.hint, font=fonts.sans(kit.PX_MICRO_CJK),
-                             foreground=dual.color("muted_text"), background=surface,
-                             anchor="w", justify="left",
-                             wraplength=self._wrap_hint()).grid(row=1, column=1, sticky="w",
-                                                                pady=(3, 0))
+                    self._wrap(tk.Label(block, text=field.hint, font=fonts.sans(kit.PX_MICRO_CJK),
+                                      foreground=dual.color("muted_text"), background=surface,
+                                      anchor="w", justify="left",
+                                      wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
+                                                                         pady=(3, 0))
 
     # ── 动作
     def _on_action(self, key: str) -> None:
