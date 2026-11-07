@@ -216,3 +216,156 @@ def test_apply_layout_then_render_does_not_explode(tmp_path):
         assert app._tree is not None                  # noqa: SLF001 - 渲染确实跑完了
     finally:
         root.destroy()
+
+
+# ───────────────────────────────────────── IA R2：分组 / 滚动 / 快捷键 / 表头（B1–B7）
+def test_content_item_width_never_exceeds_canvas():
+    """B4：内容列宽恒等于画布宽（负值/0 当 0，绝不把内容撑到画布外）。"""
+    assert desktop_app.content_item_width(1232) == 1232
+    assert desktop_app.content_item_width("1232") == 1232
+    assert desktop_app.content_item_width(0) == 1      # Tk 的 item width 最小 1
+    assert desktop_app.content_item_width(-8) == 1
+    assert desktop_app.content_item_width(None) == 1
+
+
+def test_nav_needs_scroll_only_when_content_is_taller():
+    """B2：13 项 + 4 分组头 574px —— 900 宽时不滚，620 高时滚。"""
+    assert desktop_app.nav_needs_scroll(574, 671) is False
+    assert desktop_app.nav_needs_scroll(574, 391) is True
+    assert desktop_app.nav_needs_scroll(391, 391) is False
+    assert desktop_app.nav_needs_scroll(0, 0) is False
+    assert desktop_app.nav_needs_scroll(574, 1) is False     # 还没布局（h=1）不猜
+    # 2px 磁滞：差 1~2px 不算溢出（否则 1px 摆动会让滚动条反复开关）
+    assert desktop_app.nav_needs_scroll(573, 571) is False
+    assert desktop_app.nav_needs_scroll(574, 571) is True
+
+
+def test_view_shortcuts_cover_every_view_exactly_once():
+    """B5：Ctrl+1…9 给前 9 项，Ctrl+Shift+1…4 给后 4 项；13 个视图一个不落。"""
+    bindings = desktop_app.view_shortcut_bindings()
+    assert [key for _sequence, key in bindings] == list(VIEW_KEYS)
+    sequences = [sequence for sequence, _key in bindings]
+    assert sequences[:9] == ["<Control-Key-%d>" % number for number in range(1, 10)]
+    # Shift+数字在 Tk 里是 exclam/at/numbersign/dollar，绑数字本身不会触发
+    assert sequences[9:] == ["<Control-Shift-exclam>", "<Control-Shift-at>",
+                             "<Control-Shift-numbersign>", "<Control-Shift-dollar>"]
+    assert len(set(sequences)) == len(VIEW_KEYS)
+
+
+def test_view_shortcuts_accept_a_command_modifier():
+    """macOS 走 Command：只换修饰符，键位表不动（xplat 流接这里）。"""
+    bindings = desktop_app.view_shortcut_bindings(modifier="Command")
+    assert bindings[0][0] == "<Command-Key-1>"
+    assert bindings[9][0] == "<Command-Shift-exclam>"
+
+
+def test_shortcut_hint_mentions_both_key_ranges():
+    text = desktop_app.sync_shortcut_hint(
+        "就绪：F5 刷新 · Ctrl+1…9 切换视图 · 关闭窗口不会停止 daemon")
+    assert "Ctrl+1…9" in text and "Ctrl+Shift+1…4" in text
+    assert text.endswith("关闭窗口不会停止 daemon")            # 其它段落原样保留
+    assert desktop_app.sync_shortcut_hint("没有旧文案") == "没有旧文案"
+
+
+def test_page_kickers_come_from_the_ia_table():
+    """B3：页头眉标只有一份数据源（views.page_kicker），app 里不手抄第二份。"""
+    from djb_node.desktop.views import page_kicker
+
+    assert desktop_app.PAGE_KICKERS == {key: page_kicker(key) for key in VIEW_KEYS}
+    assert desktop_app.PAGE_KICKERS["account"] == "SYSTEM / ACCOUNT"
+    assert desktop_app.PAGE_KICKERS["receipts"] == "EARN / RECEIPTS"
+
+
+def test_looks_numeric_knows_money_tokens_and_units():
+    assert desktop_app.looks_numeric("1,234")
+    assert desktop_app.looks_numeric("¥12.00")
+    assert desktop_app.looks_numeric("98%")
+    assert desktop_app.looks_numeric("1.5k")
+    assert desktop_app.looks_numeric("512 MB")
+    assert not desktop_app.looks_numeric("rcpt_uat_0001")
+    assert not desktop_app.looks_numeric("2026-11-01 03:12")
+    assert not desktop_app.looks_numeric("已接受")
+    assert not desktop_app.looks_numeric("—")
+
+
+def test_numeric_columns_flags_money_and_tokens_not_ids():
+    """B7：数字列（Tokens/金额）右对齐，编号/时间/状态保持左对齐。"""
+    from types import SimpleNamespace
+
+    columns = ("收据号", "时间", "Tokens", "状态")
+    rows = [
+        SimpleNamespace(cells=("rcpt_uat_0001", "2026-11-01 03:10", "1,500", "已接受")),
+        SimpleNamespace(cells=("rcpt_uat_0002", "2026-11-01 03:12", "¥12.00", "已拒绝")),
+    ]
+    assert desktop_app.numeric_columns(columns, rows) == {"Tokens"}
+    assert desktop_app.numeric_columns(("余额",), [
+        SimpleNamespace(cells=("—",)), SimpleNamespace(cells=("¥3.20",))
+    ]) == {"余额"}
+    assert desktop_app.numeric_columns(("空列",), [SimpleNamespace(cells=("",))]) == set()
+
+
+# ── 真窗口：分组头 / 13 项 / 滚动条只在溢出时出现 / 内容宽不变量 / 键盘
+def test_sidebar_renders_four_groups_and_thirteen_items(tmp_path):
+    app, root = _window_app(tmp_path, 1440)
+    try:
+        from djb_node.desktop.views import NAV_SECTIONS
+
+        assert list(app._nav_section_headers) == [section.key for section in NAV_SECTIONS]
+        assert len(app._nav_section_headers) == 4
+        assert list(app._nav_buttons) == list(VIEW_KEYS)
+        for section in NAV_SECTIONS:
+            header = app._nav_section_headers[section.key]
+            first = app._nav_buttons[section.keys[0]]
+            assert first.winfo_y() > header.winfo_y()
+        # 13 项都在同一列里（没有横向溢出）：内层宽 = 画布宽
+        assert int(app._nav_inner.winfo_width()) <= int(app._nav_canvas.winfo_width()) + 1
+    finally:
+        root.destroy()
+
+
+def test_short_window_scrolls_the_nav_and_keeps_every_item_reachable(tmp_path):
+    """B2：900×620 下导航区可滚，最后一项滚到底能看全；1440 高不出现滚动条。"""
+    app, root = _window_app(tmp_path, 900)
+    try:
+        root.geometry("900x620")
+        root.update()
+        assert app._nav_scrollbar.winfo_ismapped()
+        assert int(app._nav_inner.winfo_reqheight()) > int(app._nav_canvas.winfo_height())
+        app._nav_canvas.yview_moveto(1.0)
+        root.update()
+        last = app._nav_buttons[VIEW_KEYS[-1]]
+        visible_bottom = app._nav_canvas.canvasy(0) + int(app._nav_canvas.winfo_height())
+        assert last.winfo_y() + last.winfo_height() <= visible_bottom + 1
+        # 没有横向滚动：xview 永远在 (0, 1)
+        assert app._nav_canvas.xview() == (0.0, 1.0)
+        # 回到高窗：13 项放得下 → 滚动条收起
+        root.geometry("1440x900")
+        root.update()
+        assert not app._nav_scrollbar.winfo_ismapped()
+    finally:
+        root.destroy()
+
+
+def test_content_width_follows_canvas_across_views_and_resizes(tmp_path):
+    """B4：换视图 / 改窗口宽之后，内容宽 == 画布宽（右侧不再被裁）。"""
+    app, root = _window_app(tmp_path, 1440)
+    try:
+        assert int(app._content.winfo_width()) == int(app._canvas.winfo_width())
+        app.show_view("account")
+        root.update()
+        assert int(app._content.winfo_width()) == int(app._canvas.winfo_width())
+        root.geometry("1100x700")
+        root.update()
+        assert int(app._content.winfo_width()) == int(app._canvas.winfo_width())
+    finally:
+        root.destroy()
+
+
+def test_page_kicker_label_shows_two_level_ascii_for_account(tmp_path):
+    app, root = _window_app(tmp_path, 1440)
+    try:
+        app.show_view("account")
+        root.update()
+        assert app._page_kicker.cget("text") == "SYSTEM / ACCOUNT"
+    finally:
+        root.destroy()

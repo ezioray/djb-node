@@ -16,8 +16,14 @@
 3. **不伪造层级**：卡片 = ``surface`` 底 + 1px 描边（``card_line``），**不加阴影、不加深色底**。
    设计样的层级只靠描边 + 间距 + 字号（01-DESIGN-SPEC §0.3）。
 
-字号一律用**负数字号（像素）**：``-13`` = 13px。见 :data:`PX_*`。
-所有几何计算都在 :mod:`djb_node.desktop.ui_geom`（不依赖 Tk，可无窗口单测）。
+排版（R2 裁决 01-FONT-DECISION）
+================================
+
+* 字号一律用**负数字号（像素）**：``-13`` = 13px，字阶只有 :data:`PX_*` 那几档。
+* **中文不许进 mono**：要画字符串就调 :meth:`Fonts.for_text`（ASCII → mono，其余 → sans）。
+  手写 ``fonts.mono()`` 只允许出现在「确定是 ASCII」的地方（回执号/时间戳/版本/快捷键）。
+* 字重只有 normal / bold；用颜色（``muted_text``）做层级，不靠加粗。
+* 所有几何计算都在 :mod:`djb_node.desktop.ui_geom`（不依赖 Tk，可无窗口单测）。
 """
 from __future__ import annotations
 
@@ -29,47 +35,144 @@ from . import theme, ui_geom
 
 __all__ = [
     "Bars", "Button", "Chip", "Divider", "Fonts", "Gauge", "Icon", "NavItem", "PX_BODY",
-    "PX_CARD", "PX_H1", "PX_HERO", "PX_MICRO", "PX_MICRO_CJK", "PX_NAV", "PX_NUM",
-    "PX_NUM_L", "PX_NUM_XL", "PX_TABLE", "RoundedCard", "SectionHead", "StatCell", "Switch",
+    "PX_BODY_S", "PX_CARD", "PX_CJK_MIN", "PX_DISPLAY", "PX_H1", "PX_HERO", "PX_MICRO",
+    "PX_MICRO_CJK", "PX_NAV", "PX_NUM", "PX_NUM_L", "PX_NUM_XL", "PX_SMALL", "PX_TABLE",
+    "PX_TITLE", "RoundedCard", "SectionHead", "StatCell", "Switch",
     "apply_kit_styles", "fonts_for",
 ]
 
-# ── 字阶（px；01-DESIGN-SPEC §2.2，CJK 下限按该节注 +1~2px，避免 7pt 糊成一团）
-PX_H1 = 18          # 页头标题（设计 18px/650）
-PX_HERO = 20        # 状态主卡标题（设计 20px/650）
-PX_CARD = 14        # 卡片标题（设计 14px/650）
-PX_BODY = 13        # 正文（设计 11.5px；CJK 在 12px 以下开始糊，+1.5px）
-PX_BODY_S = 12      # 按钮/次级正文（设计 11px）
-PX_NAV = 12         # 侧栏导航项（设计 12px）
-PX_NUM_XL = 30      # 仪表环中心数字（设计 30px/650）
-PX_NUM_L = 19       # TODAY 四宫格数值（设计 19px/650）
-PX_NUM = 13         # 指标数值（设计 11.5px mono，+1.5px 便于对齐等宽）
-PX_TABLE = 10       # 表格正文（设计 9px mono；CJK 下限 +1px）
-PX_MICRO = 8        # 拉丁微标（NODE STATUS / SYNC / 版本号；设计 7–8px mono）
-PX_MICRO_CJK = 10   # 含中文的微标（设计 7.5px mono 只放得下拉丁；中文 +2.5px）
+# ── 字阶（px；R2 裁决 01-FONT-DECISION §2.1：只保留 7 档）
+#
+# 下表是**唯一**的字号来源：渲染层不许再写裸数字字号（``sans(14)`` 那种）。
+# 7 档 = 30 / 19 / 18 / 13 / 12 / 10，外加「表格正文 11」这一档**特例**
+# （设计 9px 在 CJK 上糊、10px 又比微标还小，见 01-FONT-DECISION §2.1 末段）。
+# 字重只两档：标题与关键数字 bold，正文/说明/微标 normal（§2.3）。
+PX_DISPLAY = 30     # 仪表环中心大数字                    bold
+PX_TITLE = 19       # 页头标题                            bold
+PX_HERO = 18        # 主卡标题                            bold
+PX_CARD = 13        # 卡片标题 / 关键数值                  bold
+PX_BODY = 13        # 正文                                normal
+PX_SMALL = 12       # 按钮、辅助说明                       normal
+PX_MICRO = 10       # 微标、表头、版本号（含中文也用它，sans）normal / 表头 bold
+PX_TABLE = 11       # 表格正文（特例档；行高 26 不变）      normal
+
+#: 含中文时的**最小**字号：中文在 10px 以下会糊成一团（§1 F1 的根因就是 8px 塞中文）
+PX_CJK_MIN = PX_MICRO
+
+# ── 兼容别名：调用方（app.py / views.py 投影层）不改签名，值收敛到上面 7 档
+PX_H1 = PX_TITLE          # 旧名：页头标题（原 18）
+PX_BODY_S = PX_SMALL      # 旧名：按钮/次级正文（原 12）
+PX_NAV = PX_SMALL         # 旧名：侧栏导航项（原 12）
+PX_NUM = PX_BODY          # 旧名：指标数值（原 13）
+PX_NUM_L = PX_TITLE       # 旧名：四宫格数值（原 19）
+PX_NUM_XL = PX_DISPLAY    # 旧名：仪表环数字（原 30）
+#: 旧名：含中文的微标。**保留为别名**只为不打断调用方签名；
+#: 渲染层改用 :meth:`Fonts.for_text`（含中文 → sans 10px），不许再拿它把中文塞进 mono。
+PX_MICRO_CJK = PX_MICRO
 
 
 class Fonts:
-    """按窗口解析一次字体族，之后按 px 取 ``tkfont.Font``（缓存，避免每帧新建）。"""
+    """按窗口解析一次字体族，之后按 px 取 ``tkfont.Font``（缓存，避免每帧新建）。
 
-    def __init__(self, root: Any) -> None:
+    两个必须遵守的约定
+    ==================
+
+    1. **中文不许进 mono**：取字体用 :meth:`for_text`（纯 ASCII → mono，含非 ASCII → sans），
+       而不是手写 ``mono(...)`` 去包一个可能含中文的字符串（01-FONT-DECISION §1 F1）。
+    2. **命名字体只有一份、且必须活到进程结束**：:data:`ROLE_FONTS` 里的角色用 Tcl **具名**字体
+       建出来，ttk 样式与 ``option_add("*Font")`` 都按名字引用。曾经的 bug 是
+       ``apply_kit_styles`` 里临时建了一个 ``Fonts``，函数返回后它被 GC，
+       ``tkfont.Font.__del__`` 把 Tcl 字体删掉，样式里只剩一个**悬空名字** ⇒
+       Tk 静默退回默认字体（12pt）⇒「表头字号不受控」（§1 F2；复现与证据见 01-FONT-IMPL.md）。
+       因此本类只通过 :func:`fonts_for` 取得（模块级缓存 ≈ 窗口生命周期）。
+
+    ``scale`` 是给后续 DPI 适配留的**钩子**：字阶按 px@96dpi 设计，
+    ``scale=1.25`` 时 30px → 38px。默认 1.0，本轮不接线（由 lead 合并后注入）。
+    """
+
+    #: 角色 → ``(族, px, bold)``；ttk 样式与 option 数据库都引用这些名字
+    ROLE_FONTS: dict[str, tuple[str, int, bool]] = {
+        "body": ("sans", PX_BODY, False),
+        "small": ("sans", PX_SMALL, False),
+        "micro": ("sans", PX_MICRO, False),
+        "heading": ("sans", PX_MICRO, True),
+        "table": ("sans", PX_TABLE, False),
+        "mono": ("mono", PX_MICRO, False),
+        "nav": ("sans", PX_NAV, False),
+        "card": ("sans", PX_CARD, True),
+        "title": ("sans", PX_TITLE, True),
+        "hero": ("sans", PX_HERO, True),
+        "display": ("sans", PX_DISPLAY, True),
+    }
+
+    #: 角色的 Tcl 具名字体（``option_add`` / ``style.configure`` 只认名字）
+    NAMES: dict[str, str] = {role: "DJB." + role.title() for role in ROLE_FONTS}
+
+    def __init__(self, root: Any, *, scale: float = 1.0) -> None:
         self.root = root
         try:
+            self.scale = float(scale)
+        except (TypeError, ValueError):             # pragma: no cover - 非法注入
+            self.scale = 1.0
+        if not self.scale > 0:                      # 0/负数/NaN 一律回到 1.0（不静默缩成 0）
+            self.scale = 1.0
+        try:
             families: Iterable[str] = tkfont.families(root)
-        except Exception:                          # pragma: no cover - 无字库
+        except Exception:                           # pragma: no cover - 无字库
             families = ()
-        self.sans_family = ui_geom.pick_family(families, ui_geom.SANS_CHAIN)
-        self.mono_family = ui_geom.pick_family(families, ui_geom.MONO_CHAIN)
-        self._cache: dict[tuple[str, int, str], Any] = {}
+        self.families = tuple(families or ())
+        self.platform = ui_geom.platform_key()
+        # 族名探测：平台链 → 系统实际装了什么（可证伪，见 ui_geom.pick_sans_family）
+        self.sans_family = ui_geom.pick_sans_family(self.families, self.platform)
+        self.mono_family = ui_geom.pick_mono_family(self.families, self.platform)
+        self._cache: dict[tuple[str, int, str, str], Any] = {}
+        # 角色字体一次建好：改字号只改 ROLE_FONTS 一处
+        self.named: dict[str, Any] = {}
+        for role, (kind, px, bold) in self.ROLE_FONTS.items():
+            self.named[role] = self._build(self.NAMES[role], kind, px, bold)
+
+    # ── 取字体
+    def px(self, value: int) -> int:
+        """设计 px → 实际 px（乘 ``scale``，至少 1）。"""
+        return max(1, int(round(float(value) * self.scale)))
+
+    def _build(self, name: str | None, kind: str, px: int, bold: bool) -> Any:
+        family = self.mono_family if kind == "mono" else self.sans_family
+        weight = "bold" if bold else "normal"
+        size = -self.px(px)
+        key = (family, size, weight, name or "")
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        font: Any = None
+        if name:
+            # 具名字体：已存在就复用（同进程重建窗口/换肤都不会撞名），否则新建
+            try:
+                font = tkfont.Font(root=self.root, name=name, exists=True)
+                font.configure(family=family, size=size, weight=weight)
+            except Exception:
+                try:
+                    font = tkfont.Font(root=self.root, name=name, exists=False,
+                                       family=family, size=size, weight=weight)
+                except Exception:                   # pragma: no cover - 极端环境
+                    font = None
+        if font is None:
+            try:
+                font = tkfont.Font(root=self.root, family=family, size=size, weight=weight)
+            except Exception:                       # pragma: no cover - 无字库
+                font = (family, size, weight)
+        self._cache[key] = font
+        return font
 
     def _get(self, family: str, px: int, weight: str) -> Any:
-        key = (family, int(px), weight)
+        size = -abs(self.px(px))
+        key = (family, size, weight, "")
         if key not in self._cache:
             try:
                 self._cache[key] = tkfont.Font(root=self.root, family=family,
-                                               size=-abs(int(px)), weight=weight)
-            except Exception:                      # pragma: no cover - 极端环境
-                self._cache[key] = (family, -abs(int(px)), weight)
+                                               size=size, weight=weight)
+            except Exception:                       # pragma: no cover - 极端环境
+                self._cache[key] = (family, size, weight)
         return self._cache[key]
 
     def sans(self, px: int = PX_BODY, *, bold: bool = False) -> Any:
@@ -77,6 +180,24 @@ class Fonts:
 
     def mono(self, px: int = PX_MICRO, *, bold: bool = False) -> Any:
         return self._get(self.mono_family, px, "bold" if bold else "normal")
+
+    def for_text(self, text: Any, px: int = PX_MICRO, *, bold: bool = False) -> Any:
+        """按**这段文字**选族：纯 ASCII → mono；含任何非 ASCII → sans（中文最小 10px）。
+
+        为什么需要它：等宽族（Cascadia Mono / Menlo / DejaVu Sans Mono）**没有 CJK 字形**，
+        Tk 会静默逐字回退到 CJK 族，但**字号仍是等宽那一档**，于是中文糊成一团、中英基线跳。
+        """
+        raw = "" if text is None else str(text)
+        if raw.isascii():
+            return self.mono(px, bold=bold)
+        return self.sans(max(int(px), PX_CJK_MIN), bold=bold)
+
+    def named_name(self, role: str) -> Any:
+        """该角色可放进 ``option_add`` / ``style.configure`` 的字体值（名字或元组）。"""
+        font = self.named.get(role)
+        if isinstance(font, tkfont.Font):
+            return str(font)
+        return font
 
     def measure(self, text: str, spec: Any) -> int:
         """文本像素宽（给 Canvas 按钮/徽标算宽度用）；失败时按 7px/字粗估。"""
@@ -89,16 +210,23 @@ class Fonts:
 _FONTS: dict[str, Fonts] = {}
 
 
-def fonts_for(widget: Any) -> Fonts:
-    """取该控件所属窗口的 :class:`Fonts`（按 Tcl 窗口路径缓存，一个窗口只探一次字体）。"""
+def fonts_for(widget: Any, *, scale: float | None = None) -> Fonts:
+    """取该控件所属窗口的 :class:`Fonts`（按 Tcl 窗口路径缓存，一个窗口只探一次字体）。
+
+    缓存必须活到进程结束：``tkfont.Font`` 被回收时会把 Tcl 字体一起删掉，而 ttk 样式
+    与 option 数据库里只存字体**名字**（删掉就成了悬空引用 → 静默退回默认字体）。
+    同一进程里重建根窗口（测试会这么干）时按对象身份识别并重建，不会拿到已销毁窗口的字体。
+    """
     try:
         root = widget.winfo_toplevel()
     except Exception:                              # pragma: no cover - 未映射控件
         root = widget
     key = str(root)
     cached = _FONTS.get(key)
+    if cached is not None and cached.root is not root:
+        cached = None                              # 旧根窗口已销毁：重建，不沿用死字体
     if cached is None:
-        cached = Fonts(root)
+        cached = Fonts(root, scale=1.0 if scale is None else scale)
         _FONTS[key] = cached
     return cached
 
@@ -329,6 +457,15 @@ class Icon:
                            fill=color, outline=color, tags=tags)
 
 
+#: Canvas 上画 1px 描边时的内缩量（B6 的真根因）。
+#:
+#: Tk 的 ``width=1`` 描边是**以路径为中心**向两侧各铺半个线宽：路径贴着画布边缘（0.5）时，
+#: 外侧那半个像素落到画布外被裁掉，剩下的半像素在浅色底上几乎等于背景 ⇒ 底边/右边「看起来
+#: 没有边」（浅色 ghost 按钮最明显）。内缩 1.5 让 1px 描边完整落在 1..2 的像素行内，四条边
+#: 都看得见；再往里的 focus ring 相应放到 3（不压描边、也不留缝）。
+EDGE_INSET = 1.5
+
+
 # ─────────────────────────────────────────────────────────────── 基元
 class Divider(tk.Frame):
     """1px 分隔线（设计里到处是 ``border-top:1px``；不用 Canvas，省一个控件）。"""
@@ -360,7 +497,16 @@ class RoundedCard(tk.Frame):
         self.body = tk.Frame(self, background=self.fill, bd=0, highlightthickness=0)
         self.body.pack(fill="both", expand=True, padx=pad[0], pady=pad[1])
         self._shape = None
-        self.bind("<Configure>", self._redraw, add="+")
+        self._last_size: tuple[int, int] = (0, 0)
+        self.bind("<Configure>", self._on_configure, add="+")
+
+    def _on_configure(self, _event: Any = None) -> None:
+        """尺寸没变就不重画（Canvas 的 1px 抖动不许被 ``_redraw`` 放大成重绘风暴）。"""
+        size = (self.winfo_width(), self.winfo_height())
+        if size == self._last_size:
+            return
+        self._last_size = size
+        self._redraw()
 
     def _redraw(self, _event: Any = None) -> None:
         try:
@@ -371,7 +517,7 @@ class RoundedCard(tk.Frame):
             return
         try:
             self._back.delete("all")
-            inset = self.border / 2.0
+            inset = self.border / 2.0 + (1.0 if self.border else 0.0)   # 见 EDGE_INSET
             self._shape = self._back.create_polygon(
                 ui_geom.round_rect_points(inset, inset, width - inset, height - inset,
                                           self.radius),
@@ -401,7 +547,9 @@ class Chip(tk.Canvas):
         self.text = str(text)
         self.ground = ground or theme.color("bg")
         fonts = fonts_for(master)
-        self._font = fonts.mono(px) if mono else fonts.sans(px)
+        # ``mono`` 只为不改调用方签名而保留：现在一律按**内容**选族（ASCII → mono，含中文 → sans）
+        self._px = int(px)
+        self._font = fonts.for_text(self.text, px)
         self._pad = int(pad)
         self._radius = int(radius)
         width = fonts.measure(self.text, self._font) + self._pad * 2 + 2
@@ -418,7 +566,8 @@ class Chip(tk.Canvas):
         self.delete("all")
         height = int(self.cget("height"))
         width = int(self.cget("width"))
-        self.create_polygon(ui_geom.round_rect_points(0.5, 0.5, width - 0.5, height - 0.5,
+        self.create_polygon(ui_geom.round_rect_points(EDGE_INSET, EDGE_INSET,
+                                                      width - EDGE_INSET, height - EDGE_INSET,
                                                       self._radius),
                             smooth=True, splinesteps=8, fill=fill, outline=stroke, width=1)
         self.create_text(width / 2.0, height / 2.0, text=self.text,
@@ -429,6 +578,7 @@ class Chip(tk.Canvas):
         if tone:
             self.tone = tone
         fonts = fonts_for(self)
+        self._font = fonts.for_text(self.text, self._px)   # 文案变了，族可能也要跟着变
         self.configure(width=fonts.measure(self.text, self._font) + self._pad * 2 + 2)
         self._redraw()
 
@@ -522,13 +672,16 @@ class Button(tk.Canvas):
                 stroke = fill
             else:
                 stroke = fill
-        self.create_polygon(ui_geom.round_rect_points(0.5, 0.5, width - 0.5, height - 0.5,
+        self.create_polygon(ui_geom.round_rect_points(EDGE_INSET, EDGE_INSET,
+                                                      width - EDGE_INSET, height - EDGE_INSET,
                                                       self._radius),
                             smooth=True, splinesteps=8, fill=fill, outline=stroke,
                             width=1)
         if self.focus_get() is self:
-            self.create_polygon(ui_geom.round_rect_points(2, 2, width - 2, height - 2,
-                                                          max(2, self._radius - 2)),
+            ring = EDGE_INSET + 1.5
+            self.create_polygon(ui_geom.round_rect_points(ring, ring, width - ring,
+                                                          height - ring,
+                                                          max(2, self._radius - ring)),
                                 smooth=True, splinesteps=8, fill="", outline=theme.color("focus"),
                                 width=1)
         self.create_text(width / 2.0, height / 2.0, text=self.text, fill=text_color,
@@ -616,7 +769,7 @@ class Gauge(tk.Canvas):
         if self._label:
             self.create_text(center, center + 20, text=self._label,
                              fill=theme.color("muted_text"),
-                             font=fonts.mono(PX_MICRO), anchor="center")
+                             font=fonts.for_text(self._label, PX_MICRO), anchor="center")
 
 
 class Bars(tk.Canvas):
@@ -638,7 +791,16 @@ class Bars(tk.Canvas):
         self._axis: tuple[str, ...] = ()
         super().__init__(master, height=self.chart_height + 14, background=self.ground,
                          bd=0, highlightthickness=0, takefocus=0, **kwargs)
-        self.bind("<Configure>", lambda _e: self._redraw(), add="+")
+        self._last_size: tuple[int, int] = (0, 0)
+        self.bind("<Configure>", self._on_configure, add="+")
+
+    def _on_configure(self, _event: Any = None) -> None:
+        """尺寸没变就不重画（抖动事故防线：1px 抖动 → 重绘 → reqwidth 变 → 再抖动）。"""
+        size = (self.winfo_width(), self.winfo_height())
+        if size == self._last_size:
+            return
+        self._last_size = size
+        self._redraw()
 
     def set(self, values: Sequence[float] = (), *, axis: Sequence[str] = ()) -> None:
         self._values = tuple(ui_geom.clamp01(value) for value in values)
@@ -691,11 +853,16 @@ class Bars(tk.Canvas):
             anchor = "w" if index == 0 else ("e" if index == len(labels) - 1 else "center")
             self.create_text(round(positions[index], 1), baseline + 7, text=label,
                              anchor=anchor, fill=theme.color("muted_text"),
-                             font=fonts.mono(PX_MICRO))
+                             font=fonts.for_text(label, PX_MICRO))
 
 
 class StatCell(tk.Frame):
-    """指标格：微标 + 数值（+单位）+ 说明；用于状态卡四指标与 TODAY 四宫格。"""
+    """指标格：微标 + 数值（+单位）+ 说明；用于状态卡四指标与 TODAY 四宫格。
+
+    基线（01-FONT-DECISION §1 F4）：**值与单位同字号、同 baseline**，
+    「62 °C」「23 张」不再一个小两号、也不会被 ``pady`` 顶得上下错位——
+    单位靠 ``muted_text`` 降权，不靠缩字号（缩字号就是 F4 那个跳）。
+    """
 
     def __init__(self, master: Any, *, label: str, value: str, unit: str = "",
                  note: str = "", ground: str | None = None, value_px: int = PX_NUM_L,
@@ -704,28 +871,35 @@ class StatCell(tk.Frame):
         self.ground = ground or theme.color("surface")
         super().__init__(master, background=self.ground, bd=0, highlightthickness=0, **kwargs)
         fonts = fonts_for(master)
-        tk.Label(self, text=label, font=fonts.sans(PX_MICRO_CJK),
+        tk.Label(self, text=label, font=fonts.sans(PX_MICRO),
                  foreground=theme.color("muted_text"), background=self.ground,
                  anchor=align).pack(anchor=align, fill="x")
         line = tk.Frame(self, background=self.ground)
         line.pack(anchor=align, fill="x", pady=(2, 0))
-        value_font = fonts.mono(value_px, bold=not mono_value) if mono_value else \
+        # 数值：数字/符号走 mono 更齐（ASCII），含单位中文时靠 for_text 换族
+        value_font = fonts.for_text(value, value_px, bold=True) if mono_value else \
             fonts.sans(value_px, bold=True)
-        tk.Label(line, text=str(value), font=value_font,
-                 foreground=theme.color(value_tone or "ink"), background=self.ground,
-                 anchor=align).pack(side="left" if align == "w" else "right")
+        value_label = tk.Label(line, text=str(value), font=value_font,
+                               foreground=theme.color(value_tone or "ink"), background=self.ground,
+                               anchor=align)
+        # 单位与值同一个 baseline：右手边（align="e"）时先摆值、再摆单位（单位在值的左侧）
+        if align == "w":
+            value_label.pack(side="left")
+        else:
+            value_label.pack(side="right")
         if unit:
-            tk.Label(line, text=" " + str(unit), font=fonts.sans(PX_MICRO_CJK),
+            # 同字号 + muted 色（不缩字号、不加 pady：两者都是 F4 基线跳的来源）
+            tk.Label(line, text=" " + str(unit), font=fonts.sans(value_px),
                      foreground=theme.color("muted_text"), background=self.ground,
-                     anchor=align).pack(side="left", pady=(3, 0))
+                     anchor=align).pack(side="left" if align == "w" else "right")
         if note:
-            tk.Label(self, text=note, font=fonts.sans(PX_MICRO_CJK),
+            tk.Label(self, text=note, font=fonts.sans(PX_MICRO),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor=align, justify="left").pack(anchor=align, fill="x", pady=(1, 0))
 
 
 class SectionHead(tk.Frame):
-    """卡片头：眉标（mono 微标）+ 标题 + 副标，右侧可挂一个控件。"""
+    """卡片头：眉标（微标）+ 标题 + 副标，右侧可挂一个控件。"""
 
     def __init__(self, master: Any, *, kicker: str = "", title: str = "", subtitle: str = "",
                  ground: str | None = None, right: Callable[[Any], Any] | None = None,
@@ -736,7 +910,7 @@ class SectionHead(tk.Frame):
         left = tk.Frame(self, background=self.ground)
         left.pack(side="left", fill="x", expand=True)
         if kicker:
-            tk.Label(left, text=kicker, font=fonts.mono(PX_MICRO),
+            tk.Label(left, text=kicker, font=fonts.for_text(kicker, PX_MICRO),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor="w").pack(anchor="w")
         if title:
@@ -744,7 +918,7 @@ class SectionHead(tk.Frame):
                      foreground=theme.color("ink"), background=self.ground,
                      anchor="w", justify="left").pack(anchor="w", pady=(3, 0))
         if subtitle:
-            tk.Label(left, text=subtitle, font=fonts.sans(PX_MICRO_CJK),
+            tk.Label(left, text=subtitle, font=fonts.sans(PX_MICRO),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor="w").pack(anchor="w", pady=(3, 0))
         if right is not None:
@@ -774,7 +948,7 @@ class NavItem(tk.Canvas):
         self.ground = ground or theme.color("surface3")
         super().__init__(master, width=190, height=self.HEIGHT, background=self.ground,
                          bd=0, highlightthickness=0, takefocus=1, **kwargs)
-        self.bind("<Configure>", lambda _e: self._redraw(), add="+")
+        self.bind("<Configure>", self._on_configure, add="+")
         self.bind("<Button-1>", self._click)
         self.bind("<Return>", self._click)
         self.bind("<space>", self._click)
@@ -783,6 +957,15 @@ class NavItem(tk.Canvas):
         self.bind("<FocusIn>", lambda _e: self._redraw())
         self.bind("<FocusOut>", lambda _e: self._redraw())
         self._hot = False
+        self._last_size: tuple[int, int] = (0, 0)
+
+    def _on_configure(self, _event: Any = None) -> None:
+        """尺寸没变就不重画（同 RoundedCard：1px 抖动不许放大成重绘风暴）。"""
+        size = (self.winfo_width(), self.winfo_height())
+        if size == self._last_size:
+            return
+        self._last_size = size
+        self._redraw()
 
     def set_active(self, active: bool) -> None:
         self.active = bool(active)
@@ -817,7 +1000,9 @@ class NavItem(tk.Canvas):
             fill = self.ground
             outline = ""
         if fill != self.ground or outline:
-            self.create_polygon(ui_geom.round_rect_points(0.5, 0.5, width - 0.5, height - 0.5, 7),
+            self.create_polygon(ui_geom.round_rect_points(EDGE_INSET, EDGE_INSET,
+                                                          width - EDGE_INSET,
+                                                          height - EDGE_INSET, 7),
                                 smooth=True, splinesteps=8, fill=fill,
                                 outline=outline or fill, width=1)
         if self.active:
@@ -843,30 +1028,68 @@ class NavItem(tk.Canvas):
             self.create_text(x0 + badge_w / 2.0, height / 2.0, text=label, anchor="center",
                              fill=theme.color("muted_text"), font=count_font)
         if self.focus_get() is self:
-            self.create_polygon(ui_geom.round_rect_points(1.5, 1.5, width - 1.5, height - 1.5, 6),
+            ring = EDGE_INSET + 1.5
+            self.create_polygon(ui_geom.round_rect_points(ring, ring, width - ring,
+                                                          height - ring, 6),
                                 smooth=True, splinesteps=8, fill="",
                                 outline=theme.color("focus"), width=1)
 
 
 # ─────────────────────────────────────────────────────────────── ttk 皮肤
-def apply_kit_styles(root: Any, ttk: Any) -> Any:
-    """给 ttk 控件套一层「无边框 + 白底」皮肤（只新增 ``Kit.*`` 样式名，不动既有样式）。
+#: 原生 ttk 样式名 → :class:`Fonts` 角色。**两套都设**：``Kit.*`` 给本模块用，
+#: 裸名（``TEntry``/``Treeview``/…）给没写 ``style=`` 的调用方（窄窗导航下拉就是裸 ``TCombobox``）。
+#: 这样「一边 11pt 点值、一边 13px 像素」的第二套字体系统（01-FONT-DECISION §1 F6）就没了。
+STYLE_FONT_ROLES: dict[str, str] = {
+    # 输入类控件与按钮同档（12）：控件里的字比正文小一档，视觉上才像「可操作的格子」
+    "TEntry": "small", "TCombobox": "small", "TMenubutton": "small",
+    "TLabel": "body", "TButton": "small", "Toolbutton": "small",
+    "TCheckbutton": "small", "TRadiobutton": "small",
+    "Treeview": "table", "Heading": "heading", "Treeview.Heading": "heading",
+    "TScrollbar": "small",
+    "Kit.TEntry": "small", "Kit.TCombobox": "small",
+    "Kit.Treeview": "table", "Kit.Treeview.Heading": "heading", "Kit.Heading": "heading",
+    "Kit.Vertical.TScrollbar": "small",
+}
 
-    为什么不改 ``Treeview`` / ``TEntry`` 本身：``gui.theme.apply_theme`` 是托盘与
-    ``gui`` 共用的一套样式，``tests/test_desktop_theme.py`` 逐项钉死了它的取值；
-    这里只新增命名样式，老调用方与老断言都不受影响。
+
+def apply_kit_styles(root: Any, ttk: Any) -> Any:
+    """给 ttk 控件套一层「无边框 + 白底」皮肤，并**统一字体**（01-FONT-DECISION §2.4）。
+
+    两条硬约定：
+
+    1. 字体一律来自 ``fonts_for(root)`` 的**命名字体**（``DJB.Body`` 等），不新建临时
+       :class:`Fonts`。临时对象一被 GC，``tkfont.Font.__del__`` 就会删掉对应的 Tcl 字体，
+       样式里只剩下悬空名字 ⇒ Tk 静默退回默认字体（12pt）⇒ 表头字号不受控（§1 F2）。
+    2. 只改**字体与 Kit 那层皮肤**：颜色/间距的取值仍来自 ``theme``，``gui.theme`` 的
+       ``FONT`` / ``TYPE_SCALE`` 与 ``tests/test_desktop_theme.py`` 的 pin 值一个字不动。
     """
-    fonts = Fonts(root)
+    fonts = fonts_for(root)                   # 必须与渲染层共用同一个 Fonts（见上面第 1 条）
     style = ttk.Style(root)
+
+    # 全局默认字体：tk 自带控件（Label/Frame…）与 ttk 的子控件都吃这一条。
+    # ``gui.theme.apply_theme`` 先写过 (family, 11) 的点值；这里用命名字体覆盖（同名 pattern 后写生效）。
+    for pattern in ("*Font", "*TCombobox*Listbox.font"):
+        try:
+            root.option_add(pattern, fonts.named_name("body"))
+        except Exception:                          # pragma: no cover - 极端环境
+            pass
+
+    # 一套 Font 铺满 ttk（表体 11 / 表头 10 bold / 正文 13 / 按钮 12）
+    for name, role in STYLE_FONT_ROLES.items():
+        try:
+            style.configure(name, font=fonts.named_name(role))
+        except Exception:                          # pragma: no cover - 主题不支持
+            pass
+
     style.configure("Kit.Treeview", background=theme.color("surface"),
                     fieldbackground=theme.color("surface"),
-                    foreground=theme.color("ink2"), font=fonts.sans(PX_TABLE),
+                    foreground=theme.color("ink2"), font=fonts.named_name("table"),
                     rowheight=26, borderwidth=0, relief="flat")
     style.map("Kit.Treeview",
               background=[("selected", theme.color("violet3"))],
               foreground=[("selected", theme.color("violet_text"))])
     style.configure("Kit.Treeview.Heading", background=theme.color("surface3"),
-                    foreground=theme.color("muted_text"), font=fonts.mono(PX_MICRO),
+                    foreground=theme.color("muted_text"), font=fonts.named_name("heading"),
                     relief="flat", borderwidth=0, padding=(6, 5))
     style.map("Kit.Treeview.Heading", background=[("active", theme.color("surface3"))])
     try:
@@ -876,7 +1099,7 @@ def apply_kit_styles(root: Any, ttk: Any) -> Any:
     style.configure("Kit.TEntry", fieldbackground=theme.color("surface"),
                     foreground=theme.color("ink"), bordercolor=theme.color("border"),
                     lightcolor=theme.color("line"), darkcolor=theme.color("line"),
-                    insertcolor=theme.color("ink"), padding=(6, 4), relief="flat")
+                    insertcolor=theme.color("ink"), padding=(6, 5), relief="flat")
     style.map("Kit.TEntry", bordercolor=[("focus", theme.color("focus"))])
     style.configure("Kit.Vertical.TScrollbar", background=theme.color("surface3"),
                     troughcolor=theme.color("bg"), bordercolor=theme.color("bg"),

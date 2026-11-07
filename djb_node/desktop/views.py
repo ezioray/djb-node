@@ -23,8 +23,9 @@ from .nodecloud import STATE_TEXT
 from .. import facts
 
 __all__ = [
-    "Action", "Card", "Chart", "Field", "GaugeData", "Hero", "Mark", "Metric", "RailCard",
-    "Row", "Table", "VIEWS", "VIEW_KEYS", "View", "build_view", "build_views",
+    "Action", "Card", "Chart", "Field", "GaugeData", "Hero", "Mark", "Metric", "NAV_SECTIONS",
+    "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "VIEWS",
+    "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -45,29 +46,98 @@ class Mark:
     IDLE = MARK_IDLE
 
 
-#: 13 视图（key, 侧栏标题）——顺序即 IA 顺序
+#: 每个视图的侧栏标题（**语义**，与顺序无关；13 项一个不少、一个不并）
+VIEW_TITLES: dict[str, str] = {
+    "overview": "总览",
+    "bench": "性能基准",
+    "gpu": "GPU 监控",
+    "models": "可提供模型",
+    "tasks": "任务队列",
+    "receipts": "收据",
+    "earnings": "收益",
+    "token_plan": "共享 Token Plan",
+    "agent": "Agent 接入",
+    "access": "接入配置",
+    "yield": "让路 / 节能",
+    "account": "账户与安全",
+    "logs": "日志",
+}
+
+
+@dataclass(frozen=True)
+class NavSection:
+    """侧栏分组（IA 的中间层）：一个使用场景 = 一段连续视图。
+
+    渲染层只按 :data:`NAV_SECTIONS` 排侧栏，不再假设 ``VIEWS`` 是平铺列表；
+    新增/调整视图时改这里一处，顺序、分组头、页头面包屑同时跟着变。
+    """
+
+    #: 组 key（英文小写，给测试/样式用）
+    key: str
+    #: 中文组名（侧栏分组头的主文案）
+    title: str
+    #: 拉丁微标（分组头的 mono 小字；只放 ASCII，别让中文进 mono）
+    micro: str
+    #: 组成员（顺序即侧栏顺序；必须恰好覆盖一次全部视图）
+    keys: tuple[str, ...]
+
+
+#: 侧栏 4 组——按**用户旅程**排，不按后端模块排：
 #:
-#: 第 9 项「共享 Token Plan」（键名 ``token_plan``）回应「客户找不到共享 Token Plan 入口」：
-#: 它**聚合**已有数据域（access/account 的绑定态 + 上游清单 + 限额预算 + 今日用量），
-#: 不新造后端接口；放在「接入配置」之前，客户第一眼就能看到「共享了什么、还能共享多少」，
-#: 主操作一步跳到「接入配置」去加第一条上游。
-VIEWS: tuple[tuple[str, str], ...] = (
-    ("overview", "总览"),
-    ("bench", "性能基准"),
-    ("models", "可提供模型"),
-    ("gpu", "GPU 监控"),
-    ("tasks", "任务队列"),
-    ("receipts", "收据"),
-    ("earnings", "收益"),
-    ("agent", "Agent 接入"),
-    ("token_plan", "共享 Token Plan"),
-    ("access", "接入配置"),
-    ("yield", "让路 / 节能"),
-    ("account", "账户与安全"),
-    ("logs", "日志"),
+#: 运行 RUN     先看「这台机器现在怎么样」（总览 → 基准 → 算力/模型 → 任务）
+#: 收益 EARN    再看「跑出来的东西值多少钱」（收据 → 收益 → 共享 Token Plan 预算）
+#: 接入 CONNECT 想扩大供给才需要（Agent 接入 → 接入配置）
+#: 系统 SYSTEM  平时不动、出事才找（让路节能 → 账户与安全 → 日志）
+#:
+#: 约束：13 项不删不并；``token_plan`` 必须仍在 ``access`` 之前（既有产品语义），
+#: 因此它落在「收益」组末尾——先看到「共享了什么、还能共享多少」，再进「接入」动手。
+NAV_SECTIONS: tuple[NavSection, ...] = (
+    NavSection("run", "运行", "RUN",
+               ("overview", "bench", "gpu", "models", "tasks")),
+    NavSection("earn", "收益", "EARN",
+               ("receipts", "earnings", "token_plan")),
+    NavSection("connect", "接入", "CONNECT",
+               ("agent", "access")),
+    NavSection("system", "系统", "SYSTEM",
+               ("yield", "account", "logs")),
+)
+
+#: 视图 → 所属分组（渲染层查面包屑/分组头用；未知 key 直接 KeyError，不猜）
+SECTION_FOR_VIEW: dict[str, NavSection] = {
+    key: section for section in NAV_SECTIONS for key in section.keys
+}
+
+#: 13 视图（key, 侧栏标题）——顺序即 IA 顺序（由 :data:`NAV_SECTIONS` 展平而来）
+VIEWS: tuple[tuple[str, str], ...] = tuple(
+    (key, VIEW_TITLES[key]) for section in NAV_SECTIONS for key in section.keys
 )
 VIEW_KEYS: tuple[str, ...] = tuple(key for key, _ in VIEWS)
-VIEW_TITLES: dict[str, str] = dict(VIEWS)
+
+#: 页头眉标的**页名**部分（拉丁；纯 ASCII，可交给 mono 字族）
+PAGE_MICROS: dict[str, str] = {
+    "overview": "OVERVIEW",
+    "bench": "BENCH",
+    "gpu": "GPU",
+    "models": "MODELS",
+    "tasks": "TASKS",
+    "receipts": "RECEIPTS",
+    "earnings": "EARNINGS",
+    "token_plan": "TOKEN PLAN",
+    "agent": "AGENT",
+    "access": "ACCESS",
+    "yield": "YIELD",
+    "account": "ACCOUNT",
+    "logs": "LOGS",
+}
+
+
+def page_kicker(key: str) -> str:
+    """页头面包屑眉标：``组名 / 页名`` 两级（如 ``RUN / OVERVIEW``）。
+
+    为什么是两级：页头标题（中文 18px）只说「是哪一页」，眉标补上「在哪一组」，
+    侧栏收起（窄窗下拉）时也不会失去位置感。整串是 ASCII，走 mono 不会跳基线。
+    """
+    return SECTION_FOR_VIEW[key].micro + " / " + PAGE_MICROS[key]
 
 
 @dataclass(frozen=True)
