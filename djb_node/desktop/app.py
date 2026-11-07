@@ -1059,11 +1059,14 @@ class DesktopApp:
         if view.cards:
             grid = tk.Frame(self._body, background=dual.color("bg"), bd=0, highlightthickness=0)
             grid.pack(fill="x", pady=(0, 12))
-            per_row = self._cards_per_row()
+            per_row = self._cards_per_row(len(view.cards))
             for index, card in enumerate(view.cards):
                 self._render_card(grid, card, index, per_row=per_row)
             for column in range(per_row):
                 grid.columnconfigure(column, weight=1, uniform="card")
+        # 有表单的页：卡片 → 字段 → 动作（保存）→ 表格；没有表单的页：卡片 → 动作 → 表格
+        if view.fields:
+            self._render_fields(view.fields, view.key)
         if view.actions:
             bar = tk.Frame(self._body, background=dual.color("bg"))
             bar.pack(fill="x", pady=(0, 12))
@@ -1071,18 +1074,21 @@ class DesktopApp:
                 self._render_action(bar, action)
         if view.table is not None:
             self._render_table(view.table)
-        if view.fields:
-            self._render_fields(view.fields, view.key)
 
-    def _cards_per_row(self) -> int:
-        """宽窗 4 张、中宽 2 张、窄窗 1 张（设计是四宫格；不许再把第三张挤出窗口）。"""
+    def _cards_per_row(self, count: int = 0) -> int:
+        """宽窗 4 张、中宽 2 张、窄窗 1 张（设计是四宫格；不许再把第三张挤出窗口）。
+
+        张数不能整除时优先换列数（6 张 → 3 列 2 行），别让最后一行孤零零挂两张。
+        """
         try:
             width = int(self._root.winfo_width())
         except Exception:                              # pragma: no cover - 无窗口
+            width = 1440
+        try:
+            limit = 4 if width <= 1 else self._geom.cards_per_row(width)
+            return self._geom.card_columns(count, limit)
+        except Exception:                              # pragma: no cover - 还没建壳
             return 4
-        if width <= 1:
-            return 4
-        return self._geom.cards_per_row(width)
 
     def _render_card(self, parent: Any, card: Card, index: int, *, per_row: int = 4) -> None:
         """指标卡：圆角 + 1px 描边 + 白底，取值按 tone 上色，文字按卡片实宽换行。"""
@@ -1321,7 +1327,7 @@ class DesktopApp:
 
     def _render_fields(self, fields: Sequence[Field], view_key: str,
                        parent: Any = None) -> None:
-        """字段区：标签 + 输入框 + 下一行提示（保存按钮在上方动作条，不重复）。"""
+        """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。"""
         kit, tk, ttk = self._kit, self._tk, self._ttk
         fonts = self._fonts
         surface = dual.color("surface")
@@ -1329,30 +1335,40 @@ class DesktopApp:
         card = kit.RoundedCard(target, ground=dual.color("bg"), pad=(16, 14))
         card.pack(fill="x", pady=(0, 10))
         body = card.body
-        tk.Label(body, text="可编辑字段" if any(f.editable for f in fields) else "详情",
+        editable = any(field.editable for field in fields)
+        tk.Label(body, text="可编辑字段" if editable else "详情",
                  font=fonts.sans(kit.PX_CARD, bold=True), foreground=dual.color("ink"),
                  background=surface, anchor="w").pack(anchor="w", pady=(0, 10))
-        for field in fields:
-            block = tk.Frame(body, background=surface)
-            block.pack(fill="x", pady=(0, 8))
+        per_row = 1 if (self._is_narrow() or len(fields) <= 2) else 2
+        grid = tk.Frame(body, background=surface)
+        grid.pack(fill="x")
+        for column in range(per_row):
+            grid.columnconfigure(column, weight=1, uniform="field")
+        for index, field in enumerate(fields):
+            row, column = divmod(index, per_row)
+            block = tk.Frame(grid, background=surface)
+            block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
             block.columnconfigure(1, weight=1)
             tk.Label(block, text=field.label, font=fonts.sans(kit.PX_MICRO_CJK),
                      foreground=dual.color("muted_text"), background=surface,
-                     width=16, anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 12))
+                     width=12, anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
             if field.editable:
                 variable = tk.StringVar(value="" if field.secret else field.value)
-                entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry", width=44)
+                entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
+                                  width=28 if per_row > 1 else 44)
                 if field.secret:
                     entry.configure(show="•")
                 entry.grid(row=0, column=1, sticky="ew")
                 hint = field.hint or ""
                 if field.secret:
                     hint = ("当前 " + field.value + "｜" + hint).strip("｜")
-                self._wrap(tk.Label(block, text=hint, font=fonts.sans(kit.PX_MICRO_CJK),
-                                  foreground=dual.color("muted_text"), background=surface,
-                                  anchor="w", justify="left",
-                                  wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
-                                                                     pady=(3, 0))
+                if hint:
+                    self._wrap(tk.Label(
+                        block, text=hint, font=fonts.sans(kit.PX_MICRO_CJK),
+                        foreground=dual.color("muted_text"), background=surface,
+                        anchor="w", justify="left",
+                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
+                                                            pady=(3, 0))
                 self._fields[field.key] = field
                 self._vars[field.key] = variable
             else:
@@ -1360,11 +1376,12 @@ class DesktopApp:
                          foreground=dual.color("ink"), background=surface,
                          anchor="w", justify="left").grid(row=0, column=1, sticky="w")
                 if field.hint:
-                    self._wrap(tk.Label(block, text=field.hint, font=fonts.sans(kit.PX_MICRO_CJK),
-                                      foreground=dual.color("muted_text"), background=surface,
-                                      anchor="w", justify="left",
-                                      wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
-                                                                         pady=(3, 0))
+                    self._wrap(tk.Label(
+                        block, text=field.hint, font=fonts.sans(kit.PX_MICRO_CJK),
+                        foreground=dual.color("muted_text"), background=surface,
+                        anchor="w", justify="left",
+                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
+                                                            pady=(3, 0))
 
     # ── 动作
     def _on_action(self, key: str) -> None:

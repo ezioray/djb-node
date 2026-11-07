@@ -72,6 +72,22 @@ def cards_per_row(width: int) -> int:
     return 4
 
 
+def card_columns(count: int, limit: int) -> int:
+    """在「最多 ``limit`` 列」的前提下选列数：优先能整除张数的，别让最后一行只剩一张。
+
+    ``6 张 / 上限 4`` → 3 列（2 行整齐），``5 张`` → 3 列（3+2），``4 张`` → 4 列。
+    """
+    limit = max(1, int(limit))
+    if count <= 0:
+        return limit
+    if count <= limit:
+        return max(1, count)
+    for candidate in (limit, 3, 2):
+        if candidate <= limit and count % candidate == 0:
+            return candidate
+    return 3 if limit >= 3 else limit
+
+
 def clamp01(value: float) -> float:
     """夹到 [0, 1]；``None``/非法值当 0（图表缺数据时画空槽，不画假高度）。"""
     try:

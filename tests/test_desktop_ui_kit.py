@@ -210,3 +210,11 @@ def test_app_and_geometry_share_the_same_breakpoints():
     from djb_node.desktop.app import DesktopApp
     assert DesktopApp.TWO_COL_WIDTH == geom.TWO_COL_WIDTH
     assert DesktopApp.NARROW_WIDTH == geom.NARROW_WIDTH
+
+
+def test_card_columns_avoid_an_orphan_last_row():
+    """6 张卡在上限 4 列时必须排 3 列（2 行），不许 4+1+1 那样挂零头。"""
+    assert [geom.card_columns(n, 4) for n in range(1, 9)] == [1, 2, 3, 4, 3, 3, 3, 4]
+    assert geom.card_columns(0, 4) == 4                      # 没有卡片时按上限
+    assert geom.card_columns(5, 1) == 1                       # 窄窗永远是单列
+    assert geom.card_columns(6, 2) == 2
