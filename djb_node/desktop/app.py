@@ -306,7 +306,8 @@ class DesktopApp:
         self._canvas.configure(yscrollcommand=scrollbar.set)
         # 滚轮直接可用（ttk 的 Scrollbar 只在指针悬停时才滚）；单一派发器：
         # 指针在侧栏导航上滚导航、在内容区滚内容（B2：矮窗要能翻到最后一项）
-        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # 滚轮按平台绑「真实会到货」的序列：X11 是 Button-4/5，绑 MouseWheel 等于没绑
+        platform_ui.bind_wheel(self._root, self._on_mousewheel)
         padding = (self._px(26), self._px(18)) if not self._is_narrow() else (self._px(12), self._px(12))
         self._content = tk.Frame(self._canvas, background=dual.color("bg"), bd=0,
                                  highlightthickness=0)
@@ -553,8 +554,16 @@ class DesktopApp:
             node = getattr(node, "master", None)
         return node is ancestor
 
-    def _on_mousewheel(self, event: Any) -> None:
-        """滚轮只有一个入口：指针在侧栏导航上滚导航，其它地方滚内容。"""
+    def _on_mousewheel(self, event: Any) -> str | None:
+        """滚轮只有一个入口：指针在侧栏导航上滚导航，其它地方滚内容。
+
+        三个平台的量纲交给 ``platform_ui.normalize_wheel``（X11 无 delta、只有
+        Button-4/5；aqua 的 delta 已是行数）。指针在 Treeview/Text/下拉/滚动条上时
+        让位给控件自己的类绑定，避免「滚一格，表格和整页各走一遍」。
+        """
+        steps = platform_ui.normalize_wheel(event)
+        if not steps:                                # 不是滚轮事件 / 缺量纲
+            return None
         target = None
         try:
             target = self._root.winfo_containing(event.x_root, event.y_root)
@@ -562,9 +571,12 @@ class DesktopApp:
             target = None
         nav_area = getattr(self, "_nav_area", None)
         if target is not None and nav_area is not None and self._is_inside(target, nav_area):
-            self._nav_scroll(-1 if getattr(event, "delta", 0) > 0 else 1)
-            return
-        self._canvas.yview_scroll(-1 if getattr(event, "delta", 0) > 0 else 1, "units")
+            self._nav_scroll(-steps)
+            return "break"
+        if platform_ui.is_self_scrolling(target):
+            return "break"                           # 表格/日志框自己滚，页面不动
+        self._canvas.yview_scroll(-steps, "units")
+        return "break"
 
     def _nav_scroll(self, units: int) -> None:
         canvas = getattr(self, "_nav_canvas", None)
@@ -832,10 +844,23 @@ class DesktopApp:
     #: 窄窗阈值：低于这个宽度侧栏让位给内容（E10 口径 390 也算“能看全”）
     NARROW_WIDTH = 760
 
+    def _logical_width(self) -> int:
+        """窗口的**逻辑**宽（÷倍率）：断点 760/1180 是设计稿逻辑像素。
+
+        125% 下 1475 物理 = 1180 逻辑；如果拿物理宽直接比断点，1300 物理
+        （1040 逻辑）会被误判成双列，窄窗下拉也永远不触发。
+        """
+        try:
+            width = int(self._root.winfo_width())
+        except Exception:                            # pragma: no cover - 无窗口
+            return 0
+        scale = getattr(self, "_scale", 1.0) or 1.0
+        return int(round(width / float(scale))) if width > 1 else width
+
     def _is_narrow(self) -> bool:
         """窄不窄以窗口真实宽度为准（不依赖 _apply_layout 的先后顺序）。"""
         try:
-            return self._geom.layout_mode(int(self._root.winfo_width())) == "narrow"
+            return self._geom.layout_mode(self._logical_width()) == "narrow"
         except Exception:                            # pragma: no cover - 无窗口
             return False
 
@@ -846,7 +871,7 @@ class DesktopApp:
         子控件的 ``<Configure>`` 也会冒到这里，按事件里的 width 判断会让侧栏反复收起/展开。
         """
         try:
-            current = int(self._root.winfo_width())
+            current = self._logical_width()
         except Exception:                                  # pragma: no cover - 无窗口
             return
         if current <= 1:                                   # 还没 map：没有可用宽度
@@ -931,6 +956,14 @@ class DesktopApp:
         """换肤时整块重建外壳：tk 控件不像 ttk 那样跟样式走，重建比逐个改色可靠。"""
         for child in list(self._root.grid_slaves()):
             child.destroy()
+        # 旧内容控件已随外壳销毁：先断引用，否则 _apply_layout/_fit_columns 会摸到
+        # 已销毁的 Treeview（换肤时 TclError: invalid command name ...!treeview）
+        self._tree = None
+        self._table = None
+        self._detail = None
+        self._row_cells = {}
+        self._row_notes = {}
+        self._wrap_targets = []
         self._nav_buttons = {}
         self._nav_combo = None
         self._layout_width = None
@@ -1171,7 +1204,7 @@ class DesktopApp:
     def _two_col(self) -> bool:
         """是否双列（设计 798/360）。R5/G-11：只做两档，>=1180 双列，其余单列。"""
         try:
-            width = int(self._root.winfo_width())
+            width = self._logical_width()
         except Exception:                              # pragma: no cover - 无窗口
             return True
         if width <= 1:
@@ -1454,7 +1487,7 @@ class DesktopApp:
         张数不能整除时优先换列数（6 张 → 3 列 2 行），别让最后一行孤零零挂两张。
         """
         try:
-            width = int(self._root.winfo_width())
+            width = self._logical_width()
         except Exception:                              # pragma: no cover - 无窗口
             width = 1440
         try:
@@ -1660,6 +1693,7 @@ class DesktopApp:
         self._hidden_columns = tuple(hidden)
 
     def _on_row_select(self, _event=None) -> None:
+        tk = self._tk                                    # note 行要用；此前漏了，带备注的收据一选就 NameError
         tree = getattr(self, "_tree", None)
         detail = getattr(self, "_detail", None)
         if tree is None or detail is None:
@@ -1692,7 +1726,7 @@ class DesktopApp:
                            anchor="w").pack(side="left")
         note = self._row_notes.get(selection[0], "")
         if note:
-            self._self._wrap(tk.Label(detail, text="原因：" + note,
+            self._wrap(tk.Label(detail, text="原因：" + note,
                                     font=fonts.sans(self._kit.PX_MICRO),
                                     foreground=dual.color("amber_text"), background=surface,
                                     anchor="w", justify="left",
@@ -1766,8 +1800,11 @@ class DesktopApp:
 
     # ── 动作
     def _on_action(self, key: str) -> None:
-        for name, variable in self._vars.items():
-            self._controller.set_draft(name, variable.get())
+        for name, variable in list(self._vars.items()):
+            try:
+                self._controller.set_draft(name, variable.get())
+            except Exception:                            # 变量随旧视图销毁：跳过，不让动作静默不执行
+                continue
         result = self._controller.action(key, confirm=self._confirm)
         if result.effect == "copy":
             self._copy(result.payload)
