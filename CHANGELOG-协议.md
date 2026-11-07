@@ -3,6 +3,31 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.8.1 · 2026-11-07 · PATCH（标注型：`/v1/batches*` 部署可用性标记 + `wallet-drafts` 409 reason 说明）
+
+**版本 / 日期 / 类型**：1.8.1 · 2026-11-07 · PATCH（0 路径 / 0 操作 / 0 schema 变化）。
+
+**影响面**：① 在 3 个既有操作上加 `x-djb-availability: m03` 并在描述里写明「默认部署不挂载」：
+`POST /v1/batches`、`GET /v1/batches/{id}`、`POST /v1/batches/{id}/cancel`；另在 `info.description`
+登记 `x-djb-availability` 的语义。② 3 条 `wallet-drafts` 操作的 409 描述补 `reason` 取值
+（`addWalletOwnerAttestation` / `markWalletDraftDeployed` / `verifyWalletDraft`，仅描述，无 schema）。
+**没有任何请求/响应字段、状态码、校验或默认值变化。**
+
+**为什么**：`/v1/batches*` 只在 `DJB_GATEWAY_M03=1` 时由 `app/gateway/router.py` 挂载
+（`app/api.py` 的 M03 装配块）；生产未开该模式（`ops/release/FLAG-REGISTRY.md` 记生产态=关），
+于是「契约有路径、生产 404」。加标记让 SDK 生成器/文档站能区分「契约定义」与「部署可用性」，
+而不是默默生成一个在默认部署上必然 404 的客户端方法。
+
+另外，钱包多签 3 个写操作早已会返回 409（`illegal_state` / `illegal_transition` /
+`concurrent_state_change` 等），但原描述只写「状态不允许」；本批把 `reason` 取值写进契约，
+客户端才能按原因分支，**不改变任何行为**。
+
+**兼容矩阵**：旧客户端不受影响（未知 `x-*` 按 OpenAPI 规则忽略，tolerant reader）；
+新 SDK 可据 `x-djb-availability` 决定是否生成该组方法。同 MAJOR 只加不改。
+
+**复核**：lead（工作区复核，证据 `reports/LANDMINES-20261107/`）；推送/发布由 release-manager
+在批准窗口内执行，本工作区不 push、不部署。
+
 ## 1.8.0 · 2026-11-07 · MINOR（实现先行 / spec 补登：7 条已实现未登记端点）
 
 **性质**：只加不改（新增 7 路径 / 8 操作 / 2 schema）。把**已实现但从未登记**的端点补进契约，

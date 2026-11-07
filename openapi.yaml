@@ -25,7 +25,10 @@ info:
   # 2026-11-05 二次发布：加性新增 `GET /api/v1/auth/captcha`（防撞库验证码）与
   # LoginRequest 两个可选字段 `captcha_id`/`captcha_answer`、错误码 40111/40112，
   # 按 MINOR 定为 1.6.0（213→214 路径；1.5.0 固定为提交 5e65b32）。
-  version: 1.8.0
+  # 2026-11-07 标注型变更（PATCH）：①`/v1/batches*` 3 个操作加 `x-djb-availability: m03`
+  # （只说明「该面只在 M03 装配时挂载」）；②3 条 wallet-drafts 操作的 409 描述补 `reason` 取值。
+  # 0 路径 / 0 操作 / 0 schema 变化。
+  version: 1.8.1
   # 2026-11-04 审计：此处原先硬编码「157 路径 / 181 操作」——那是 node 快照期的数字，
   # 与文件实测（213/252）不符，且每次加性变更都会让它更假。规模数字一律由
   # `reports/RC-2026-11-03/audit/tools/check-spec-single-source.py` 现算，不写进正文。
@@ -35,6 +38,8 @@ info:
     契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。
 
     - 命名空间：`/v1/*` 为 OpenAI 兼容网关面；`/api/v1/*` 为控制面（节点/用方/协议/后台）。
+    - 可用性：`x-djb-availability` 标记「不是所有部署都提供」的面；`m03` = 仅 M03 网关装配
+      （`DJB_GATEWAY_M03=1`）时挂载，默认部署返回 404，客户端应按「端点不存在」降级。
     - 版本：URL 中的 `v1` 是**协议 MAJOR**，冻结；新 MAJOR 走新前缀（`/v2`、`/api/v2`）
       并与旧前缀并存一个弃用周期，不得在旧前缀内做破坏性变更。
     - 兼容：同 MAJOR 内只加不改。客户端必须容忍未知字段/未知 enum 值（tolerant reader）。
@@ -1485,9 +1490,13 @@ paths:
       tags: [gateway]
       summary: 提交批量任务
       operationId: createBatch
+      x-djb-availability: m03
       description: |
         异步受理，立即返回 `batch_id` / `eta_seconds` / 预估成本；实际成本以完成后的
         收据与账本分录为准。大任务必须走这里，不得占用实时决策资源。
+
+        **部署可用性**：只在 M03 网关装配（`DJB_GATEWAY_M03=1`）时挂载；默认部署该路由
+        不存在（404），调用方按「端点不存在」降级（见 `x-djb-availability: m03`）。
       security:
         - userBearer: []
       parameters:
@@ -1536,9 +1545,13 @@ paths:
       tags: [gateway]
       summary: 批量任务进度与结果
       operationId: getBatch
+      x-djb-availability: m03
       description: |
         返回进度、检查点恢复次数、结果引用与实际成本。结果内容本身另走签名 URL
         （≤15 分钟），不在本响应内联。
+
+        **部署可用性**：只在 M03 网关装配（`DJB_GATEWAY_M03=1`）时挂载；默认部署该路由
+        不存在（404），调用方按「端点不存在」降级（见 `x-djb-availability: m03`）。
       security:
         - userBearer: []
       parameters:
@@ -1569,8 +1582,12 @@ paths:
       tags: [gateway]
       summary: 取消批量任务
       operationId: cancelBatch
+      x-djb-availability: m03
       description: |
         幂等：对已结束任务重复取消返回当前状态而非报错。已产生的用量照常计费。
+
+        **部署可用性**：只在 M03 网关装配（`DJB_GATEWAY_M03=1`）时挂载；默认部署该路由
+        不存在（404），调用方按「端点不存在」降级（见 `x-djb-availability: m03`）。
       security:
         - userBearer: []
       parameters:
@@ -8368,7 +8385,10 @@ paths:
               schema:
                 type: object
         '409':
-          description: 该 owner 已登记 / 草稿状态不允许追加
+          description: |
+            该 owner 已登记 / 草稿状态不允许追加。`reason` 取值：`illegal_state`（当前状态
+            不接收证明）、`illegal_transition`（状态机不允许的迁移）、
+            `concurrent_state_change`（并发改走状态，需重读）、`draft_expired`（草稿已过期）。
 
   /api/v1/admin/treasury/wallet-drafts/{draft_id}/deploy:
     post:
@@ -8392,7 +8412,10 @@ paths:
               schema:
                 type: object
         '409':
-          description: 签名数不足 / 状态不允许
+          description: |
+            签名数不足 / 状态不允许。`reason` 取值：`illegal_state`（当前状态不允许部署）、
+            `illegal_transition`（状态机不允许的迁移）、`concurrent_state_change`（并发改走状态）、
+            `attestation_incomplete`（证明不够数或必签槽位未签）、`attempts_exhausted`（重播达上限）。
 
   /api/v1/admin/treasury/wallet-drafts/{draft_id}/verify:
     post:
@@ -8419,7 +8442,9 @@ paths:
               schema:
                 type: object
         '409':
-          description: 校验未全绿 / 真链执行不可用
+          description: |
+            校验未全绿 / 真链执行不可用 / 状态不允许回读。错误信封的 `reason` 取值：
+            `illegal_state`、`illegal_transition`、`concurrent_state_change`。
 
   /api/v1/admin/treasury/multisig-wallets:
     get:
