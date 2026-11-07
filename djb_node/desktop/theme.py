@@ -40,9 +40,9 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
-    "DEFAULT_THEME", "GUI_CONSTANTS", "PALETTES", "PREFS_FILE", "THEME_LABELS", "apply",
-    "available", "blend", "color", "current", "gui_tokens", "load", "mix_step", "palette",
-    "prefs_path", "save", "set_active", "toggle",
+    "CHART_TOKENS", "DEFAULT_THEME", "GUI_CONSTANTS", "PALETTES", "PREFS_FILE", "THEME_LABELS",
+    "apply", "available", "blend", "chart", "color", "current", "gui_tokens", "load",
+    "mix_step", "palette", "prefs_path", "save", "set_active", "toggle",
 ]
 
 #: 没有偏好文件时的主题（白天，与既有验收截图一致）
@@ -169,6 +169,55 @@ PALETTES: dict[str, dict[str, str]] = {
     },
 }
 
+#: 图表 / 仪表环专用 token（裁决：``reports/UI-20261107-DESKTOP-PARITY/00-COLOR-DECISION.md`` §2）。
+#:
+#: 为什么单独一张表、**不塞进 PALETTES**
+#: ======================================
+#: 色板是被两条测试全量钉死的（``test_desktop_dual_theme.py`` 的 ``SPEC_DAY`` / ``SPEC_NIGHT`` /
+#: ``DERIVED``，断言 ``set(palette) == SPEC | DERIVED``）。往里加键就必须改那两张期望值表，
+#: 而裁决要求「色板不改」。所以图表 token 走独立命名空间：**键值都不进 PALETTES**，
+#: 只在渲染期由 :func:`chart` / :func:`color` 二级解析。两套主题的 PALETTES 因此逐字节不变。
+#:
+#: 取值全部**引用既有 token**（同色相、不引入新色），唯一字面例外是 ``mint_bright``：
+#: 00 §2 指定 day 用设计强调色 ``#6CC0A1``。它只许做**填充面**（仪表弧、柱顶、active 左条），
+#: 对白卡对比度仅 1.88:1，**不可当文字色**（文字仍用 ``mint_text`` = 4.62:1）。
+_CHART_SOURCES: dict[str, dict[str, str]] = {
+    "day": {
+        "mint_bright": "#6CC0A1",     # 00 §2 指定的设计强调色（填充面专用）
+        "ring_track": "mint3",        # 仪表环底
+        "bar_mint": "mint3",          # 柱图三色起点（00 §2）
+        "bar_mint_peak": "mint2",     # 柱子越高越靠近这个色（高度驱动的渐变，见 ui_kit.Bars）
+        "bar_violet": "violet3",
+        "bar_violet_peak": "violet2",
+        "bar_pink": "pink3",
+        "bar_pink_peak": "pink2",
+        "bar_peak": "mint2",          # 峰值高亮（00 §2）
+        "card_line": "line",          # 卡片 1px 描边（不加阴影）
+    },
+    "night": {
+        "mint_bright": "mint",        # 夜间 mint 本身就是亮面填充色
+        "ring_track": "mint3",
+        "bar_mint": "mint3",
+        "bar_mint_peak": "mint2",
+        "bar_violet": "violet3",
+        "bar_violet_peak": "violet2",
+        "bar_pink": "pink3",
+        "bar_pink_peak": "pink2",
+        "bar_peak": "mint2",
+        "card_line": "line",
+    },
+}
+
+
+def _build_chart_tokens(name: str) -> dict[str, str]:
+    """把 :data:`_CHART_SOURCES` 里的「引用」解成实色（引用不到就原样当字面值）。"""
+    base = PALETTES.get(name, PALETTES[DEFAULT_THEME])
+    return {key: base.get(source, source) for key, source in _CHART_SOURCES[name].items()}
+
+
+#: 图表 / 仪表环 token（按主题名索引；与 PALETTES 平行的第二个命名空间）
+CHART_TOKENS: dict[str, dict[str, str]] = {name: _build_chart_tokens(name) for name in PALETTES}
+
 #: ``gui.theme.TOKENS`` 的键 ↔ 本模块色板键（同名为主，``white`` 历史上就是 ``on_mint``）
 _GUI_TOKEN_MAP = {
     "bg": "bg", "bg2": "bg2", "surface": "surface", "surface2": "surface2",
@@ -234,8 +283,26 @@ def set_active(name: str) -> str:
 
 
 def color(token: str, default: str = "") -> str:
-    """当前主题的 token 值（渲染期取色唯一入口）。"""
-    return PALETTES.get(_ACTIVE, {}).get(token) or PALETTES[DEFAULT_THEME].get(token, default)
+    """当前主题的 token 值（渲染期取色唯一入口）。
+
+    解析顺序：``PALETTES`` → ``CHART_TOKENS`` → 当前主题的默认值 → ``default``。
+    第二级是图表/仪表环 token（见 :data:`CHART_TOKENS`），它们**不占色板键**。
+    """
+    active = PALETTES.get(_ACTIVE, PALETTES[DEFAULT_THEME])
+    value = active.get(token)
+    if value:
+        return value
+    charts = CHART_TOKENS.get(_ACTIVE, CHART_TOKENS[DEFAULT_THEME])
+    return (charts.get(token) or PALETTES[DEFAULT_THEME].get(token)
+            or CHART_TOKENS[DEFAULT_THEME].get(token, default))
+
+
+def chart(token: str, name: str | None = None) -> str:
+    """取图表 / 仪表环 token（显式指定主题名时用它；找不到退回当前主题的 ``PALETTES``）。"""
+    table = CHART_TOKENS.get(name or _ACTIVE, CHART_TOKENS[DEFAULT_THEME])
+    if token in table:
+        return table[token]
+    return PALETTES.get(name or _ACTIVE, PALETTES[DEFAULT_THEME]).get(token, "")
 
 
 def toggle(name: str) -> str:
