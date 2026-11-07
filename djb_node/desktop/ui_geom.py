@@ -46,6 +46,32 @@ def pick_family(available: Iterable[str] | None, chain: Sequence[str] = SANS_CHA
     return chain[0] if chain else "TkDefaultFont"
 
 
+#: 侧栏收到下拉的宽度（01 §4.6：< 760 用下拉导航，不做 62px 图标塔）
+NARROW_WIDTH = 760
+#: 总览双栏断点（02 §4 / G-11：>= 1180 双栏，其余单栏；只做两档）
+TWO_COL_WIDTH = 1180
+#: 卡片一行几张的中间档（760..1180 用两列，免得四宫格被挤成四条）
+CARD_GRID_WIDTH = 900
+
+
+def layout_mode(width: int) -> str:
+    """宽度 → ``narrow``（<760，下拉导航）/ ``single``（<1180，单列）/ ``two``（双列）。"""
+    if width < NARROW_WIDTH:
+        return "narrow"
+    if width < TWO_COL_WIDTH:
+        return "single"
+    return "two"
+
+
+def cards_per_row(width: int) -> int:
+    """指标卡一行几张：窄 1 / 中 2 / 宽 4（四宫格是设计值，但绝不把卡片挤出窗口）。"""
+    if width < NARROW_WIDTH:
+        return 1
+    if width < TWO_COL_WIDTH:
+        return 2
+    return 4
+
+
 def clamp01(value: float) -> float:
     """夹到 [0, 1]；``None``/非法值当 0（图表缺数据时画空槽，不画假高度）。"""
     try:

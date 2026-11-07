@@ -103,10 +103,29 @@ def test_missing_value_is_dash_not_zero():
 
 
 def test_gpu_absent_says_so():
-    view = vw.build_view("gpu", demo_snapshot())
+    """无 GPU 时必须说实话。
+
+    演示数据自设计改版起**带一块卡**（否则总览的仪表环与四指标全是「—」，实拍看不出设计），
+    所以这里不再拿 demo 快照当「无 GPU」样本，而是自造一个 no-GPU 快照——
+    断言的意图不变：没有设备就明说，不许留空表假装正常。
+    """
+    sections = dict(demo_snapshot().sections)
+    sections["gpu"] = {"present": False, "devices": [],
+                       "note": "本机无可用 GPU（没有 nvidia-smi；没有 rocm-smi）"}
+    view = vw.build_view("gpu", ds.Snapshot(sections))
     text = view.plain_text()
     assert "无可用 GPU" in text or "暂不可用" in text
     assert view.table is not None and not view.table.rows
+
+
+def test_gpu_absent_keeps_the_overview_gauge_honest():
+    """没有 GPU 时仪表环给「—」，**不许**画成 0%（0 和「没有数据」是两件事）。"""
+    sections = dict(demo_snapshot().sections)
+    sections["gpu"] = {"present": False, "devices": [], "note": "无 GPU"}
+    hero = vw.build_view("overview", ds.Snapshot(sections)).hero
+    assert hero is not None and hero.gauge is not None
+    assert hero.gauge.ratio is None and hero.gauge.value == "—"
+    assert {metric.label: metric.value for metric in hero.metrics}["显存"] == "—"
 
 
 def test_models_incompatible_rows_greyed_with_reason():
@@ -229,7 +248,9 @@ def test_token_plan_today_card_uses_limiter_usage_and_receipts():
         usage=usage)
     text = vw.build_view("token_plan", snapshot).plain_text()
     assert "41892 tokens" in text
-    assert "2 张收据" in text                                  # 演示数据里的两张收据
+    # 收据数来自 receipts 域，别写死条数（演示数据会随版式需要增删）
+    rows = snapshot.sections["receipts"]["rows"]
+    assert str(len(rows)) + " 张收据" in text
 
 
 def test_token_plan_open_access_is_a_goto_action_without_network(tmp_path):

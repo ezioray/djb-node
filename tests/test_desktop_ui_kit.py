@@ -22,6 +22,9 @@ import sys
 import pytest
 
 from djb_node.desktop import theme, ui_geom
+
+#: 本文件统一用短名，断言更好读
+geom = ui_geom
 from djb_node.gui.theme import contrast_ratio
 
 # ────────────────────────────────────────────────────────────── 图表 token（00 §2）
@@ -181,3 +184,29 @@ def test_ui_kit_is_not_imported_by_the_app_module():
                             timeout=120)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().split() == ["False", "False", "False"]
+
+
+# ───────────────────────────────────────────── 断点（R5/G-11：只做两档 + 卡片列数）
+def test_layout_mode_has_exactly_three_regions():
+    assert geom.layout_mode(390) == "narrow"       # 手机宽度：侧栏收成下拉
+    assert geom.layout_mode(geom.NARROW_WIDTH - 1) == "narrow"
+    assert geom.layout_mode(geom.NARROW_WIDTH) == "single"      # 边界含在内
+    assert geom.layout_mode(900) == "single"
+    assert geom.layout_mode(geom.TWO_COL_WIDTH - 1) == "single"
+    assert geom.layout_mode(geom.TWO_COL_WIDTH) == "two"
+    assert geom.layout_mode(1440) == "two"
+
+
+def test_cards_per_row_never_squeezes_the_fourth_card_out():
+    assert geom.cards_per_row(390) == 1
+    assert geom.cards_per_row(geom.NARROW_WIDTH) == 2
+    assert geom.cards_per_row(1000) == 2
+    assert geom.cards_per_row(geom.TWO_COL_WIDTH) == 4
+    assert geom.cards_per_row(1440) == 4
+
+
+def test_app_and_geometry_share_the_same_breakpoints():
+    """app.py 里的两个类常量必须和 ui_geom 一致（否则文档写的断点是假的）。"""
+    from djb_node.desktop.app import DesktopApp
+    assert DesktopApp.TWO_COL_WIDTH == geom.TWO_COL_WIDTH
+    assert DesktopApp.NARROW_WIDTH == geom.NARROW_WIDTH

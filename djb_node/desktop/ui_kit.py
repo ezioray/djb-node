@@ -120,9 +120,10 @@ class Icon:
         draw = getattr(Icon, "_draw_" + name, None) or Icon._draw_dot
         draw(canvas, x, y, size, color, width, tags)
 
-    #: 图标名 → 语义（侧栏 7 项 + 设置 + 头部动作）
+    #: 图标名 → 语义（侧栏 13 项 + 头部动作）
     NAMES = ("grid", "chip", "queue", "doc", "coin", "slider", "terminal", "gear",
-             "refresh", "moon", "sun", "external", "play", "pause", "bolt", "dot")
+             "refresh", "moon", "sun", "external", "play", "pause", "bolt", "dot",
+             "user", "key", "list")
 
     @staticmethod
     def _line(canvas, *coords, **kwargs) -> None:
@@ -284,6 +285,41 @@ class Icon:
                               round(x + size * 0.78, 1), round(y + size * 0.44, 1),
                               round(x + size * 0.54, 1), round(y + size * 0.44, 1),
                               fill=color, outline=color, tags=tags)
+
+    @staticmethod
+    def _draw_user(canvas, x, y, size, color, width, tags):
+        """人像：头 + 肩（账户与安全）。"""
+        Icon._line(canvas, x + size * 0.5, y + size * 0.16, x + size * 0.5, y + size * 0.16,
+                   fill=color, width=width, capstyle=tk.ROUND, tags=tags)
+        canvas.create_oval(round(x + size * 0.32, 1), round(y + size * 0.14, 1),
+                           round(x + size * 0.68, 1), round(y + size * 0.5, 1),
+                           outline=color, width=width, tags=tags)
+        canvas.create_arc(round(x + size * 0.14, 1), round(y + size * 0.52, 1),
+                          round(x + size * 0.86, 1), round(y + size * 1.16, 1),
+                          start=0, extent=180, style=tk.ARC, outline=color,
+                          width=width, tags=tags)
+
+    @staticmethod
+    def _draw_key(canvas, x, y, size, color, width, tags):
+        """钥匙：环 + 齿（接入配置）。"""
+        canvas.create_oval(round(x + size * 0.08, 1), round(y + size * 0.3, 1),
+                           round(x + size * 0.5, 1), round(y + size * 0.72, 1),
+                           outline=color, width=width, tags=tags)
+        Icon._line(canvas, x + size * 0.5, y + size * 0.51, x + size * 0.94, y + size * 0.51,
+                   fill=color, width=width, capstyle=tk.ROUND, tags=tags)
+        Icon._line(canvas, x + size * 0.72, y + size * 0.51, x + size * 0.72, y + size * 0.72,
+                   fill=color, width=width, capstyle=tk.ROUND, tags=tags)
+
+    @staticmethod
+    def _draw_list(canvas, x, y, size, color, width, tags):
+        """文本行：三行 + 行首点（日志）。"""
+        for index in range(3):
+            offset = y + size * (0.24 + index * 0.26)
+            canvas.create_oval(round(x + size * 0.14, 1), round(offset - 1, 1),
+                               round(x + size * 0.2, 1), round(offset + 1, 1),
+                               fill=color, outline=color, tags=tags)
+            Icon._line(canvas, x + size * 0.36, offset, x + size * 0.88, offset,
+                       fill=color, width=width, capstyle=tk.ROUND, tags=tags)
 
     @staticmethod
     def _draw_dot(canvas, x, y, size, color, width, tags):

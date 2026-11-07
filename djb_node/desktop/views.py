@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from .datasource import Snapshot, UNAVAILABLE, Unavailable
@@ -22,8 +23,8 @@ from .nodecloud import STATE_TEXT
 from .. import facts
 
 __all__ = [
-    "Action", "Card", "Field", "Mark", "Row", "Table", "VIEWS", "VIEW_KEYS", "View",
-    "build_view", "build_views",
+    "Action", "Card", "Chart", "Field", "GaugeData", "Hero", "Mark", "Metric", "RailCard",
+    "Row", "Table", "VIEWS", "VIEW_KEYS", "View", "build_view", "build_views",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -120,13 +121,97 @@ class Field:
 
 @dataclass(frozen=True)
 class Action:
-    """可点动作；``enabled=False`` 时按钮置灰并显示 ``reason``（不隐藏）。"""
+    """可点动作；``enabled=False`` 时按钮置灰并显示 ``reason``（不隐藏）。
+
+    ``nav`` 非空表示这是**页面内跳转**（不发任何后端请求），渲染层直接 ``show_view(nav)``；
+    这样「调整时段」这类入口也能留在投影层里被断言，而不是散在 Tk 代码里。
+    """
 
     key: str
     label: str
     enabled: bool = True
     reason: str = ""
     primary: bool = False
+    nav: str = ""
+
+
+@dataclass(frozen=True)
+class Metric:
+    """一个指标格：微标 + 值 + 单位 + 说明（状态卡四指标 / TODAY 四宫格共用）。"""
+
+    label: str
+    value: str
+    unit: str = ""
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class GaugeData:
+    """仪表环投影。``ratio=None`` = **没有数字**：只画轨道，中心显示 ``value``（通常是「—」）。
+
+    这里绝不把「没有数据」折算成 0——0% 和「没有数据」在仪表盘上是两件事。
+    """
+
+    ratio: float | None = None
+    value: str = "—"
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class Hero:
+    """状态主卡（只有 overview 填）：标题 + 徽标 + 说明 + 运行时长 + 仪表环 + 四指标 + 动作。"""
+
+    kicker: str
+    title: str
+    chip: str = ""
+    chip_tone: str = "muted"
+    body: str = ""
+    runtime_label: str = "连续贡献"
+    runtime: str = "—"
+    gauge: GaugeData | None = None
+    metrics: tuple[Metric, ...] = ()
+    actions: tuple[Action, ...] = ()
+    hint: str = ""
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class Chart:
+    """时序柱图投影（只有 overview 填）。
+
+    ``values`` 是 0..1 的**归一化高度**；``empty`` 非空 = 没有可用时序，
+    渲染层据此画空态并只显示 ``empty`` 这句话（不画假柱子）。
+    """
+
+    kicker: str = ""
+    title: str = ""
+    caption: str = ""
+    values: tuple[float, ...] = ()
+    labels: tuple[str, ...] = ()
+    peak: str = ""
+    foot: str = ""
+    empty: str = ""
+
+
+@dataclass(frozen=True)
+class RailCard:
+    """右栏卡（只有 overview 填）。
+
+    ``kind``：``setup``（只读字段 + 跳转）/ ``stats``（四宫格）/ ``throttle``（标签-值行 + 开关）。
+    """
+
+    kicker: str
+    title: str
+    kind: str = "stats"
+    badge: str = ""
+    badge_tone: str = "muted"
+    note: str = ""
+    stats: tuple[Metric, ...] = ()
+    fields: tuple[Field, ...] = ()
+    rows: tuple[tuple[str, str, str], ...] = ()
+    toggle: tuple[str, bool] | None = None
+    actions: tuple[Action, ...] = ()
+    foot: str = ""
 
 
 @dataclass(frozen=True)
@@ -140,9 +225,17 @@ class View:
     actions: tuple[Action, ...] = ()
     notes: tuple[str, ...] = ()
     unavailable: tuple[str, ...] = ()
+    #: 设计样新增的三块（只有 overview 填；其余 12 页走通用卡片+表格渲染）
+    hero: Hero | None = None
+    chart: Chart | None = None
+    rail: tuple[RailCard, ...] = ()
 
     def plain_text(self) -> str:
-        """文本快照（证据 / 无显示环境验收）：稳定顺序，无时间戳抖动。"""
+        """文本快照（证据 / 无显示环境验收）：稳定顺序，无时间戳抖动。
+
+        ``hero`` / ``chart`` / ``rail`` 也写进来：设计改造后视觉信息变多，
+        但**说出来的每句话都必须可断言**，所以主卡、柱图、右栏同样落成文本。
+        """
         lines = ["# " + self.title + (("  ·  " + self.subtitle) if self.subtitle else "")]
         for item in self.unavailable:
             lines.append("! " + item)
@@ -151,6 +244,12 @@ class View:
             for card in self.cards:
                 suffix = ("  " + card.meta) if card.meta else ""
                 lines.append("[" + card.title + "] " + card.value + suffix)
+        if self.hero is not None:
+            lines.extend(_hero_text(self.hero))
+        if self.chart is not None:
+            lines.extend(_chart_text(self.chart))
+        if self.rail:
+            lines.extend(_rail_text(self.rail))
         if self.table is not None:
             lines.append("")
             lines.append(" | ".join(self.table.columns))
@@ -177,6 +276,70 @@ class View:
         for note in self.notes:
             lines.append("· " + note)
         return "\n".join(lines)
+
+
+def _hero_text(hero: Hero) -> list[str]:
+    """主卡的文本形态（与渲染顺序一致：标题 → 说明 → 指标 → 动作 → 提示）。"""
+    lines = ["", "{ 主卡 } " + hero.title + (("  " + hero.chip) if hero.chip else "")]
+    if hero.kicker:
+        lines.append("  " + hero.kicker)
+    if hero.body:
+        lines.append("  " + hero.body)
+    lines.append("  " + hero.runtime_label + "：" + hero.runtime)
+    if hero.gauge is not None:
+        lines.append("  " + (hero.gauge.label or "仪表环") + "：" + hero.gauge.value)
+    if hero.metrics:
+        lines.append("  指标：" + " · ".join(
+            item.label + " " + item.value
+            + ((" " + item.unit) if item.unit and item.value not in ("—", "") else "")
+            for item in hero.metrics))
+    for action in hero.actions:
+        state = "" if action.enabled else ("（置灰：" + (action.reason or "当前不可用") + "）")
+        lines.append("  [" + action.label + "]" + state)
+    if hero.hint:
+        lines.append("  " + hero.hint)
+    if hero.note:
+        lines.append("  · " + hero.note)
+    return lines
+
+
+def _chart_text(chart: Chart) -> list[str]:
+    lines = ["", "{ " + (chart.title or "图表") + " } " + chart.caption]
+    if chart.empty:
+        lines.append("  " + chart.empty)
+        return lines
+    if chart.peak:
+        lines.append("  " + chart.peak)
+    if chart.foot:
+        lines.append("  " + chart.foot)
+    return lines
+
+
+def _rail_text(rail: tuple[RailCard, ...]) -> list[str]:
+    lines: list[str] = []
+    for card in rail:
+        lines.append("")
+        head = "{ " + card.title + " }"
+        if card.note:
+            head += "  " + card.note
+        if card.badge:
+            head += "  " + card.badge
+        lines.append(head)
+        for stat in card.stats:
+            lines.append("  " + stat.label + "：" + stat.value
+                         + ((" " + stat.unit) if stat.unit else ""))
+        for field in card.fields:
+            lines.append("  " + field.label + "：" + field.value)
+        for label, value, _tone in card.rows:
+            lines.append("  " + label + "：" + value)
+        if card.toggle is not None:
+            lines.append("  " + card.toggle[0] + "：" + ("开" if card.toggle[1] else "关"))
+        for action in card.actions:
+            state = "" if action.enabled else ("（置灰：" + (action.reason or "当前不可用") + "）")
+            lines.append("  [" + action.label + "]" + state)
+        if card.foot:
+            lines.append("  " + card.foot)
+    return lines
 
 
 # ─────────────────────────────────────────────────────────────── 小工具
@@ -237,6 +400,279 @@ def _section(snapshot: Snapshot, name: str) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+# ─────────────────────────────────────────────── 总览：主卡 / 节奏图 / 右栏（设计样 v2.1）
+#: 让路模式的短说明（与 :func:`_yield` 的模式表同源，改文案只改这里）
+YIELD_MODE_SUMMARY = {
+    "full": "只要接单就满载",
+    "balanced": "工作时段实时算力，其余慢任务",
+    "saver": "只在我不使用电脑时工作",
+    "paused": "不接新任务；在途任务按护栏处理",
+}
+
+#: 贡献节奏图的时间窗（小时）
+CHART_HOURS = 24
+
+
+def _parse_ts(value: Any) -> Any:
+    """解析 RFC3339（带 ``Z`` / ``+08:00`` / 无时区三种写法）；解析不了给 ``None``。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text[-1] in "Zz":
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _seconds(value: Any) -> int | None:
+    """非负整数秒；``None``/非法/负数 → ``None``（缺失不许变成 0）。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or number != number:
+        return None
+    return int(number)
+
+
+def _runtime_text(value: Any) -> str:
+    """运行时长 → ``HH:MM:SS``；没有这个字段就给「—」（本机数据源暂未提供 uptime）。"""
+    seconds = _seconds(value)
+    if seconds is None:
+        return "—"
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _first_device(gpu: Mapping[str, Any]) -> Mapping[str, Any]:
+    """GPU 域的第一块卡（字段名与 ``parse_nvidia_smi`` 一致：utilization_pct / temperature_c…）。"""
+    devices = gpu.get("devices")
+    if isinstance(devices, (list, tuple)):
+        for device in devices:
+            mapping = _mapping(device)
+            if mapping:
+                return mapping
+    return {}
+
+
+def _gigabytes(megabytes: Any, *, digits: int = 1) -> str:
+    """MB → GB 文本（只做单位换算，不改口径）；缺失给「—」。"""
+    try:
+        number = float(megabytes)
+    except (TypeError, ValueError):
+        return "—"
+    if number < 0:
+        return "—"
+    return f"{number / 1024.0:.{digits}f}"
+
+
+def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
+    """贡献节奏：**用已有收据的时间戳按小时聚合 tokens**（不新增数据域、不联网）。
+
+    时间窗的锚点是 :attr:`Snapshot.fetched_at`（这次取数的时刻）——所以「近 24 小时」
+    就是「到现在为止的 24 小时」。某个小时没有收据 = 该柱为 0 高（诚实），
+    整段都没有收据 = ``empty`` 文案（不画假柱子）。
+    """
+    receipts = _section(snapshot, "receipts")
+    samples: list[tuple[Any, int]] = []
+    for row in receipts.get("rows") or ():
+        mapping = _mapping(row)
+        moment = _parse_ts(mapping.get("created_at"))
+        if moment is None:
+            continue
+        samples.append((moment, _seconds(mapping.get("tokens")) or 0))
+    anchor = _parse_ts(snapshot.fetched_at)
+    if anchor is None and samples:
+        anchor = max(moment for moment, _ in samples)
+    title, caption = "贡献节奏", "近 " + str(hours) + " 小时 · 每小时 tokens"
+    if anchor is None:
+        return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+                     empty="暂不可用（当前没有收据时间戳）")
+    end = anchor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    start = end - timedelta(hours=hours)
+    totals = [0] * hours
+    inside = 0                       # 只数落在时间窗里的收据（窗外的不能算进「N 张收据」）
+    for moment, tokens in samples:
+        if not (start <= moment < end):
+            continue
+        index = int((moment - start).total_seconds() // 3600)
+        if 0 <= index < hours:
+            totals[index] += tokens
+            inside += 1
+    total = sum(totals)
+    if total <= 0:
+        return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+                     empty="暂不可用（当前没有收据时间戳）")
+    peak_value = max(totals)
+    peak_index = totals.index(peak_value)
+    values = tuple(round(value / float(peak_value), 4) for value in totals)
+    step = hours // 4
+    # 4 个整点刻度 + 末尾「现在」：24 小时后与起点同一钟点，直接画第 5 个刻度会出现两个一样的时刻
+    labels = tuple((start + timedelta(hours=step * position)).strftime("%H:00")
+                   for position in range(4)) + ("现在",)
+    peak_at = (start + timedelta(hours=peak_index)).strftime("%H:00")
+    return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+                 values=values, labels=labels,
+                 peak="峰值 " + f"{peak_value:,}" + " tokens · " + peak_at,
+                 foot="近 " + str(hours) + " 小时合计 " + f"{total:,}" + " tokens · "
+                      + str(inside) + " 张收据")
+
+
+def _hero(snapshot: Snapshot) -> Hero:
+    """状态主卡：全部字段来自既有数据域；缺什么就写「—」，不补 0、不编运行时长。"""
+    status = _section(snapshot, "status")
+    gpu = _section(snapshot, "gpu")
+    device = _first_device(gpu)
+    yield_state = _section(snapshot, "yield")
+    receipts = _section(snapshot, "receipts")
+    bench = _section(snapshot, "bench")
+    access = _section(snapshot, "access")
+    binding = _mapping(access.get("binding"))
+    profile = _mapping(_section(snapshot, "account").get("profile"))
+    state = str(status.get("state") or "unknown")
+    paused = state == "paused"
+    titles = {"online": "这台机器，正在贡献。", "starting": "这台机器，正在准备。",
+              "paused": "这台机器，正在让路。", "updating": "这台机器，正在更新。",
+              "stopped": "这台机器，还没有开始。", "error": "这台机器，需要看一眼。"}
+    chips = {"online": ("● LIVE", "mint"), "starting": ("◐ STARTING", "amber"),
+             "paused": ("● PAUSED", "amber"), "updating": ("◐ UPDATING", "amber"),
+             "stopped": ("○ STOPPED", "muted"), "error": ("✕ ERROR", "red")}
+    chip, chip_tone = chips.get(state, ("? 状态未知", "muted"))
+    node_id = str(profile.get("node_id") or binding.get("node_id") or "—")
+    mode = str(yield_state.get("mode") or "")
+    summary = YIELD_MODE_SUMMARY.get(mode)
+    accepting = yield_state.get("accepting")
+    if summary:
+        body = summary
+        if accepting is True:
+            body += "；当前允许接单"
+        elif accepting is False:
+            body += "；当前不接新任务"
+    elif snapshot.ok("yield"):
+        body = "让路规则已启用，" + ("当前允许接单" if accepting is True else "接单状态未知")
+    else:
+        body = "让路规则暂不可用（数据源未提供）"
+    util = _seconds(device.get("utilization_pct"))
+    gauge = GaugeData(None if util is None else min(100, util) / 100.0,
+                      "—" if util is None else str(util) + "%", "GPU 利用率")
+    receipt_rows = [_mapping(row) for row in (receipts.get("rows") or ())]
+    receipt_count = (str(len(receipt_rows)) + " 张") if snapshot.ok("receipts") else "—"
+    memory = "—"
+    if device.get("memory_used_mb") is not None and device.get("memory_total_mb") is not None:
+        memory = _gigabytes(device.get("memory_used_mb")) + " / " \
+            + _gigabytes(device.get("memory_total_mb"), digits=0)
+    temperature = _seconds(device.get("temperature_c"))
+    load = bench.get("cpu_load_1m")
+    metrics = (
+        Metric("收据", receipt_count, note="近 24 小时累计" if snapshot.ok("receipts") else ""),
+        Metric("显存", memory, unit="GB", note="已用 / 总量"),
+        Metric("温度", "—" if temperature is None else str(temperature), unit="°C"),
+        Metric("负载", f"{float(load):.2f}" if _is_number(load) else "—", note="1 分钟平均"),
+    )
+    actions = (
+        Action("yield.pause", "暂停 1 小时", enabled=not paused, reason="已经是暂停状态"),
+        Action("yield.resume", "恢复接单", enabled=paused, reason="当前不是暂停状态",
+               primary=paused),
+        Action("", "调整时段", nav="yield"),
+    )
+    if binding.get("state") in ("bound", "active"):
+        hint = "已授权 1 个客户端"
+    elif snapshot.ok("access"):
+        hint = "还没有客户端授权"
+    else:
+        hint = "授权状态暂不可用"
+    return Hero(kicker="NODE STATUS / " + node_id, title=titles.get(state, "这台机器的状态未知。"),
+                chip=chip, chip_tone=chip_tone, body=body,
+                runtime=_runtime_text(status.get("uptime_s")), gauge=gauge, metrics=metrics,
+                actions=actions, hint=hint)
+
+
+def _is_number(value: Any) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
+    """右栏三张卡：SETUP（接入进度）/ TODAY（今日四格）/ THROTTLE（让路规则）。
+
+    编辑表单仍只在「接入配置」页（同一个配置文件不允许两处可写）；这里只读展示 + 一键跳转。
+    """
+    access = _section(snapshot, "access")
+    config = _mapping(access.get("config"))
+    earnings = _section(snapshot, "earnings")
+    status = _section(snapshot, "status")
+    plan = _section(snapshot, "token_plan")
+    limits = _mapping(plan.get("limits"))
+    receipts = _section(snapshot, "receipts")
+    yield_state = _section(snapshot, "yield")
+    steps = (bool(config.get("node_secret") or config.get("node_id")), bool(config.get("price_mode")),
+             bool(config.get("usdt_address")))
+    done = sum(1 for step in steps if step)
+    setup_fields = (
+        Field("节点凭证", str(config.get("node_secret") or "未设置"), key="node_secret", secret=True),
+        Field("价格", str(config.get("price_mode_label") or config.get("price_mode") or "未设置"),
+              key="price_mode"),
+        Field("USDT 收款地址", str(config.get("usdt_address") or "未设置"), key="usdt_address"),
+    )
+    setup = RailCard(kicker="SETUP / 接入配置", title="三步，把节点接上。", kind="setup",
+                     badge=("接入完成" if done == 3 else "待完成"), badge_tone=("mint" if done == 3
+                                                                          else "amber"),
+                     note=str(done) + " / 3", fields=setup_fields,
+                     actions=(Action("", "去接入配置", nav="access", primary=done < 3),),
+                     foot="编辑请到「接入配置」页；配置只在服务端与本机各存一份。")
+    daily = None
+    for item in plan.get("usage") or ():
+        mapping = _mapping(item)
+        if str(mapping.get("name") or "") == "daily":
+            daily = mapping
+            break
+    today_tokens = _seconds(_mapping(daily).get("used")) if daily else None
+    verified = sum(1 for row in receipts.get("rows") or ()
+                   if str(_mapping(row).get("state") or _mapping(row).get("status") or "")
+                   in ("verified", "accepted"))
+    total_receipts = len([1 for row in receipts.get("rows") or () if _mapping(row)])
+    today = RailCard(
+        kicker="TODAY / 今日算力", title="今日收益",
+        badge="进行中" if str(yield_state.get("state") or "") == "online" else "",
+        badge_tone="mint",
+        stats=(Metric("今日收益", _num(earnings.get("today") or status.get("today_earnings")),
+                      unit=str(earnings.get("currency") or "USDT"), note="服务端下发值"),
+               Metric("今日 tokens", "—" if today_tokens is None else f"{today_tokens:,}",
+                      note="共享 Token Plan 用量"),
+               Metric("收据数", (str(total_receipts) if snapshot.ok("receipts") else "—"),
+                      note="本机已生成"),
+               Metric("验证通过", ("—" if not snapshot.ok("receipts")
+                                 else f"{verified} / {total_receipts}"), note="服务端校验"),
+               ),
+        foot="收益按服务端记账口径，本机不换算、不四舍五入。")
+    throttle_rows = (
+        ("并发上限", _num(limits.get("concurrent")) + " 路", "default"),
+        ("每日 tokens 上限", "—" if limits.get("daily_tokens") in (None, 0)
+                            else f"{_seconds(limits.get('daily_tokens')):,}", "default"),
+        ("让路模式", YIELD_MODE_SUMMARY.get(str(yield_state.get("mode") or ""),
+                                            str(yield_state.get("mode") or "未设置")), "muted"),
+    )
+    throttle = RailCard(kicker="THROTTLE / 让路规则", title="让路规则",
+                        badge="生效中" if yield_state.get("yield_enabled") else "已关闭",
+                        badge_tone="mint" if yield_state.get("yield_enabled") else "muted",
+                        kind="throttle", rows=throttle_rows,
+                        toggle=("自动让路", bool(yield_state.get("yield_enabled"))),
+                        actions=(Action("", "调整让路", nav="yield"),),
+                        foot="只会用你让出来的算力；全屏游戏与会议期间自动让路。")
+    return (setup, today, throttle)
+
+
 # ─────────────────────────────────────────────────────────────── 13 个构建器
 def _overview(snapshot: Snapshot) -> View:
     status, earnings = _section(snapshot, "status"), _section(snapshot, "earnings")
@@ -281,6 +717,10 @@ def _overview(snapshot: Snapshot) -> View:
                     narrow_headers=(("本机校验", "校验"),),
                     note=str(receipts.get("note") or ""),
                     empty="还没有收据（完成后自动生成）"),
+        # 设计样新增：左栏主卡 + 节奏图，右栏三卡（数据仍全部来自上面这些既有数据域）
+        hero=_hero(snapshot),
+        chart=_hourly_chart(snapshot),
+        rail=_rail(snapshot),
         unavailable=_missing(snapshot, ("status", "earnings")),
         notes=("数值全部原样展示服务端字段；无数据显示「—」，不显示 0。",),
     )
