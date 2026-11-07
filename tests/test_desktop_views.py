@@ -15,11 +15,19 @@ from djb_node.desktop.app import demo_snapshot
 from djb_node.desktop.controller import ControlOutcome, DesktopController
 
 SECRET = "djb_sk_live_9f2c41aa77be"
-SPEC_ORDER = ["overview", "bench", "models", "gpu", "tasks", "receipts", "earnings",
-              "agent", "token_plan", "access", "yield", "account", "logs"]
-SPEC_TITLES = ["总览", "性能基准", "可提供模型", "GPU 监控", "任务队列", "收据", "收益",
-               "Agent 接入", "共享 Token Plan", "接入配置", "让路/节能", "账户与安全",
+#: 侧栏顺序 = IA 顺序（4 组：运行 → 收益 → 接入 → 系统；见 views.NAV_SECTIONS）
+SPEC_ORDER = ["overview", "bench", "gpu", "models", "tasks", "receipts", "earnings",
+              "token_plan", "agent", "access", "yield", "account", "logs"]
+SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "可提供模型", "任务队列", "收据", "收益",
+               "共享 Token Plan", "Agent 接入", "接入配置", "让路/节能", "账户与安全",
                "日志"]
+#: 分组口径（00-PLAN §1.1 已裁决）：组 key / 中文名 / 拉丁微标 / 成员顺序
+SPEC_SECTIONS = [
+    ("run", "运行", "RUN", ["overview", "bench", "gpu", "models", "tasks"]),
+    ("earn", "收益", "EARN", ["receipts", "earnings", "token_plan"]),
+    ("connect", "接入", "CONNECT", ["agent", "access"]),
+    ("system", "系统", "SYSTEM", ["yield", "account", "logs"]),
+]
 #: 合规红线：不许出现「许愿式」金融承诺；「不可提现」这类否定式免责声明是允许的
 FORBIDDEN_PROMISES = ("充值", "APY", "保本", "固定收益", "储值账户", "稳赚", "保证收益")
 
@@ -34,6 +42,43 @@ def test_thirteen_views_in_spec_order():
     for (key, title), expected_key, expected_title in zip(vw.VIEWS, SPEC_ORDER, SPEC_TITLES):
         assert key == expected_key
         assert title.replace(" ", "") == expected_title.replace(" ", "")
+
+
+def test_nav_sections_cover_every_view_exactly_once():
+    """分组是「加结构」不是「删项/并项」：13 项展平后必须与 VIEW_KEYS 完全一致。"""
+    assert len(vw.NAV_SECTIONS) == 4
+    flattened = [key for section in vw.NAV_SECTIONS for key in section.keys]
+    assert flattened == SPEC_ORDER
+    assert sorted(flattened) == sorted(vw.VIEW_KEYS)
+    assert len(flattened) == len(set(flattened)) == 13
+    # 每个视图都能查到所属分组，且不认识的 key 直接报错（不猜）
+    for key in vw.VIEW_KEYS:
+        assert vw.SECTION_FOR_VIEW[key].key in {section.key for section in vw.NAV_SECTIONS}
+    with pytest.raises(KeyError):
+        vw.page_kicker("nope")
+
+
+def test_nav_sections_follow_the_agreed_groups():
+    """钉住 00-PLAN §1.1 裁决：4 组、组名/微标/成员顺序一个不差。"""
+    actual = [(section.key, section.title, section.micro, list(section.keys))
+              for section in vw.NAV_SECTIONS]
+    assert actual == SPEC_SECTIONS
+    # 组顺序 = 用户旅程：先看运行，再看收益，要扩大供给才看接入，系统放最后
+    assert [section.key for section in vw.NAV_SECTIONS] == ["run", "earn", "connect", "system"]
+
+
+def test_every_page_kicker_is_two_level_ascii():
+    """页头眉标 =「组名 / 页名」两级；整串 ASCII，交给 mono 不会跳基线。"""
+    for key in vw.VIEW_KEYS:
+        kicker = vw.page_kicker(key)
+        assert kicker.isascii(), kicker
+        parts = kicker.split(" / ")
+        assert len(parts) == 2, kicker
+        assert parts[0] == vw.SECTION_FOR_VIEW[key].micro
+        assert parts[1] == vw.PAGE_MICROS[key]
+    assert vw.page_kicker("overview") == "RUN / OVERVIEW"
+    assert vw.page_kicker("token_plan") == "EARN / TOKEN PLAN"
+    assert vw.page_kicker("logs") == "SYSTEM / LOGS"
 
 
 def test_every_view_renders_from_demo_data():
@@ -187,12 +232,20 @@ def _token_plan_snapshot(*, upstreams, bound=True, usage=None):
     return ds.Snapshot(sections)
 
 
-def test_token_plan_nav_item_sits_right_before_access():
-    """客户找不到入口 = 导航表里根本没有；这条钉住「第 9 项、标题、在接入配置之前」。"""
+def test_token_plan_nav_item_sits_before_access_in_earn_section():
+    """客户找不到入口 = 导航表里根本没有；这条钉住「标题、在接入配置之前、属收益组末位」。
+
+    R2 分组后它从平铺第 9 项变为第 8 项（组内顺序变了，产品意图没变）：
+    先看到「共享了什么、还能共享多少」，再进「接入」组动手。
+    """
     assert ("token_plan", "共享 Token Plan") in vw.VIEWS
     order = list(vw.VIEW_KEYS)
-    assert order.index("token_plan") == 8                     # 第 9 项
+    assert order.index("token_plan") == 7                     # 第 8 项
     assert order.index("token_plan") < order.index("access")
+    assert vw.SECTION_FOR_VIEW["token_plan"].key == "earn"
+    assert vw.SECTION_FOR_VIEW["access"].key == "connect"
+    # 收益组的最后一项就是它：组内不会被别的项挤到后面
+    assert vw.SECTION_FOR_VIEW["token_plan"].keys[-1] == "token_plan"
     assert len(vw.VIEWS) == 13
 
 
