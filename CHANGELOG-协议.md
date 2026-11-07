@@ -3,6 +3,30 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.8.0 · 2026-11-07 · MINOR（实现先行 / spec 补登：7 条已实现未登记端点）
+
+**性质**：只加不改（新增 7 路径 / 8 操作 / 2 schema）。把**已实现但从未登记**的端点补进契约，
+使"运行时导出"与 `spec` 完全对齐（`ops/gov/audit/route_parity.py`，差异 0）。
+
+| # | 路径 | 方法 | 说明 | 来源 |
+|---|---|---|---|---|
+| 1 | `/api/v1/client/releases` | GET | 客户端版本清单（**公开读**，门户下载页 + 客户端自更新依赖）；fail-closed 503 三码 | `app/client_release/router.py`（M15） |
+| 2 | `/api/v1/admin/treasury/wallet-drafts` | GET / POST | 多签钱包草稿列表 / 建房稿（回每 owner 待签 EIP-712 摘要） | `app/chain/router.py`（flag `wallet_draft`，默认关） |
+| 3 | `/api/v1/admin/treasury/wallet-drafts/{draft_id}` | GET | 草稿详情 + 证明收集进度 | 同上 |
+| 4 | `/api/v1/admin/treasury/wallet-drafts/{draft_id}/attestations` | POST | 登记 owner 证明（**只收 `signature_hash`**） | 同上 |
+| 5 | `/api/v1/admin/treasury/wallet-drafts/{draft_id}/deploy` | POST | 登记部署交易（不代签、不广播） | 同上 |
+| 6 | `/api/v1/admin/treasury/wallet-drafts/{draft_id}/verify` | POST | V1–V8 回读校验（全绿才 active） | 同上 |
+| 7 | `/api/v1/admin/treasury/multisig-wallets` | GET | 已激活多签钱包列表 | 同上 |
+
+**新增 schema**：`ClientReleaseManifest`、`ClientReleaseChannel`（清单形状冻结，含 `signature_status` 三态枚举）。
+
+**为什么之前漏了**：这 7 条从实现侧看是"只加不改"新增，但没同步进 `spec`；静态路由扫描受
+`include_router(prefix=…)` 与开关装配干扰看不准，改用**运行时 `app.openapi()` 导出**才发现。
+**标记**：6 条 `admin/treasury/*` 带 `x-djb-visibility: internal`（不面向第三方 SDK 生成），
+响应体只锁路径/方法/鉴权/错误码，不锁内部字段。
+
+**统计**：路径 218 → **225**；操作 258 → **266**；schema 348 → **350**。
+
 ## 1.7.0 · 2026-11-07 · MINOR（实现先行 / spec 补登）
 
 > 背景：邮箱验证码登录与「可信设备免码」在 2026-11-04 就已实现并上线（`app/identity/email_otp.py`

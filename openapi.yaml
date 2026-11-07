@@ -25,7 +25,7 @@ info:
   # 2026-11-05 二次发布：加性新增 `GET /api/v1/auth/captcha`（防撞库验证码）与
   # LoginRequest 两个可选字段 `captcha_id`/`captcha_answer`、错误码 40111/40112，
   # 按 MINOR 定为 1.6.0（213→214 路径；1.5.0 固定为提交 5e65b32）。
-  version: 1.7.0
+  version: 1.8.0
   # 2026-11-04 审计：此处原先硬编码「157 路径 / 181 操作」——那是 node 快照期的数字，
   # 与文件实测（213/252）不符，且每次加性变更都会让它更假。规模数字一律由
   # `reports/RC-2026-11-03/audit/tools/check-spec-single-source.py` 现算，不写进正文。
@@ -8250,6 +8250,196 @@ paths:
           $ref: '#/components/responses/TokenRouteNodeNotFound'
         '424':
           $ref: '#/components/responses/TokenRouteStepUpRequired'
+  /api/v1/client/releases:
+    get:
+      tags:
+      - client-release
+      summary: 客户端版本清单（公开读；fail-closed）
+      description: |
+        门户下载页与客户端自更新读取的发布清单。**公开读、无需鉴权**（只回版本 / 下载地址 / 校验值）。
+        清单由发布方生成（服务端环境变量 `DJB_CLIENT_MANIFEST_FILE`），服务端只读，不生成安装包、不验签真伪——
+        `signature_status` 是发布方写进清单的事实（`unsigned-test` / `signed` / `notarized`）。
+        失败一律 **fail-closed 503**（宁可不给下载，也不给"看起来能下"的空清单）：
+        `release_manifest_unconfigured`（未配置）/ `release_manifest_missing`（文件不存在）/
+        `release_manifest_invalid`（JSON 坏了、结构不合格、sha256 非 64 位 hex）。
+      operationId: getClientReleases
+      security: []
+      responses:
+        '200':
+          description: 清单读取成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientReleaseManifest'
+        '503':
+          description: fail-closed——清单未配置 / 缺失 / 不合法
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/admin/treasury/wallet-drafts:
+    get:
+      tags:
+      - admin
+      - treasury
+      summary: 多签钱包草稿列表（flag wallet_draft，默认关）
+      description: |
+        多签钱包（multisig）建房稿流程的列表。**开关 `wallet_draft` 默认关**：关闭时整组端点返回 `403`。
+        响应体形状由 `app/chain/wallet_store.py` 决定，本契约只锁路径/方法/鉴权与错误码，不锁定内部字段
+        （`x-djb-visibility: internal`：不面向第三方 SDK 生成）。
+      operationId: listWalletDrafts
+      x-djb-visibility: internal
+      responses:
+        '200':
+          description: 草稿列表
+          content:
+            application/json:
+              schema:
+                type: object
+        '403':
+          description: 开关 `wallet_draft` 关闭，或多签后台未启用
+    post:
+      tags:
+      - admin
+      - treasury
+      summary: 建多签钱包草稿（返回每个 owner 要签的 EIP-712 摘要）
+      description: |
+        **只回摘要，不收回签名**：服务端为每个 owner 生成待签摘要，owner 在各自钱包里签，
+        再通过 `attestations` 端点只提交 `signature_hash`。开关 `wallet_draft` 关闭时 `403`。
+      operationId: createWalletDraft
+      x-djb-visibility: internal
+      responses:
+        '200':
+          description: 草稿已建（含各 owner 待签摘要）
+          content:
+            application/json:
+              schema:
+                type: object
+        '403':
+          description: 开关 `wallet_draft` 关闭，或鉴权/step-up 不足
+
+  /api/v1/admin/treasury/wallet-drafts/{draft_id}:
+    get:
+      tags:
+      - admin
+      - treasury
+      summary: 草稿详情 + 证明收集进度
+      operationId: getWalletDraft
+      x-djb-visibility: internal
+      parameters:
+      - name: draft_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 草稿详情与已收集的 owner 证明数
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: 草稿不存在
+
+  /api/v1/admin/treasury/wallet-drafts/{draft_id}/attestations:
+    post:
+      tags:
+      - admin
+      - treasury
+      summary: 登记 owner 证明（只收 signature_hash）
+      description: |
+        **只收 `signature_hash`**，不收签名字节、不收私钥。服务端据此推进 `signed` 计数；
+        凑不齐阈值不得进 `deploy`（对应 INV-02 / INV-10 的口径）。
+      operationId: addWalletOwnerAttestation
+      x-djb-visibility: internal
+      parameters:
+      - name: draft_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 证明已登记（返回当前进度）
+          content:
+            application/json:
+              schema:
+                type: object
+        '409':
+          description: 该 owner 已登记 / 草稿状态不允许追加
+
+  /api/v1/admin/treasury/wallet-drafts/{draft_id}/deploy:
+    post:
+      tags:
+      - admin
+      - treasury
+      summary: 登记部署交易（不代签、不广播）
+      operationId: markWalletDraftDeployed
+      x-djb-visibility: internal
+      parameters:
+      - name: draft_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 部署交易已登记
+          content:
+            application/json:
+              schema:
+                type: object
+        '409':
+          description: 签名数不足 / 状态不允许
+
+  /api/v1/admin/treasury/wallet-drafts/{draft_id}/verify:
+    post:
+      tags:
+      - admin
+      - treasury
+      summary: V1–V8 回读校验（全绿才 active）
+      description: |
+        链上回读校验：V1–V8 全部通过才置 `active`；任一不过则保持非 active 并回逐项失败原因。
+        真链执行未实现时返回 `409` + `chain_execution_unavailable`（不是 `500`）。
+      operationId: verifyWalletDraft
+      x-djb-visibility: internal
+      parameters:
+      - name: draft_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 校验结果（V1–V8 逐项）
+          content:
+            application/json:
+              schema:
+                type: object
+        '409':
+          description: 校验未全绿 / 真链执行不可用
+
+  /api/v1/admin/treasury/multisig-wallets:
+    get:
+      tags:
+      - admin
+      - treasury
+      summary: 已激活多签钱包列表
+      operationId: listMultisigWallets
+      x-djb-visibility: internal
+      responses:
+        '200':
+          description: 已激活钱包列表
+          content:
+            application/json:
+              schema:
+                type: object
+        '403':
+          description: 开关 `wallet_draft` 关闭
+
+
 components:
 
   securitySchemes:
@@ -15107,3 +15297,30 @@ components:
         authorization_effective:
           type: boolean
           description: 仅授权响应带：授权后是否**真的**生效（开关关着时为 false）。
+
+    ClientReleaseChannel:
+      type: object
+      description: 一个平台/架构的发布通道条目（发布方生成，服务端原样透出）。
+      required: [platform, arch, kind, version, url, sha256]
+      properties:
+        platform: {type: string, enum: [windows, macos, linux, container]}
+        arch: {type: string, description: '如 x64 / arm64 / universal'}
+        kind: {type: string, description: '如 portable-zip / dmg / tar.gz'}
+        version: {type: string, description: '该通道的产物版本（可与清单 version 不同）'}
+        url: {type: string, description: '下载地址（https）'}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: 64 位小写 hex}
+        size_bytes: {type: integer, minimum: 0}
+        signature_status: {type: string, enum: [unsigned-test, signed, notarized]}
+        notes: {type: string}
+    ClientReleaseManifest:
+      type: object
+      description: |
+        `GET /api/v1/client/releases` 的响应（形状冻结）。清单缺失或不合格时**不返回本对象**，
+        而是 `503` + 错误信封（`release_manifest_unconfigured` / `_missing` / `_invalid`）。
+      required: [version, generated_at, channels]
+      properties:
+        version: {type: string, description: 清单版本号}
+        generated_at: {type: string, format: date-time, description: 发布方生成时间（UTC）}
+        channels:
+          type: array
+          items: {$ref: '#/components/schemas/ClientReleaseChannel'}
