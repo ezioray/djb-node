@@ -40,7 +40,14 @@ from .config import (GATEWAY_PLACEHOLDER, Paths, load_config, resolve_home,
 from .store import Store
 
 __all__ = ["DEFAULT_GATEWAY_URL", "default_gateway", "is_placeholder",
-           "ensure_ready", "start_daemon", "control_ping"]
+           "ensure_ready", "start_daemon", "control_ping", "disabled_by_env"]
+
+#: 一键关掉自举（打包自检 / 机房批量部署 / 离线环境）：``DJB_BOOTSTRAP_DISABLE=1``
+DISABLE_ENV = "DJB_BOOTSTRAP_DISABLE"
+
+
+def disabled_by_env() -> bool:
+    return (os.environ.get(DISABLE_ENV) or "").strip().lower() in ("1", "true", "on", "yes")
 
 #: 构建期可用 ``DJB_DEFAULT_GATEWAY`` 覆盖（自建部署 / 预发环境）
 DEFAULT_GATEWAY_URL = (os.environ.get("DJB_DEFAULT_GATEWAY") or "").strip() \
@@ -79,7 +86,7 @@ def ensure_ready(home: str | os.PathLike | None = None, *,
     result: dict[str, Any] = {"enabled": bool(enabled), "home": paths.home,
                               "created": False, "gateway_fixed": False,
                               "gateway": "", "preset": "", "errors": []}
-    if not enabled:
+    if not enabled or disabled_by_env():
         return result
     try:
         target = (gateway or default_gateway()).strip()
@@ -155,7 +162,7 @@ def start_daemon(home: str | os.PathLike | None = None, *,
     paths = Paths(resolve_home(None if home is None else str(home)))
     result: dict[str, Any] = {"enabled": bool(enabled), "started": False,
                               "reason": "", "errors": []}
-    if not enabled:
+    if not enabled or disabled_by_env():
         return result
     try:
         if control_ping(paths):
