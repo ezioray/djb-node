@@ -359,6 +359,49 @@ def test_short_window_scrolls_the_nav_and_keeps_every_item_reachable(tmp_path):
         root.destroy()
 
 
+def _label_offenders(root) -> list[str]:
+    """收集「文字放不下」的 Label：reqwidth > 实际 width + 2（差 2px 是 Tk 的边框内距）。"""
+    bad, stack = [], [root]
+    while stack:
+        widget = stack.pop()
+        stack.extend(widget.winfo_children())
+        try:
+            if not widget.winfo_ismapped() or widget.winfo_class() not in ("Label", "TLabel"):
+                continue
+            text = widget.cget("text")
+        except Exception:
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if widget.winfo_reqwidth() > widget.winfo_width() + 2:
+            bad.append("%r 需要 %d px，只有 %d px"
+                       % (text[:28], widget.winfo_reqwidth(), widget.winfo_width()))
+    return bad
+
+
+@pytest.mark.parametrize("view", ["access", "agent"])
+def test_form_hints_wrap_instead_of_clipping_at_min_width(tmp_path, view):
+    """900×620（产品最小窗）下表单一列的说明/值文字必须换行，不能把尾巴切掉。
+
+    真缺陷（ROUND3 UI 审计 before 截图 + audit.json）：表单行第二列只分到 ~170 px，而
+    hint label 的 wraplength 是按**窗口**估的 ~620 px ⇒ grid 把它压回列宽、文字被硬切：
+    '掩码显示；粘贴新值才会覆盖' 需要 238 px 只有 170 px、'TRC20（T 开头 34 位）或 EVM（0x + 40 位）'
+    需要 205 px 只有 171 px、'http://127.0.0.1:1717/agent' 需要 193 px 只有 178 px。
+    现在改成 ``_wrap_to_column``：wraplength 跟 label 实际分到的列宽走。
+    """
+    app, root = _window_app(tmp_path, 900)
+    try:
+        root.geometry("900x620")
+        root.update()
+        app.show_view(view)
+        root.update_idletasks()
+        root.update()
+        offenders = _label_offenders(root)
+        assert not offenders, "文字被裁：" + "；".join(offenders)
+    finally:
+        root.destroy()
+
+
 @pytest.mark.parametrize("ui_scale", [None, "1.25"])
 def test_nav_item_height_does_not_drift_across_windows(tmp_path, monkeypatch, ui_scale):
     """同进程连开 5 个窗口：导航项高度与侧栏总高**不得**随窗口数漂移（ROUND3 真缺陷）。

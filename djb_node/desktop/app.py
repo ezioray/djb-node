@@ -1181,12 +1181,53 @@ class DesktopApp:
             self._wrap_targets = [label]
         return label
 
+    def _wrap_to_column(self, label: Any) -> Any:
+        """登记「按自己那一列的实际宽度换行」的文本控件（ROUND3 真缺陷）。
+
+        表单行是两层网格：外层 block 的 column1 只分到「父列宽 − 标签列(104) − 间距」，
+        900 宽单列时约 170–180 px。可 `_wrap_hint()` 是按**窗口**估的（~620），
+        label 又带着这个大 wraplength 被 grid 压回列宽 ⇒ 尾部被硬切：
+        audit 实测 'TRC20（T 开头 34 位）或 EVM（0x + 40 位）' 需要 205 px 只有 171 px、
+        'http://127.0.0.1:1717/agent' 需要 193 px 只有 178 px。用户看到的是半句话。
+        这里把 wraplength 钳到 label **实际分到**的宽度，并随列宽变化重算。
+        """
+        self._wrap(label)
+        try:
+            self._column_wrap_targets.append(label)
+        except AttributeError:                       # pragma: no cover - 还没渲染过
+            self._column_wrap_targets = [label]
+        label.bind("<Configure>", lambda event, target=label: self._fit_wrap(target), add="+")
+        return label
+
+    def _fit_wrap(self, label: Any, width: int | None = None) -> None:
+        """把单条 label 的换行宽钳到它实际分到的宽度（只减不增，防抖）。"""
+        try:
+            span = int(label.winfo_width() if width is None else width)
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        span -= 2
+        if span < 80:
+            return
+        try:
+            current = int(float(label.cget("wraplength")))
+        except Exception:                            # pragma: no cover - 防御
+            current = -1
+        if current != span:
+            try:
+                label.configure(wraplength=span)
+            except Exception:                        # pragma: no cover - 控件已销毁
+                pass
+
     def _rewrap(self) -> None:
         """宽度变了但没跨断点：只更新换行宽度，不重建控件。"""
         if not getattr(self, "_wrap_targets", None):
             return
         width = self._wrap_hint()
+        column_targets = getattr(self, "_column_wrap_targets", None) or []
         for label in self._wrap_targets:
+            if label in column_targets:              # 表单行：按自己那一列算，别用窗口估宽
+                self._fit_wrap(label)
+                continue
             try:
                 label.configure(wraplength=width)
             except Exception:                        # pragma: no cover - 控件已销毁
@@ -1774,30 +1815,30 @@ class DesktopApp:
                 if field.secret:
                     hint = ("当前 " + field.value + "｜" + hint).strip("｜")
                 if hint:
-                    self._wrap(tk.Label(
+                    self._wrap_to_column(tk.Label(
                         block, text=hint, font=fonts.sans(kit.PX_MICRO),
                         foreground=dual.color("muted_text"), background=surface,
                         anchor="w", justify="left",
-                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
+                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
                                                             pady=(3, 0))
                 self._fields[field.key] = field
                 self._vars[field.key] = variable
             else:
                 # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
                 # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
-                value_label = tk.Label(block, text=field.value,
-                                       font=fonts.for_text(field.value, kit.PX_SMALL),
-                                       foreground=dual.color("ink"), background=surface,
-                                       anchor="w", justify="left",
-                                       wraplength=self._wrap_hint())
-                self._wrap(value_label)
-                value_label.grid(row=0, column=1, sticky="w")
+                value_label = self._wrap_to_column(tk.Label(
+                    block, text=field.value,
+                    font=fonts.for_text(field.value, kit.PX_SMALL),
+                    foreground=dual.color("ink"), background=surface,
+                    anchor="w", justify="left",
+                    wraplength=self._wrap_hint()))
+                value_label.grid(row=0, column=1, sticky="we")
                 if field.hint:
-                    self._wrap(tk.Label(
+                    self._wrap_to_column(tk.Label(
                         block, text=field.hint, font=fonts.sans(kit.PX_MICRO),
                         foreground=dual.color("muted_text"), background=surface,
                         anchor="w", justify="left",
-                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
+                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
                                                             pady=(3, 0))
 
     # ── 动作
