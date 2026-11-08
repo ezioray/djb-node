@@ -539,7 +539,10 @@ def _run_cli_json(cli_args: Sequence[str], *, timeout: float = CLI_TIMEOUT_S) ->
     except Exception:                                # pragma: no cover - 配置坏了也别炸壳
         pass
     try:
-        completed = subprocess.run(command, capture_output=True, text=True,
+        # 子进程是我们自己的 CLI（stdout 强制 UTF-8），必须显式按 UTF-8 解；
+        # 中文 Windows 上沿用 cp936 会 UnicodeDecodeError（见 desktop/datasource.py）
+        completed = subprocess.run(command, capture_output=True,
+                                   encoding="utf-8", errors="replace",
                                    timeout=timeout, check=False, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         event("tray.cli_failed", level="warning", command=label,
@@ -597,7 +600,8 @@ def _run_cli_command(cli_args: Sequence[str], *,
     except Exception:                                  # 配置坏了也别炸壳
         pass
     try:
-        completed = subprocess.run(command, capture_output=True, text=True,
+        completed = subprocess.run(command, capture_output=True,
+                                   encoding="utf-8", errors="replace",
                                    timeout=timeout, check=False, env=env,
                                    stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:

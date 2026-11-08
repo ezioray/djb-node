@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -442,3 +443,61 @@ def test_cli_runner_refuses_when_home_is_not_the_configured_one(tmp_path, monkey
     with pytest.raises(ProviderError) as excinfo:
         source._cli_runner(["status"])
     assert "home" in str(excinfo.value)
+
+
+# ─────────────── CLI 子进程解码：中文 Windows 上整屏「暂不可用」的根因（0.2.3 回归）
+def test_cli_runner_forces_utf8_decoding(tmp_path, monkeypatch):
+    """父进程必须显式按 UTF-8 解子进程 stdout。
+
+    子进程是我们自己的 CLI，``cli.main()`` 会 ``_enable_utf8_stdio()`` 强制 UTF-8；
+    父进程若沿用本地代码页（中文 Windows = cp936）解码，UTF-8 中文三字节判非法 →
+    ``UnicodeDecodeError`` → payload 为空 → ``status()`` 报「状态回显不完整」→
+    token_plan / access / account 一起变「暂不可用」。这里锁死调用参数。
+    """
+    seen: dict = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs)
+        seen["command"] = list(command)
+        return subprocess.CompletedProcess(command, 0,
+                                           stdout='{"state": "online", "reason_label": "等待平台审核"}',
+                                           stderr="")
+
+    monkeypatch.setattr(ds.subprocess, "run", fake_run)
+    snapshot = make_source(tmp_path, runner=None).snapshot(sections=("status",))
+    assert snapshot.get("status")["reason_label"] == "等待平台审核"
+    assert seen.get("encoding") == "utf-8"
+    assert seen.get("errors") == "replace"
+    assert "text" not in seen          # text=True 会让 stdlib 按本地代码页解码
+
+
+@pytest.mark.skipif(os.name == "nt", reason="需要一个 POSIX 可执行垫片脚本")
+def test_cli_runner_decodes_utf8_child_output(tmp_path, monkeypatch):
+    """真起一个子进程，输出真 UTF-8 中文 → 父进程必须解出中文（不是乱码、不是空）。"""
+    script = _cli_stub(tmp_path, "child_utf8.py",
+                       "sys.stdout.buffer.write('{\"state\": \"online\", "
+                       "\"reason_label\": \"\\u7b49\\u5f85\\u5e73\\u53f0\\u5ba1\\u6838\"}'"
+                       ".encode('utf-8'))")
+    monkeypatch.setattr(ds.sys, "executable", str(script))
+    payload = make_source(tmp_path, runner=None).status()
+    assert payload["state"] == "online"
+    assert payload["reason_label"] == "等待平台审核"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="需要一个 POSIX 可执行垫片脚本")
+def test_cli_runner_tolerates_invalid_bytes(tmp_path, monkeypatch):
+    """坏字节不许把整个视图打成不可用：errors="replace" 兜底成 U+FFFD。"""
+    script = _cli_stub(tmp_path, "child_badbytes.py",
+                       "sys.stdout.buffer.write(b'{\"state\": \"online\", \"note\": \"\\xff\\xfe\"}')")
+    monkeypatch.setattr(ds.sys, "executable", str(script))
+    payload = make_source(tmp_path, runner=None).status()
+    assert payload["state"] == "online"
+    assert "\ufffd" in payload["note"]
+
+
+def _cli_stub(tmp_path, name, body):
+    """造一个可执行垫片：``sys.executable -m djb_node ...`` 会被换成它。"""
+    script = tmp_path / name
+    script.write_text("#!/usr/bin/env python3\nimport sys\n" + body + "\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script

@@ -15,11 +15,19 @@ from djb_node.desktop.app import demo_snapshot
 from djb_node.desktop.controller import ControlOutcome, DesktopController
 
 SECRET = "djb_sk_live_9f2c41aa77be"
-SPEC_ORDER = ["overview", "bench", "models", "gpu", "tasks", "receipts", "earnings",
-              "agent", "token_plan", "access", "yield", "account", "logs"]
-SPEC_TITLES = ["总览", "性能基准", "可提供模型", "GPU 监控", "任务队列", "收据", "收益",
-               "Agent 接入", "共享 Token Plan", "接入配置", "让路/节能", "账户与安全",
+#: 侧栏顺序 = IA 顺序（4 组：运行 → 收益 → 接入 → 系统；见 views.NAV_SECTIONS）
+SPEC_ORDER = ["overview", "bench", "gpu", "models", "tasks", "receipts", "earnings",
+              "token_plan", "agent", "access", "yield", "account", "logs"]
+SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "可提供模型", "任务队列", "收据", "收益",
+               "共享 Token Plan", "Agent 接入", "接入配置", "让路/节能", "账户与安全",
                "日志"]
+#: 分组口径（00-PLAN §1.1 已裁决）：组 key / 中文名 / 拉丁微标 / 成员顺序
+SPEC_SECTIONS = [
+    ("run", "运行", "RUN", ["overview", "bench", "gpu", "models", "tasks"]),
+    ("earn", "收益", "EARN", ["receipts", "earnings", "token_plan"]),
+    ("connect", "接入", "CONNECT", ["agent", "access"]),
+    ("system", "系统", "SYSTEM", ["yield", "account", "logs"]),
+]
 #: 合规红线：不许出现「许愿式」金融承诺；「不可提现」这类否定式免责声明是允许的
 FORBIDDEN_PROMISES = ("充值", "APY", "保本", "固定收益", "储值账户", "稳赚", "保证收益")
 
@@ -34,6 +42,43 @@ def test_thirteen_views_in_spec_order():
     for (key, title), expected_key, expected_title in zip(vw.VIEWS, SPEC_ORDER, SPEC_TITLES):
         assert key == expected_key
         assert title.replace(" ", "") == expected_title.replace(" ", "")
+
+
+def test_nav_sections_cover_every_view_exactly_once():
+    """分组是「加结构」不是「删项/并项」：13 项展平后必须与 VIEW_KEYS 完全一致。"""
+    assert len(vw.NAV_SECTIONS) == 4
+    flattened = [key for section in vw.NAV_SECTIONS for key in section.keys]
+    assert flattened == SPEC_ORDER
+    assert sorted(flattened) == sorted(vw.VIEW_KEYS)
+    assert len(flattened) == len(set(flattened)) == 13
+    # 每个视图都能查到所属分组，且不认识的 key 直接报错（不猜）
+    for key in vw.VIEW_KEYS:
+        assert vw.SECTION_FOR_VIEW[key].key in {section.key for section in vw.NAV_SECTIONS}
+    with pytest.raises(KeyError):
+        vw.page_kicker("nope")
+
+
+def test_nav_sections_follow_the_agreed_groups():
+    """钉住 00-PLAN §1.1 裁决：4 组、组名/微标/成员顺序一个不差。"""
+    actual = [(section.key, section.title, section.micro, list(section.keys))
+              for section in vw.NAV_SECTIONS]
+    assert actual == SPEC_SECTIONS
+    # 组顺序 = 用户旅程：先看运行，再看收益，要扩大供给才看接入，系统放最后
+    assert [section.key for section in vw.NAV_SECTIONS] == ["run", "earn", "connect", "system"]
+
+
+def test_every_page_kicker_is_two_level_ascii():
+    """页头眉标 =「组名 / 页名」两级；整串 ASCII，交给 mono 不会跳基线。"""
+    for key in vw.VIEW_KEYS:
+        kicker = vw.page_kicker(key)
+        assert kicker.isascii(), kicker
+        parts = kicker.split(" / ")
+        assert len(parts) == 2, kicker
+        assert parts[0] == vw.SECTION_FOR_VIEW[key].micro
+        assert parts[1] == vw.PAGE_MICROS[key]
+    assert vw.page_kicker("overview") == "RUN / OVERVIEW"
+    assert vw.page_kicker("token_plan") == "EARN / TOKEN PLAN"
+    assert vw.page_kicker("logs") == "SYSTEM / LOGS"
 
 
 def test_every_view_renders_from_demo_data():
@@ -103,10 +148,29 @@ def test_missing_value_is_dash_not_zero():
 
 
 def test_gpu_absent_says_so():
-    view = vw.build_view("gpu", demo_snapshot())
+    """无 GPU 时必须说实话。
+
+    演示数据自设计改版起**带一块卡**（否则总览的仪表环与四指标全是「—」，实拍看不出设计），
+    所以这里不再拿 demo 快照当「无 GPU」样本，而是自造一个 no-GPU 快照——
+    断言的意图不变：没有设备就明说，不许留空表假装正常。
+    """
+    sections = dict(demo_snapshot().sections)
+    sections["gpu"] = {"present": False, "devices": [],
+                       "note": "本机无可用 GPU（没有 nvidia-smi；没有 rocm-smi）"}
+    view = vw.build_view("gpu", ds.Snapshot(sections))
     text = view.plain_text()
     assert "无可用 GPU" in text or "暂不可用" in text
     assert view.table is not None and not view.table.rows
+
+
+def test_gpu_absent_keeps_the_overview_gauge_honest():
+    """没有 GPU 时仪表环给「—」，**不许**画成 0%（0 和「没有数据」是两件事）。"""
+    sections = dict(demo_snapshot().sections)
+    sections["gpu"] = {"present": False, "devices": [], "note": "无 GPU"}
+    hero = vw.build_view("overview", ds.Snapshot(sections)).hero
+    assert hero is not None and hero.gauge is not None
+    assert hero.gauge.ratio is None and hero.gauge.value == "—"
+    assert {metric.label: metric.value for metric in hero.metrics}["显存"] == "—"
 
 
 def test_models_incompatible_rows_greyed_with_reason():
@@ -168,12 +232,20 @@ def _token_plan_snapshot(*, upstreams, bound=True, usage=None):
     return ds.Snapshot(sections)
 
 
-def test_token_plan_nav_item_sits_right_before_access():
-    """客户找不到入口 = 导航表里根本没有；这条钉住「第 9 项、标题、在接入配置之前」。"""
+def test_token_plan_nav_item_sits_before_access_in_earn_section():
+    """客户找不到入口 = 导航表里根本没有；这条钉住「标题、在接入配置之前、属收益组末位」。
+
+    R2 分组后它从平铺第 9 项变为第 8 项（组内顺序变了，产品意图没变）：
+    先看到「共享了什么、还能共享多少」，再进「接入」组动手。
+    """
     assert ("token_plan", "共享 Token Plan") in vw.VIEWS
     order = list(vw.VIEW_KEYS)
-    assert order.index("token_plan") == 8                     # 第 9 项
+    assert order.index("token_plan") == 7                     # 第 8 项
     assert order.index("token_plan") < order.index("access")
+    assert vw.SECTION_FOR_VIEW["token_plan"].key == "earn"
+    assert vw.SECTION_FOR_VIEW["access"].key == "connect"
+    # 收益组的最后一项就是它：组内不会被别的项挤到后面
+    assert vw.SECTION_FOR_VIEW["token_plan"].keys[-1] == "token_plan"
     assert len(vw.VIEWS) == 13
 
 
@@ -229,7 +301,9 @@ def test_token_plan_today_card_uses_limiter_usage_and_receipts():
         usage=usage)
     text = vw.build_view("token_plan", snapshot).plain_text()
     assert "41892 tokens" in text
-    assert "2 张收据" in text                                  # 演示数据里的两张收据
+    # 收据数来自 receipts 域，别写死条数（演示数据会随版式需要增删）
+    rows = snapshot.sections["receipts"]["rows"]
+    assert str(len(rows)) + " 张收据" in text
 
 
 def test_token_plan_open_access_is_a_goto_action_without_network(tmp_path):
@@ -883,3 +957,32 @@ def test_bind_action_cancel_and_failure_do_not_touch_credentials():
     controller.cli = lambda argv: {"ok": False, "error": "invalid_or_expired"}
     failed = controller.action("account.bind")
     assert failed.ok is False and "invalid_or_expired" in failed.message
+
+
+# ───────────── 日志页：两行同一时间戳不许把窗口打死（0.2.3 实拍崩溃）
+def test_logs_rows_have_unique_keys_even_with_identical_timestamps():
+    """同一微秒的两行日志（init 与 daemon 各写一遍同一事件）→ Treeview iid 撞车
+    会抛 TclError「Item ... already exists」，整个窗口直接死。行 key 必须唯一。"""
+    ts = "2026-11-06T17:01:16.072172Z"
+    snapshot = ds.Snapshot({"logs": {"rows": [
+        {"ts": ts, "level": "info", "event": "daemon.start"},
+        {"ts": ts, "level": "info", "event": "daemon.start"},
+        {"ts": ts, "level": "warning", "event": "daemon.heartbeat_forbidden"},
+    ], "path": "x.log", "levels": ["all", "info"], "note": ""}})
+    view = vw.build_view("logs", snapshot)
+    keys = [row.key for row in view.table.rows]
+    assert len(keys) == 3
+    assert len(set(keys)) == 3
+    assert all(keys)                       # 空 key 会让 Tk 自动编号，等于放弃可控性
+
+
+def test_unique_iid_never_repeats_and_keeps_plain_key():
+    from djb_node.desktop.app import unique_iid
+
+    used: set[str] = set()
+    assert unique_iid("a", used) == "a"
+    used.add("a")
+    assert unique_iid("a", used) == "a#2"
+    used.add("a#2")
+    assert unique_iid("a", used) == "a#3"
+    assert unique_iid("", used) == ""      # 空 key 交给 Tk 自动编号

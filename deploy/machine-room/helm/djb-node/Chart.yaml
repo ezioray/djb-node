@@ -12,7 +12,7 @@ type: application
 # Chart 版本：模板/默认值变化时递增（SemVer）
 version: 0.1.0
 # 应用版本：与 djb-node 的 pyproject.toml [project].version 保持一致（测试会断言）
-appVersion: "0.2.2"
+appVersion: "0.2.3"
 # 依赖：只用 Deployment / DaemonSet / ConfigMap / SA / PDB 这些 1.25+ 稳定 API
 kubeVersion: ">=1.25.0-0"
 keywords:

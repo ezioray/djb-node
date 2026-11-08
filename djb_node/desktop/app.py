@@ -20,7 +20,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 from .access import ACCESS_FILE, RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED
@@ -28,7 +30,9 @@ from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
-from .views import VIEW_KEYS, VIEW_TITLES, Action, Card, Field, Row, Table, View
+from . import platform_ui
+from .views import (NAV_SECTIONS, VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
+                    Metric, RailCard, Row, Table, View, page_kicker)
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
            "demo_snapshot", "main", "make_controller"]
@@ -39,7 +43,115 @@ EXIT_OK = 0
 EXIT_HEADLESS = 3
 HEADLESS_HINT = "桌面客户端需要图形环境（tkinter + 桌面会话），当前无法启动，已跳过"
 
+#: 侧栏图标（13 项一一对应；名字都在 :attr:`ui_kit.Icon.NAMES` 里，缺一个就退化成圆点）
+NAV_ICONS = {
+    "overview": "grid", "bench": "bolt", "models": "slider", "gpu": "chip",
+    "tasks": "queue", "receipts": "doc", "earnings": "coin", "agent": "terminal",
+    "token_plan": "external", "access": "key", "yield": "moon", "account": "user",
+    "logs": "list",
+}
+
+#: 页头眉标：**组名 / 页名** 两级（B3），如 ``RUN / OVERVIEW``。
+#:
+#: 数据口径在 :func:`djb_node.desktop.views.page_kicker`（组名来自 ``NAV_SECTIONS``），
+#: 这里只做「13 个视图各一条」的派生，不再手写第二份表；整串 ASCII，走 mono 不会跳基线。
+PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
+
 TOP_NAV_KEYS = VIEW_KEYS
+
+#: 视图切换快捷键（B5）：Ctrl+1…9 直达前 9 项，Ctrl+Shift+1…4 直达后 4 项。
+#:
+#: Tk 里 Shift+数字 的 keysym 是**移位后的字符**（! @ # $），绑 ``<Control-Shift-Key-1>``
+#: 永远不触发（Xvfb 实测），必须绑移位后的 keysym；``Ctrl+PageUp/PageDown`` 前后循环
+#: 不依赖键盘布局，作为兜底。macOS 的 Command 版由 xplat 的 platform_ui 提供 modifier 后
+#: 复用同一张表（``view_shortcut_bindings(modifier="Command")``），这里只做 Control。
+SHIFTED_DIGITS = {1: "exclam", 2: "at", 3: "numbersign", 4: "dollar"}
+
+#: 状态栏提示（与绑定表同源；controller 的默认文案由 ``sync_shortcut_hint`` 替换显示）
+VIEW_SHORTCUT_HINT = "Ctrl+1…9 / Ctrl+Shift+1…4 切换视图"
+
+
+def content_item_width(canvas_width: Any) -> int:
+    """内容列宽决策（纯函数，无 Tk）：**任何时刻都不超过画布宽**（B4）。
+
+    单独抽出来是为了无窗口断言：Windows 启动即目标尺寸时，画布先配置、内容后撑宽；
+    旧实现只在画布 ``<Configure>`` 时写 item width，内容就会保持自然请求宽（≈1494）。
+    """
+    try:
+        width = int(canvas_width)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, width)
+
+
+def nav_needs_scroll(content_height: Any, viewport_height: Any) -> bool:
+    """导航区是否真的溢出（B2：滚动条只在溢出时出现，与内容区同一策略）。
+
+    显示阈值留 2px 磁滞，避免 1px 请求高摆动把滚动条自己卷进 Configure 回环。
+    """
+    try:
+        need, have = int(content_height), int(viewport_height)
+    except (TypeError, ValueError):
+        return False
+    if have <= 1:                                    # 还没 map：别猜
+        return False
+    return need > have + 2
+
+
+def view_shortcut_bindings(keys: Sequence[str] = VIEW_KEYS,
+                           modifier: str = "Control") -> tuple[tuple[str, str], ...]:
+    """(Tk 事件序列, 视图 key)：13 个视图各覆盖一次（前 9 项 + 后 4 项）。"""
+    bindings: list[tuple[str, str]] = []
+    for index, key in enumerate(tuple(keys)[:9], start=1):
+        bindings.append(("<" + modifier + "-Key-" + str(index) + ">", key))
+    for index, key in enumerate(tuple(keys)[9:13], start=1):
+        bindings.append(("<" + modifier + "-Shift-" + SHIFTED_DIGITS[index] + ">", key))
+    return tuple(bindings)
+
+
+#: 数字单元格（B7）：去币种/千分位后是纯数字，可带 %/K/M/GB 这类短单位。
+_NUMERIC_CELL = re.compile(
+    r"^[¥￥$€]?\s*[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%|k|K|m|M|x|GB|MB|ms|s)?$")
+
+
+def looks_numeric(value: Any) -> bool:
+    """``"1,234"`` / ``"¥12.00"`` / ``"98%"`` 算数字；``"—"`` / 中文 / 编号不算。"""
+    text = str(value).strip()
+    if not text or text in ("—", "-", "–"):
+        return False
+    return bool(_NUMERIC_CELL.match(text))
+
+
+def numeric_columns(columns: Sequence[str], rows: Sequence[Any]) -> set[str]:
+    """表里哪些列是数字列（B7）。
+
+    判据：该列非空单元格里 ≥80% 是数字（``looks_numeric``）。用于把
+    「Tokens / 用量 / 金额」这类列连同表头一起右对齐；编号、时间、状态保持左对齐。
+    """
+    found: set[str] = set()
+    for index, column in enumerate(columns):
+        values: list[str] = []
+        for row in rows:
+            cells = getattr(row, "cells", ())
+            if index < len(cells):
+                value = str(cells[index]).strip()
+                if value and value not in ("—", "-", "–"):
+                    values.append(value)
+        if not values:
+            continue
+        hits = sum(1 for value in values if looks_numeric(value))
+        if hits >= max(1, int(round(len(values) * 0.8))):
+            found.add(column)
+    return found
+
+
+def sync_shortcut_hint(text: Any) -> str:
+    """状态栏提示与真实绑定同步（B5）：替换 controller 默认文案里的旧说法。
+
+    ``controller.DEFAULT_MESSAGE`` 不在本流的文件所有权内（不改接口/不改文案本体），
+    显示层做同源替换；待 controller 维护者方便时再把默认文案本身更新。
+    """
+    return str(text).replace("Ctrl+1…9 切换视图", VIEW_SHORTCUT_HINT)
 
 
 class HeadlessError(RuntimeError):
@@ -71,6 +183,11 @@ class DesktopApp:
                  tk: Any = None, title: str = "DJB 联脑 · 桌面控制台",
                  bus: Any | None = None, on_quit: Any = None,
                  prefs_home: Any = None) -> None:
+        # DPI：必须在 Tk() 之前开感知（PMv2 → per-monitor → system 三级回退，幂等）
+        try:
+            platform_ui.enable_high_dpi()
+        except Exception:                          # pragma: no cover - 非 Windows 无副作用
+            pass
         self._tk = tk if tk is not None else _import_tk()
         try:
             self._root = root if root is not None else self._tk.Tk()
@@ -78,6 +195,14 @@ class DesktopApp:
             raise HeadlessError("窗口创建失败：" + type(exc).__name__) from None
         from tkinter import ttk
         self._ttk = ttk
+        # 倍率：DJB_UI_SCALE 覆盖（测试/回滚）→ 否则按 Tk 实际 DPI（aqua 恒 1.0）
+        try:
+            self._scale = float(os.environ.get("DJB_UI_SCALE") or platform_ui.ui_scale(self._root))
+        except Exception:                          # pragma: no cover - 无 Tk/非法值
+            self._scale = 1.0
+        if not (0.5 <= self._scale <= 4.0):
+            self._scale = 1.0
+        self._px = lambda n: int(round(float(n) * self._scale))
         self._controller = controller
         if getattr(controller, "save_path", None) is None:
             controller.save_path = _make_save_path(lambda: self._root)
@@ -94,8 +219,16 @@ class DesktopApp:
         self._detail_columns: tuple[str, ...] = ()
         self._vars: dict[str, Any] = {}
         self._root.title(title)
-        self._root.geometry("1180x780")
-        self._root.minsize(900, 620)
+        # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
+        try:
+            screen_w = int(self._root.winfo_screenwidth())
+            screen_h = int(self._root.winfo_screenheight())
+        except Exception:                          # pragma: no cover - 无窗口
+            screen_w = screen_h = 0
+        self._root.geometry(platform_ui.initial_geometry(
+            self._root, self._px(1180), self._px(780)))
+        self._root.minsize(*platform_ui.fit_minsize(
+            self._px(900), self._px(620), screen_w, screen_h))
         # 偏好落在数据源自己的 home（临时 home 的窗口不会写真实 ~/.djb）
         self._prefs_home = prefs_home if prefs_home is not None else getattr(
             getattr(controller, "source", None), "_home", None)
@@ -110,82 +243,480 @@ class DesktopApp:
             self._unsubscribe = self._bus.subscribe(self._on_bus)
         self.show_view(controller.view)
 
-    # ── 骨架
+    # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
+    #: 三段壳的高度（设计值；窗口总高会多出 Windows 原生标题栏 ~31px，见 R6）
+    HEADER_H = 43
+    PAGEHEAD_H = 68
+    #: 状态条 30（B6 复核）：27 时 11/10px 中文字体行高 22 + 上下留白 8 > 27，
+    #: 13 个视图全都报 ``text-clip-h``（标签 19 vs 需要 22）；30 给足行高。
+    STATUS_H = 30
+    #: 侧栏宽度（设计 208）
+    SIDEBAR_W = 208
+    #: 两列断点：< 这个宽度右栏落到主栏下面（R5/G-11 只做两档，不做图标塔）
+    #: 数值与 :mod:`ui_geom` 同源，单测里会比对（几何计算在那边，这里只是给 Tk 层引用）
+    TWO_COL_WIDTH = 1180
+
     def _build_shell(self) -> None:
-        tk, ttk = self._tk, self._ttk
+        """三段壳：应用头（跨整宽）→ 侧栏 + 主体（页头 + 滚动内容）→ 状态条（跨整宽）。
+
+        侧栏从应用头**下沿**开始，不再横跨顶栏（01 §1.1 / G-03）。
+        """
+        from . import ui_geom as geom
+        from . import ui_kit as kit
+
+        self._geom = geom
+        self._kit = kit
+        tk = self._tk
+        # fonts_for 缓存按 root 键「先到先得」：必须先按 scale 播种，再 apply_kit_styles
+        self._fonts = kit.fonts_for(self._root, scale=self._scale)
+        kit.apply_kit_styles(self._root, self._ttk)
+        if self._scale != 1.0:
+            try:                                   # 行高跟着字号一起放大（26 → 32@125%）
+                self._ttk.Style().configure("Kit.Treeview", rowheight=self._px(26))
+                kit.NavItem.HEIGHT = self._px(kit.NavItem.HEIGHT)
+            except Exception:                      # pragma: no cover - 主题缺样式
+                pass
         self._root.rowconfigure(1, weight=1)
         self._root.columnconfigure(1, weight=1)
-        top = ttk.Frame(self._root, style="Topbar.TFrame", padding=(16, 12))
-        top.grid(row=0, column=0, columnspan=2, sticky="ew")
-        top.columnconfigure(1, weight=1)
-        ttk.Label(top, text="DJB 联脑", style="TopH2.TLabel").grid(row=0, column=0, sticky="w")
-        self._view_title = ttk.Label(top, text=VIEW_TITLES[self._controller.view],
-                                     style="TopH3.TLabel")
-        self._view_title.grid(row=0, column=1, sticky="w", padx=(16, 0))
-        # 演示数据必须在窗口上贴标签：截图/录屏不许被误当成真机数据
-        self._demo_badge = None
-        if getattr(self._controller.snapshot, "source", "") == "demo":
-            self._demo_badge = ttk.Label(top, text="· 演示数据（--demo）", style="PillWait.TLabel")
-            self._demo_badge.grid(row=0, column=2, sticky="e", padx=(0, 8))
-        self._state_pill = ttk.Label(top, text="状态未知", style="PillMuted.TLabel")
-        self._state_pill.grid(row=0, column=3, sticky="e", padx=(0, 12))
-        self._theme_button = ttk.Button(top, text=self._theme_button_text(),
-                                        command=self.toggle_theme)
-        self._theme_button.grid(row=0, column=4, sticky="e", padx=(0, 8))
-        self._refresh_button = ttk.Button(top, text="刷新 / F5", command=self.refresh)
-        self._refresh_button.grid(row=0, column=5, sticky="e")
-        # 窄窗（<760）时侧栏放不下：导航改成一个下拉，仍然一个都不少
-        self._nav_combo = ttk.Combobox(top, state="readonly", takefocus=True,
-                                       values=[str(i) + " · " + VIEW_TITLES[key]
-                                               for i, key in enumerate(VIEW_KEYS, start=1)])
-        self._nav_combo.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
-        self._nav_combo.grid_remove()
-        self._nav_combo.bind("<<ComboboxSelected>>", self._on_nav_combo)
-        self._top = top
-        side = ttk.Frame(self._root, style="Sidebar.TFrame", padding=(10, 12))
-        self._side = side
+        self._build_header()
+        side = tk.Frame(self._root, background=dual.color("surface3"),
+                        width=self._px(self.SIDEBAR_W), bd=0, highlightthickness=0)
         side.grid(row=1, column=0, sticky="nsew")
-        ttk.Label(side, text="导航", style="Meta.TLabel").pack(anchor="w", padx=6, pady=(0, 8))
-        for index, key in enumerate(VIEW_KEYS, start=1):
-            button = ttk.Button(side, text=str(index) + " · " + VIEW_TITLES[key],
-                                style="Nav.TButton",
-                                takefocus=True,
-                                command=lambda name=key: self.show_view(name))
-            button.pack(fill="x", pady=1)
-            self._nav_buttons[key] = button
-        wrapper = ttk.Frame(self._root, style="App.TFrame")
-        wrapper.grid(row=1, column=1, sticky="nsew")
+        side.grid_propagate(False)                     # 固定 208：内容再长也不许撑宽
+        side.pack_propagate(False)                     # 子控件是 pack 的：这条才是真正生效的那条
+        self._side = side
+        self._build_sidebar()
+        main = tk.Frame(self._root, background=dual.color("bg"), bd=0, highlightthickness=0)
+        main.grid(row=1, column=1, sticky="nsew")
+        main.rowconfigure(1, weight=1)
+        main.columnconfigure(0, weight=1)
+        self._main = main
+        self._build_pagehead()
+        wrapper = tk.Frame(main, background=dual.color("bg"), bd=0, highlightthickness=0)
+        wrapper.grid(row=1, column=0, sticky="nsew")
         wrapper.rowconfigure(0, weight=1)
         wrapper.columnconfigure(0, weight=1)
         self._canvas = tk.Canvas(wrapper, background=dual.color("bg"), highlightthickness=0,
-                                 borderwidth=0)
+                                borderwidth=0)
         self._canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=self._canvas.yview)
+        scrollbar = self._ttk.Scrollbar(wrapper, orient="vertical", style="Kit.Vertical.TScrollbar",
+                                        command=self._canvas.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
+        self._scrollbar = scrollbar
         self._canvas.configure(yscrollcommand=scrollbar.set)
-        self._content = ttk.Frame(self._canvas, style="App.TFrame", padding=(20, 16))
+        # 滚轮直接可用（ttk 的 Scrollbar 只在指针悬停时才滚）；单一派发器：
+        # 指针在侧栏导航上滚导航、在内容区滚内容（B2：矮窗要能翻到最后一项）
+        # 滚轮按平台绑「真实会到货」的序列：X11 是 Button-4/5，绑 MouseWheel 等于没绑
+        platform_ui.bind_wheel(self._root, self._on_mousewheel)
+        padding = (self._px(26), self._px(18)) if not self._is_narrow() else (self._px(12), self._px(12))
+        self._content = tk.Frame(self._canvas, background=dual.color("bg"), bd=0,
+                                 highlightthickness=0)
         self._content_id = self._canvas.create_window((0, 0), window=self._content, anchor="nw")
+        self._content_pad = padding
         self._content.bind("<Configure>", self._on_content_resize)
         self._canvas.bind("<Configure>", self._on_canvas_resize)
-        status = ttk.Frame(self._root, style="Topbar.TFrame", padding=(16, 8))
-        status.grid(row=2, column=0, columnspan=2, sticky="ew")
-        self._status = ttk.Label(status, text=DEFAULT_MESSAGE, style="TopMeta.TLabel")
-        self._status.pack(side="left")
+        # B4：首次 map 也要把内容宽钉回画布宽（Windows 启动即目标尺寸时没有额外的 Configure）
+        self._canvas.bind("<Map>", lambda _event: self._sync_content_width(), add="+")
+        self._build_statusbar()
+        # 窄窗导航下拉（<760 时替代侧栏；一个视图都不少）
+        self._nav_combo = self._ttk.Combobox(
+            self._page_actions, state="readonly", takefocus=True, width=18,
+            values=[str(i) + " · " + VIEW_TITLES[key]
+                    for i, key in enumerate(VIEW_KEYS, start=1)])
+        self._nav_combo.bind("<<ComboboxSelected>>", self._on_nav_combo)
+        self._nav_combo.pack(side="right")
+        self._nav_combo.pack_forget()
+
+    def _build_header(self) -> None:
+        """43px 应用头：品牌 + 状态徽标 … SYNC 时刻 + 跳转 + 主题 + 刷新。
+
+        Windows 原生标题栏保留（既定取舍：不伪造 —/□/×），所以这 43px 只放应用自己的东西。
+        """
+        kit, tk = self._kit, self._tk
+        fonts = self._fonts
+        head = tk.Frame(self._root, background=dual.color("surface"), height=self._px(self.HEADER_H),
+                        bd=0, highlightthickness=0)
+        head.grid(row=0, column=0, columnspan=2, sticky="ew")
+        head.grid_propagate(False)                     # 固定 43：子控件不改变条高
+        head.pack_propagate(False)                     # 子控件用 pack：这条才是真正生效的那条
+        self._header = head
+        brand = tk.Frame(head, background=dual.color("surface"))
+        brand.pack(side="left", padx=(14, 0))
+        self._brand = brand
+        logo = tk.Canvas(brand, width=self._px(24), height=self._px(24), background=dual.color("surface"),
+                         bd=0, highlightthickness=0, takefocus=0)
+        logo.pack(side="left", pady=self._px(9))
+        logo.create_polygon(self._geom.round_rect_points(
+            0.5, 0.5, self._px(24) - 0.5, self._px(24) - 0.5, self._px(6)), smooth=True,
+            splinesteps=12, fill=dual.chart("mint_bright"),
+            outline=dual.chart("mint_bright"))
+        logo.create_text(self._px(12), self._px(12), text="D", fill=dual.color("ink"),
+                         font=fonts.sans(kit.PX_CARD, bold=True))
+        tk.Label(brand, text="DJB 联脑", font=fonts.sans(kit.PX_CARD, bold=True),
+                 foreground=dual.color("ink"), background=dual.color("surface")).pack(
+                     side="left", padx=(8, 0))
+        self._brand_sub = tk.Label(brand, text="· 节点工作台",
+                                   font=fonts.sans(kit.PX_SMALL),
+                                   foreground=dual.color("muted_text"),
+                                   background=dual.color("surface"))
+        self._brand_sub.pack(side="left", padx=(6, 0))
+        self._state_pill = kit.Chip(brand, "状态未知", tone="muted", ground=dual.color("surface"))
+        self._state_pill.pack(side="left", padx=(10, 0))
+        right = tk.Frame(head, background=dual.color("surface"))
+        right.pack(side="right", padx=(0, 12))
+        self._header_right = right
+        self._refresh_button = kit.Button(right, "刷新", self.refresh, kind="ghost",
+                                          ground=dual.color("surface"), px=kit.PX_SMALL,
+                                          height=self._px(26), pad=self._px(10))
+        self._theme_button = kit.Button(right, self._theme_button_text(), self.toggle_theme,
+                                        kind="ghost", ground=dual.color("surface"),
+                                        px=kit.PX_SMALL, height=self._px(26), pad=self._px(10))
+        self._log_button = kit.Button(right, "打开日志", lambda: self.show_view("logs"),
+                                      kind="ghost", ground=dual.color("surface"),
+                                      px=kit.PX_SMALL, height=self._px(26), pad=self._px(10))
+        self._tune_button = kit.Button(right, "调整贡献", lambda: self.show_view("yield"),
+                                       kind="primary", ground=dual.color("surface"),
+                                       px=kit.PX_SMALL, height=self._px(26), pad=self._px(12))
+        self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.PX_MICRO),
+                                    foreground=dual.color("muted_text"),
+                                    background=dual.color("surface"))
+        self._pack_header_right(narrow=False)
+        # 头下沿一条 1px 分隔线（挂在头里，换肤重建时一起销毁）：无阴影，只靠描边分层
+        tk.Frame(head, background=dual.color("line"), height=1).place(
+            x=0, y=self._px(self.HEADER_H) - 1, relwidth=1.0)
+
+    def _pack_header_right(self, *, narrow: bool) -> None:
+        """右侧控件顺序固定：SYNC · 打开日志 · 调整贡献 · 主题 · 刷新（窄窗只留后两个）。"""
+        for widget in (self._refresh_button, self._theme_button, self._log_button,
+                       self._tune_button, self._sync_label):
+            widget.pack_forget()
+        self._refresh_button.pack(side="right", padx=(6, 0))
+        self._theme_button.pack(side="right", padx=(6, 0))
+        if not narrow:
+            self._tune_button.pack(side="right", padx=(6, 0))
+            self._log_button.pack(side="right", padx=(10, 0))
+            self._sync_label.pack(side="right", padx=(12, 6))
+
+    def _build_sidebar(self) -> None:
+        """208px 侧栏：节点身份块 + 图标导航（13 项，一个都不少）+ 底部版本。"""
+        kit, tk = self._kit, self._tk
+        fonts = self._fonts
+        side = self._side
+        ground = dual.color("surface3")
+        ident = tk.Frame(side, background=ground)
+        ident.pack(fill="x", padx=16, pady=(14, 10))
+        self._ident = ident
+        tk.Label(ident, text="NODE / EDGE", font=fonts.mono(kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=ground, anchor="w").pack(fill="x")
+        self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.PX_CARD, bold=True),
+                                    foreground=dual.color("ink"), background=ground, anchor="w")
+        self._ident_name.pack(fill="x", pady=(2, 2))
+        line = tk.Frame(ident, background=ground)
+        line.pack(fill="x")
+        self._ident_dot = tk.Canvas(line, width=10, height=10, background=ground, bd=0,
+                                    highlightthickness=0, takefocus=0)
+        self._ident_dot.pack(side="left")
+        self._ident_dot.create_oval(2, 2, 8, 8, fill=dual.color("mint_text"), outline="")
+        self._ident_state = tk.Label(line, text="状态未知", font=fonts.sans(kit.PX_MICRO),
+                                     foreground=dual.color("muted_text"), background=ground,
+                                     anchor="w")
+        self._ident_state.pack(side="left", padx=(4, 0))
+        self._ident_meta = tk.Label(ident, text="—", font=fonts.sans(kit.PX_MICRO),
+                                    foreground=dual.color("muted_text"), background=ground,
+                                    anchor="w", justify="left")
+        self._ident_meta.pack(fill="x", pady=(4, 0))
+        kit.Divider(side, color=dual.color("line")).pack(fill="x", padx=12)
+        # 导航区可滚动（B2）：13 项 + 4 个分组头在 900×620 放不下，滚动条只在溢出时出现；
+        # 不创建横向滚动条，内层宽永远钉成画布宽。
+        nav_area = tk.Frame(side, background=ground)
+        nav_area.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        nav_area.rowconfigure(0, weight=1)
+        nav_area.columnconfigure(0, weight=1)
+        self._nav_area = nav_area
+        self._nav_canvas = tk.Canvas(nav_area, background=ground, highlightthickness=0,
+                                     borderwidth=0, takefocus=0)
+        self._nav_canvas.grid(row=0, column=0, sticky="nsew")
+        self._nav_scrollbar = self._ttk.Scrollbar(
+            nav_area, orient="vertical", style="Kit.Vertical.TScrollbar",
+            command=self._nav_canvas.yview)
+        self._nav_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._nav_canvas.configure(yscrollcommand=self._nav_scrollbar.set)
+        self._nav_inner = tk.Frame(self._nav_canvas, background=ground)
+        self._nav_inner_id = self._nav_canvas.create_window(
+            (0, 0), window=self._nav_inner, anchor="nw")
+        self._nav_box = self._nav_inner
+        self._nav_inner.bind("<Configure>", self._on_nav_inner_resize)
+        self._nav_canvas.bind("<Configure>", self._on_nav_canvas_resize)
+        self._nav_section_headers: dict[str, Any] = {}
+        for index, section in enumerate(NAV_SECTIONS):
+            self._render_nav_section(section, first=index == 0)
+        kit.Divider(side, color=dual.color("line")).pack(fill="x", padx=12)
+        foot = tk.Frame(side, background=ground)
+        foot.pack(fill="x", padx=16, pady=(8, 10))
+        from ..facts import CLIENT_VERSION
+        self._version_label = tk.Label(
+            foot, text="v" + CLIENT_VERSION, font=fonts.mono(kit.PX_MICRO),
+            foreground=dual.color("muted_text"), background=ground, anchor="w")
+        self._version_label.pack(side="left")
+        self._demo_chip = None
+        if getattr(self._controller.snapshot, "source", "") == "demo":
+            self._demo_chip = kit.Chip(foot, "演示数据", tone="amber", ground=ground,
+                                       px=kit.PX_MICRO, height=17)
+            self._demo_chip.pack(side="right")
+
+    def _font_for(self, text: str, px: int, *, bold: bool = False) -> Any:
+        """按文本取字体：纯 ASCII 走 mono、含中文走 sans（分组头 / 页头微标共用）。
+
+        字体流已提供 ``Fonts.for_text(text, px, bold=...)``，这里只做薄封装：
+        少一处判断口径，以后回退链/字阶调整只改 ``Fonts``。
+        """
+        for_text = getattr(self._fonts, "for_text", None)
+        if callable(for_text):
+            try:
+                return for_text(text, px, bold=bold)
+            except TypeError:                       # pragma: no cover - 旧签名（无 bold）
+                return for_text(text, px)
+        if str(text).isascii():
+            return self._fonts.mono(px, bold=bold)
+        return self._fonts.sans(px, bold=bold)
+
+    def _render_nav_section(self, section: Any, *, first: bool = False) -> None:
+        """一个分组：10px 分组头（拉丁微标 + 中文组名）+ 该组导航项。
+
+        只是给既有 :class:`ui_kit.NavItem` 加一层结构；选中态/图标/窄窗下拉都不变。
+        """
+        kit, tk = self._kit, self._tk
+        ground = dual.color("surface3")
+        head = tk.Frame(self._nav_inner, background=ground)
+        head.pack(fill="x", padx=6, pady=(0 if first else 10, 2))
+        tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=ground,
+                 anchor="w").pack(side="left")
+        tk.Label(head, text=section.title, font=self._fonts.sans(kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=ground,
+                 anchor="w").pack(side="left", padx=(6, 0))
+        self._nav_section_headers[section.key] = head
+        for key in section.keys:
+            item = kit.NavItem(self._nav_inner, text=VIEW_TITLES[key],
+                               icon=NAV_ICONS.get(key, "dot"), ground=ground,
+                               command=lambda name=key: self.show_view(name))
+            item.pack(fill="x", pady=1)
+            self._nav_buttons[key] = item
+
+    # ── 侧栏导航滚动（B2：900×620 下 13 项都能点到）
+    def _on_nav_inner_resize(self, _event: Any = None) -> None:
+        """导航内容变大：更新滚动区、把内层宽钉成画布宽、按需露出滚动条。"""
+        canvas = getattr(self, "_nav_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            width = int(canvas.winfo_width())
+            if width > 1:
+                current = canvas.itemcget(self._nav_inner_id, "width")
+                if not str(current).strip() or int(float(current)) != width:
+                    canvas.itemconfigure(self._nav_inner_id, width=width)
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        self._sync_nav_scrollbar()
+
+    def _on_nav_canvas_resize(self, event: Any) -> None:
+        try:
+            width = content_item_width(getattr(event, "width", 0))
+            current = self._nav_canvas.itemcget(self._nav_inner_id, "width")
+            if not str(current).strip() or int(float(current)) != width:
+                self._nav_canvas.itemconfigure(self._nav_inner_id, width=width)
+        except Exception:                            # pragma: no cover
+            pass
+        self._sync_nav_scrollbar()
+
+    def _sync_nav_scrollbar(self) -> None:
+        """滚动条只在 13 项 + 4 分组头真的放不下时出现（与内容区同一策略）。"""
+        canvas = getattr(self, "_nav_canvas", None)
+        bar = getattr(self, "_nav_scrollbar", None)
+        if canvas is None or bar is None:
+            return
+        try:
+            need = int(self._nav_inner.winfo_reqheight())
+            have = int(canvas.winfo_height())
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        if nav_needs_scroll(need, have):
+            if not bar.winfo_ismapped():
+                bar.grid()
+        elif need <= have - 2 and bar.winfo_ismapped():
+            bar.grid_remove()
+
+    def _is_inside(self, widget: Any, ancestor: Any) -> bool:
+        """控件是否在 ancestor 子树里（滚轮派发用；Canvas 内嵌控件也走 master 链）。"""
+        node = widget
+        while node is not None and node is not ancestor:
+            node = getattr(node, "master", None)
+        return node is ancestor
+
+    def _on_mousewheel(self, event: Any) -> str | None:
+        """滚轮只有一个入口：指针在侧栏导航上滚导航，其它地方滚内容。
+
+        三个平台的量纲交给 ``platform_ui.normalize_wheel``（X11 无 delta、只有
+        Button-4/5；aqua 的 delta 已是行数）。指针在 Treeview/Text/下拉/滚动条上时
+        让位给控件自己的类绑定，避免「滚一格，表格和整页各走一遍」。
+        """
+        steps = platform_ui.normalize_wheel(event)
+        if not steps:                                # 不是滚轮事件 / 缺量纲
+            return None
+        target = None
+        try:
+            target = self._root.winfo_containing(event.x_root, event.y_root)
+        except Exception:                            # pragma: no cover - 无窗口
+            target = None
+        nav_area = getattr(self, "_nav_area", None)
+        if target is not None and nav_area is not None and self._is_inside(target, nav_area):
+            self._nav_scroll(-steps)
+            return "break"
+        if platform_ui.is_self_scrolling(target):
+            return "break"                           # 表格/日志框自己滚，页面不动
+        self._canvas.yview_scroll(-steps, "units")
+        return "break"
+
+    def _nav_scroll(self, units: int) -> None:
+        canvas = getattr(self, "_nav_canvas", None)
+        if canvas is None:
+            return
+        try:
+            first, last = canvas.yview()
+        except Exception:                            # pragma: no cover
+            return
+        if first <= 0.0 and last >= 1.0:             # 没溢出：滚轮不该动任何东西
+            return
+        canvas.yview_scroll(int(units), "units")
+
+    def _build_pagehead(self) -> None:
+        """68px 页头：左「眉标 + 18px 标题」，右「数据时刻 + 刷新」。"""
+        kit, tk = self._kit, self._tk
+        fonts = self._fonts
+        head = tk.Frame(self._main, background=dual.color("bg"), height=self._px(self.PAGEHEAD_H),
+                        bd=0, highlightthickness=0)
+        head.grid(row=0, column=0, sticky="ew")
+        head.grid_propagate(False)
+        head.columnconfigure(0, weight=1)
+        self._pagehead = head
+        left = tk.Frame(head, background=dual.color("bg"))
+        left.grid(row=0, column=0, sticky="w", padx=(self._px(26), 0), pady=(self._px(12), self._px(12)))
+        self._page_kicker = tk.Label(left, text="OVERVIEW", font=fonts.for_text("OVERVIEW", kit.PX_MICRO),
+                                     foreground=dual.color("muted_text"),
+                                     background=dual.color("bg"), anchor="w")
+        self._page_kicker.pack(anchor="w")
+        self._view_title = tk.Label(left, text=VIEW_TITLES[self._controller.view],
+                                    font=fonts.sans(kit.PX_H1, bold=True),
+                                    foreground=dual.color("ink"), background=dual.color("bg"),
+                                    anchor="w")
+        self._view_title.pack(anchor="w")
+        right = tk.Frame(head, background=dual.color("bg"))
+        right.grid(row=0, column=1, sticky="e", padx=(0, self._px(26)))
+        self._page_actions = right
+        self._snapshot_label = tk.Label(right, text="数据截至 —", font=fonts.sans(kit.PX_MICRO),
+                                        foreground=dual.color("muted_text"),
+                                        background=dual.color("bg"))
+        self._snapshot_label.pack(side="left", padx=(0, 10))
+
+    def _build_statusbar(self) -> None:
+        """30px 状态条：左「消息」，右「GPU · 显存 · 版本 · 主题」（高度见 ``STATUS_H``）。"""
+        kit, tk = self._kit, self._tk
+        fonts = self._fonts
+        bar = tk.Frame(self._root, background=dual.color("surface3"), height=self._px(self.STATUS_H),
+                       bd=0, highlightthickness=0)
+        bar.grid(row=2, column=0, columnspan=2, sticky="ew")
+        bar.grid_propagate(False)
+        bar.pack_propagate(False)
+        self._statusbar = bar
+        self._status = tk.Label(bar, text=DEFAULT_MESSAGE, font=fonts.sans(kit.PX_MICRO),
+                                foreground=dual.color("muted_text"),
+                                background=dual.color("surface3"), anchor="w")
+        self._status.pack(side="left", padx=(self._px(14), 0), pady=self._px(4))
+        self._status_right = tk.Label(bar, text="—", font=fonts.sans(kit.PX_MICRO),
+                                      foreground=dual.color("muted_text"),
+                                      background=dual.color("surface3"), anchor="e")
+        self._status_right.pack(side="right", padx=(0, self._px(14)), pady=self._px(4))
+
+    def _sync_content_width(self) -> None:
+        """把内容列宽钉回画布宽（B4：**任何时刻**内容宽 ≤ 画布宽）。
+
+        旧实现只在画布 ``<Configure>`` 里写 item width；内容在画布配置之后才撑宽时
+        （Windows 启动即目标尺寸）内容就保持自然请求宽（≈1494）→ 右侧被窗口裁掉。
+        这里在内容自己变大 / 首次 map / 换视图 / 换主题之后都再写一次，且只在
+        「当前值与目标值不同」时写，避免和内容的 ``<Configure>`` 形成回环。
+        """
+        try:
+            target = content_item_width(self._canvas.winfo_width())
+            current = self._canvas.itemcget(self._content_id, "width")
+            current_width = int(float(current)) if str(current).strip() else 0
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        if current_width != target:
+            try:
+                self._canvas.itemconfigure(self._content_id, width=target)
+            except Exception:                        # pragma: no cover
+                pass
+        try:
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        except Exception:                            # pragma: no cover
+            pass
 
     def _on_content_resize(self, _event=None) -> None:
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        self._sync_content_width()                   # 内容请求宽变了：宽度重新收敛
+        self._sync_scrollbar()
 
     def _on_canvas_resize(self, event) -> None:
-        self._canvas.itemconfigure(self._content_id, width=max(1, event.width))
+        self._sync_content_width()                   # 画布宽变了：内容宽跟着收敛
+        self._sync_scrollbar()
+        width = int(getattr(event, "width", 0) or 0)
+        if abs(width - getattr(self, "_rewrap_width", 0)) > 24:
+            self._rewrap_width = width
+            self._rewrap()
+
+    def _sync_scrollbar(self) -> None:
+        """只在内容真的溢出时才露出滚动条（一屏装得下就没有，G-16）。
+
+        2px 磁滞（P0）：显示要 ``need > have + 2``，收起要 ``need <= have - 2``。
+        没有磁滞时，1px 的请求高摆动会让滚动条反复 grid/grid_remove，自己把自己
+        卷进 Configure 回环（1180 宽死循环的另一半）。
+        """
+        bar = getattr(self, "_scrollbar", None)
+        if bar is None:
+            return
+        try:
+            need = int(self._content.winfo_reqheight())
+            have = int(self._canvas.winfo_height())
+        except Exception:                            # pragma: no cover - 控件已销毁
+            return
+        if have <= 1:                                # 还没 map：别猜
+            return
+        try:
+            if need > have + 2:
+                if not bar.winfo_ismapped():
+                    bar.grid()
+            elif need <= have - 2 and bar.winfo_ismapped():
+                bar.grid_remove()
+        except Exception:                            # pragma: no cover
+            pass
 
     def _bind_keys(self) -> None:
         self._root.bind("<F5>", lambda _e: self.refresh())
-        for index, key in enumerate(VIEW_KEYS, start=1):
-            if index <= 9:
-                self._root.bind("<Control-Key-" + str(index) + ">",
-                                lambda _e, name=key: self.show_view(name))
+        # B5：13 个视图全部可键盘直达（Ctrl+1…9 / Ctrl+Shift+1…4）+ 前后循环兜底
+        for sequence, key in view_shortcut_bindings():
+            self._root.bind(sequence, lambda _e, name=key: self.show_view(name))
+        self._root.bind("<Control-Prior>", lambda _e: self._step_view(-1))
+        self._root.bind("<Control-Next>", lambda _e: self._step_view(1))
         self._root.bind("<Control-r>", lambda _e: self.refresh())
         self._root.bind("<Escape>", lambda _e: self._canvas.yview_moveto(0))
+
+    def _step_view(self, step: int) -> None:
+        """Ctrl+PageUp/PageDown：按 IA 顺序前后切（13 个视图循环，不依赖键盘布局）。"""
+        try:
+            key = self._controller.next_view(int(step)).key
+        except Exception:                            # pragma: no cover - 控制器异常
+            return
+        self.show_view(key)
 
     # ── 渲染
     def show_view(self, key: str) -> View:
@@ -202,6 +733,7 @@ class DesktopApp:
             self._root.update_idletasks()
         except Exception:
             pass
+        self._sync_content_width()                   # B4：换视图后内容宽仍 ≤ 画布宽
         self._page_fade()
         return view
 
@@ -235,11 +767,10 @@ class DesktopApp:
         def finish() -> None:
             self._cancel_fade()
             self._theme_name = dual.apply(self._root, self._ttk, name)
-            try:
-                self._theme_button.configure(text=self._theme_button_text())
-            except Exception:                      # pragma: no cover - 控件已销毁
-                pass
-            self._paint_backgrounds()
+            self._apply_kit_skin()                 # apply_theme 会把字体改回 11pt 点值，这里重新钉住
+            # 外壳（头/侧栏/页头/状态条）是普通 tk 控件：换肤直接整块重建
+            self._rebuild_chrome()
+            self._set_widget_text(self._theme_button, self._theme_button_text())
             view = getattr(self, "_last_view", None)
             if view is not None:
                 # 表格 tag 颜色、卡片 tone 都是渲染时取的：重画一次才真正换色
@@ -313,21 +844,34 @@ class DesktopApp:
     #: 窄窗阈值：低于这个宽度侧栏让位给内容（E10 口径 390 也算“能看全”）
     NARROW_WIDTH = 760
 
+    def _logical_width(self) -> int:
+        """窗口的**逻辑**宽（÷倍率）：断点 760/1180 是设计稿逻辑像素。
+
+        125% 下 1475 物理 = 1180 逻辑；如果拿物理宽直接比断点，1300 物理
+        （1040 逻辑）会被误判成双列，窄窗下拉也永远不触发。
+        """
+        try:
+            width = int(self._root.winfo_width())
+        except Exception:                            # pragma: no cover - 无窗口
+            return 0
+        scale = getattr(self, "_scale", 1.0) or 1.0
+        return int(round(width / float(scale))) if width > 1 else width
+
     def _is_narrow(self) -> bool:
         """窄不窄以窗口真实宽度为准（不依赖 _apply_layout 的先后顺序）。"""
         try:
-            return int(self._root.winfo_width()) < self.NARROW_WIDTH
+            return self._geom.layout_mode(self._logical_width()) == "narrow"
         except Exception:                            # pragma: no cover - 无窗口
             return False
 
     def _apply_layout(self, width: int | None = None) -> None:
-        """窗口窄了就把侧栏收成下拉：内容区拿到整宽，表格列才不会被挤没。
+        """宽度变化只做两件事：窄窗把侧栏换成下拉；跨过 1180 时双列 ↔ 单列重排。
 
         只看**根窗口**的宽度，且只在宽度真的变化时才动布局——
         子控件的 ``<Configure>`` 也会冒到这里，按事件里的 width 判断会让侧栏反复收起/展开。
         """
         try:
-            current = int(self._root.winfo_width())
+            current = self._logical_width()
         except Exception:                                  # pragma: no cover - 无窗口
             return
         if current <= 1:                                   # 还没 map：没有可用宽度
@@ -335,55 +879,40 @@ class DesktopApp:
         if current == getattr(self, "_layout_width", None):
             return
         self._layout_width = current
-        narrow = current < self.NARROW_WIDTH
-        if narrow == getattr(self, "_narrow", None):
-            return
+        mode = self._geom.layout_mode(current)
+        narrow, two_col = mode == "narrow", mode == "two"
+        flipped = (getattr(self, "_narrow", None) not in (None, narrow)
+                   or getattr(self, "_two_col_mode", None) not in (None, two_col))
         self._narrow = narrow
+        self._two_col_mode = two_col
         if narrow:
             self._side.grid_remove()
-            self._nav_combo.grid()
-            self._view_title.grid_remove()
+            self._nav_combo.pack(side="right")
+            self._snapshot_label.pack_forget()
+            self._brand_sub.pack_forget()
+            self._state_pill.pack_forget()
+            self._pack_header_right(narrow=True)
+            self._set_widget_text(self._theme_button,
+                                  "日" if self._theme_name == "day" else "夜")
         else:
             self._side.grid()
-            self._nav_combo.grid_remove()
-            self._view_title.grid()
-        # 390 宽顶栏放不下四个带字控件：把「主题 / 刷新」挪到导航下拉那一行右侧，
-        # 下拉让出两格（它本来就只需要显示当前视图名）。
-        # 窄窗要显式给 width（字符数）：ttk 默认按上一次的文字宽度记着，
-        # 光换 text 不换 width，390 宽顶栏仍会按「◐ 日间」的宽度排，把刷新挤出屏幕。
-        for widget, text, chars in (
-                (getattr(self, "_theme_button", None), self._theme_button_text(narrow), 2),
-                (getattr(self, "_refresh_button", None), "刷新" if narrow else "刷新 / F5", 4)):
-            if widget is not None:
-                try:
-                    widget.configure(text=text, width=(chars if narrow else 0))
-                except Exception:                  # pragma: no cover - 控件已销毁
-                    pass
-        if getattr(self, "_theme_button", None) is not None:
-            row = 1 if narrow else 0
-            for widget, column in ((self._theme_button, 4), (self._refresh_button, 5)):
-                try:
-                    widget.grid_configure(row=row, column=column, sticky="e",
-                                          padx=(0, 8) if column == 4 else 0)
-                except Exception:                  # pragma: no cover - 控件已销毁
-                    pass
-            try:
-                self._nav_combo.grid_configure(columnspan=4 if narrow else 6)
-                if not narrow:
-                    # grid_configure 会把 grid_remove 过的控件重新映射：宽窗要再收一次，
-                    # 否则侧栏下面会多出一条没用的下拉
-                    self._nav_combo.grid_remove()
-            except Exception:                      # pragma: no cover
-                pass
+            self._nav_combo.pack_forget()
+            self._snapshot_label.pack(side="left", padx=(0, 10))
+            if not self._brand_sub.winfo_ismapped():
+                self._brand_sub.pack(side="left", padx=(6, 0))
+            if not self._state_pill.winfo_ismapped():
+                self._state_pill.pack(side="left", padx=(10, 0))
+            self._pack_header_right(narrow=False)
+            self._set_widget_text(self._theme_button, self._theme_button_text())
         self._sync_nav(self._controller.view)
+        if flipped and hasattr(self, "_status"):
+            self._update_status()                    # 状态条文案也分窄/宽两套
         tree = getattr(self, "_tree", None)
         if tree is not None:
             self._apply_narrow_cells(narrow)         # 行文案跟着窄/宽切换
             self._fit_columns(tree)                  # 让位/回位后重排一次列宽
-        if getattr(self, "_rendered_narrow", None) not in (None, narrow) \
-                and not getattr(self, "_in_render", False):
-            # 卡片列数（3 → 1）和「让位列」都是渲染时定的：翻转后重画一次，
-            # 否则窄窗看到的是宽窗那套（卡里的值被截成「0.00 USC…」）。
+        if flipped and not getattr(self, "_in_render", False):
+            # 卡片列数、双列栅格、内距都是渲染时定的：翻转后必须重画一次
             self._relayout_pending = True
             try:
                 self._root.after_idle(self._reflow)
@@ -409,6 +938,40 @@ class DesktopApp:
                 self._fit_columns(tree)
         except Exception:                            # pragma: no cover - 窗口正在销毁
             pass
+
+    def _set_widget_text(self, widget: Any, text: str) -> None:
+        """给「Canvas 按钮」和「ttk 控件」都能用的改字助手。"""
+        if widget is None:
+            return
+        setter = getattr(widget, "set_text", None)
+        try:
+            if callable(setter):
+                setter(text)
+            else:
+                widget.configure(text=text)
+        except Exception:                            # pragma: no cover - 控件已销毁
+            pass
+
+    def _rebuild_chrome(self) -> None:
+        """换肤时整块重建外壳：tk 控件不像 ttk 那样跟样式走，重建比逐个改色可靠。"""
+        for child in list(self._root.grid_slaves()):
+            child.destroy()
+        # 旧内容控件已随外壳销毁：先断引用，否则 _apply_layout/_fit_columns 会摸到
+        # 已销毁的 Treeview（换肤时 TclError: invalid command name ...!treeview）
+        self._tree = None
+        self._table = None
+        self._detail = None
+        self._row_cells = {}
+        self._row_notes = {}
+        self._wrap_targets = []
+        self._nav_buttons = {}
+        self._nav_combo = None
+        self._layout_width = None
+        self._narrow = None
+        self._two_col_mode = None
+        self._build_shell()
+        self._apply_layout(self._root.winfo_width())
+        self._sync_content_width()                   # B4：换主题重建后宽度不变量仍成立
 
     def _apply_narrow_cells(self, narrow: bool) -> None:
         """窄窗用行级紧凑文案，回宽恢复完整文案（数据两份都在视图里，不丢字段）。"""
@@ -438,33 +1001,122 @@ class DesktopApp:
                     return
 
     def _sync_nav(self, key: str) -> None:
-        for name, button in self._nav_buttons.items():
-            button.configure(style="NavOn.TButton" if name == key else "Nav.TButton")
+        for name, item in self._nav_buttons.items():
+            item.set_active(name == key)
         combo = getattr(self, "_nav_combo", None)
         if combo is not None:
-            try:
+            try:                                           # 窄窗下拉与侧栏保持同一状态
                 index = VIEW_KEYS.index(key) + 1
                 combo.set(str(index) + " · " + VIEW_TITLES[key])
-            except (ValueError, Exception):                # pragma: no cover - 视图名变了
+            except Exception:                              # pragma: no cover - 视图名变了
                 pass
 
+    # ── 状态（状态条 / 徽标 / 侧栏身份块 / 页头时刻）
     def _update_status(self) -> None:
-        self._status.configure(text=self._controller.status_line())
-        pill = self._pill_text()
-        self._state_pill.configure(text=pill[0], style=pill[1])
+        """把快照里的状态一次写进四处：状态条消息、状态徽标、身份块、页头「数据截至」。"""
+        snapshot = self._controller.snapshot
+        self._status.configure(text=self._status_line())
+        pill, tone = self._pill_text()
+        try:
+            self._state_pill.set_text(pill, tone)
+        except Exception:                                  # pragma: no cover - 控件已销毁
+            pass
+        self._update_identity()
+        self._update_clock()
+        self._status_right.configure(text=self._status_right_text())
 
     def _pill_text(self) -> tuple[str, str]:
-        status = self._controller.snapshot.get("status")
-        if not isinstance(status, Mapping):
-            return "? 状态未知", "PillMuted.TLabel"
-        state = str(status.get("state") or "unknown")
+        """状态徽标文案 + tone（mint/amber/red/muted）；未知就说未知。"""
+        status = snapshot_section(self._controller.snapshot, "status")
+        state = str(status.get("state") or "")
         if state in ("online", "starting"):
-            return "✓ 运行中", "Pill.TLabel"
+            return "● 运行中", "mint"
         if state in ("paused", "updating"):
-            return "◐ 已暂停", "PillWait.TLabel"
+            return "◐ 已暂停", "amber"
         if state == "error":
-            return "✕ 错误", "PillFail.TLabel"
-        return "· 已停止", "PillMuted.TLabel"
+            return "✕ 错误", "red"
+        if state == "stopped":
+            return "○ 已停止", "muted"
+        return "? 状态未知", "muted"
+
+    def _update_identity(self) -> None:
+        """侧栏身份块：节点号 / 在线态 / 显卡与显存。全部来自既有数据域，缺就写「—」。"""
+        snapshot = self._controller.snapshot
+        account = snapshot_section(snapshot, "account")
+        profile = account.get("profile") if isinstance(account.get("profile"), Mapping) else {}
+        access = snapshot_section(snapshot, "access")
+        binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
+        node_id = str(profile.get("node_id") or binding.get("node_id") or "—")
+        self._ident_name.configure(text=node_id)
+        pill, _tone = self._pill_text()
+        self._ident_state.configure(text=pill.lstrip("●◐○✕? ").strip() or "状态未知")
+        gpu = snapshot_section(snapshot, "gpu")
+        devices = gpu.get("devices") if isinstance(gpu.get("devices"), list) else []
+        device = devices[0] if devices and isinstance(devices[0], Mapping) else {}
+        name = str(device.get("name") or "—")
+        if len(name) > 22:
+            name = name[:21] + "…"
+        total = device.get("memory_total_mb")
+        vram = (str(round(float(total) / 1024.0)) + " GB") if is_number(total) else "—"
+        self._ident_meta.configure(text=name + " · " + vram if device else "显卡：暂不可用")
+
+    def _update_clock(self) -> None:
+        """页头/头上的「数据截至」：只用 ``Snapshot.fetched_at``，没有就写「—」。"""
+        stamp = short_clock(self._controller.snapshot.fetched_at)
+        self._sync_label.configure(text="SYNC " + stamp)
+        self._snapshot_label.configure(text="数据截至 " + stamp)
+
+    def _status_line(self) -> str:
+        """状态条左侧消息：窄窗只留前两段（否则会挤到右侧的 GPU/版本上去）。"""
+        line = sync_shortcut_hint(self._controller.status_line())
+        if not getattr(self, "_narrow", False):
+            return line
+        parts = [part.strip() for part in line.split("·") if part.strip()]
+        return " · ".join(parts[:2])
+
+    def _status_right_text(self) -> str:
+        """状态条右侧：GPU 利用率 · 显存 · 版本 · 主题（缺值写「—」，不写 0）。"""
+        from ..facts import CLIENT_VERSION
+        snapshot = self._controller.snapshot
+        gpu = snapshot_section(snapshot, "gpu")
+        devices = gpu.get("devices") if isinstance(gpu.get("devices"), list) else []
+        device = devices[0] if devices and isinstance(devices[0], Mapping) else {}
+        util = device.get("utilization_pct")
+        used, total = device.get("memory_used_mb"), device.get("memory_total_mb")
+        theme_name = "日间" if self._theme_name == "day" else "夜间"
+        if getattr(self, "_narrow", False):
+            # 窄窗：GPU/显存留给主卡，状态条只留版本与主题（否则两段文字会叠在一起）
+            return "v" + CLIENT_VERSION + "  ·  " + theme_name
+        parts = ["GPU " + (str(int(float(util))) + "%" if is_number(util) else "—"),
+                 "显存 " + ("%.1f/%.0f GB" % (float(used) / 1024.0, float(total) / 1024.0)
+                          if is_number(used) and is_number(total) else "—"),
+                 "v" + CLIENT_VERSION,
+                 theme_name]
+        return "  ·  ".join(parts)
+
+    def _apply_kit_skin(self) -> None:
+        """把 ttk 字体与 ``*Font`` 默认字体重新钉回 ui_kit 那套（幂等，换肤后必须调一次）。
+
+        ``gui.theme.apply_theme`` 每次都写 ``option_add("*Font", (family, 11))`` 并重设裸 ttk
+        样式字体，而 ``ttk.Style`` / option 数据库都是**解释器级**的：换肤（含二次确认窗）之后
+        不重钉，就会退回「11pt 点值 + 13px 像素」两套字体并存（01-FONT-DECISION §1 F6）。
+        顺带把 ``Kit.*`` 的颜色刷新到新主题（原来换肤后表格/输入框仍是旧主题的颜色）。
+        """
+        try:
+            self._kit.apply_kit_styles(self._root, self._ttk)
+        except Exception:                          # pragma: no cover - 控件已销毁
+            pass
+
+    def _set_font(self, label: Any, text: str, px: int, *, bold: bool = False) -> None:
+        """给「内容会变」的 Label 连文案带族一起换：ASCII → mono，含中文 → sans。
+
+        只换文字不换字体，正是「中文被塞进 mono」的来源（01-FONT-DECISION §1 F1）：
+        这类标签初值是拉丁（如 ``OVERVIEW``），运行时可能被换成中文（如 ``总览``）。
+        """
+        try:
+            label.configure(text=text, font=self._fonts.for_text(text, px, bold=bold))
+        except Exception:                              # pragma: no cover - 控件已销毁
+            pass
 
     def _clear(self) -> None:
         for child in self._content.winfo_children():
@@ -474,86 +1126,450 @@ class DesktopApp:
         self._row_notes.clear()
         self._tree = None
         self._detail = None
+        self._table = None
+        self._wrap_targets = []
 
+    # ── 渲染入口
     def _render(self, view: View) -> None:
-        ttk = self._ttk
+        """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。"""
+        tk = self._tk
+        kit = self._kit
         self._last_view = view
         self._in_render = True
         self._rendered_narrow = self._is_narrow()
+        self._rendered_two_col = self._two_col()
         self._clear()
         self._view_title.configure(text=view.title)
-        ttk.Label(self._content, text=view.subtitle, style="Muted.TLabel").pack(
-            anchor="w", pady=(0, 10))
+        self._set_font(self._page_kicker,
+                       PAGE_KICKERS.get(view.key, view.key.upper()), kit.PX_MICRO)
+        pad = (12, 6) if self._rendered_narrow else (26, 6)
+        self._content_pad = pad
+        body = tk.Frame(self._content, background=dual.color("bg"), bd=0, highlightthickness=0)
+        body.pack(fill="both", expand=True, padx=pad[0], pady=pad[1])
+        self._body = body
+        if view.subtitle:
+            self._wrap(tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.PX_SMALL),
+                              foreground=dual.color("muted_text"), background=dual.color("bg"),
+                              anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
+                                  anchor="w", pady=(0, 4))
         for text in view.unavailable:
-            ttk.Label(self._content, text=text, style="Warning.TLabel",
-                      wraplength=760).pack(anchor="w", pady=(0, 4))
-        if view.cards:
-            row = ttk.Frame(self._content, style="App.TFrame")
-            row.pack(fill="x", pady=(4, 12))
-            per_row = 2 if self._is_narrow() else 3    # 窄窗一行两张：一格 ~150px，标题和值都放得下
-            for index, card in enumerate(view.cards):
-                self._render_card(row, card, index, per_row=per_row)
+            self._wrap(tk.Label(body, text="! " + text, font=self._fonts.sans(kit.PX_SMALL),
+                              foreground=dual.color("amber_text"), background=dual.color("bg"),
+                              anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
+                                  anchor="w", pady=(0, 4))
+        if view.hero is not None or view.chart is not None or view.rail:
+            self._render_dashboard(view)
+        else:
+            self._render_generic(view)
+        for note in view.notes:
+            if not note:
+                continue
+            self._wrap(tk.Label(body, text="· " + note, font=self._fonts.sans(kit.PX_MICRO),
+                              foreground=dual.color("muted_text"), background=dual.color("bg"),
+                              anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
+                                  anchor="w", pady=(2, 0))
+        self._in_render = False
+        self._sync_content_width()                   # B4：内容重排后把宽度钉回画布宽
+
+    def _wrap(self, label: Any) -> Any:
+        """登记一个「按窗口宽度换行」的文本控件（窗口变宽变窄时统一重算，只改 wraplength）。"""
+        try:
+            self._wrap_targets.append(label)
+        except AttributeError:                       # pragma: no cover - 还没渲染过
+            self._wrap_targets = [label]
+        return label
+
+    def _rewrap(self) -> None:
+        """宽度变了但没跨断点：只更新换行宽度，不重建控件。"""
+        if not getattr(self, "_wrap_targets", None):
+            return
+        width = self._wrap_hint()
+        for label in self._wrap_targets:
+            try:
+                label.configure(wraplength=width)
+            except Exception:                        # pragma: no cover - 控件已销毁
+                pass
+
+    def _wrap_hint(self) -> int:
+        """文本换行宽度（像素）：按当前窗口估，宽窗留出侧栏与内距。"""
+        try:
+            width = int(self._root.winfo_width())
+        except Exception:                              # pragma: no cover - 无窗口
+            return 620
+        if width <= 1:
+            return 620
+        side = 0 if self._is_narrow() else self._px(self.SIDEBAR_W)
+        return max(220, width - side - 2 * self._content_pad[0] - 40)
+
+    def _two_col(self) -> bool:
+        """是否双列（设计 798/360）。R5/G-11：只做两档，>=1180 双列，其余单列。"""
+        try:
+            width = self._logical_width()
+        except Exception:                              # pragma: no cover - 无窗口
+            return True
+        if width <= 1:
+            return True
+        return self._geom.layout_mode(width) == "two"
+
+    # ── 总览：双列仪表盘
+    def _render_dashboard(self, view: View) -> None:
+        tk = self._tk
+        two_col = self._two_col()
+        grid = tk.Frame(self._body, background=dual.color("bg"), bd=0, highlightthickness=0)
+        grid.pack(fill="both", expand=True)
+        if two_col:
+            # 设计栅格 798 : 360，右栏固定 340（最小可读宽）。
+            # **右栏绝不能写 weight>0 + minsize**：Tk 会在「按权重重分」和「按 reqwidth 撑开」
+            # 之间来回切（实测 1180 宽时右栏 330↔368、左栏 596↔558，Bars 宽 567↔568 无限
+            # 重绘 → update_idletasks 永不返回）。左栏吃掉剩余宽度即可。
+            grid.columnconfigure(0, weight=1, minsize=420)
+            grid.columnconfigure(1, weight=0, minsize=340)
+        else:
+            grid.columnconfigure(0, weight=1)
+        left = tk.Frame(grid, background=dual.color("bg"), bd=0, highlightthickness=0)
+        left.grid(row=0, column=0, sticky="nsew")
+        right = tk.Frame(grid, background=dual.color("bg"), bd=0, highlightthickness=0)
+        if two_col:
+            right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        else:
+            right.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        if view.hero is not None:
+            self._render_hero(left, view.hero)
+        if view.chart is not None:
+            self._render_chart(left, view.chart)
+        if view.table is not None:
+            # 总览只放「最近几张」：整页要一屏装下（G-16），完整列表在「收据」页
+            self._render_table(view.table, parent=left, max_rows=4)
+        for card in view.rail:
+            self._render_rail_card(right, card)
         if view.actions:
-            bar = ttk.Frame(self._content, style="App.TFrame")
+            bar = tk.Frame(left, background=dual.color("bg"))
+            bar.pack(fill="x", pady=(2, 0))
+            for action in view.actions:
+                self._render_action(bar, action)
+
+    def _render_hero(self, parent: Any, hero: Hero) -> None:
+        """状态主卡：左「标题 + 说明 + 运行时长 + 动作」，右 125px 仪表环，下面四指标。"""
+        kit, tk = self._kit, self._tk
+        fonts = self._fonts
+        surface = dual.color("surface")
+        card = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 10))
+        card.pack(fill="x", pady=(0, 10))
+        body = card.body
+        top = tk.Frame(body, background=surface)
+        top.pack(fill="x")
+        if hero.gauge is not None:
+            gauge = kit.Gauge(top, ground=surface)
+            gauge.pack(side="right", padx=(14, 0))
+            gauge.set(hero.gauge.ratio, hero.gauge.value, hero.gauge.label)
+        text = tk.Frame(top, background=surface)
+        text.pack(side="left", fill="both", expand=True)
+        tk.Label(text, text=hero.kicker, font=fonts.for_text(hero.kicker, kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
+        head = tk.Frame(text, background=surface)
+        head.pack(fill="x", pady=(2, 0))
+        tk.Label(head, text=hero.title, font=fonts.sans(kit.PX_HERO, bold=True),
+                 foreground=dual.color("ink"), background=surface, anchor="w").pack(side="left")
+        if hero.chip:
+            kit.Chip(head, hero.chip, tone=hero.chip_tone, ground=surface,
+                     px=kit.PX_MICRO, height=19).pack(side="left", padx=(10, 0))
+        body_label = tk.Label(text, text=hero.body, font=fonts.sans(kit.PX_SMALL),
+                              foreground=dual.color("ink2"), background=surface, anchor="w",
+                              justify="left")
+        body_label.pack(fill="x", pady=(4, 0))
+        runtime = tk.Frame(text, background=surface)
+        runtime.pack(fill="x", pady=(3, 0))
+        tk.Label(runtime, text=hero.runtime_label, font=fonts.sans(kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=surface).pack(side="left")
+        tk.Label(runtime, text=hero.runtime,
+                 font=fonts.for_text(hero.runtime, kit.PX_BODY, bold=True),
+                 foreground=dual.color("ink"), background=surface).pack(side="left", padx=(6, 0))
+        # 说明文字按卡片实际宽度换行（窗口变宽/变窄都不截断）
+        def _fit(_event: Any = None) -> None:
+            try:
+                width = max(180, text.winfo_width() - 8)
+            except Exception:                          # pragma: no cover - 控件已销毁
+                return
+            try:
+                body_label.configure(wraplength=width)
+            except Exception:                          # pragma: no cover
+                pass
+
+        card.bind("<Configure>", _fit, add="+")
+        if hero.metrics:
+            metrics = tk.Frame(body, background=surface)
+            metrics.pack(fill="x", pady=(7, 0))
+            for index, metric in enumerate(hero.metrics):
+                metrics.columnconfigure(index, weight=1, uniform="metric")
+                cell = kit.StatCell(metrics, label=metric.label, value=metric.value,
+                                    unit=metric.unit, note=metric.note, ground=surface,
+                                    value_px=kit.PX_NUM_L, align="w")
+                cell.grid(row=0, column=index, sticky="nsew", padx=(0, 10))
+        if hero.actions or hero.hint:
+            foot = tk.Frame(body, background=surface)
+            # B6：底部留 2px，别让 1px 描边贴着卡片下缘/下一行
+            foot.pack(fill="x", pady=(7, 2))
+            if hero.hint:
+                # B6：提示先 pack（side=right）并限宽换行 —— 旧实现里它排在按钮后面，
+                # 剩余宽度不够时被内容画布右缘裁掉（「已授权 1 个客户端」就是这样丢字的）。
+                tk.Label(foot, text=hero.hint, font=fonts.sans(kit.PX_MICRO),
+                         foreground=dual.color("muted_text"), background=surface,
+                         anchor="e", justify="right", wraplength=240).pack(
+                             side="right", padx=(10, 0))
+            for action in hero.actions:
+                self._render_action(foot, action, ground=surface)
+
+    def _render_chart(self, parent: Any, chart: Chart) -> None:
+        """贡献节奏柱图：没有时序就只写一句实话，不画假柱子。"""
+        kit, tk = self._kit, self._tk
+        fonts = self._fonts
+        surface = dual.color("surface")
+        card = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 10))
+        card.pack(fill="x", pady=(0, 10))
+        body = card.body
+        head = tk.Frame(body, background=surface)
+        head.pack(fill="x")
+        left = tk.Frame(head, background=surface)
+        left.pack(side="left")
+        tk.Label(left, text=chart.kicker or "CHART",
+                 font=fonts.for_text(chart.kicker or "CHART", kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
+        tk.Label(left, text=chart.title, font=fonts.sans(kit.PX_CARD, bold=True),
+                 foreground=dual.color("ink"), background=surface, anchor="w").pack(fill="x")
+        if chart.caption:
+            tk.Label(head, text=chart.caption, font=fonts.sans(kit.PX_MICRO),
+                     foreground=dual.color("muted_text"), background=surface).pack(
+                         side="right", pady=(10, 0))
+        if chart.empty:
+            tk.Label(body, text=chart.empty, font=fonts.sans(kit.PX_SMALL),
+                     foreground=dual.color("amber_text"), background=surface, anchor="w",
+                     justify="left", wraplength=520).pack(anchor="w", pady=(12, 4))
+            return
+        bars = kit.Bars(body, bars=max(1, len(chart.values)), height=78, gap=4, ground=surface)
+        bars.pack(fill="x", pady=(8, 0))
+        bars.set(chart.values, axis=chart.labels)
+        foot = tk.Frame(body, background=surface)
+        foot.pack(fill="x", pady=(2, 0))
+        tk.Label(foot, text=chart.peak, font=fonts.for_text(chart.peak, kit.PX_MICRO),
+                 foreground=dual.color("mint_text"), background=surface).pack(side="left")
+        tk.Label(foot, text=chart.foot, font=fonts.sans(kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=surface).pack(side="right")
+
+    def _render_rail_card(self, parent: Any, card: RailCard) -> None:
+        """右栏卡：SETUP（只读字段 + 跳转）/ TODAY（四宫格）/ THROTTLE（规则 + 开关）。"""
+        kit, tk = self._kit, self._tk
+        fonts = self._fonts
+        surface = dual.color("surface")
+        box = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 10))
+        box.pack(fill="x", pady=(0, 10))
+        body = box.body
+        head = tk.Frame(body, background=surface)
+        head.pack(fill="x")
+        tk.Label(head, text=card.kicker, font=fonts.for_text(card.kicker, kit.PX_MICRO),
+                 foreground=dual.color("muted_text"), background=surface, anchor="w").pack(side="left")
+        if card.note:
+            tk.Label(head, text=card.note,
+                     font=fonts.for_text(card.note, kit.PX_MICRO, bold=True),
+                     foreground=dual.color("mint_text"), background=surface).pack(side="right")
+        title = tk.Frame(body, background=surface)
+        title.pack(fill="x", pady=(2, 0))
+        tk.Label(title, text=card.title, font=fonts.sans(kit.PX_CARD, bold=True),
+                 foreground=dual.color("ink"), background=surface, anchor="w").pack(side="left")
+        if card.badge:
+            kit.Chip(title, card.badge, tone=card.badge_tone, ground=surface,
+                     px=kit.PX_MICRO, height=18).pack(side="right")
+        if card.kind == "stats" and card.stats:
+            grid = tk.Frame(body, background=surface)
+            grid.pack(fill="x", pady=(6, 0))
+            for index, stat in enumerate(card.stats):
+                row, column = divmod(index, 2)
+                grid.columnconfigure(column, weight=1, uniform="today")
+                kit.StatCell(grid, label=stat.label, value=stat.value, unit=stat.unit,
+                             note=stat.note, ground=surface, value_px=kit.PX_NUM_L,
+                             mono_value=True).grid(row=row, column=column, sticky="nsew",
+                                                  padx=(0, 10), pady=(0, 2))
+        if card.kind == "setup" and card.fields:
+            form = tk.Frame(body, background=surface)
+            form.pack(fill="x", pady=(8, 0))
+            for field in card.fields:
+                line = tk.Frame(form, background=surface)
+                line.pack(fill="x", pady=(0, 5))
+                tk.Label(line, text=field.label, font=fonts.sans(kit.PX_MICRO),
+                         foreground=dual.color("muted_text"), background=surface,
+                         anchor="w", width=12).pack(side="left")
+                tk.Label(line, text=field.value,
+                         font=fonts.for_text(field.value, kit.PX_SMALL),
+                         foreground=dual.color("ink"), background=surface,
+                         anchor="w").pack(side="left", fill="x", expand=True)
+        if card.kind == "throttle":
+            box_rows = tk.Frame(body, background=surface)
+            box_rows.pack(fill="x", pady=(8, 0))
+            for label, value, tone in card.rows:
+                line = tk.Frame(box_rows, background=surface)
+                line.pack(fill="x", pady=(0, 2))
+                tk.Label(line, text=label, font=fonts.sans(kit.PX_MICRO),
+                         foreground=dual.color("muted_text"), background=surface,
+                         anchor="w").pack(side="left")
+                colour = {"mint": "mint_text", "amber": "amber_text", "red": "red_text",
+                          "muted": "muted_text"}.get(tone, "ink")
+                tk.Label(line, text=value, font=fonts.for_text(value, kit.PX_SMALL),
+                         foreground=dual.color(colour), background=surface).pack(side="right")
+            if card.toggle is not None:
+                line = tk.Frame(box_rows, background=surface)
+                line.pack(fill="x", pady=(2, 0))
+                tk.Label(line, text=card.toggle[0], font=fonts.sans(kit.PX_MICRO),
+                         foreground=dual.color("muted_text"), background=surface).pack(side="left")
+                # 开关只读：点它等于「去让路页改」，这里不假装能改（无对应后端动作）
+                kit.Switch(line, on=bool(card.toggle[1]), ground=surface,
+                           command=lambda _on: self.show_view("yield")).pack(
+                               side="right")
+        if card.progress is not None:
+            # 进度轨（设计 G-05）：一行标签 + 6px 圆角轨，比例直接来自服务端用量
+            label, ratio, value_text = card.progress
+            head_row = tk.Frame(body, background=surface)
+            head_row.pack(fill="x", pady=(4, 0))
+            tk.Label(head_row, text=label, font=fonts.sans(kit.PX_MICRO),
+                     foreground=dual.color("muted_text"), background=surface).pack(side="left")
+            tk.Label(head_row, text=value_text,
+                     font=fonts.for_text(value_text, kit.PX_MICRO),
+                     foreground=dual.color("muted_text"), background=surface).pack(side="right")
+            track = tk.Canvas(body, width=1, height=6, background=surface, bd=0,
+                              highlightthickness=0, takefocus=0)
+            track.pack(fill="x", pady=(3, 0))
+
+            def _draw_track(_event: Any = None, canvas: Any = track,
+                            share: float = float(ratio or 0.0)) -> None:
+                width = max(1, int(canvas.winfo_width()))
+                canvas.delete("all")
+                canvas.create_polygon(
+                    self._geom.round_rect_points(0, 1, width, 5, 2), smooth=True,
+                    splinesteps=6, fill=dual.chart("ring_track"), outline="")
+                filled = max(4, int((width - 2) * max(0.0, min(1.0, share))))
+                canvas.create_polygon(
+                    self._geom.round_rect_points(1, 1, 1 + filled, 5, 2), smooth=True,
+                    splinesteps=6, fill=dual.chart("bar_peak"), outline="")
+
+            track.bind("<Configure>", _draw_track)
+        foot = tk.Frame(body, background=surface)
+        foot.pack(fill="x", pady=(7, 0))
+        for action in card.actions:
+            self._render_action(foot, action, ground=surface)
+        if card.foot:
+            tk.Label(body, text=card.foot, font=fonts.sans(kit.PX_MICRO),
+                     foreground=dual.color("muted_text"), background=surface, anchor="w",
+                     justify="left", wraplength=300).pack(anchor="w", pady=(5, 0))
+
+    # ── 其余 12 视图：通用卡片 + 表格 + 字段
+    def _render_generic(self, view: View) -> None:
+        tk = self._tk
+        if view.cards:
+            grid = tk.Frame(self._body, background=dual.color("bg"), bd=0, highlightthickness=0)
+            grid.pack(fill="x", pady=(0, 12))
+            per_row = self._cards_per_row(len(view.cards))
+            for index, card in enumerate(view.cards):
+                self._render_card(grid, card, index, per_row=per_row)
+            for column in range(per_row):
+                grid.columnconfigure(column, weight=1, uniform="card")
+        # 有表单的页：卡片 → 字段 → 动作（保存）→ 表格；没有表单的页：卡片 → 动作 → 表格
+        if view.fields:
+            self._render_fields(view.fields, view.key)
+        if view.actions:
+            bar = tk.Frame(self._body, background=dual.color("bg"))
             bar.pack(fill="x", pady=(0, 12))
             for action in view.actions:
                 self._render_action(bar, action)
         if view.table is not None:
             self._render_table(view.table)
-        if view.fields:
-            self._render_fields(view.fields, view.key)
-        for note in view.notes:
-            if not note:
-                continue
-            ttk.Label(self._content, text="· " + note, style="Meta.TLabel",
-                      wraplength=760).pack(anchor="w", pady=(6, 0))
-        self._in_render = False
 
-    def _render_card(self, parent, card: Card, index: int, *, per_row: int = 3) -> None:
-        """指标卡：宽窗每行 3 张、窄窗一列；取值按 tone 上色，文字按可用宽度换行。"""
-        ttk = self._ttk
+    def _cards_per_row(self, count: int = 0) -> int:
+        """宽窗 4 张、中宽 2 张、窄窗 1 张（设计是四宫格；不许再把第三张挤出窗口）。
+
+        张数不能整除时优先换列数（6 张 → 3 列 2 行），别让最后一行孤零零挂两张。
+        """
+        try:
+            width = self._logical_width()
+        except Exception:                              # pragma: no cover - 无窗口
+            width = 1440
+        try:
+            limit = 4 if width <= 1 else self._geom.cards_per_row(width)
+            return self._geom.card_columns(count, limit)
+        except Exception:                              # pragma: no cover - 还没建壳
+            return 4
+
+    def _render_card(self, parent: Any, card: Card, index: int, *, per_row: int = 4) -> None:
+        """指标卡：圆角 + 1px 描边 + 白底，取值按 tone 上色，文字按卡片实宽换行。"""
+        kit, tk = self._kit, self._tk
+        fonts = self._fonts
+        surface = dual.color("surface")
         row, column = divmod(index, per_row)
-        pad = (8, 8) if per_row < 3 else (14, 12)
-        frame = ttk.Frame(parent, style="Card.TFrame", padding=pad)
-        frame.grid(row=row, column=column, sticky="nsew", padx=(0, 10), pady=(0, 10))
-        parent.columnconfigure(column, weight=1, uniform="card")
-        ttk.Label(frame, text=card.title, style="CardMuted.TLabel").pack(anchor="w")
-        value_style = {"mint": "ValueMint.TLabel", "amber": "ValueWait.TLabel",
-                       "red": "ValueFail.TLabel", "muted": "ValueMuted.TLabel",
-                       "default": "ValueDefault.TLabel"}.get(card.tone, "ValueDefault.TLabel")
-        # 窄窗卡只有 ~100px 宽：wraplength 还写 240 就会被裁成「0.00 USC…」，按真实格宽换行
-        wrap = 240 if not self._is_narrow() else max(
-            80, (self._root.winfo_width() - 40) // per_row - 30)
-        ttk.Label(frame, text=card.value, style=value_style, wraplength=wrap).pack(
-            anchor="w", pady=(4, 0))
+        box = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 11))
+        box.grid(row=row, column=column, sticky="nsew", padx=(0, 10), pady=(0, 10))
+        body = box.body
+        tk.Label(body, text=card.title, font=fonts.sans(kit.PX_CARD, bold=True),
+                 foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
+        tone = {"mint": "mint_text", "amber": "amber_text", "red": "red_text",
+                "muted": "muted_text"}.get(card.tone, "ink")
+        value = tk.Label(body, text=card.value, font=fonts.sans(kit.PX_NUM_L, bold=True),
+                         foreground=dual.color(tone), background=surface, anchor="w",
+                         justify="left")
+        value.pack(fill="x", pady=(3, 0))
+        meta = None
         if card.meta:
-            ttk.Label(frame, text=card.meta, style="CardMuted.TLabel", wraplength=wrap).pack(
-                anchor="w", pady=(4, 0))
+            meta = tk.Label(body, text=card.meta, font=fonts.sans(kit.PX_MICRO),
+                            foreground=dual.color("muted_text"), background=surface,
+                            anchor="w", justify="left")
+            meta.pack(fill="x", pady=(3, 0))
+
+        def _fit(_event: Any = None) -> None:
+            try:
+                width = max(90, box.winfo_width() - 30)
+            except Exception:                          # pragma: no cover - 控件已销毁
+                return
+            for widget in (value, meta):
+                if widget is None:
+                    continue
+                try:
+                    widget.configure(wraplength=width)
+                except Exception:                  # pragma: no cover
+                    pass
+
+        box.bind("<Configure>", _fit, add="+")
 
     def _ttk_family(self) -> str:
         from ..gui.theme import FONT
         return FONT[0]
 
-    def _render_action(self, parent, action: Action) -> None:
-        ttk = self._ttk
-        button = ttk.Button(parent, text=action.label, takefocus=True,
-                            style="Primary.TButton" if action.primary else "TButton",
-                            command=lambda key=action.key: self._on_action(key))
-        if not action.enabled:
-            button.state(["disabled"])
+    def _render_action(self, parent: Any, action: Action, *,
+                       ground: str | None = None) -> None:
+        """动作按钮：主/次两档；置灰时旁边写原因（不隐藏，C9 既有行为）。"""
+        kit, tk = self._kit, self._tk
+        base = ground or dual.color("bg")
+        target = (lambda name=action.nav: self.show_view(name)) if action.nav else \
+            (lambda key=action.key: self._on_action(key))
+        button = kit.Button(parent, action.label, target,
+                            kind="primary" if action.primary else "ghost", ground=base,
+                            px=kit.PX_SMALL, height=29, pad=12, enabled=action.enabled)
         button.pack(side="left", padx=(0, 8))
         if not action.enabled and action.reason:
-            ttk.Label(parent, text=action.reason, style="Meta.TLabel").pack(
-                side="left", padx=(0, 12))
+            tk.Label(parent, text=action.reason, font=self._fonts.sans(kit.PX_MICRO),
+                     foreground=dual.color("muted_text"), background=base).pack(
+                         side="left", padx=(0, 10))
 
-    def _render_table(self, table: Table) -> None:
+    def _render_table(self, table: Table, parent: Any = None,
+                      max_rows: int = 12) -> None:
+        """表格：保留 ttk.Treeview（``_tree`` / ``_row_cells`` 是既有契约），只换外观。"""
         self._table = table
         narrow = self._is_narrow()
         tk, ttk = self._tk, self._ttk
-        frame = ttk.Frame(self._content, style="Card.TFrame", padding=(1, 1))
-        frame.pack(fill="both", expand=True, pady=(0, 10))
-        tree = ttk.Treeview(frame, columns=list(table.columns), show="headings",
-                            height=min(12, max(3, len(table.rows) + 1)), selectmode="browse")
+        kit = self._kit
+        target = parent if parent is not None else getattr(self, "_body", self._content)
+        card = kit.RoundedCard(target, ground=dual.color("bg"), pad=(14, 11))
+        card.pack(fill="both", expand=True, pady=(0, 10))
+        body = card.body
+        tree = ttk.Treeview(body, columns=list(table.columns), show="headings",
+                            style="Kit.Treeview",
+                            height=min(max_rows, max(3, len(table.rows) + 1)),
+                            selectmode="browse")
         for column in table.columns:
             tree.heading(column, text=column, anchor="w")
             tree.column(column, anchor="w", width=120, stretch=True)
@@ -565,11 +1581,14 @@ class DesktopApp:
             tree.tag_configure("tone-" + name, foreground=color)
         self._row_notes = {}
         self._row_cells = {}
+        used_iids: set[str] = set()
         for row in table.rows:
             tags = ["tone-" + (row.tone or "default")]
             if row.disabled:
                 tags.append("disabled")          # 标灰优先于语义色
-            iid = row.key or ""
+            iid = unique_iid(row.key or "", used_iids)
+            if iid:
+                used_iids.add(iid)
             values = row.cells
             if narrow and getattr(row, "narrow", ()) and len(row.narrow) == len(row.cells):
                 values = row.narrow              # 窄窗用紧凑文案，详情抽屉仍看完整字段
@@ -583,18 +1602,25 @@ class DesktopApp:
         self._fit_columns(tree)
         tree.bind("<Configure>", lambda _event, view=tree: self._fit_columns(view), add="+")
         if not table.rows:
-            ttk.Label(frame, text=table.empty, style="CardMuted.TLabel",
-                      padding=(12, 16)).pack(anchor="w")
-        # 详情抽屉：选中一行就在表格下面展开字段（键盘 ↑↓ 也生效）
-        self._detail = ttk.Frame(self._content, style="CardAlt.TFrame", padding=(14, 10))
+            tk.Label(body, text=table.empty, font=self._fonts.sans(kit.PX_SMALL),
+                     foreground=dual.color("muted_text"), background=dual.color("surface"),
+                     anchor="w").pack(anchor="w", pady=(10, 2))
+        # 详情抽屉：选中一行就在表格下面展开字段（键盘 ↑↓ 也生效；本轮不改抽屉形态）
+        self._detail = tk.Frame(body, background=dual.color("surface3"), bd=0,
+                                highlightthickness=0)
         self._detail_columns = tuple(table.columns)
         self._tree = tree
         if table.rows:
             tree.bind("<<TreeviewSelect>>", self._on_row_select)
-            ttk.Label(self._content, text="选中一行看详情（↑↓ 或点击）",
-                      style="Meta.TLabel").pack(anchor="w")
+            tk.Label(body, text="选中一行看详情（↑↓ 或点击）",
+                     font=self._fonts.sans(kit.PX_MICRO),
+                     foreground=dual.color("muted_text"),
+                     background=dual.color("surface")).pack(anchor="w", pady=(6, 0))
         if table.note:
-            ttk.Label(self._content, text=table.note, style="Meta.TLabel").pack(anchor="w")
+            self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.PX_MICRO),
+                              foreground=dual.color("muted_text"),
+                              background=dual.color("surface"), anchor="w",
+                              justify="left", wraplength=self._wrap_hint())).pack(anchor="w", pady=(4, 0))
 
     def _fit_columns(self, tree: Any) -> None:
         """列宽按可视宽度分配，保证所有可见列都在首屏内（Treeview 没有横向滚动条）。
@@ -629,18 +1655,19 @@ class DesktopApp:
             weights.append(float(max(4, longest)))
         total = sum(weights) or 1.0
         floor = 40
-        remaining = available
         headers = dict(getattr(table, "narrow_headers", ()) or ())
-        for column in shown:
-            text = headers.get(column, column) if narrow else column
-            tree.heading(column, text=text, anchor="w")
-        widths: list[int] = []
+        # 末列右对齐（设计 G-07）+ 数字列右对齐（B7）：数字/结论靠右，整列一条线
+        numeric = numeric_columns(all_columns, rows)
         for index, column in enumerate(shown):
-            share = max(floor, int(available * weights[index] / total))
-            if index == len(shown) - 1:
-                share = max(floor, remaining)
-            widths.append(share)
-            remaining -= share
+            text = headers.get(column, column) if narrow else column
+            anchor = "e" if (index == len(shown) - 1 or column in numeric) else "w"
+            tree.heading(column, text=text, anchor=anchor)
+        # 按权重分配，舍入误差给最宽的一列（别让末列只剩「剩余」而被挤扁）
+        widths: list[int] = [max(floor, int(available * weight / total)) for weight in weights]
+        slack = available - sum(widths)
+        if slack:
+            widest = max(range(len(widths)), key=lambda i: widths[i])
+            widths[widest] = max(floor, widths[widest] + slack)
         # 短列也要放得下表头 + 典型值（「校验」列被压到 43px 时只剩「无副」两个字）
         for index, column in enumerate(shown):
             header = headers.get(column, column) if narrow else column
@@ -658,13 +1685,15 @@ class DesktopApp:
                 if donor != index and widths[donor] - gap >= floor:
                     widths[donor] -= gap
                     widths[index] = need
-        for column, width in zip(shown, widths):
-            tree.column(column, width=width, stretch=True)
+        for index, (column, width) in enumerate(zip(shown, widths)):
+            tree.column(column, width=width, stretch=True,
+                        anchor="e" if (index == len(shown) - 1 or column in numeric) else "w")
         self._column_widths = tuple(int(tree.column(column, "width")) for column in shown)
         self._column_viewport = available
         self._hidden_columns = tuple(hidden)
 
     def _on_row_select(self, _event=None) -> None:
+        tk = self._tk                                    # note 行要用；此前漏了，带备注的收据一选就 NameError
         tree = getattr(self, "_tree", None)
         detail = getattr(self, "_detail", None)
         if tree is None or detail is None:
@@ -682,56 +1711,100 @@ class DesktopApp:
             self._controller.select_row(self._controller.view, values[0] if values else "")
         except Exception:
             pass
-        detail.pack(fill="x", pady=(0, 10))
+        detail.pack(fill="x", pady=(8, 2), padx=0)
+        surface = dual.color("surface3")
+        fonts = self._fonts
         for column, value in zip(self._detail_columns, values):
-            line = self._ttk.Frame(detail, style="CardAlt.TFrame")
-            line.pack(fill="x", pady=1)
-            self._ttk.Label(line, text=column, style="CardMuted.TLabel", width=14,
-                            anchor="w").pack(side="left")
-            self._ttk.Label(line, text=str(value), style="Card.TLabel").pack(side="left")
+            line = self._tk.Frame(detail, background=surface)
+            line.pack(fill="x", pady=1, padx=10)
+            self._tk.Label(line, text=column, font=fonts.sans(self._kit.PX_MICRO),
+                           foreground=dual.color("muted_text"), background=surface,
+                           width=12, anchor="w").pack(side="left")
+            self._tk.Label(line, text=str(value),
+                           font=fonts.for_text(str(value), self._kit.PX_SMALL),
+                           foreground=dual.color("ink"), background=surface,
+                           anchor="w").pack(side="left")
         note = self._row_notes.get(selection[0], "")
         if note:
-            self._ttk.Label(detail, text="原因：" + note, style="CardMuted.TLabel").pack(
-                anchor="w", pady=(4, 0))
+            self._wrap(tk.Label(detail, text="原因：" + note,
+                                    font=fonts.sans(self._kit.PX_MICRO),
+                                    foreground=dual.color("amber_text"), background=surface,
+                                    anchor="w", justify="left",
+                                    wraplength=self._wrap_hint())).pack(anchor="w", padx=10, pady=(4, 6))
 
-    def _render_fields(self, fields: Sequence[Field], view_key: str) -> None:
-        """字段区：标签 + 输入框 + 下一行提示（保存按钮在上方动作条，不重复）。"""
-        ttk = self._ttk
-        tk = self._tk
-        box = ttk.Frame(self._content, style="Card.TFrame", padding=(16, 14))
-        box.pack(fill="x", pady=(4, 10))
-        ttk.Label(box, text="可编辑字段" if any(f.editable for f in fields) else "详情",
-                  style="H3.TLabel").pack(anchor="w", pady=(0, 8))
-        for field in fields:
-            block = ttk.Frame(box, style="Card.TFrame")
-            block.pack(fill="x", pady=(0, 8))
+    def _render_fields(self, fields: Sequence[Field], view_key: str,
+                       parent: Any = None) -> None:
+        """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。"""
+        kit, tk, ttk = self._kit, self._tk, self._ttk
+        fonts = self._fonts
+        surface = dual.color("surface")
+        target = parent if parent is not None else getattr(self, "_body", self._content)
+        card = kit.RoundedCard(target, ground=dual.color("bg"), pad=(16, 14))
+        card.pack(fill="x", pady=(0, 10))
+        body = card.body
+        editable = any(field.editable for field in fields)
+        tk.Label(body, text="可编辑字段" if editable else "详情",
+                 font=fonts.sans(kit.PX_CARD, bold=True), foreground=dual.color("ink"),
+                 background=surface, anchor="w").pack(anchor="w", pady=(0, 10))
+        per_row = 1 if (self._is_narrow() or len(fields) <= 2) else 2
+        grid = tk.Frame(body, background=surface)
+        grid.pack(fill="x")
+        for column in range(per_row):
+            grid.columnconfigure(column, weight=1, uniform="field")
+        for index, field in enumerate(fields):
+            row, column = divmod(index, per_row)
+            block = tk.Frame(grid, background=surface)
+            block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
+            # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
+            block.columnconfigure(0, minsize=104)
             block.columnconfigure(1, weight=1)
-            ttk.Label(block, text=field.label, style="CardMuted.TLabel", width=18,
-                      anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 12))
+            tk.Label(block, text=field.label, font=fonts.sans(kit.PX_MICRO),
+                     foreground=dual.color("muted_text"), background=surface,
+                     anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
             if field.editable:
                 variable = tk.StringVar(value="" if field.secret else field.value)
-                entry = ttk.Entry(block, textvariable=variable, width=48)
+                entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
+                                  width=28 if per_row > 1 else 44)
                 if field.secret:
                     entry.configure(show="•")
                 entry.grid(row=0, column=1, sticky="ew")
                 hint = field.hint or ""
                 if field.secret:
                     hint = ("当前 " + field.value + "｜" + hint).strip("｜")
-                ttk.Label(block, text=hint, style="CardMuted.TLabel", wraplength=620).grid(
-                    row=1, column=1, sticky="w", pady=(2, 0))
+                if hint:
+                    self._wrap(tk.Label(
+                        block, text=hint, font=fonts.sans(kit.PX_MICRO),
+                        foreground=dual.color("muted_text"), background=surface,
+                        anchor="w", justify="left",
+                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
+                                                            pady=(3, 0))
                 self._fields[field.key] = field
                 self._vars[field.key] = variable
             else:
-                ttk.Label(block, text=field.value, style="Card.TLabel").grid(
-                    row=0, column=1, sticky="w")
+                # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
+                # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
+                value_label = tk.Label(block, text=field.value,
+                                       font=fonts.for_text(field.value, kit.PX_SMALL),
+                                       foreground=dual.color("ink"), background=surface,
+                                       anchor="w", justify="left",
+                                       wraplength=self._wrap_hint())
+                self._wrap(value_label)
+                value_label.grid(row=0, column=1, sticky="w")
                 if field.hint:
-                    ttk.Label(block, text=field.hint, style="CardMuted.TLabel",
-                              wraplength=620).grid(row=1, column=1, sticky="w", pady=(2, 0))
+                    self._wrap(tk.Label(
+                        block, text=field.hint, font=fonts.sans(kit.PX_MICRO),
+                        foreground=dual.color("muted_text"), background=surface,
+                        anchor="w", justify="left",
+                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="w",
+                                                            pady=(3, 0))
 
     # ── 动作
     def _on_action(self, key: str) -> None:
-        for name, variable in self._vars.items():
-            self._controller.set_draft(name, variable.get())
+        for name, variable in list(self._vars.items()):
+            try:
+                self._controller.set_draft(name, variable.get())
+            except Exception:                            # 变量随旧视图销毁：跳过，不让动作静默不执行
+                continue
         result = self._controller.action(key, confirm=self._confirm)
         if result.effect == "copy":
             self._copy(result.payload)
@@ -788,6 +1861,7 @@ class DesktopApp:
         tk, ttk = self._tk, self._ttk
         window = tk.Toplevel(self._root)
         dual.apply(window, ttk, self._theme_name)
+        self._apply_kit_skin()                     # 同上：option 数据库是解释器级的，别被改回 11pt
         window.title("DJB / 确认本机控制")
         window.geometry("560x260")
         choice = [False]
@@ -843,6 +1917,36 @@ class DesktopApp:
 
 
 # ─────────────────────────────────────────────────────────────── 演示 / 入口
+def snapshot_section(snapshot: Any, name: str) -> Mapping[str, Any]:
+    """取一个数据域（不是 Mapping 就当空，调用方各自写「暂不可用」）。"""
+    value = snapshot.get(name)
+    return value if isinstance(value, Mapping) else {}
+
+
+def is_number(value: Any) -> bool:
+    """真·数字（``bool`` 不算；``None``/空串/非数字 → False）。"""
+    if value is None or isinstance(value, bool) or value == "":
+        return False
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def short_clock(value: Any) -> str:
+    """「数据截至」用的时刻：解析成功给 ``HH:MM:SS``，解析不了给「—」（绝不编时间）。"""
+    text = str(value or "").strip()
+    if not text:
+        return "—"
+    if text[-1] in "Zz":
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text).strftime("%H:%M:%S")
+    except ValueError:
+        return text[11:19] if len(text) >= 19 else "—"
+
+
 def demo_snapshot() -> Snapshot:
     """确定性的演示数据（截图取证用；不连网络、不读用户目录）。"""
     return FakeDataSource(_DEMO_SECTIONS, source="demo").snapshot()
@@ -860,9 +1964,14 @@ _DEMO_SECTIONS = {
                               "next_step": "无需处理"},
                              {"id": "acceleration", "level": "warn",
                               "summary": "未检测到 GPU 加速",
-                              "next_step": "CPU 模式可运行，收益按 CPU 计"}]},
-        "gpu": {"present": False, "devices": [],
-                "note": "本机无可用 GPU（没有 nvidia-smi；没有 rocm-smi）"},
+                              "next_step": "CPU 模式可运行，收益按 CPU 单价计"}]},
+        # 演示数据里的 GPU：与 parse_nvidia_smi 的字段形状**完全一致**（不新增字段），
+        # 真机没有 GPU 时仍走 present=False 那条真话路径（见 test_gpu_absent_says_so）。
+        "gpu": {"present": True,
+                "devices": [{"vendor": "nvidia", "name": "NVIDIA GeForce RTX 4070",
+                             "memory_total_mb": 12282, "memory_used_mb": 9830,
+                             "temperature_c": 62, "utilization_pct": 62}],
+                "note": "nvidia-smi"},
         "models": {"catalog": [
             {"id": "qwen2.5-7b-instruct", "context": 32768, "offered": True},
             {"id": "llama-3.1-8b-instruct", "context": 131072, "offered": True},
@@ -874,11 +1983,58 @@ _DEMO_SECTIONS = {
             {"id": "t-8821", "state": "running", "elapsed_s": 12, "tokens": 1536},
             {"id": "t-8820", "state": "done", "elapsed_s": 43, "tokens": 8192,
              "receipt_id": "rcpt-77a1"}], "origin": "local", "note": "云端任务列表暂不可用"},
+        # 演示收据：跨 24 小时铺开（裁决 R3）——节奏图按 created_at 逐小时聚合，
+        # 所以演示数据必须**有时间跨度**，否则实拍里只有一根柱子。
+        # 时间窗以快照 fetched_at（2026-11-01T12:00+0800）为锚点往回 24 小时，
+        # 故最早一条落在 10-31T05:32Z（=13:32+08），最晚 11-01T04:31Z（=12:31+08）。
+        # token 数故意有峰谷，形状才像真实工作量；全部为演示值，窗口上有「演示数据」标注。
         "receipts": {"rows": [
-            {"receipt_id": "rcpt-77a1", "created_at": "2026-11-01T03:12:00Z", "tokens": 8192,
-             "status": "verified"},
+            {"receipt_id": "rcpt-7781", "created_at": "2026-10-31T05:32:00Z", "tokens": 512,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7782", "created_at": "2026-10-31T06:10:00Z", "tokens": 1024,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7783", "created_at": "2026-10-31T07:41:00Z", "tokens": 2048,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7784", "created_at": "2026-10-31T09:05:00Z", "tokens": 4096,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7785", "created_at": "2026-10-31T10:22:00Z", "tokens": 8192,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7786", "created_at": "2026-10-31T10:58:00Z", "tokens": 1024,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7787", "created_at": "2026-10-31T12:33:00Z", "tokens": 2048,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7788", "created_at": "2026-10-31T13:47:00Z", "tokens": 6144,
+             "state": "rejected", "rejected_code": "46001"},
+            {"receipt_id": "rcpt-7789", "created_at": "2026-10-31T14:02:00Z", "tokens": 8192,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-778a", "created_at": "2026-10-31T15:19:00Z", "tokens": 4096,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-778b", "created_at": "2026-10-31T16:40:00Z", "tokens": 2048,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-778c", "created_at": "2026-10-31T17:11:00Z", "tokens": 512,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-778d", "created_at": "2026-10-31T18:26:00Z", "tokens": 1024,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-778e", "created_at": "2026-10-31T19:33:00Z", "tokens": 3072,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-778f", "created_at": "2026-10-31T20:45:00Z", "tokens": 12288,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7790", "created_at": "2026-10-31T21:07:00Z", "tokens": 2048,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7791", "created_at": "2026-10-31T22:50:00Z", "tokens": 1024,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7792", "created_at": "2026-10-31T23:15:00Z", "tokens": 512,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7793", "created_at": "2026-11-01T00:38:00Z", "tokens": 2048,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-7794", "created_at": "2026-11-01T01:52:00Z", "tokens": 4096,
+             "state": "accepted"},
             {"receipt_id": "rcpt-77a0", "created_at": "2026-11-01T02:44:00Z", "tokens": 2048,
-             "status": "pending"}], "origin": "local", "note": ""},
+             "state": "recorded"},
+            {"receipt_id": "rcpt-77a1", "created_at": "2026-11-01T03:12:00Z", "tokens": 8192,
+             "state": "accepted"},
+            {"receipt_id": "rcpt-77a2", "created_at": "2026-11-01T04:31:00Z", "tokens": 4096,
+             "state": "accepted"}], "origin": "local", "note": ""},
         "earnings": {"balance": "128.40", "today": "6.12", "currency": "USDT",
                      "pending": "1.80", "settled": "4.32",
                      "payouts": [{"id": "po-31", "amount": "4.32", "currency": "USDT",
@@ -949,6 +2105,24 @@ def _make_save_path(root_getter):
     return ask
 
 
+def unique_iid(key: str, used: set[str]) -> str:
+    """Treeview 的行 id 必须唯一。
+
+    撞 key 时 Tk 抛 ``TclError: Item ... already exists``，而它是从
+    ``tree.insert()`` 里抛出来的——一旦冒泡，整个窗口直接死（0.2.3 实拍里
+    「日志」页就是这么崩的：同一微秒的两行日志用了同一个 ts 当 key）。
+    这里统一去重：``a`` / ``a#2`` / ``a#3``……空 key 交给 Tk 自动编号。
+    """
+    if not key:
+        return ""
+    candidate = key
+    suffix = 1
+    while candidate in used:
+        suffix += 1
+        candidate = "%s#%d" % (key, suffix)
+    return candidate
+
+
 def _make_cli_runner(home):
     """本机命令通道：显式带上 ``DJB_HOME``，避免子进程读到别的 home。"""
     def run(argv):
@@ -961,7 +2135,11 @@ def _make_cli_runner(home):
         if "--json" not in argv:
             command.append("--json")
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=20,
+            # 与 datasource._cli_runner 同一条规矩：子进程是我们自己的 CLI，它按 UTF-8
+            # 写 stdout（cli.main()._enable_utf8_stdio），这里必须显式按 UTF-8 解，
+            # 否则中文 Windows 上按 cp936 解会 UnicodeDecodeError → 动作区报错。
+            completed = subprocess.run(command, capture_output=True,
+                                       encoding="utf-8", errors="replace", timeout=20,
                                        env=env, stdin=subprocess.DEVNULL, check=False)
         except subprocess.TimeoutExpired:
             raise ProviderError("本地命令超时（20s）") from None

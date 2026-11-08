@@ -157,16 +157,30 @@ class DesktopController:
         return self.show(VIEW_KEYS[index])
 
     def refresh(self, sections: Sequence[str] | None = None) -> View:
-        """重新取数；单个数据域失败会在视图里显示「暂不可用」，不影响其他页。"""
+        """重新取数；单个数据域失败会在视图里显示「暂不可用」，不影响其他页。
+
+        只刷部分域（``sections=("gpu",)``）时**必须合并**进旧快照：数据源只返回
+        被点名的域，直接替换会把其它 12 页一起变成「暂不可用」（点一次「刷新 GPU」
+        后日志/收据全空，直到整页刷新）。
+        """
+        names = tuple(sections) if sections else SECTIONS
         try:
-            self._snapshot = self.source.snapshot(sections=sections)
+            fresh = self.source.snapshot(sections=sections)
         except Exception as exc:                       # 数据层理论上不抛；兜底不让窗口空白
-            names = tuple(sections) if sections else SECTIONS
-            self._snapshot = Snapshot(
-                sections={name: Unavailable("刷新失败（" + type(exc).__name__ + "）")
-                          for name in names}, source="error")
+            merged = dict(self._snapshot.sections) if self._snapshot is not None else {}
+            merged.update({name: Unavailable("刷新失败（" + type(exc).__name__ + "）")
+                           for name in names})
+            self._snapshot = Snapshot(sections=merged, source="error")
             self.message = "刷新失败：界面保留上一次结果，详情见日志。"
         else:
+            if sections and self._snapshot is not None:
+                merged = dict(self._snapshot.sections)
+                merged.update(fresh.sections)
+                self._snapshot = Snapshot(sections=merged,
+                                          fetched_at=fresh.fetched_at or self._snapshot.fetched_at,
+                                          source=fresh.source, notes=fresh.notes)
+            else:
+                self._snapshot = fresh
             self.message = "已刷新：" + (self._snapshot.fetched_at or "刚刚")
         self._publish()
         return self.current()
