@@ -273,7 +273,9 @@ class DesktopApp:
         if self._scale != 1.0:
             try:                                   # 行高跟着字号一起放大（26 → 32@125%）
                 self._ttk.Style().configure("Kit.Treeview", rowheight=self._px(26))
-                kit.NavItem.HEIGHT = self._px(kit.NavItem.HEIGHT)
+                # 必须从**基常量**派生：原地写 self._px(NavItem.HEIGHT) 会让类属性
+                # 每开一个窗口就再乘一次 scale（34→35→36→…），同进程第二个窗口起布局漂移。
+                kit.NavItem.HEIGHT = self._px(kit.NAV_ITEM_HEIGHT)
             except Exception:                      # pragma: no cover - 主题缺样式
                 pass
         self._root.rowconfigure(1, weight=1)

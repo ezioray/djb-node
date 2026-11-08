@@ -204,18 +204,72 @@ def daemon_pids_for_home(home: str, table: dict[int, tuple[int, str]] | None = N
     return sorted(hits)
 
 
+def _reap_own_child(pid: int) -> bool:
+    """本进程的直接子进程：顺手 waitpid 回收（幂等、不抛；非子进程返回 False）。"""
+    try:
+        done, _status = os.waitpid(int(pid), os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return False
+    return done == int(pid)
+
+
+def _proc_state(pid: int) -> str | None:
+    """读 /proc/<pid>/stat 的进程状态字符（R/S/D/Z/T…）；读不到返回 None。
+
+    comm 字段可能含空格与括号，所以从**最后一个** ``)`` 之后切（与 ``_table_posix`` 同法）。
+    """
+    try:
+        with open("/proc/%d/stat" % int(pid), "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    try:
+        fields = raw.rsplit(b")", 1)[-1].split()
+    except (AttributeError, IndexError):                       # pragma: no cover - 防御
+        return None
+    if not fields:
+        return None
+    return fields[0].decode("ascii", "replace")
+
+
+def _alive_posix(pid: int) -> bool:
+    """POSIX「还活着」判据：**僵尸不算活**（ROUND3 修复）。
+
+    修前这里用 ``os.path.exists('/proc/<pid>')``：被 SIGKILL 但父进程还没 reap 的进程
+    仍留在 /proc 里（state=Z），于是 ``wait_gone`` 永远等到超时、断言「进程未退出」——
+    在 Linux 上这是**必现假红**（Windows 侧走 OpenProcess+WaitForSingleObject，没有这问题），
+    也就是 ROUND2 记成「环境性 2 failed」的真身。
+
+    判定顺序：进程不存在 → 死；存在但是僵尸（Z/X）→ 死（顺手 waitpid 回收）；
+    其余状态 → 活。
+    """
+    if not os.path.exists("/proc/%d" % int(pid)):
+        return False
+    state = _proc_state(pid)
+    if state is None:
+        # /proc 存在但读不到 stat：可能是刚退出，也可能权限不足 —— 交给下一轮再判
+        return os.path.exists("/proc/%d" % int(pid))
+    if state in ("Z", "X", "x"):
+        _reap_own_child(pid)       # 自己的子进程：回收掉，别让 /proc 里挂着
+        return False
+    return True
+
+
 def wait_gone(pids, timeout: float = 10.0) -> list[int]:
-    """等到这些 pid 全部消失；返回超时后仍存活的 pid。"""
+    """等到这些 pid 全部消失；返回超时后仍存活的 pid（僵尸算「已消失」）。"""
     pending = {int(pid) for pid in pids}
     deadline = time.monotonic() + timeout
     while pending and time.monotonic() < deadline:
         if WINDOWS:                                            # pragma: no cover
             alive = {pid for pid in pending if _alive_windows(pid)}
         else:
-            alive = {pid for pid in pending if os.path.exists("/proc/%d" % pid)}
+            alive = {pid for pid in pending if _alive_posix(pid)}
         pending = alive
         if pending:
             time.sleep(0.1)
+    # 退出循环后再收一次：最后 100 ms 内退出、但已变僵尸的进程不该算「仍存活」
+    if not WINDOWS:
+        pending = {pid for pid in pending if _alive_posix(pid)}
     return sorted(pending)
 
 

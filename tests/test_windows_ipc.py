@@ -425,6 +425,8 @@ def test_windows_stop_retained_unstarted_control_refuses_full_stop(monkeypatch):
     d = daemon.Daemon.__new__(daemon.Daemon)
     d._started = False
     d._control = SimpleNamespace(join=lambda **_: pytest.fail("unstarted join"))
+    d._quotes_stop = None            # 同上：缺字段会抛 AttributeError，掩盖真正的断言
+    d._quotes_thread = None
     d.server = SimpleNamespace(shutdown=lambda: pytest.fail("unstarted shutdown"))
     monkeypatch.setattr(daemon.os, "name", "nt")
     with pytest.raises(ipc.UsageError, match="清理未完成"):
@@ -440,6 +442,11 @@ def test_windows_stop_live_control_retains_ref(monkeypatch):
     d._control = retained
     d._stop_event = threading.Event()
     d._stop_channel = d._stop_model_sync = d._stop_notifications = lambda: None
+    # stop() 还会停报价环（CR-20261106 新增）；半成品 Daemon 必须把这些字段补齐，
+    # 否则抛的是 AttributeError 而不是用例要验的 UsageError，而 os.name 被临时改成 "nt"
+    # 时连 pytest 的失败报告都拼不出来（Path → WindowsPath），整个文件只会打出 INTERNALERROR。
+    d._quotes_stop = None
+    d._quotes_thread = None
     d.server = SimpleNamespace(shutdown=lambda: None)
     d.machine = SimpleNamespace(snapshot=SimpleNamespace(state="stopped"))
     d._persist = lambda: None

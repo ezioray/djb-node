@@ -26,10 +26,36 @@ def test_module_import_does_not_touch_tkinter():
     assert result.stdout.strip() == "False"
 
 
-def test_main_returns_headless_code_without_display():
-    """没有 tkinter / 没有 DISPLAY：退出码必须是 3，且不打印 traceback。"""
+class BrokenTk:
+    """模拟「有 tkinter 但没有可用显示」：Tk() 抛 TclError。"""
+
+    class TclError(RuntimeError):
+        pass
+
+    def Tk(self):                                   # noqa: N802 - 模拟 tkinter.Tk
+        raise self.TclError("couldn't connect to display")
+
+    def Toplevel(self, *args, **kwargs):             # noqa: N802
+        raise self.TclError("no display")
+
+
+def test_main_returns_headless_code_without_display(monkeypatch, capsys):
+    """没有可用显示（``Tk()`` 抛 TclError）：退出码必须是 3，且给可行动提示、不抛 traceback。
+
+    修前这条用例**假定运行环境本身没有 DISPLAY**：在 Xvfb / 真桌面上跑，``main()`` 会真的
+    建出窗口并进 ``mainloop`` ⇒ 整个 tk 套件挂死（ROUND2 只能靠 ``--deselect`` 绕开，
+    等于这条门禁在 CI 里是瞎的）。现在把「无显示」做成**注入**：清掉
+    ``DISPLAY``/``WAYLAND_DISPLAY``，再把 ``_import_tk`` 换成连不上显示的桩 ——
+    于是无论有没有显示器，验的都是同一条产品判据（建窗口失败 ⇒ 3 + 提示）。
+    """
     assert desktop_app.EXIT_HEADLESS == 3
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(desktop_app, "_import_tk", lambda: BrokenTk())
     assert desktop_app.main(["--demo"]) == desktop_app.EXIT_HEADLESS
+    captured = capsys.readouterr()
+    assert desktop_app.HEADLESS_HINT in captured.out
+    assert "Traceback" not in captured.out + captured.err
 
 
 def test_headless_hint_is_actionable():
@@ -45,19 +71,6 @@ def test_has_display_respects_env(monkeypatch):
         assert desktop_app._has_display() is False
         monkeypatch.setenv("DISPLAY", ":99")
         assert desktop_app._has_display() is True
-
-
-class BrokenTk:
-    """模拟「有 tkinter 但没有可用显示」：Tk() 抛 TclError。"""
-
-    class TclError(RuntimeError):
-        pass
-
-    def Tk(self):                                   # noqa: N802 - 模拟 tkinter.Tk
-        raise self.TclError("couldn't connect to display")
-
-    def Toplevel(self, *args, **kwargs):             # noqa: N802
-        raise self.TclError("no display")
 
 
 def test_window_creation_failure_becomes_headless_error():
@@ -344,6 +357,46 @@ def test_short_window_scrolls_the_nav_and_keeps_every_item_reachable(tmp_path):
         assert not app._nav_scrollbar.winfo_ismapped()
     finally:
         root.destroy()
+
+
+@pytest.mark.parametrize("ui_scale", [None, "1.25"])
+def test_nav_item_height_does_not_drift_across_windows(tmp_path, monkeypatch, ui_scale):
+    """同进程连开 5 个窗口：导航项高度与侧栏总高**不得**随窗口数漂移（ROUND3 真缺陷）。
+
+    修前 `app._build_shell` 写的是 ``kit.NavItem.HEIGHT = self._px(kit.NavItem.HEIGHT)`` ——
+    对**类属性**原地乘 DPI 比例，于是每新建一个根窗口导航项就再高一点：
+    Xvfb(99.93 dpi, scale≈1.0413) 实测 34→35→36→37→41 px，``_nav_inner`` 的 reqheight
+    595→608→621→673。后果不止是「变丑」：13 项在 900 高下会「放不下」，侧栏凭空冒出滚动条，
+    于是整文件跑到该用例时滚动条合法地留着、断言失败（ROUND2 把它当成用例顺序问题）。
+    100% 与 125% 两种缩放下都必须稳，所以这里用 `DJB_UI_SCALE` 注入倍率。
+    """
+    if ui_scale is None:
+        monkeypatch.delenv("DJB_UI_SCALE", raising=False)
+    else:
+        monkeypatch.setenv("DJB_UI_SCALE", ui_scale)
+    heights, needs, mapped, scales = [], [], [], []
+    for _index in range(5):
+        app, root = _window_app(tmp_path, 1440)
+        try:
+            first = app._nav_buttons[VIEW_KEYS[0]]
+            heights.append(int(first.winfo_reqheight()))
+            needs.append(int(app._nav_inner.winfo_reqheight()))
+            mapped.append(bool(app._nav_scrollbar.winfo_ismapped()))
+            scales.append(round(float(app._scale), 4))
+            assert int(first.winfo_height()) == int(first.winfo_reqheight())
+        finally:
+            root.destroy()
+    assert len(set(heights)) == 1, "导航项高度随窗口数漂移：" + repr(heights)
+    assert len(set(needs)) == 1, "侧栏内容高随窗口数漂移：" + repr(needs)
+    # 5 个窗口之间高度必须一模一样，且等于「基常量 × 倍率」（不是被反复乘过的值）
+    from djb_node.desktop import ui_kit as kit
+    assert len(set(scales)) == 1, "倍率本身不该随窗口数变化：" + repr(scales)
+    if ui_scale is not None:
+        assert scales[0] == float(ui_scale)
+    expected = int(round(kit.NAV_ITEM_HEIGHT * scales[0]))
+    assert heights[0] == expected, (heights, expected, scales)
+    # 布局结论也必须一致：同样尺寸的窗口，滚动条该在就在、该收就收，不允许第 N 个才变
+    assert len(set(mapped)) == 1, "侧栏滚动条状态随窗口数变化：" + repr(mapped)
 
 
 def test_content_width_follows_canvas_across_views_and_resizes(tmp_path):

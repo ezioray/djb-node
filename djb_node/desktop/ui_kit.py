@@ -927,13 +927,22 @@ class SectionHead(tk.Frame):
             right(holder)
 
 
+#: 导航项的**设计高度**（px@96dpi）。必须是不被改写的基常量（ROUND3，见 NavItem 文档）。
+NAV_ITEM_HEIGHT = 34
+
+
 class NavItem(tk.Canvas):
     """侧栏导航项：图标 + 标题 + 计数徽标；active = 浅薄荷底 + 2px 薄荷左条。
 
     整项画在一块 Canvas 上（圆角 7、行高 34），宽度跟着侧栏走（``<Configure>`` 重画）。
+
+    **高度只能从 :data:`NAV_ITEM_HEIGHT` 派生，不许原地乘**：``HEIGHT`` 是类属性，
+    曾经被 ``app._build_shell`` 写成 ``self._px(NavItem.HEIGHT)`` —— 每新建一个根窗口就
+    再乘一次 DPI 比例，同进程开第 N 个窗口时导航项高 34+N×scale 一路漂移
+    （Xvfb 实测 34→35→36→37→41），13 项于是「放不下 900 高」，侧栏凭空冒出滚动条。
     """
 
-    HEIGHT = 34
+    HEIGHT = NAV_ITEM_HEIGHT
 
     def __init__(self, master: Any, *, text: str, icon: str = "dot", count: str = "",
                  active: bool = False, ground: str | None = None,
