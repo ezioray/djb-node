@@ -174,6 +174,10 @@ LOG_RETENTION_DAYS = 7
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE = "djb.log"
 
+#: daemon 的重定向输出文件名（``djb start`` / bootstrap 自愈 / uninstall 三处必须同一个名字）
+DAEMON_OUT_NAME = "daemon.out"
+
+
 # ─────────────────────────────────────────────────────────── 重试（M15 §7）
 RETRY_DELAYS_S: tuple[int, ...] = (1, 5, 30, 300, 1800)
 RETRY_MAX_ATTEMPTS = 8

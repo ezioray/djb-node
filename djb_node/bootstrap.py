@@ -173,7 +173,7 @@ def start_daemon(home: str | os.PathLike | None = None, *,
         if command is None:
             result["reason"] = "no-cli"
             return result
-        log_path = os.path.join(paths.logs_dir, "daemon.out")
+        log_path = os.path.join(paths.logs_dir, facts.DAEMON_OUT_NAME)
         os.makedirs(paths.logs_dir, mode=0o700, exist_ok=True)
         with open(log_path, "ab") as stdout:
             subprocess.Popen(command, stdout=stdout, stderr=stdout,

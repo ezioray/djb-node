@@ -357,7 +357,7 @@ _START_SETTLED_STATES = ("online", "paused", "error", "updating", "stopped")
 
 # ─────────────────────────────────────────────────────────── start / stop
 #: daemon 子进程 stdout/stderr 的落点（启动失败时回显它的尾行，E2E-09）
-_DAEMON_OUT_NAME = "daemon.out"
+_DAEMON_OUT_NAME = facts.DAEMON_OUT_NAME      # 单一口径：bootstrap / uninstall 共用
 
 
 def _port_busy(port: int) -> bool:
