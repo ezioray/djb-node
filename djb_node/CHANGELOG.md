@@ -6,6 +6,56 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.2.5 · 2026-11-09
+
+ROUND3（C-01b）+ 基线红收敛。**没有**协议/契约变更（`openapi.yaml` 未动），也**没有**新增运行时依赖。
+
+### 功能
+- **C-01b 周期复探默认开启**：`client.probe.periodic.enabled` 的 `default` 改为 `true`。
+  修前默认关闭 ⇒ 探针一过期（15 min）就掉容量，而 `djb status` 仍显示「接单=是」，
+  供方只能靠人工 `djb upstream probe` 维持（Windows 0.2.4 真机原文见 ROUND3 报告 win-probe.json）。
+  三字段：owner=`client-seat`；expire_at=`2026-12-15T00:00:00+08:00`；rollback_rule=
+  `djb flags --disable client.probe.periodic.enabled` 或 **环境变量**
+  `DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false`（压过配置）或 revert 本提交。
+  决策留痕：`reports/ROUND3-20261109/DECISIONS.md §D-R3-01`。
+- **周期常量与不变式对齐**：`PROBE_PERIODIC_DEFAULT_S` 600 → **450**（= `PROBE_FRESH_S // 2`）。
+  修前 600 恒被 `PROBE_PERIODIC_CAP_S`(450) 钳制，常量与实际行为自相矛盾；现在「基础周期 ≤ 半新鲜度」
+  是恒成立的不变式，P6 的新鲜度语义（900 s）不变。
+- **`djb status` 周期行精确化**：`每 8 分钟`（= `round(450/60)`，已越过自己的上限）→
+  `每 7.5 分钟（450 秒，上限 7.5 分钟（450 秒）…）`；`probe.cap_s` 进 status payload，
+  渲染层不必再猜上限。其余「还剩多久掉容量」类文案改为**向下取整**（宁可少说 0.5 分钟，不夸大剩余新鲜度）。
+- **特性开关支持环境变量闸门**：`config.feature_flag` 取值优先级改为
+  「环境变量（`DJB_FLAG_<NAME>`）> 配置 > 登记表默认」；未设该变量时行为与改前逐字一致。
+  用途：真机取证/事故处置不必先改配置文件。
+
+### 修复
+- **同进程多窗口导航行高漂移**（真缺陷，Xvfb 实测）：`app._build_shell` 曾写
+  `kit.NavItem.HEIGHT = self._px(kit.NavItem.HEIGHT)` —— 对**类属性**原地乘 DPI 比例，
+  第 N 个根窗口的导航项高 34→35→36→37→41 px，13 项于是在 900 高下「放不下」、侧栏凭空出滚动条。
+  现改为从基常量 `kit.NAV_ITEM_HEIGHT` 派生（幂等）；100%/125% 下连续开 5 个窗口高度不漂移（有用例钉住）。
+- **`djb status` 安装行不再并列两个版本**：`安装：` 打的是**本机 home 安装记录**
+  （只在 `djb init` / 自升级 apply·rollback 时写），覆盖安装不会更新它。记录与运行版本不一致时
+  追加事实括注「（本机 home 记录，运行版本 X）」，一致时输出与改前逐字相同。
+- `_spawn_daemon` 的 `"daemon.out"` 改用 `_DAEMON_OUT_NAME` 常量（单一口径）；
+  删除零引用的 `cli._control_reachable()`（无调用方，见 ROUND3 报告零引用证明）。
+
+### 测试
+- **基线红收敛（3/3 有结论）**：
+  - `tests/test_daemon_leak_guard.py` 2 failed 根因不是「环境」而是 `tests/process_tree.py::wait_gone`
+    把**僵尸进程**（SIGKILL 后未 reap，`/proc/<pid>` 仍在）当成活着 ⇒ 改为按 `/proc/<pid>/stat`
+    的状态位判定（Z/X 视为已退出并顺手 `waitpid`）。
+  - `test_short_window_scrolls_the_nav_and_keeps_every_item_reachable` 的顺序敏感由上面那条
+    **导航行高漂移**导致，已按产品缺陷修复（不动断言）。
+  - `test_main_returns_headless_code_without_display` 不再依赖「运行环境没有 DISPLAY」：
+    注入「连不上显示」的 Tk 桩 + 清空 `DISPLAY`/`WAYLAND_DISPLAY`，有/无显示器都能跑，
+    不再需要 `--deselect`。
+- 新增：C-01b 三路径（默认开 / 显式关（配置+环境变量）/ 非法值回退）、周期显示值 ≤ 上限、
+  DPI 多窗口不漂移、安装行括注、环境变量开关优先级。
+
+### 已知限制
+- macOS 仍无真机验证（仅代码级 + 单测），沿用 0.2.4 结论。
+- `安装：` 行的记录版本只在自升级时更新；覆盖安装后它会落后于二进制，属既定设计（status 已加括注说明）。
+
 ## 0.2.4 · 2026-11-08
 
 本轮 = 客户端 UI R2 合入 + E2E 补丁包 P4/P6 + 缺陷单 E2E-06 / E2E-09。
