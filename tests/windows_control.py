@@ -24,7 +24,17 @@ FLAG = ipc_windows.FLAG
 
 
 def enabled(paths) -> bool:
-    """开关在本机配置里是否为真（唯一求值入口 `config.feature_flag`）。"""
+    """开关在本机配置里是否为真（唯一求值入口 `config.feature_flag`）。
+
+    非 Windows 一律 False —— 与本模块 docstring、`disable` 同口径。
+    原先这里直接求真值：该开关 default=True（首发决策 2026-11-05），于是 **Linux 上求值恒为 True**，
+    `test_disabled_flag_is_really_off` 里的
+    `enabled(paths) is (os.name == "nt")` 必然失败 —— 这是 R2 合并时在 6f4ef66 上
+    复现出来的**基线红**（与 UI parity 无关）。控制口在非 Windows 走 unix socket，
+    与本开关无关，所以平台门控就是正确语义。
+    """
+    if os.name != "nt":
+        return False
     from djb_node.config import feature_flag, load_config
 
     return bool(feature_flag(load_config(paths), FLAG))
