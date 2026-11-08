@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from djb_node import facts
-from djb_node.config import ClientConfig
+from djb_node.config import ClientConfig, feature_flag, flag_env_name
 from djb_node.probe import periodic_interval_s
 from tests.test_daemon import _add_upstream, _daemon
 
@@ -28,42 +28,109 @@ def _chat_count(mock) -> int:
                 if item.get("path") == "/v1/chat/completions"])
 
 
-# ─────────────────────────────────────────────────────────── 开关三字段
+# ─────────────────────────────────────────────────────────── 开关三字段（C-01b）
+def _clean_config(mock) -> ClientConfig:
+    """干净 home 的配置：**不写** feature_flags，走登记表默认值（真机客户就是这个形态）。"""
+    return ClientConfig(gateway_url=mock.base_url, mirror_port=1717)
+
+
 def test_status_exposes_flag_with_three_fields(paths, store, credentials, mock, clock):
+    """C-01b 路径 1/3：**默认开**（没有显式配置、没有环境变量）。"""
     _add_upstream(store, mock)
-    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock,
+                     config=_clean_config(mock))
     daemon.start()
     try:
         status = daemon.status()
         flag = status["flags"][facts.PROBE_FLAG_PERIODIC]
-        assert flag["enabled"] is False                    # 默认关闭
+        assert flag["enabled"] is True                      # 0.2.5 起默认开
         assert flag["owner"] == "client-seat"
-        assert flag["expire_at"] == "2026-12-31"
+        assert flag["expire_at"] == "2026-12-15T00:00:00+08:00"
         assert flag["rollback_rule"]
-        assert status["probe"]["periodic_enabled"] is False
-        # P6：周期复探间隔一律钳在 half-fresh（默认 600 → 450），不再是裸的默认值
-        assert status["probe"]["interval_s"] == facts.PROBE_PERIODIC_CAP_S
+        assert status["probe"]["periodic_enabled"] is True
+        # P6 + C-01b：基础周期已降到 half-fresh ⇒ 间隔 == cap == 450，且**永不越过 cap**
+        assert status["probe"]["interval_s"] == facts.PROBE_PERIODIC_CAP_S == 450
+        assert status["probe"]["cap_s"] == facts.PROBE_PERIODIC_CAP_S
         assert status["probe"]["next_at"]
     finally:
         daemon.stop()
 
 
-# ─────────────────────────────────────────────────────────── 启动校验
-def test_startup_probe_verifies_models_before_announcing(paths, store, credentials,
-                                                         mock, clock):
+def test_default_on_reprobes_without_any_flag_setting(paths, store, credentials, mock,
+                                                      clock):
+    """C-01b 路径 1/3 的行为面：干净 home 下到点就自己复探（不再靠人手动 probe）。"""
     _add_upstream(store, mock)
-    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock,
+                     config=_clean_config(mock))
     daemon.start()
     try:
-        record = store.upstream("u1")
-        assert record.state == "verified"
-        assert record.models[0]["inference_ok"] is True
-        assert record.models[0]["probe_version"] == facts.PROBE_VERSION
-        assert record.last_probe_at == record.models[0]["last_probe_at"]
-        # 首次心跳就带正容量（不需要人工 probe）
-        assert mock.heartbeats[-1]["capacity"][0]["model"] == "mock-model"
-        assert mock.heartbeats[-1]["capacity"][0]["max_qps"] > 0
-        assert daemon._last_probe["reason"] == "startup"
+        baseline = _chat_count(mock)
+        clock.advance(facts.PROBE_PERIODIC_CAP_S + 1)        # 越过一个周期
+        daemon.tick(clock())
+        assert _chat_count(mock) > baseline
+        assert daemon._last_probe["reason"] == "periodic"
+    finally:
+        daemon.stop()
+
+
+def test_explicit_config_disable_still_wins(paths, store, credentials, mock, clock):
+    """C-01b 路径 2/3：配置层显式关（`djb flags --disable` 写的就是这个值）。"""
+    _add_upstream(store, mock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock,
+                     config=_flag_config(mock, False))
+    daemon.start()
+    try:
+        baseline = _chat_count(mock)
+        clock.advance(facts.PROBE_PERIODIC_CAP_S * 4)
+        daemon.tick(clock())
+        assert _chat_count(mock) == baseline
+        assert daemon.status()["probe"]["periodic_enabled"] is False
+    finally:
+        daemon.stop()
+
+
+def test_env_disable_wins_over_default(paths, store, credentials, mock, clock,
+                                       monkeypatch):
+    """C-01b 路径 2/3（环境变量）：`DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false`。
+
+    回滚规则写的就是这条 —— 事故现场不必改配置文件、不必发版。
+    """
+    monkeypatch.setenv(flag_env_name(facts.PROBE_FLAG_PERIODIC), "false")
+    _add_upstream(store, mock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock,
+                     config=_clean_config(mock))
+    daemon.start()
+    try:
+        baseline = _chat_count(mock)
+        clock.advance(facts.PROBE_PERIODIC_CAP_S * 4)
+        daemon.tick(clock())
+        assert _chat_count(mock) == baseline
+        assert daemon.status()["probe"]["periodic_enabled"] is False
+    finally:
+        daemon.stop()
+
+
+def test_illegal_flag_value_falls_back_to_safe_side(paths, store, credentials, mock, clock):
+    """C-01b 路径 3/3：配置里写错值时不猜、不崩，落到**安全侧**（关）。
+
+    口径沿用 C7 既有语义（`config.feature_flag`）：只有 bool 真值 / `_TRUE_TEXT` 里的文本
+    算开，其余文本一律关。默认开之后这条尤其要紧 —— 不能因为配置里手滑写了 `maybe`
+    就把周期复探打开，也不能因此让 daemon 抛异常。
+    """
+    for value, expected in (("maybe", False), ("off", False), ("  ", False),
+                            (0, False), (1, True), (None, True)):
+        config = ClientConfig()
+        config.extra = {} if value is None else {facts.PROBE_FLAG_PERIODIC: value}
+        assert feature_flag(config, facts.PROBE_FLAG_PERIODIC) is expected, value
+    # daemon 侧只验一条（每 start 一次都要建 mock/端口，别把用例拖成几十秒）：
+    # 非法值既不让 daemon 崩，也不会偷偷把周期复探打开。
+    _add_upstream(store, mock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock,
+                     config=ClientConfig(gateway_url=mock.base_url, mirror_port=1717,
+                                         extra={facts.PROBE_FLAG_PERIODIC: "maybe"}))
+    daemon.start()
+    try:
+        assert daemon.status()["probe"]["periodic_enabled"] is False
     finally:
         daemon.stop()
 
@@ -88,9 +155,11 @@ def test_startup_probe_with_unreachable_upstream_still_boots(paths, store, crede
 
 
 # ─────────────────────────────────────────────────────────── 周期开关
-def test_periodic_off_by_default_never_reprobes(paths, store, credentials, mock, clock):
+def test_periodic_off_never_reprobes(paths, store, credentials, mock, clock):
+    """关掉时行为与改前完全一致：只有启动校验那一次探针。"""
     _add_upstream(store, mock)
-    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock,
+                     config=_flag_config(mock, False))
     daemon.start()
     try:
         baseline = _chat_count(mock)                     # 启动校验的那一次
@@ -192,7 +261,8 @@ def test_failed_reprobe_zeroes_announced_capacity(paths, store, credentials, moc
 def test_flag_off_keeps_manual_probe_path(paths, store, credentials, mock, clock):
     """回滚规则：开关关闭 → 只保留手动 probe，公告按已存 last_probe_at 判新鲜。"""
     _add_upstream(store, mock)
-    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock,
+                     config=_flag_config(mock, False))
     daemon.start()
     try:
         assert daemon.status()["probe"]["periodic_enabled"] is False

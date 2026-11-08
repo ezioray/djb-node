@@ -1359,7 +1359,13 @@ class Daemon:
 
     # ── 探针调度（C7：L1–L3 + 公告门控前置 + 周期复探）
     def _periodic_probe_enabled(self) -> bool:
-        """开关 `client.probe.periodic.enabled`（默认关闭；见 facts.FEATURE_FLAGS）。"""
+        """开关 `client.probe.periodic.enabled`（**0.2.5 起默认开启**；见 facts.FEATURE_FLAGS）。
+
+        关闭有三条等价路径（回滚规则）：配置 `feature_flags[...]=false`、
+        `djb flags --disable client.probe.periodic.enabled`、
+        环境变量 `DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false`（压过配置）。
+        三者都走 `config.feature_flag` 这一个入口，所以 status / flags / daemon 三处口径一致。
+        """
         return feature_flag(self.config, facts.PROBE_FLAG_PERIODIC)
 
     def _probe_upstreams(self, now: datetime, *, reason: str) -> dict[str, Any]:
@@ -1917,6 +1923,9 @@ class Daemon:
             # C7：探针调度 + 特性开关（三字段齐全，见 facts.FEATURE_FLAGS）
             "probe": {"periodic_enabled": self._periodic_probe_enabled(),
                       "interval_s": self._probe_interval_s,
+                      # ROUND3 / D-R3-02：把「上限」一并给渲染层，status 才能证明
+                      # 「显示的周期 ≤ 上限」，而不是让用户自己猜 half-fresh 是多少。
+                      "cap_s": facts.PROBE_PERIODIC_CAP_S,
                       "next_at": iso(self._next_probe_at),
                       "failures": self._probe_failures,
                       "last_pass": dict(self._last_probe),

@@ -233,10 +233,25 @@ def test_periodic_interval_never_crosses_half_fresh_window():
     for models, failures in combos:
         interval = probe_mod.periodic_interval_s(models, failures)
         assert 60 <= interval <= cap, (models, failures, interval)
-    # 基础周期(600 s)本身就比 half-fresh(450 s) 长 ⇒ 默认配置下被钳到 450
+    # C-01b：基础周期已改为 half-fresh(450 s) 本身，所以默认配置下每一档都等于 cap；
+    # 「基础值不得大于 cap」这条不变式由 test_periodic_base_never_exceeds_cap 钉住。
+    assert facts.PROBE_PERIODIC_DEFAULT_S <= cap
     assert probe_mod.periodic_interval_s(0, 0) == cap
     assert probe_mod.periodic_interval_s(1, 2) == cap
     assert probe_mod.periodic_interval_s(100, 9) < facts.PROBE_PERIODIC_MAX_S
+
+
+def test_periodic_base_never_exceeds_cap():
+    """C-01b：基础周期必须 ≤ half-fresh（修前 600 > 450，常量与实际行为自相矛盾）。
+
+    这条不变式一旦破：状态行会渲染出「每 8 分钟」而 cap 是 7.5 分钟（显示值越过上限），
+    且「模型数缩放 / 失败退避」两个维度全被常量本身吃掉（永远只看到钳制后的同一个数）。
+    """
+    assert facts.PROBE_PERIODIC_DEFAULT_S <= facts.PROBE_PERIODIC_CAP_S
+    assert facts.PROBE_PERIODIC_DEFAULT_S == facts.PROBE_FRESH_S // 2 == 450
+    assert facts.PROBE_PERIODIC_CAP_S == 450
+    for models, failures in ((0, 0), (8, 0), (1, 1), (100, 9)):
+        assert probe_mod.periodic_interval_s(models, failures) <= 450
 
 
 def test_probe_deadline_is_clock_injected(clock):

@@ -21,4 +21,10 @@ DEFAULT_ON_APPROVED: dict[str, str] = {
         " 150 s 超时 → 503 50901，而客户端 status 仍显示「接单=是」，两侧都不说人话。"
         "留痕 reports/E2E-20261107-FULL/TICKETS.md E2E-04 + RELEASE-PREP/PATCHES.md P4；"
         "显式 flags --disable 优先于服务端协商 ⇒ 仍是真开关",
+    "client.probe.periodic.enabled":
+        "ROUND3-20261109 DECISIONS.md §D-R3-01（Lead 签发）：默认关闭 ⇒ 探针 15 min 过期即掉容量，"
+        "供方只能人工 djb upstream probe 续命（Windows 0.2.4 真机 status 原文见"
+        " reports/ROUND3-20261109/client/win-probe.json）。三字段：owner=client-seat /"
+        " expire_at=2026-12-15T00:00:00+08:00 / rollback_rule=djb flags --disable 或"
+        " DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false 或 revert ⇒ 仍是真开关",
 }

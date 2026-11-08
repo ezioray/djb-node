@@ -232,16 +232,18 @@ def test_catalog_exposes_probe_visibility_additively(manager, store, stub, clock
 
 
 # ─────────────────────────────────────────────────────────── 特性开关
-def test_feature_flag_shape_and_default_off():
+def test_feature_flag_shape_and_default_on():
+    """C-01b：周期复探开关**默认开**，三字段与 DECISIONS §D-R3-01 一致。"""
     spec = facts.FEATURE_FLAGS[facts.PROBE_FLAG_PERIODIC]
-    assert spec["default"] is False
+    assert spec["default"] is True
     assert spec["owner"] == "client-seat"
-    assert spec["expire_at"] == "2026-12-31"
+    assert spec["expire_at"] == "2026-12-15T00:00:00+08:00"
     assert spec["rollback_rule"]
     assert "last_probe_at" in spec["rollback_rule"]
     assert flag_spec(facts.PROBE_FLAG_PERIODIC)["owner"] == "client-seat"
-    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC) is False
-    assert feature_flag({}, facts.PROBE_FLAG_PERIODIC) is False
+    # 干净配置（没有 extra）与「空 mapping」都按登记表默认值 → 开
+    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC) is True
+    assert feature_flag({}, facts.PROBE_FLAG_PERIODIC) is True
     assert feature_flag(ClientConfig(), "unknown.flag") is False
 
 

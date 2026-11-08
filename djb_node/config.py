@@ -246,6 +246,24 @@ def load_config_strict(paths: Paths) -> ClientConfig:
 
 _TRUE_TEXT = ("1", "true", "on", "yes", "y", "enabled")
 
+#: 开关的环境变量覆盖前缀（ROUND3 / C-01b）：`client.probe.periodic.enabled`
+#: → `DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED`。给运维一个**不改配置、不改代码**的
+#: 一键闸门（回滚规则里写的就是它），也让「干净 home 上做真机取证」不必先写盘。
+FLAG_ENV_PREFIX = "DJB_FLAG_"
+
+
+def flag_env_name(name: str) -> str:
+    """开关名 → 环境变量名（唯一换算处：CLI/文档/测试都引用这里，不各自拼字符串）。"""
+    return FLAG_ENV_PREFIX + str(name).upper().replace(".", "_").replace("-", "_")
+
+
+def _env_flag(name: str) -> bool | None:
+    """环境变量里有没有显式取值；没设/空串返回 None（= 不用它，继续看配置）。"""
+    raw = os.environ.get(flag_env_name(name))
+    if raw is None or not str(raw).strip():
+        return None
+    return str(raw).strip().lower() in _TRUE_TEXT
+
 
 def _extra_of(config: Any) -> dict[str, Any]:
     """把 ClientConfig / 形状等价的 mapping（`config.extra`）统一成 extra 字典。"""
@@ -267,8 +285,10 @@ def _utc_today() -> date:
 def _parse_expire_at(value: Any) -> date | None:
     """把 `expire_at` 解析成日期；缺失/非法返回 None（调用方 fail-closed 处理）。
 
-    只接受 ISO 日期字符串或 date/datetime 对象：登记表用字符串，数字等其它类型
-    一律视为非法（避免 `20271231` 这类整数被 ISO basic 格式静默解析成日期）。
+    接受三类写法：ISO 日期字符串、ISO **日期时间**字符串（ROUND3：`2026-12-15T00:00:00+08:00`
+    这类带时区的「批准窗口」写法，取**写明的那个时区里的日期**，不换算到 UTC 免得前后差一天）、
+    以及 date/datetime 对象。数字等其它类型一律视为非法（避免 `20271231` 被 ISO basic
+    格式静默解析成日期）。
     """
     if isinstance(value, datetime):
         return value.date()
@@ -281,6 +301,10 @@ def _parse_expire_at(value: Any) -> date | None:
         return None
     try:
         return date.fromisoformat(text)
+    except ValueError:
+        pass
+    try:                                   # 带时间的 ISO 8601（含时区偏移）
+        return datetime.fromisoformat(text).date()
     except ValueError:
         return None
 
@@ -312,6 +336,11 @@ def feature_flag(config: Any, name: str, *, today: date | None = None) -> bool:
     定义在 `facts.FEATURE_FLAGS`。本机取值只读 config.json 的非敏感 `extra`
     （`feature_flags` 子字典优先，其次同名平铺键），不覆盖服务端 policy。
 
+    取值优先级（ROUND3 追加，只加不改）：**环境变量 > 配置 > 登记表 default**。
+    环境变量名由 :func:`flag_env_name` 换算（`DJB_FLAG_<NAME 大写点转下划线>`），
+    只在该变量存在且非空时参与判定 —— 没设它时行为与改前逐字一致。它是回滚规则里
+    写的那道闸门：`DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false` 可压过配置里的 true。
+
     `expire_at` 由本入口统一强制（与 tray/actions、ipc_windows 同一口径：**UTC 日期，
     到期日当天仍有效，次日起为 False**）；已登记但 `expire_at` 缺失/非法按 fail-closed
     处理。未登记开关没有到期元数据，保持 C7 既有语义不额外收紧。
@@ -324,6 +353,9 @@ def feature_flag(config: Any, name: str, *, today: date | None = None) -> bool:
         return False
     spec = facts.FEATURE_FLAGS.get(str(name)) or {}
     default = bool(spec.get("default", False))
+    from_env = _env_flag(name)
+    if from_env is not None:
+        return from_env
     extra = _extra_of(config)
     nested = extra.get("feature_flags")
     value: Any = None

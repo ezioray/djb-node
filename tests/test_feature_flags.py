@@ -6,13 +6,14 @@ Lead 集成口径：开关只登记在 ``facts.FEATURE_FLAGS``，取值统一走
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
 from djb_node import facts
 from djb_node.attest import attestation_enabled
-from djb_node.config import ClientConfig, feature_flag, flag_expired, flag_spec
+from djb_node.config import (ClientConfig, _parse_expire_at, feature_flag, flag_expired,
+                             flag_spec, flag_env_name)
 from djb_node.relay import relay_enabled
 from tests.feature_flag_policy import DEFAULT_ON_APPROVED
 
@@ -29,7 +30,10 @@ def make_config(**extra) -> ClientConfig:
 #: 各开关自己的到期日（默认 2026-12-31；按任务单另定的在这里列明）
 EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30",
                     # M3 机器画像上报：跟 E2E 周期一起，2027-06-30 前必须收敛成默认开或删掉
-                    facts.MACHINE_PROFILE_FLAG: "2027-06-30"}
+                    facts.MACHINE_PROFILE_FLAG: "2027-06-30",
+                    # ROUND3 / C-01b：批准窗口写到「日期时间 + 时区」（DECISIONS.md §D-R3-01），
+                    # 登记表原样保留这个写法，求值只取该时区里的日期（config._parse_expire_at）
+                    facts.PROBE_FLAG_PERIODIC: "2026-12-15T00:00:00+08:00"}
 
 
 def test_every_flag_has_three_fields_and_default_off():
@@ -109,11 +113,15 @@ def test_default_off_flag_stays_false_after_expiry():
 def test_every_registered_flag_is_forced_off_after_expiry():
     all_on = make_config(feature_flags={name: True for name in facts.FEATURE_FLAGS})
     far_future = date(2031, 1, 1)
-    for name in facts.FEATURE_FLAGS:
+    for name, spec in facts.FEATURE_FLAGS.items():
+        expiry = _parse_expire_at(spec["expire_at"])
+        assert expiry is not None, name + " 的 expire_at 必须可解析（否则 fail-closed 直接关）"
         assert flag_expired(name, today=far_future) is True, name
         assert feature_flag(all_on, name, today=far_future) is False, name
-        # 到期前一天仍按登记表判定（不被提前关）
-        assert flag_expired(name, today=date(2026, 12, 30)) is False, name
+        # 到期日**当天仍有效**、次日起强制关（按各开关自己的 expire_at，不写死日期：
+        # C-01b 的批准窗口是 2026-12-15，写死 2026-12-30 就会把「还没到期」判成错）
+        assert flag_expired(name, today=expiry) is False, name
+        assert flag_expired(name, today=expiry + timedelta(days=1)) is True, name
 
 
 @pytest.mark.parametrize("bad_expire", ["", "   ", None, "not-a-date", "2026-13-01", 20271231])
@@ -149,6 +157,65 @@ def test_unregistered_flag_keeps_c7_semantics_without_expiry():
     # 未登记开关没有到期元数据：不额外收紧（C7 既有语义），也不报"已到期"
     assert flag_expired("nope") is False
     assert feature_flag(make_config(feature_flags={"nope": True}), "nope") is True
+
+
+def test_expire_at_accepts_iso_datetime_with_offset():
+    """批准窗口允许写成「日期时间 + 时区」（ROUND3 / D-R3-01）。
+
+    修前 `_parse_expire_at` 只认 `date.fromisoformat`，`2026-12-15T00:00:00+08:00` 直接
+    ValueError → `flag_expired` fail-closed 返回 True ⇒ 批准窗口把开关**立刻关掉**，
+    而登记表上看起来「写着 2026-12-15」，没人会想到它其实已经到期。
+    """
+    assert _parse_expire_at("2026-12-15T00:00:00+08:00") == date(2026, 12, 15)
+    # 取**写明的时区**里的日期，不换算到 UTC：+08:00 的 12-16 00:30 = UTC 12-15 16:30，
+    # 若按 UTC 取日期会少一天（12-15），批准窗口就提前一天结束。
+    assert _parse_expire_at("2026-12-16T00:30:00+08:00") == date(2026, 12, 16)
+    assert _parse_expire_at("2026-12-15") == date(2026, 12, 15)
+    assert _parse_expire_at("2026-12-15T00:00:00Z") == date(2026, 12, 15)
+
+
+def test_probe_periodic_flag_is_the_registered_default_on_case():
+    """C-01b 的三字段必须与 DECISIONS.md §D-R3-01 逐字一致（批准留痕的可核对性）。"""
+    spec = flag_spec(facts.PROBE_FLAG_PERIODIC)
+    assert spec["default"] is True
+    assert spec["owner"] == "client-seat"
+    assert spec["expire_at"] == "2026-12-15T00:00:00+08:00"
+    assert "djb flags --disable" in spec["rollback_rule"]
+    assert _parse_expire_at(spec["expire_at"]) == date(2026, 12, 15)
+    # 干净 home（没有任何显式配置、没有环境变量）下就是开着的
+    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC) is True
+
+
+def test_env_var_overrides_config_and_default(monkeypatch):
+    """环境变量闸门：`DJB_FLAG_<NAME>` 压过配置与默认值（ROUND3 只加不改）。
+
+    它是回滚规则里写的那条「一键停」：不需要改配置文件、不需要碰代码。
+    """
+    assert flag_env_name(facts.PROBE_FLAG_PERIODIC) == \
+        "DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED"
+    env = flag_env_name(facts.PROBE_FLAG_PERIODIC)
+    monkeypatch.delenv(env, raising=False)
+    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC) is True
+
+    monkeypatch.setenv(env, "false")           # 压过默认开
+    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC) is False
+    on = make_config(feature_flags={facts.PROBE_FLAG_PERIODIC: True})
+    assert feature_flag(on, facts.PROBE_FLAG_PERIODIC) is False   # 也压过配置里的 true
+
+    monkeypatch.setenv(env, "true")             # 反过来也成立（默认关的开关可临时开）
+    off = make_config(feature_flags={facts.ATTEST_FLAG: False})
+    monkeypatch.setenv(flag_env_name(facts.ATTEST_FLAG), "on")
+    assert feature_flag(off, facts.ATTEST_FLAG) is True
+
+    monkeypatch.setenv(env, "   ")              # 空值 = 没设，继续看配置/默认
+    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC) is True
+
+
+def test_env_var_cannot_resurrect_expired_flag(monkeypatch):
+    """到期是硬闸门：环境变量写 true 也不能把过期开关重新打开（fail-closed 优先）。"""
+    monkeypatch.setenv(flag_env_name(facts.PROBE_FLAG_PERIODIC), "true")
+    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC,
+                        today=date(2026, 12, 16)) is False
 
 
 def test_flag_readers_inherit_expiry(monkeypatch):

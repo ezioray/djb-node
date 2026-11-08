@@ -457,7 +457,16 @@ PROBE_TIMEOUT_S = _float_env("DJB_NODE_PROBE_TIMEOUT_S", 20.0)
 """
 PROBE_FRESH_S = 15 * 60
 """last_probe_at 新鲜窗口：超过即不进容量公告（默认 15 min）。"""
-PROBE_PERIODIC_DEFAULT_S = 10 * 60
+PROBE_PERIODIC_DEFAULT_S = PROBE_FRESH_S // 2
+"""周期复探的**基础**间隔（秒）= 新鲜度一半 = 450 s（7.5 min）。ROUND3 / C-01b。
+
+修前是 ``10 * 60`` = 600 s，本身就 > ``PROBE_PERIODIC_CAP_S``(450) ⇒ 常规配置下**恒被钳制**，
+600 这个值一次都没真正生效过（ROUND2 client README §4.5 记为待收敛项）。这里按不变式
+直接取 half-fresh：**不改 P6 的新鲜度语义**（``PROBE_FRESH_S`` 仍是 900），只让常量与
+``periodic_interval_s`` 的钳制上界一致。于是「模型数缩放 / 失败退避」两个维度只在
+``PROBE_PERIODIC_CAP_S`` 被放大时才生效，默认配置下每 450 s 必复探一次。
+回滚：改回 ``10 * 60``（行为等价，仍被钳到 450）。
+"""
 PROBE_PERIODIC_MAX_S = 6 * 3600
 PROBE_PERIODIC_CAP_S = PROBE_FRESH_S // 2
 """周期复探（含失败退避、模型数缩放）的**硬上界** = 新鲜度窗口的一半（P6 / E2E-12）。
@@ -557,13 +566,20 @@ ATTEST_FLAG = "supply.attestation.enabled"
 FLAG_REQUIRED_FIELDS: tuple[str, ...] = ("owner", "expire_at", "rollback_rule", "default")
 
 # ── C7 周期复探开关（与 C8/M17 共用同一 FEATURE_FLAGS 登记表）
+# ROUND3 / C-01b（Lead 授权）：**0.2.5 起默认开启**。理由：周期复探关闭时探针一过期就掉容量，
+# 而 status 仍显示「接单=是」——两侧都不说人话（P6/E2E-12 的同一类缺陷）。默认关闭是
+# 「保守」但事实上让默认安装的供方 15 min 后必然 0 容量，只能靠人工 `djb upstream probe`。
+# 显式关闭仍是**真开关**：config `feature_flags[<name>]=false`、或环境变量
+# `DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false`（见 config.feature_flag）都能一键停。
 FEATURE_FLAGS["client.probe.periodic.enabled"] = {
-    "default": False,
+    "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
-    "rollback_rule": "关闭后只保留手动 probe（djb upstream probe）；"
-                     "公告按已存 last_probe_at 判新鲜",
-    "description": "客户端周期复探（L2/L3），默认关闭",
+    "expire_at": "2026-12-15T00:00:00+08:00",
+    "rollback_rule": "环境变量 DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false 或配置 "
+                     "feature_flags[\"client.probe.periodic.enabled\"]=false（djb flags --disable）"
+                     "即停周期复探，只保留手动 probe（djb upstream probe），公告按已存 "
+                     "last_probe_at 判新鲜；或 git revert 本提交",
+    "description": "客户端周期复探（L2/L3），0.2.5 起默认开启（显式关闭仍生效）",
 }
 PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
 

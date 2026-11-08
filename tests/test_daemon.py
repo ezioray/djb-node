@@ -43,7 +43,12 @@ def mock():
 def _daemon(paths, store, credentials, mock, *, probes=None, clock=None,
             resources=None, port=0, config=None):
     clock = clock or utcnow
-    config = config or ClientConfig(gateway_url=mock.base_url, mirror_port=1717)
+    # 这些用例讲的是心跳 / 策略 / 收据，不是探针节奏：**显式关掉**周期复探，
+    # 免得 0.2.5 起「默认开 + 周期 450 s」给它们凭空加出 chat 请求与上游状态变化
+    # （改的只是测试夹具口径，不改产品语义；默认开的路径由 test_daemon_probe 的
+    #  「干净 home」用例 `test_status_exposes_flag_with_three_fields` 覆盖）。
+    config = config or ClientConfig(gateway_url=mock.base_url, mirror_port=1717,
+                                    extra={facts.PROBE_FLAG_PERIODIC: False})
     save_config(paths, config)
     mock.policy_issued_at = iso(clock())
     detector = YieldDetector(probes if probes is not None else [FixedProbe()])

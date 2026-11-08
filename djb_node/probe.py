@@ -399,15 +399,17 @@ def probe_models(base_url: str, models: Iterable[str], *, credential: str | None
 
 
 def periodic_interval_s(model_count: int, failures: int) -> int:
-    """周期复探间隔（秒）：基础 10 min；模型越多越稀疏；连续失败指数退避。
+    """周期复探间隔（秒）：基础 7.5 min（= 新鲜度一半）；模型越多越稀疏；连续失败指数退避。
 
-    **上界 = ``facts.PROBE_PERIODIC_CAP_S``（新鲜度的一半）**（P6 / E2E-12）：
+    **上界 = ``facts.PROBE_PERIODIC_CAP_S``（新鲜度的一半，450 s）**（P6 / E2E-12）：
     退避与模型数缩放都不得把下一轮推到新鲜度窗口之外，否则「探针失败一次」就等于
     「公告窗口必然过期」——实测 Windows 上一次失败退避到 1200 s（窗口 900 s），
     每个周期固定掉 5 分钟容量；两次失败 2400 s 后永久 0 容量，且两侧都不报错。
 
-    钳制后行为：常规配置下一律 ≤ 450 s（= 900//2），所以一次抖动也只会掉一次、
-    下一轮必然在窗口内复探回来；上限仍受 ``PROBE_PERIODIC_MAX_S`` 约束（配置放大时生效）。
+    钳制后行为：常规配置下一律 ≤ 450 s（= 900//2，ROUND3 起基础值也取 450，见
+    ``facts.PROBE_PERIODIC_DEFAULT_S``），所以一次抖动也只会掉一次、下一轮必然在窗口内
+    复探回来；上限仍受 ``PROBE_PERIODIC_MAX_S`` 约束（仅当 ``PROBE_PERIODIC_CAP_S``
+    被放大时，模型数缩放与退避才可能生效）。
     回滚：把最后一行改回上界 ``facts.PROBE_PERIODIC_MAX_S`` 即恢复旧退避曲线。
     """
     count = max(0, int(model_count or 0))
