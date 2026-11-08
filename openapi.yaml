@@ -28,7 +28,11 @@ info:
   # 2026-11-07 标注型变更（PATCH）：①`/v1/batches*` 3 个操作加 `x-djb-availability: m03`
   # （只说明「该面只在 M03 装配时挂载」）；②3 条 wallet-drafts 操作的 409 描述补 `reason` 取值。
   # 0 路径 / 0 操作 / 0 schema 变化。
-  version: 1.8.1
+  # 2026-11-08 加性变更（PATCH，ROUND2 / B 云端流）：PaymentOrder 增加 **optional**
+  # `checkout`（收银台会话：provider / pay_url / qr），仅 POST /api/v1/pay/orders 的 201
+  # 创建响应返回；0 路径 / 0 操作变化，1 个 schema 加 1 个 optional 属性，无删改。
+  # 旧客户端忽略之即回到今天的行为；不给 checkout 的服务端（或重放请求）视为「无收银台会话」。
+  version: 1.8.2
   # 2026-11-04 审计：此处原先硬编码「157 路径 / 181 操作」——那是 node 快照期的数字，
   # 与文件实测（213/252）不符，且每次加性变更都会让它更假。规模数字一律由
   # `reports/RC-2026-11-03/audit/tools/check-spec-single-source.py` 现算，不写进正文。
@@ -13989,6 +13993,23 @@ components:
         paid_at: { type: [string, 'null'], format: date-time }
         credited_at: { type: [string, 'null'], format: date-time }
         created_at: { type: string, format: date-time }
+        checkout:
+          type: [object, 'null']
+          additionalProperties: true
+          description: |
+            收银台会话（spec 1.8.2 加性字段，optional）。**仅** `POST /api/v1/pay/orders` 的
+            201 创建响应返回；GET 详情 / 列表 / 幂等重放不返回（重放不产生新的收银台会话）。
+            mock / test 通道的 `pay_url` 形如 `mock://checkout/<order_no>`，仅供联调；
+            生产 PSP 未接线时该字段可为 null，门户必须容忍缺省（降级为「稍后重试」，
+            不得伪造支付链接）。**不得含密钥 / 签名材料**——签名由服务端在通道请求里计算。
+          properties:
+            provider: { type: string, description: 通道标识（= PaymentProvider.id()）。 }
+            pay_url:
+              type: string
+              description: 收银台地址（通道返回；mock 通道为 `mock://checkout/<order_no>`）。
+            qr:
+              type: [string, 'null']
+              description: 二维码载荷（通道返回；无则 null）。
 
     PaymentAttempt:
       type: object
