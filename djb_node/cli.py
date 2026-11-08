@@ -430,14 +430,6 @@ def _startup_log_hint(paths: Paths, *, limit: int = 3) -> str:
     return "\n".join(clean[-limit:])
 
 
-def _control_reachable(paths: Paths, *, timeout: float = 1.0) -> bool:
-    """本 home 的 daemon 现在能不能应答（用于区分「端口被自己占」与「被别人占」）。"""
-    try:
-        return bool(ControlClient(paths).call({"cmd": "ping"}, timeout=timeout).get("ok"))
-    except (NotRunningError, DjbError):
-        return False
-
-
 def cmd_start(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
     if getattr(args, "port", None):
@@ -539,7 +531,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def _spawn_daemon(paths: Paths, config: ClientConfig, token: str) -> None:
-    log_path = os.path.join(paths.logs_dir, "daemon.out")
+    log_path = os.path.join(paths.logs_dir, _DAEMON_OUT_NAME)
     ensure_dir(paths.logs_dir, 0o700)
     stdout = open(log_path, "ab")
     try:
@@ -730,14 +722,38 @@ def _clock(moment: Any) -> str:
 
 
 def _minutes(seconds: Any) -> str:
-    """秒 → 人话（<90 s 用秒，其余取整到分钟）；缺失给「?」，绝不补 0。"""
+    """秒 → 人话（<90 s 用秒，其余**向下取整**到分钟）；缺失给「?」，绝不补 0。
+
+    向下取整是 ROUND3 / D-R3-02 的刻意选择：这一族文案几乎都在说「还剩多久掉容量」，
+    ``round()`` 会把 350 s 说成「约 6 分钟」（实际 5.8 min）——把剩余新鲜度说多，
+    正是 P6 要消灭的「谎报」。宁可少说 30 秒，不许多说 1 秒。
+    """
     try:
         value = int(round(float(seconds)))
     except (TypeError, ValueError):
         return "?"
     if value < 90:
         return str(max(1, value)) + " 秒"
-    return str(int(round(value / 60.0))) + " 分钟"
+    return str(int(value // 60)) + " 分钟"
+
+
+def _duration_exact(seconds: Any) -> str:
+    """周期/上限这类**承诺值**的精确说法（ROUND3 / D-R3-02）：450 s → 「7.5 分钟」。
+
+    与 :func:`_minutes` 不同，这里不能取整：`PROBE_PERIODIC_CAP_S=450` 若渲染成
+    「8 分钟」，显示值就**越过了自己声明的上限**（450 s = 7.5 min < 8 min），
+    用户没法判断哪个是真的。整分钟才省略小数，其余保留一位。
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if value < 90:
+        return str(max(1, int(round(value)))) + " 秒"
+    minutes = value / 60.0
+    if abs(minutes - round(minutes)) < 0.05:
+        return str(int(round(minutes))) + " 分钟"
+    return ("%.1f" % minutes) + " 分钟"
 
 
 def _probe_status_line(models: Any, *, now: Any = None, fresh_s: Any = None) -> str:
@@ -805,8 +821,15 @@ def _capacity_lines(value: dict[str, Any]) -> list[str]:
             lines.append("周期复探：关（client.probe.periodic.enabled）→ 探针一过期就掉容量，"
                          "只能手动 djb upstream probe")
         elif isinstance(probe.get("interval_s"), int):
-            lines.append("周期复探：每 " + _minutes(probe.get("interval_s"))
-                         + "（上限=新鲜度一半，退避不得越过）")
+            # D-R3-02：周期是**承诺值**，必须精确（450 s → 7.5 分钟）；上限一并印出来，
+            # 让「显示值 ≤ 上限」肉眼可核（round() 曾把 450 s 说成「每 8 分钟」越过 cap）。
+            interval = int(probe.get("interval_s"))
+            cap = probe.get("cap_s")
+            cap_text = ""
+            if isinstance(cap, int) and cap > 0:
+                cap_text = "，上限 " + _duration_exact(cap) + "（" + str(cap) + " 秒）"
+            lines.append("周期复探：每 " + _duration_exact(interval)
+                         + "（" + str(interval) + " 秒" + cap_text + "；退避不得越过上限）")
     return lines
 
 
@@ -883,8 +906,16 @@ def _status_text(value: dict[str, Any]) -> str:
         lines.append("下一步：" + str(value["next_step"]))
     install = value.get("install") or {}
     if install:
-        lines.append("安装：" + str(install.get("version")) + " · 频道 "
-                     + str(install.get("channel")) + " · 桶 " + str(install.get("bucket")))
+        # ROUND3：install.version 是**本机 home 的安装记录**（只在 djb init / 自升级 apply·rollback
+        # 时写，见 store.py:438 / update.py:502,522），**不是**运行中的二进制版本。
+        # 覆盖安装不会更新它，于是 0.2.5 的二进制旁边会显示「安装：0.2.2」——两行并列就是谎报。
+        # 两者不一致时补一句事实括注；相等时输出与改前逐字一致（不加噪音）。
+        recorded = str(install.get("version"))
+        running = str(value.get("version") or "")
+        mismatch = bool(running) and bool(recorded) and recorded != running
+        lines.append("安装：" + recorded + " · 频道 "
+                     + str(install.get("channel")) + " · 桶 " + str(install.get("bucket"))
+                     + ("（本机 home 记录，运行版本 " + running + "）" if mismatch else ""))
     policy = value.get("policy") or {}
     lines.append("策略：" + ("可用" if policy.get("usable") else "不可用（保守模式）")
                  + (" · " + str(policy.get("policy_version"))
@@ -2068,7 +2099,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
                os.path.join(paths.keys_dir, "update_mock.key"),
                paths.db_file, paths.db_file + "-wal", paths.db_file + "-shm",
                paths.config_file, bundle_file(paths),
-               os.path.join(paths.runtime_dir, "daemon.out")]
+               # 老版本把 daemon.out 写在 runtime/（现役在 logs/）：卸载时两处都清，文件名同源
+               os.path.join(paths.runtime_dir, _DAEMON_OUT_NAME)]
     if not keep_logs:
         targets.extend(_log_files(paths.logs_dir))
     versions = []

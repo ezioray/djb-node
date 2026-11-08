@@ -93,7 +93,29 @@ def test_capacity_lines_explain_why_each_model_dropped():
     assert "slow —— 探针未通过（timeout）" in text
     assert "stale —— 探针过期" in text
     assert "off —— 上游已停用" in text
-    assert "周期复探：每 8 分钟" in text          # 450 s → 取整到分钟
+    # D-R3-02：450 s 必须说成「7.5 分钟」而不是 round() 出来的「8 分钟」（越过自己的上限）
+    assert "周期复探：每 7.5 分钟" in text
+    assert "每 8 分钟" not in text
+
+
+def test_capacity_lines_periodic_display_never_exceeds_cap():
+    """D-R3-02 不变量：**显示出来的周期 ≤ 上限**（任何间隔都不许被说大）。
+
+    修前 `_minutes()` 用 round()：450 s → 「8 分钟」，而同一行还写着「上限=新鲜度一半」
+    （7.5 分钟）—— 用户看到的是「8 ≤ 7.5」，凭空一个矛盾。
+    """
+    for interval in (60, 90, 120, 450, 600, 1200, 3600, 21600):
+        cap = facts.PROBE_PERIODIC_CAP_S if interval <= facts.PROBE_PERIODIC_CAP_S \
+            else facts.PROBE_PERIODIC_MAX_S
+        text = "\n".join(cli_module._capacity_lines({
+            "probe": {"periodic_enabled": True, "interval_s": interval, "cap_s": cap}}))
+        shown = text.split("每 ", 1)[1].split("（", 1)[0]
+        if shown.endswith("秒"):
+            shown_s = float(shown[:-1])
+        else:
+            shown_s = float(shown.replace(" 分钟", "")) * 60
+        assert shown_s <= interval + 0.01, (interval, shown)
+        assert shown_s <= cap + 0.01, (interval, cap, shown)
 
 
 def test_capacity_lines_flag_disabled_periodic_probe_as_real_cause():
@@ -138,6 +160,30 @@ def test_status_text_renders_channel_probe_and_capacity():
     assert "容量：1/1 个模型可广播" in text
     assert "暂停细节：让路（load）；load：GPU 97%" in text
     assert "提示：已恢复接单" in text
+
+
+def test_install_line_flags_home_record_when_it_lags_running_version():
+    """`安装：` 打的是**本机 home 安装记录**，不是运行版本（ROUND3 结论）。
+
+    覆盖安装不会更新这条记录（只有 djb init / 自升级 apply·rollback 会写），于是 0.2.5 的
+    二进制会显示「安装：0.2.2」。两个数字并列而不解释，就是又一次「谎报」——
+    不一致时加事实括注；一致时输出**与改前逐字相同**（不制造噪音，老断言不受影响）。
+    """
+    base = {
+        "state": "online", "accepting": True, "version": "0.2.5",
+        "protocol_version": "1.8.2", "daemon_running": True,
+        "install": {"version": "0.2.2", "channel": "stable", "bucket": 3},
+        "receipts": {"count": 0, "oldest_age_s": 0},
+        "credentials": {"client_key_set": True, "storage": "0600"},
+    }
+    text = cli_module._status_text(base)
+    assert "安装：0.2.2 · 频道 stable · 桶 3（本机 home 记录，运行版本 0.2.5）" in text
+
+    same = dict(base)
+    same["install"] = {"version": "0.2.5", "channel": "stable", "bucket": 3}
+    text = cli_module._status_text(same)
+    assert "安装：0.2.5 · 频道 stable · 桶 3" in text
+    assert "本机 home 记录" not in text
 
 
 # ───────────────────────────────────────────── 暂停细节（E2E-06）
