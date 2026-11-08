@@ -162,6 +162,30 @@ def test_status_text_renders_channel_probe_and_capacity():
     assert "提示：已恢复接单" in text
 
 
+def test_offline_status_keeps_periodic_line_with_planned_rhythm(tmp_path):
+    """daemon 未运行时也要打印「周期复探：每 …」（真机取证就是停止态）。
+
+    修前 `_offline_status` 给的是 ``interval_s=None`` ⇒ 整行消失，读者会以为周期复探没开；
+    而 Windows 0.2.4 的取证正是停止态采的（win-probe.json）。
+    """
+    from djb_node.config import Paths, save_config
+    from djb_node.store import Store
+    paths = Paths(str(tmp_path / "home"))
+    paths.prepare()
+    save_config(paths, cli_module.ClientConfig())
+    store = Store.create(paths.db_file, version=facts.CLIENT_VERSION)
+    value = cli_module._offline_status(paths, store)
+    assert value["probe"]["periodic_enabled"] is True          # 干净 home：默认开
+    assert value["probe"]["interval_s"] == facts.PROBE_PERIODIC_DEFAULT_S
+    assert value["probe"]["planned"] is True
+    text = "\n".join(cli_module._capacity_lines(value))
+    assert "周期复探：每 7.5 分钟" in text
+    assert "daemon 未运行，启动后生效" in text
+    # 空闲状态下没有模型 → 不该凭空编出容量行
+    assert "容量：" not in text
+    store.close() if hasattr(store, "close") else None
+
+
 def test_install_line_flags_home_record_when_it_lags_running_version():
     """`安装：` 打的是**本机 home 安装记录**，不是运行版本（ROUND3 结论）。
 

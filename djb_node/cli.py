@@ -682,8 +682,14 @@ def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
                     "wanted": channel_enabled(config, required=required),
                     "state": "offline", "wait_s": facts.CHANNEL_POLL_WAIT_S,
                     "jobs_done": 0, "jobs_failed": 0, "last_error": None},
+        # ROUND3：daemon 未运行时也必须能回答「周期复探：每 …」——真机取证（Windows
+        # win-probe.json）就是停止态采的，此时 interval_s=None 会让整行消失，
+        # 又被读成「周期复探没开」。这里给**计划节奏**（健康启动后的基础周期）并显式标注
+        # planned，渲染层据此加「daemon 未运行，启动后生效」。
         "probe": {"periodic_enabled": feature_flag(config, facts.PROBE_FLAG_PERIODIC),
-                  "interval_s": None, "status": "daemon 未运行",
+                  "interval_s": facts.PROBE_PERIODIC_DEFAULT_S,
+                  "cap_s": facts.PROBE_PERIODIC_CAP_S,
+                  "planned": True, "status": "daemon 未运行",
                   "fresh_window_s": facts.PROBE_FRESH_S,
                   "models": local_models},
         "state": snapshot.state if snapshot.state == "stopped" else "stopped",
@@ -825,11 +831,13 @@ def _capacity_lines(value: dict[str, Any]) -> list[str]:
             # 让「显示值 ≤ 上限」肉眼可核（round() 曾把 450 s 说成「每 8 分钟」越过 cap）。
             interval = int(probe.get("interval_s"))
             cap = probe.get("cap_s")
-            cap_text = ""
+            parts = ["周期复探：每 " + _duration_exact(interval) + "（" + str(interval) + " 秒）"]
             if isinstance(cap, int) and cap > 0:
-                cap_text = "，上限 " + _duration_exact(cap) + "（" + str(cap) + " 秒）"
-            lines.append("周期复探：每 " + _duration_exact(interval)
-                         + "（" + str(interval) + " 秒" + cap_text + "；退避不得越过上限）")
+                parts.append("上限 " + _duration_exact(cap) + "（" + str(cap) + " 秒）")
+            parts.append("退避不得越过上限")
+            if probe.get("planned") is True:
+                parts.append("daemon 未运行，启动后生效")
+            lines.append(" · ".join(parts))
     return lines
 
 
