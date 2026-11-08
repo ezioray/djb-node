@@ -433,11 +433,42 @@ PROBE_VERSION = "c7.1"
 PROBE_PROMPT = "djb-probe"
 """合成 prompt：编译期常量，**不含任何用户正文**（M17 §10 / T9）。"""
 PROBE_MAX_TOKENS = 1
-PROBE_TIMEOUT_S = 5.0
+
+
+def _float_env(name: str, default: float = 0.0, *, minimum: float = 0.1) -> float:
+    """读浮点环境变量：缺省/非法/低于下限一律回退 ``default``（不抛、不静默变 0）。"""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return float(default)
+    return value if value >= minimum else float(default)
+
+
+PROBE_TIMEOUT_S = _float_env("DJB_NODE_PROBE_TIMEOUT_S", 20.0)
+"""单次探针超时（秒）：**环境变量可配**，默认 20（P6）。
+
+修前写死 5.0：本地 Ollama / llama.cpp 冷启动 20–60 s、thinking 模型 16–21 s
+（实测 Windows ``qwen3:8b`` 非流式 21.3 s / 预驻留 16.1 s），5 s 内必然 timeout →
+上游永远停在 ``rejected``，家庭/办公机供方在默认配置下**不可能通过验证**（E2E-11）。
+回滚：``DJB_NODE_PROBE_TIMEOUT_S=5`` 即恢复旧超时，无需改代码。
+"""
 PROBE_FRESH_S = 15 * 60
 """last_probe_at 新鲜窗口：超过即不进容量公告（默认 15 min）。"""
 PROBE_PERIODIC_DEFAULT_S = 10 * 60
 PROBE_PERIODIC_MAX_S = 6 * 3600
+PROBE_PERIODIC_CAP_S = PROBE_FRESH_S // 2
+"""周期复探（含失败退避、模型数缩放）的**硬上界** = 新鲜度窗口的一半（P6 / E2E-12）。
+
+修前上界是 ``PROBE_PERIODIC_MAX_S``(6 h)：一次失败退避到 1200 s 就已经越过 900 s 的
+新鲜度窗口 ⇒ **每周期固定掉 5 分钟容量**；两次失败 2400 s ⇒ 供方永久 0 容量，
+而客户端 ``status`` 全程显示「接单=是」，云端只说 ``no_candidates``（无人知晓）。
+钳到 half-fresh 的不变式：任何一次复探失败，下一轮都必然落在新鲜度窗口内，
+容量只会「下降」不会「静默归零」。回滚：把 ``probe.periodic_interval_s`` 的返回值
+改回 ``min(PROBE_PERIODIC_MAX_S, ...)`` 即回旧行为。
+"""
 PROBE_MODELS_PER_STEP = 8
 """模型数退避：每多 8 个模型，周期复探间隔再加一档。"""
 PROBE_MAX_BACKOFF_SHIFT = 5
@@ -551,13 +582,19 @@ QUOTES_FLAG = "client.quotes.publish.enabled"
 
 # ─────────────────────────────────────────────────────────── C10c 出站长轮询通道
 # 口径：客户端不开放入站端口，主动长轮询平台取 job → 调本机 127.0.0.1 镜像端点执行 →
-# 回传结果。默认关闭；关闭时 daemon 不起线程，行为与无通道版本完全一致。
+# 回传结果。**0.2.4 起默认开启**（P4 / E2E-04：默认关闭时云端派单必然 150 s 超时 →
+# 503，而客户端 status 还显示「接单=是」，两侧都不说人话）。
+# 显式关闭仍然是**真开关**：本地显式写盘 false 优先于服务端 ``channel_required``（P4 落点 B），
+# 所以 rollback_rule 里的命令在任何时候都能一键停通道。
 FEATURE_FLAGS["client.channel.enabled"] = {
-    "default": False,
+    "default": True,
     "owner": "client-seat",
     "expire_at": "2026-12-31",
-    "rollback_rule": "关闭后停长轮询、退回无通道模式；已取 job 尽力回传后停止",
-    "description": "客户端出站长轮询通道（C10c）：平台下发 job、本机执行、回传结果，默认关闭",
+    "rollback_rule": ("显式写盘 false 即停长轮询、退回无通道模式（已取 job 尽力回传后停止；"
+                      "本地显式关闭优先于服务端 channel_required）。"
+                      "回滚=djb flags --disable client.channel.enabled + 重启 daemon"),
+    "description": ("客户端出站长轮询通道（C10c）：平台下发 job、本机执行、回传结果；"
+                    "0.2.4 起默认开启（显式关闭仍生效）"),
 }
 CHANNEL_FLAG = "client.channel.enabled"
 CHANNEL_POLL_PATH = "/api/v1/node/channel/poll"
@@ -584,6 +621,12 @@ CHANNEL_BODY_FIELDS: tuple[str, ...] = ("model", "messages", "max_tokens", "temp
 CHANNEL_STOP_JOIN_S = 5
 """daemon 停止时等待通道线程的秒数。"""
 CHANNEL_STATUS_KINDS: tuple[str, ...] = ("idle", "polling", "executing", "stopping")
+CHANNEL_REQUIRED_KV = "channel"
+"""服务端通道协商（心跳 ``channel_required``）的落盘位置（store kv）：
+
+写 ``{"required": bool, "at": iso}``。落盘而不是只留内存：进程重启后
+服务端的要求依然成立，否则「服务端要通道 / 客户端重启就不开了」又回到 E2E-04。
+"""
 
 # ─────────────────────────────────────────────────────────── M18b 客户端模型 / tokenizer 同步
 # 口径：客户端拉取服务端**签名 bundle**（版本 + payload_hash + TTL），校验后热应用本地

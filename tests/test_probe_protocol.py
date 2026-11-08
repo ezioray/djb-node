@@ -281,7 +281,9 @@ def test_cli_upstream_list_shows_kind(ready, store, credentials, capsys):
     assert any("third_party_relay" in line for line in lines)
     plain = [line for line in lines if "local-model" in line][0]
     assert "third_party_relay" not in plain
-    assert plain.count(" · ") == 4                    # id·access·base·state·模型
+    # id·access·base·state·模型 + P6 的「最近探针」（第 6 段，一行里看得到掉容量）
+    assert plain.count(" · ") == 5
+    assert "最近探针：" in plain
 
 
 def test_diagnose_summary_exposes_kind_and_protocol(paths, store, credentials):

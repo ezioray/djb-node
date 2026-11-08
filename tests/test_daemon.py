@@ -157,6 +157,72 @@ def test_yield_pause_and_auto_resume(paths, store, credentials, mock, clock):
         daemon.stop()
 
 
+def test_resume_clears_yield_pause_and_disables_auto_yield(paths, store, credentials,
+                                                           mock, clock):
+    """E2E-06：让路默认开会把节点按在 paused(yield_paused)，`djb resume` 必须真能恢复。
+
+    修前：resume 只推状态机 / 重启 daemon，判别器下一次采样又立刻 pause ⇒
+    用户眼里就是「djb resume 无效」（Windows 端实测）。
+    修后：resume 清掉让路暂停并**关掉自动让路**，同时把回开命令写进 resume_note。
+    """
+    _add_upstream(store, mock)
+    probe = FixedProbe("in_use", "load")
+    daemon = _daemon(paths, store, credentials, mock, probes=[probe], clock=clock)
+    daemon.start()
+    try:
+        assert daemon.machine.snapshot.reason == "yield_paused"
+        response = daemon.control({"cmd": "resume"})
+        assert response["yield_cleared"] is True
+        status = response["status"]
+        assert status["state"] == "online" and status["accepting"] is True
+        assert status["profile"]["yield_enabled"] is False
+        assert "自动让路" in status["resume_note"]
+        assert "djb limits --yield" in status["resume_note"]   # 恢复路径必须给出来
+        # 采样仍然是 in_use，但不许再把用户按回 paused（自动让路已关）
+        clock.advance(30)
+        daemon.tick(clock())
+        assert daemon.machine.snapshot.state == "online"
+        assert daemon.admit("mock-model").ok is True
+    finally:
+        daemon.stop()
+
+
+def test_resume_keeps_yield_setting_when_paused_for_another_reason(paths, store,
+                                                                  credentials, mock,
+                                                                  clock):
+    """只在「确实因为让路而暂停」时动让路设置：用户暂停不该顺手改别人的配置。"""
+    _add_upstream(store, mock)
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        assert daemon.control({"cmd": "pause"})["status"]["reason"] == "user_paused"
+        response = daemon.control({"cmd": "resume"})
+        assert response["yield_cleared"] is False
+        assert response["status"]["profile"]["yield_enabled"] is True
+        assert "resume_note" not in response["status"]
+    finally:
+        daemon.stop()
+
+
+def test_status_exposes_pause_detail_only_while_paused(paths, store, credentials,
+                                                       mock, clock):
+    """E2E-06：paused 时要知道「为什么」（让路信号），online 时不带噪音。"""
+    _add_upstream(store, mock)
+    probe = FixedProbe("in_use", "load")
+    daemon = _daemon(paths, store, credentials, mock, probes=[probe], clock=clock)
+    daemon.start()
+    try:
+        status = daemon.status()
+        assert status["state"] == "paused"
+        assert status["pause_detail"].get("source") == "load"
+        probe.state = "idle"
+        clock.advance(30)
+        daemon.tick(clock())
+        assert daemon.status()["pause_detail"] == {}
+    finally:
+        daemon.stop()
+
+
 def test_detection_error_pauses(paths, store, credentials, mock, clock):
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock,

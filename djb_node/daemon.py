@@ -273,10 +273,13 @@ class Daemon:
         self._stop_event = threading.Event()
         self._control: ControlServer | None = None
         self._started = False
-        # C10c 出站长轮询通道（默认关闭：开关关闭时不创建线程，行为与无通道版本一致）
+        # C10c 出站长轮询通道（0.2.4 起开关默认开；显式关闭时仍不创建线程）
         self._channel: ChannelClient | None = None
         self._channel_thread: threading.Thread | None = None
         self._channel_stop: threading.Event | None = None
+        # P4 落点 B：服务端心跳协商 channel_required。落盘（store kv）而不是只留内存
+        # —— 进程重启后服务端的要求依然成立。
+        self._channel_required = self._load_channel_required()
         # M18b 模型/tokenizer 同步（默认关闭：关闭时不拉取、不建线程）
         self._model_sync: ModelSyncClient | None = None
         self._model_sync_thread: threading.Thread | None = None
@@ -672,7 +675,10 @@ class Daemon:
     def _apply_subsystem_toggles(self, fresh: ClientConfig) -> list[str]:
         """开关变了就起停对应线程；**不碰**在途请求、状态机、收据缓冲。"""
         applied: list[str] = []
-        plan = (("channel", channel_enabled, self._start_channel, self._stop_channel),
+        # 通道的「该不该开」不只看本地开关：服务端心跳可以要求通道（P4 落点 B），
+        # 但本地显式关闭优先（见 channel.channel_enabled 的优先级说明）。
+        plan = (("channel", self._channel_flag_state, self._start_channel,
+                 self._stop_channel),
                 ("model_sync", model_sync_enabled, self._start_model_sync,
                  self._stop_model_sync),
                 ("notifications", notifications_enabled, self._start_notifications,
@@ -812,10 +818,29 @@ class Daemon:
             return False
         return True
 
-    # ── C10c 出站长轮询通道（默认关闭）
+    # ── C10c 出站长轮询通道（0.2.4 起默认开；Kill switch 仍生效）
+    def _load_channel_required(self) -> bool:
+        """从 store kv 读服务端通道要求（P4：心跳协商结果跨重启保留）。"""
+        raw = self.store.get_kv(facts.CHANNEL_REQUIRED_KV, default={}) or {}
+        if isinstance(raw, dict):
+            return raw.get("required") is True
+        return False
+
+    def _channel_flag_state(self, config: ClientConfig | None = None) -> bool:
+        """通道「该不该工作」的唯一判定（本地开关 + 服务端协商）。
+
+        签名接受一个 config 是为了与 ``_apply_subsystem_toggles`` 里其它开关同形；
+        协商状态始终取自本实例（配置重载只换 config，不换协商结论）。
+        """
+        return channel_enabled(config if config is not None else self.config,
+                               required=self._channel_required)
+
+    def _channel_wanted(self) -> bool:
+        return self._channel_flag_state(self.config)
+
     def _start_channel(self) -> None:
-        """开关 ``client.channel.enabled`` 打开时起通道线程；关闭时不创建任何线程。"""
-        if not channel_enabled(self.config):
+        """通道该工作时起线程（本地开关 or 服务端要求）；显式关闭时不创建任何线程。"""
+        if not self._channel_wanted():
             return
         if self._channel_thread is not None and self._channel_thread.is_alive():
             return
@@ -852,19 +877,48 @@ class Daemon:
         self._channel_thread = None
 
     def _channel_status(self) -> dict[str, Any]:
-        """status / 诊断用（只有状态与计数，无正文、无令牌）。"""
+        """status / 诊断用（只有状态与计数，无正文、无令牌）。
+
+        ``enabled`` = 本地开关；``required`` = 服务端心跳要求；
+        ``wanted`` = 「它现在应不应该在跑」（前两者的合成）。三者分开给，
+        是为了让 CLI 的「通道：已连接/未开启/已断开」只按证据说话 ——
+        拿不到证据时宁可说「已断开」，也不谎报「已连接」。
+        """
         enabled = channel_enabled(self.config)
         snapshot = self._channel.snapshot() if self._channel is not None else {}
         running = bool(self._channel_thread is not None
                        and self._channel_thread.is_alive())
         return {"enabled": enabled, "running": running,
+                "required": bool(self._channel_required),
+                "wanted": self._channel_wanted(),
                 "state": snapshot.get("state", "idle"),
                 "port": self.server.port,
                 "wait_s": facts.CHANNEL_POLL_WAIT_S,
                 "jobs_done": int(snapshot.get("jobs_done", 0)),
                 "jobs_failed": int(snapshot.get("jobs_failed", 0)),
                 "last_job_id": snapshot.get("last_job_id"),
+                "last_job_at": snapshot.get("last_job_at"),
                 "last_error": snapshot.get("last_error")}
+
+    def _apply_channel_required(self, result: Any, now: datetime) -> None:
+        """心跳里的 ``channel_required``（P4 落点 B）：落盘 + 即时起停通道线程。
+
+        只认真正的 bool —— 字段缺失 / 字符串 / null 一律忽略（契约是**加性字段**，
+        老云端不发这个键时客户端行为必须逐字不变）。
+        本地显式关闭仍然优先：这里只决定「要不要起来」，不覆盖 kill switch。
+        """
+        value = result.get("channel_required") if isinstance(result, dict) else None
+        if not isinstance(value, bool) or value == self._channel_required:
+            return
+        self._channel_required = value
+        self.store.set_kv(facts.CHANNEL_REQUIRED_KV,
+                          {"required": value, "at": iso(now)})
+        event("daemon.channel_required", required=value)
+        running = self._subsystem_running("channel")
+        if self._channel_wanted() and not running:
+            self._start_channel()
+        elif not self._channel_wanted() and running:
+            self._stop_channel()
 
     # ── M18b 模型 / tokenizer 同步（默认关闭）
     def _start_model_sync(self) -> None:
@@ -1206,6 +1260,8 @@ class Daemon:
             return
         self._consecutive_failures = 0
         self._forbidden_failures = 0
+        # P4 落点 B：服务端用心跳协商通道要求（加性字段，老云端不发 = 不改行为）
+        self._apply_channel_required(result, now)
         interval = result.get("next_heartbeat_seconds")
         if not isinstance(interval, int) or isinstance(interval, bool):
             interval = facts.HEARTBEAT_DEFAULT_S
@@ -1824,6 +1880,8 @@ class Daemon:
             "control": self.control_status(),
             "reason": snapshot.reason,
             "reason_label": reason_label(snapshot.reason),
+            # E2E-06：只说「已暂停」不够，要说**为什么**（让路/资源/时段…各有不同恢复路径）。
+            "pause_detail": dict(self._last_yield) if snapshot.state == "paused" else {},
             "next_step": snapshot.next_step,
             "since": snapshot.since,
             "accepting": snapshot.is_accepting(),
@@ -1896,6 +1954,27 @@ class Daemon:
                 "reason": None if available else (reason or "control_not_running")}
 
     # ── 控制命令
+    def _clear_yield_pause(self) -> bool:
+        """手动 resume 时清掉「让路暂停」，返回是否真的动了让路设置（E2E-06）。
+
+        为什么不能只把状态机推回 online：让路判据是**实时** GPU/CPU/焦点采样，
+        下一个 tick 采样到「你在用机器」就立刻又 pause —— 用户看到的就是
+        「djb resume 无效」（E2E-06 实测：resume 重启 daemon 后仍 paused(yield_paused)）。
+
+        自动让路本身是有用的默认（别抢用户的机器），所以只在「当前确实因为让路而暂停」
+        时才动它，并把恢复命令写进 status 的 resume_note；其它暂停原因一概不碰。
+        """
+        if self.machine.snapshot.reason != "yield_paused":
+            return False
+        self._last_yield = {}
+        profile = self.store.profile()
+        if not profile.yield_enabled:
+            return False
+        profile.yield_enabled = False
+        self.store.save_profile(profile)
+        event("daemon.yield_disabled_by_resume")
+        return True
+
     def control(self, command: dict[str, Any]) -> dict[str, Any]:
         if getattr(self, "_control_unavailable_reason", None) is not None:
             from .ipc_windows import IpcUnavailable
@@ -1929,10 +2008,17 @@ class Daemon:
                 self._consecutive_failures = 0
             self._forbidden_failures = 0
             self._next_heartbeat_at = self._now()
+            # E2E-06：让路暂停必须能被手动 resume 清掉（见 _clear_yield_pause）
+            yield_cleared = self._clear_yield_pause()
             self._evaluate(self._now())
             self._persist()
-            event("daemon.user_resumed")
-            return {"ok": True, "status": self.status()}
+            event("daemon.user_resumed", yield_cleared=yield_cleared)
+            status = self.status()
+            if yield_cleared:
+                status["resume_note"] = (
+                    "已恢复接单；同时关闭了「自动让路」（它刚把你暂停了）。"
+                    "想重新打开自动让路：djb limits --yield")
+            return {"ok": True, "status": status, "yield_cleared": yield_cleared}
         if action in ("reload", "reload_config"):
             result = self.reload_config()
             if result.get("ok") is not True:

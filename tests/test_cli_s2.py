@@ -47,7 +47,7 @@ def test_token_count_messages_includes_template_overhead(ready, capsys):
     assert payload["tokens"] >= 4
 
 
-def test_flags_list_defaults_all_off(ready, capsys):
+def test_flags_list_defaults_match_approved_whitelist(ready, capsys):
     assert main(["flags", "--json"]) == 0
     payload = _json_out(capsys)
     # 计数与名单都以登记表为唯一来源（U1：原硬编码 count == 7 在新增开关后陈旧失败）

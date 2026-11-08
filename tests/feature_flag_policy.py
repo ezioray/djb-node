@@ -16,4 +16,9 @@ DEFAULT_ON_APPROVED: dict[str, str] = {
     "client.ipc.windows.enabled":
         "决策人 2026-11-05 拍板：Windows 本地控制口首发开启。"
         "留痕 ops/release/LAUNCH-ENV-CONSTRAINTS-2026-11-05.md §7（task-13）",
+    "client.channel.enabled":
+        "ROUND2-20261108 00-PLAN §2.1 P4（客户端出站通道默认开）：默认关闭时云端派单必然"
+        " 150 s 超时 → 503 50901，而客户端 status 仍显示「接单=是」，两侧都不说人话。"
+        "留痕 reports/E2E-20261107-FULL/TICKETS.md E2E-04 + RELEASE-PREP/PATCHES.md P4；"
+        "显式 flags --disable 优先于服务端协商 ⇒ 仍是真开关",
 }

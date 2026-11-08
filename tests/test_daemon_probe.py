@@ -41,7 +41,8 @@ def test_status_exposes_flag_with_three_fields(paths, store, credentials, mock, 
         assert flag["expire_at"] == "2026-12-31"
         assert flag["rollback_rule"]
         assert status["probe"]["periodic_enabled"] is False
-        assert status["probe"]["interval_s"] == facts.PROBE_PERIODIC_DEFAULT_S
+        # P6：周期复探间隔一律钳在 half-fresh（默认 600 → 450），不再是裸的默认值
+        assert status["probe"]["interval_s"] == facts.PROBE_PERIODIC_CAP_S
         assert status["probe"]["next_at"]
     finally:
         daemon.stop()
@@ -119,28 +120,34 @@ def test_periodic_on_reprobes_when_due(paths, store, credentials, mock, clock):
         daemon.stop()
 
 
-def test_periodic_failure_backs_off_exponentially(paths, store, credentials, mock, clock):
+def test_periodic_failure_backoff_never_crosses_half_fresh(paths, store, credentials,
+                                                            mock, clock):
+    """失败仍然计数（退避语义在），但**间隔不得越过新鲜度的一半**（P6 / E2E-12）。
+
+    修前这里断言 1200 / 2400 s：那正是「每周期掉 5 分钟容量 → 永久 0 容量」的根因。
+    """
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock, clock=clock,
                      config=_flag_config(mock, True))
+    cap = facts.PROBE_FRESH_S // 2
     daemon.start()
     try:
         mock.chat_status = 500                          # L1 可达、推理失败
         clock.advance(facts.PROBE_PERIODIC_DEFAULT_S + 1)
         daemon.tick(clock())
         assert daemon._probe_failures == 1
-        assert daemon._probe_interval_s == 2 * facts.PROBE_PERIODIC_DEFAULT_S
-        # 下一轮：失败继续翻倍
+        assert daemon._probe_interval_s <= cap
+        # 下一轮：失败继续计数，但间隔仍被钳住（不再翻倍到 1200/2400 s）
         clock.advance(daemon._probe_interval_s + 1)
         daemon.tick(clock())
         assert daemon._probe_failures == 2
-        assert daemon._probe_interval_s == 4 * facts.PROBE_PERIODIC_DEFAULT_S
-        # 上游恢复后失败计数归零
+        assert daemon._probe_interval_s <= cap
+        # 上游恢复后失败计数归零，间隔仍在 half-fresh 之内
         mock.chat_status = 200
         clock.advance(daemon._probe_interval_s + 1)
         daemon.tick(clock())
         assert daemon._probe_failures == 0
-        assert daemon._probe_interval_s == facts.PROBE_PERIODIC_DEFAULT_S
+        assert daemon._probe_interval_s <= cap
     finally:
         daemon.stop()
 
@@ -160,7 +167,8 @@ def test_periodic_interval_scales_with_model_count(paths, store, credentials, mo
         daemon.tick(clock())
         expected = periodic_interval_s(10, daemon._probe_failures)
         assert daemon._probe_interval_s == expected
-        assert expected >= 2 * facts.PROBE_PERIODIC_DEFAULT_S
+        # P6：模型数缩放与退避一起被钳在 half-fresh 之内（修前这里是 ≥ 2×默认 600）
+        assert expected <= facts.PROBE_FRESH_S // 2
     finally:
         daemon.stop()
 

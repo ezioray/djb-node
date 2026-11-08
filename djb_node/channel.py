@@ -61,15 +61,50 @@ from .logging_setup import event
 from .secure import CredentialStore
 from .util import iso, utcnow
 
-__all__ = ["ChannelJob", "ChannelClient", "channel_enabled", "parse_job", "result_for_error"]
+__all__ = ["ChannelJob", "ChannelClient", "channel_enabled", "explicit_flag_value",
+           "parse_job", "result_for_error"]
 
 #: 本机调用签名：(body, timeout) -> HttpResponse 形状（status/headers/body/json()）
 ChatCall = Callable[[dict[str, Any], float], Any]
 
 
-def channel_enabled(config: ClientConfig | None) -> bool:
-    """开关 ``client.channel.enabled``（默认关闭；唯一求值入口 config.feature_flag）。"""
-    return bool(config is not None and feature_flag(config, facts.CHANNEL_FLAG))
+def explicit_flag_value(config: ClientConfig | None, name: str) -> Any:
+    """**显式写盘**的开关值（``None`` = 没写过）；与 ``config.feature_flag`` 同一取值优先级。
+
+    为什么要单独读一次：``feature_flag`` 分不清「用户显式关掉」和「没写过」。
+    P4 起通道默认开，同时服务端可以用心跳 ``channel_required`` 要求通道；
+    这两种来源都不能覆盖用户的**显式**关闭，否则 ``rollback_rule`` 里的
+    ``djb flags --disable client.channel.enabled`` 就失效了（回滚不回去 = 没有开关）。
+    """
+    if config is None:
+        return None
+    extra = getattr(config, "extra", None)
+    if not isinstance(extra, Mapping):
+        return None
+    nested = extra.get("feature_flags")
+    if isinstance(nested, Mapping) and name in nested:
+        return nested[name]
+    if name in extra:
+        return extra[name]
+    return None
+
+
+def channel_enabled(config: ClientConfig | None, *, required: bool = False) -> bool:
+    """通道是否应工作：开关 ``client.channel.enabled``（0.2.4 起默认开）+ 服务端协商。
+
+    ``required`` = 心跳响应里的 ``channel_required``（P4 落点 B）。优先级：
+
+    1. 本地**显式**写盘 false → 关（kill switch 优先，回滚路径必须可靠）；
+    2. 否则 ``feature_flag`` 真值 or ``required`` → 开。
+
+    第 2 条让老配置（0.2.3 之前默认关闭、且没写过 flags 的机器）在云端要求通道时也能起来，
+    不需要用户先跑 ``djb flags --enable``。
+    """
+    if config is None:
+        return False
+    if explicit_flag_value(config, facts.CHANNEL_FLAG) is False:
+        return False
+    return bool(feature_flag(config, facts.CHANNEL_FLAG) or required)
 
 
 # ─────────────────────────────────────────────────────────── job 解析

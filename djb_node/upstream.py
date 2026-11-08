@@ -50,6 +50,9 @@ class ModelEntry:
     usage_ok: bool | None = None
     probe_version: str | None = None
     last_probe_at: str | None = None
+    #: 最近一次探针的失败分类（``timeout`` / ``connect`` …）。只落本地、只用于把
+    #: 「为什么掉了容量」说出来（P6/E2E-10：原来只有 state=rejected，用户看不到原因）。
+    probe_error_class: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"id": self.id, "enabled": bool(self.enabled)}
@@ -67,6 +70,8 @@ class ModelEntry:
             payload["probe_version"] = self.probe_version
         if self.last_probe_at is not None:
             payload["last_probe_at"] = self.last_probe_at
+        if self.probe_error_class is not None:
+            payload["probe_error_class"] = self.probe_error_class
         return payload
 
     @classmethod
@@ -81,7 +86,8 @@ class ModelEntry:
                    stream_ok=_optional_bool(raw.get("stream_ok")),
                    usage_ok=_optional_bool(raw.get("usage_ok")),
                    probe_version=_optional_str(raw.get("probe_version")),
-                   last_probe_at=_optional_str(raw.get("last_probe_at")))
+                   last_probe_at=_optional_str(raw.get("last_probe_at")),
+                   probe_error_class=_optional_str(raw.get("probe_error_class")))
 
     # ── 公告门控（C7）
     def verified(self) -> bool:
@@ -441,6 +447,12 @@ class UpstreamManager:
                 item["usage_ok"] = bool(outcome.usage_present)
                 item["probe_version"] = facts.PROBE_VERSION
                 item["last_probe_at"] = stamp
+                # P6/E2E-10：失败分类也落本地（只在失败时写，成功即清掉），
+                # 否则「容量为什么掉了」只能靠猜，用户只看到 rejected。
+                if outcome.inference_ok:
+                    item.pop("probe_error_class", None)
+                elif outcome.error_class:
+                    item["probe_error_class"] = str(outcome.error_class)
             models.append(item)
         return models
 
@@ -457,6 +469,9 @@ class UpstreamManager:
                             "usage_ok": entry.usage_ok,
                             "probe_version": entry.probe_version,
                             "last_probe_at": entry.last_probe_at,
+                            # P6：失败分类 + 已过秒数（「X 分钟后掉容量」的唯一来源）
+                            "probe_error_class": entry.probe_error_class,
+                            "probe_age_s": entry.probe_age_s(moment),
                             "fresh": entry.fresh(moment),
                             "announceable": entry.announceable(moment)})
         return details

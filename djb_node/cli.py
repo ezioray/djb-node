@@ -14,6 +14,7 @@ import getpass
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ from typing import Any, Callable
 from . import __version__, facts, pidfile
 from .api import NodeApi
 from .attest import AttestationManager
+from .channel import channel_enabled
 from .config import (ClientConfig, Paths, feature_flag, load_config, resolve_home, save_config)
 from .daemon import ControlClient, Daemon, control_socket_file
 from .diagnose import DiagnoseBuilder, DiagnoseError
@@ -354,6 +356,88 @@ _START_SETTLED_STATES = ("online", "paused", "error", "updating", "stopped")
 
 
 # ─────────────────────────────────────────────────────────── start / stop
+#: daemon 子进程 stdout/stderr 的落点（启动失败时回显它的尾行，E2E-09）
+_DAEMON_OUT_NAME = "daemon.out"
+
+
+def _port_busy(port: int) -> bool:
+    """127.0.0.1:port 现在还能不能 bind。
+
+    判据用 **bind 本身**（不开 SO_REUSEADDR），而不是 connect：
+    connect 只证明「有人在听」，bind 才回答「daemon 还能不能起来」。
+    停止竞态里正是后者（socket 文件没了、监听还在）把人骗去排「控制套接字不存在」。
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", int(port)))
+        return False
+    except OSError:
+        return True
+    finally:
+        probe.close()
+
+
+def _listening_pid(port: int) -> int | None:
+    """谁在 LISTEN 这个端口（只查 Linux /proc；拿不到返回 None —— 不猜、不编 pid）。"""
+    if not os.path.isdir("/proc"):
+        return None
+    inodes: set[str] = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, "r", encoding="utf-8", errors="replace") as handle:
+                rows = handle.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            parts = row.split()
+            if len(parts) < 10 or parts[3] != "0A":      # 0A = LISTEN
+                continue
+            try:
+                local_port = int(parts[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                continue
+            if local_port == int(port):
+                inodes.add(parts[9])
+    if not inodes:
+        return None
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = os.path.join("/proc", entry, "fd")
+        try:
+            names = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for name in names:
+            try:
+                target = os.readlink(os.path.join(fd_dir, name))
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target[8:-1] in inodes:
+                return int(entry)
+    return None
+
+
+def _startup_log_hint(paths: Paths, *, limit: int = 3) -> str:
+    """启动失败时回显**日志尾行**（E2E-09：真实原因只写在 daemon.out 里）。"""
+    lines: list[str] = []
+    out_path = os.path.join(paths.logs_dir, _DAEMON_OUT_NAME)
+    if os.path.isfile(out_path):
+        lines = _read_tail([out_path], limit)
+    if not lines:
+        lines = _read_tail(_log_files(paths.logs_dir), limit)
+    clean = [redact_text(line.rstrip("\n")) for line in lines if line.strip()]
+    return "\n".join(clean[-limit:])
+
+
+def _control_reachable(paths: Paths, *, timeout: float = 1.0) -> bool:
+    """本 home 的 daemon 现在能不能应答（用于区分「端口被自己占」与「被别人占」）。"""
+    try:
+        return bool(ControlClient(paths).call({"cmd": "ping"}, timeout=timeout).get("ok"))
+    except (NotRunningError, DjbError):
+        return False
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
     if getattr(args, "port", None):
@@ -361,6 +445,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         config.validate()
         save_config(paths, config)
     token = new_token(32)
+    port = int(config.mirror_port)
     if getattr(args, "foreground", False):
         daemon = Daemon(paths, config=config, local_token=token)
         if not getattr(args, "no_token", False):
@@ -384,7 +469,22 @@ def cmd_start(args: argparse.Namespace) -> int:
         if _control_channel_disabled(paths):
             print(_CONTROL_DISABLED_HINT, file=sys.stderr)
         else:
-            print("djb: daemon 启动超时（" + last_error + "）；查看 djb logs --tail 50", file=sys.stderr)
+            # E2E-09：端口被别人占着时，真实原因不是「控制套接字不存在」。
+            # 只改**提示**、不改退出码（启动失败仍然是 EXIT_NOT_RUNNING）。
+            buried = ""
+            if _port_busy(port):
+                owner = _listening_pid(port)
+                buried = ("；端口 " + str(port) + " 已被"
+                          + ((" pid=" + str(owner)) if owner else "其它进程")
+                          + " 占用 —— daemon 绑不上本机镜像端口。"
+                          + ("先 djb stop --force 清掉旧 daemon，" if owner else "")
+                          + "或换端口：djb start --port <新端口>")
+            print("djb: daemon 启动超时（" + last_error + "）" + buried
+                  + "；查看 djb logs --tail 50", file=sys.stderr)
+        # E2E-09：把日志尾行直接印出来 —— [Errno 98] 这类真实原因只在那里
+        hint = _startup_log_hint(paths)
+        if hint:
+            print("最近的日志：\n" + hint, file=sys.stderr)
         return facts.EXIT_NOT_RUNNING
     # 控制口起来 ≠ 已经接单：等状态机真的走到 online（或走到 paused/error 这类终态）。
     # 否则用户看到「已启动」，实际还在 starting、一单也不接。
@@ -478,15 +578,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
             return _force_stop(paths)
         print("daemon 未在运行（幂等：无需停止）")
         return 0
+    # E2E-09：控制口消失 ≠ 进程已经放端口。等**端口真的能再 bind** 再说「已停止」，
+    # 否则紧跟一条 djb start 会撞 Errno 98，却被报成「控制套接字不存在」。
+    try:
+        port = int(load_config(paths).mirror_port)
+    except DjbError:
+        port = int(facts.MIRROR_PORT)
     deadline = time.monotonic() + float(getattr(args, "timeout", 15) or 15)
     while time.monotonic() < deadline:
-        if not os.path.exists(control_socket_file(paths)):
+        if not os.path.exists(control_socket_file(paths)) and not _port_busy(port):
             print("daemon 已停止")
             return 0
         time.sleep(0.2)
     if getattr(args, "force", False):
         return _force_stop(paths)
-    print("djb: 停止超时；可用 djb stop --force", file=sys.stderr)
+    owner = _listening_pid(port) if _port_busy(port) else None
+    detail = ("控制口已关闭，但端口 " + str(port) + " 仍被"
+              + ((" pid=" + str(owner)) if owner else "其它进程") + " 占用"
+              ) if _port_busy(port) else "控制套接字仍在"
+    print("djb: 停止超时（" + detail + "）；可用 djb stop --force", file=sys.stderr)
     return facts.EXIT_CONFLICT
 
 
@@ -565,8 +675,25 @@ def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
     install = store.install()
     policy = store.policy()
     runtime = store.get_kv("runtime", default={}) or {}
+    config = load_config(paths)
+    # P4 / P6：daemon 没起时也要如实回答（离线不等于「什么都没开」）
+    negotiated = store.get_kv(facts.CHANNEL_REQUIRED_KV, default={}) or {}
+    required = (negotiated.get("required") is True
+                if isinstance(negotiated, dict) else False)
+    manager = UpstreamManager(store, CredentialStore(paths))
+    local_models = [entry for item in manager.list()
+                    for entry in manager.probe_details(item.id)]
     return {
         "daemon_running": False,
+        "channel": {"enabled": channel_enabled(config), "running": False,
+                    "required": bool(required),
+                    "wanted": channel_enabled(config, required=required),
+                    "state": "offline", "wait_s": facts.CHANNEL_POLL_WAIT_S,
+                    "jobs_done": 0, "jobs_failed": 0, "last_error": None},
+        "probe": {"periodic_enabled": feature_flag(config, facts.PROBE_FLAG_PERIODIC),
+                  "interval_s": None, "status": "daemon 未运行",
+                  "fresh_window_s": facts.PROBE_FRESH_S,
+                  "models": local_models},
         "state": snapshot.state if snapshot.state == "stopped" else "stopped",
         "reason": None,
         "reason_label": "daemon 未运行",
@@ -594,6 +721,148 @@ def _age_seconds(value: str | None) -> int:
     return max(0, int((utcnow() - moment).total_seconds()))
 
 
+def _clock(moment: Any) -> str:
+    """时间戳 → 本机时区 ``HH:MM``（只用于人看；缺失/非法返回 ``?``）。"""
+    try:
+        return moment.astimezone().strftime("%H:%M")
+    except (AttributeError, ValueError, OSError):          # pragma: no cover - 防御
+        return "?"
+
+
+def _minutes(seconds: Any) -> str:
+    """秒 → 人话（<90 s 用秒，其余取整到分钟）；缺失给「?」，绝不补 0。"""
+    try:
+        value = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return "?"
+    if value < 90:
+        return str(max(1, value)) + " 秒"
+    return str(int(round(value / 60.0))) + " 分钟"
+
+
+def _probe_status_line(models: Any, *, now: Any = None, fresh_s: Any = None) -> str:
+    """「最近探针：ok @ 14:32（约 7 分钟后掉容量）」（P6/E2E-10）。
+
+    ``djb status`` 与 ``djb upstream list`` 共用这一处口径：
+    · 没探过 → 明确说「从未探测」，不编时间、不说「正常」；
+    · 探过 → 结论（ok / 失败分类）+ 时间 + **还剩多少新鲜度**；
+    · 已过期 → 直接说「已掉容量」并给出超期时长（不再显示「接单=是」而实际 0 容量）。
+    """
+    moment = now or utcnow()
+    ttl = int(fresh_s or facts.PROBE_FRESH_S)
+    entries = [item for item in (models or []) if isinstance(item, dict)]
+    newest = None
+    for item in entries:
+        stamp = parse_iso(item.get("last_probe_at")) if item.get("last_probe_at") else None
+        if stamp is not None and (newest is None or stamp > newest):
+            newest = stamp
+    if newest is None:
+        return ("最近探针：从未探测（不产生容量；手动补一次：djb upstream probe --id <上游>）")
+    same = [item for item in entries
+            if parse_iso(item.get("last_probe_at") or "") == newest]
+    ok = any(item.get("inference_ok") is True for item in same)
+    label = "ok"
+    if not ok:
+        klass = next((str(item.get("probe_error_class")) for item in same
+                      if item.get("probe_error_class")), "")
+        label = klass or "失败"
+    age = max(0, int((moment - newest).total_seconds()))
+    remain = ttl - age
+    suffix = ("（约 " + _minutes(remain) + "后掉容量）" if remain > 0
+              else "（**已掉容量**：超出新鲜度 " + _minutes(-remain) + "）")
+    return "最近探针：" + label + " @ " + _clock(newest) + suffix
+
+
+def _capacity_reason(item: dict[str, Any]) -> str:
+    """单个模型「为什么没进容量」——按证据排序，不猜。"""
+    if item.get("enabled") is False:
+        return "上游已停用"
+    if item.get("inference_ok") is None:
+        return "从未探测"
+    if item.get("inference_ok") is False:
+        return "探针未通过（" + str(item.get("probe_error_class") or "未记录原因") + "）"
+    age = item.get("probe_age_s")
+    return ("探针过期（" + _minutes(age) + "前）" if age is not None else "探针过期")
+
+
+def _capacity_lines(value: dict[str, Any]) -> list[str]:
+    """容量与「掉容量原因」+ 周期复探节奏（P6：容量下降必须可见，不许静默）。"""
+    probe = value.get("probe") if isinstance(value.get("probe"), dict) else {}
+    models = [item for item in (probe.get("models") or []) if isinstance(item, dict)]
+    lines: list[str] = []
+    if models:
+        live = [item for item in models if item.get("announceable")]
+        lines.append("容量：" + str(len(live)) + "/" + str(len(models)) + " 个模型可广播")
+        reasons = [str(item.get("model")) + " —— " + _capacity_reason(item)
+                   for item in models if not item.get("announceable")]
+        if reasons:
+            shown = reasons[:4]
+            if len(reasons) > 4:
+                shown.append("还有 " + str(len(reasons) - 4) + " 个")
+            lines.append("掉容量原因：" + "；".join(shown))
+    if probe:
+        if probe.get("periodic_enabled") is False:
+            lines.append("周期复探：关（client.probe.periodic.enabled）→ 探针一过期就掉容量，"
+                         "只能手动 djb upstream probe")
+        elif isinstance(probe.get("interval_s"), int):
+            lines.append("周期复探：每 " + _minutes(probe.get("interval_s"))
+                         + "（上限=新鲜度一半，退避不得越过）")
+    return lines
+
+
+def _channel_text(channel: dict[str, Any]) -> str:
+    """「通道：已连接 / 未开启 / 已断开」——只按证据说，**不得谎报**（P4 落点 C）。
+
+    判据只有三个字段：``wanted``（该不该跑）、``running``（线程在不在）、
+    ``state``（通道状态机的当前态）。任何一项拿不到证据都不说「已连接」。
+    """
+    wanted = bool(channel.get("wanted", channel.get("enabled")))
+    running = bool(channel.get("running"))
+    state = str(channel.get("state") or "idle")
+    tail = ""
+    if channel.get("required") is True:
+        tail += " · 服务端要求通道"
+    done = int(channel.get("jobs_done") or 0)
+    failed = int(channel.get("jobs_failed") or 0)
+    if done or failed:
+        tail += " · 已接单 " + str(done) + ("（失败 " + str(failed) + "）" if failed else "")
+    if not wanted:
+        return ("未开启（云端派单要等超时；开：djb flags --enable "
+                + facts.CHANNEL_FLAG + " 后重启 daemon）")
+    if state == "offline":
+        return "已断开（daemon 未运行）"
+    if not running:
+        reason = channel.get("last_error")
+        return ("已断开（通道线程未运行" + ("：上次错误 " + str(reason) if reason else "")
+                + "）" + tail)
+    if state in ("polling", "executing"):
+        return "已连接（长轮询 wait_s=" + str(channel.get("wait_s")) + "）" + tail
+    return "已断开（线程在跑但状态 " + state + "，正在退出）" + tail
+
+
+def _pause_detail_text(detail: Any) -> str:
+    """暂停细节 → 人话（E2E-06：只说「已暂停」不够，要说**为什么**）。"""
+    if not isinstance(detail, dict) or not detail:
+        return ""
+    source = detail.get("source")
+    if source:
+        parts = []
+        for item in detail.get("signals") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("state") or "") in ("in_use", "error"):
+                parts.append(str(item.get("source") or "?") + "："
+                             + str(item.get("detail") or item.get("state")))
+        return ("让路（" + str(source) + "）"
+                + ("；" + "、".join(parts) if parts else ""))
+    over = detail.get("over")
+    if isinstance(over, dict) and over:
+        return "资源超上限：" + "、".join(
+            str(key) + " " + str(item.get("value")) + " > " + str(item.get("cap"))
+            for key, item in over.items() if isinstance(item, dict))
+    return ""
+
+
 def _status_text(value: dict[str, Any]) -> str:
     lines = [
         "状态：" + str(value.get("state")) + (
@@ -602,6 +871,14 @@ def _status_text(value: dict[str, Any]) -> str:
         "版本：" + str(value.get("version")) + " · 协议 " + str(value.get("protocol_version")),
         "daemon：" + ("运行中" if value.get("daemon_running") else "未运行"),
     ]
+    # P4 落点 C：通道三态。没这一行时「路由成功但节点收不到单」根本看不出来。
+    channel = value.get("channel")
+    if isinstance(channel, dict) and channel:
+        lines.append("通道：" + _channel_text(channel))
+    # E2E-06：暂停原因要能看到「为什么」（让路信号/资源超限/时段外…恢复路径各不相同）
+    pause_detail = _pause_detail_text(value.get("pause_detail"))
+    if pause_detail:
+        lines.append("暂停细节：" + pause_detail)
     if value.get("next_step"):
         lines.append("下一步：" + str(value["next_step"]))
     install = value.get("install") or {}
@@ -647,10 +924,18 @@ def _status_text(value: dict[str, Any]) -> str:
             lines.append("基准：" + str(bench.get("tokens_per_second")) + " tok/s（"
                          + str(bench.get("method")) + "）")
         lines.append("机器画像上报：" + ("开" if value.get("machine_reported") else "关"))
+    # P6 / E2E-10：最近探针 + 掉容量原因（容量下降必须可见，不许静默归零）
+    probe = value.get("probe") if isinstance(value.get("probe"), dict) else {}
+    if probe.get("models"):
+        lines.append(_probe_status_line(probe.get("models"),
+                                        fresh_s=probe.get("fresh_window_s")))
+    lines.extend(_capacity_lines(value))
     local_api = value.get("local_api") or {}
     if local_api:
         lines.append("本机镜像：http://" + str(local_api.get("host")) + ":"
                      + str(local_api.get("port")) + "/v1（仅回环）")
+    if value.get("resume_note"):
+        lines.append("提示：" + str(value["resume_note"]))
     if value.get("daemon_running"):
         lines.append("提示：djb status --show-token 可读取本次进程的 local_token")
     return "\n".join(lines)
@@ -667,8 +952,20 @@ def _pause_resume(args: argparse.Namespace, *, pause: bool) -> int:
         return 0
     except NotRunningError:
         store.set_kv("user_paused", bool(pause))
+        note = ""
+        if not pause:
+            # E2E-06 的等价可靠路径：daemon 没起时也要能把「让路暂停」清掉，
+            # 否则用户 resume 了、下次 start 又从 paused(yield_paused) 开始。
+            # 只按**持久化快照**判断（不猜）：上次确实是让路暂停才动让路设置。
+            snapshot = Snapshot.from_dict(store.get_kv("daemon_state"))
+            profile = store.profile()
+            if snapshot.reason == "yield_paused" and profile.yield_enabled:
+                profile.yield_enabled = False
+                store.save_profile(profile)
+                note = ("；已同时关闭「自动让路」（上次停在让路暂停）。"
+                        "重新打开：djb limits --yield")
         print(("已记录暂停偏好" if pause else "已记录恢复偏好")
-              + "（daemon 未运行；下次 djb start 生效）")
+              + "（daemon 未运行；下次 djb start 生效）" + note)
         return 0
 
 
@@ -828,7 +1125,10 @@ def _upstream_line(item: dict[str, Any]) -> str:
         parts.append(str(kind))
     parts.extend([str(item.get("base_url")), str(item.get("state"))])
     models = ",".join(str(model.get("id")) for model in item.get("models") or [])
-    return " · ".join(parts) + " · 模型 " + models
+    # P6：把「最近探针 / 还有多久掉容量」直接印在这一行（原来只能看 state=verified，
+    # 掉容量时用户完全无感 —— E2E-10 实测「公告 qps=0 而 status 仍说接单=是」）。
+    probe = _probe_status_line(item.get("models"))
+    return " · ".join(parts) + " · 模型 " + models + " · " + probe
 
 
 def cmd_upstream(args: argparse.Namespace) -> int:

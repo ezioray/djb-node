@@ -145,18 +145,32 @@ def _run(client, api, *, stop_after: int, timeout: float = 5.0) -> threading.Eve
 
 
 # ─────────────────────────────────────────────────────────── 开关
-def test_flag_default_off_with_three_fields():
-    for config in (None, ClientConfig()):
-        assert channel_enabled(config) is False
+def test_flag_default_on_with_three_fields_and_kill_switch():
+    """P4：默认**开**（否则云端派单必然 150 s 超时，E2E-04），但仍是真开关。"""
+    assert channel_enabled(None) is False              # 没有配置 = 没有通道
+    assert channel_enabled(ClientConfig()) is True      # 发布默认值本身就是开
     spec = facts.FEATURE_FLAGS[facts.CHANNEL_FLAG]
-    assert spec["default"] is False
+    assert spec["default"] is True
     assert spec["owner"] == "client-seat"
     assert spec["expire_at"] == "2026-12-31"
     assert "停长轮询" in str(spec["rollback_rule"])
     assert spec.get("description")
     assert "desc" not in spec
-    enabled = ClientConfig(extra={"feature_flags": {facts.CHANNEL_FLAG: True}})
-    assert channel_enabled(enabled) is True
+    off = ClientConfig(extra={"feature_flags": {facts.CHANNEL_FLAG: False}})
+    assert channel_enabled(off) is False                # kill switch 生效
+
+
+def test_server_requirement_turns_channel_on_but_never_overrides_kill_switch():
+    """P4 落点 B：心跳 "channel_required" 让老配置也开通道；本地显式关闭仍然优先。"""
+    # 老配置（0.2.3 口径：显式写 false）→ 服务端要求也**不能**把它打开
+    off = ClientConfig(extra={"feature_flags": {facts.CHANNEL_FLAG: False}})
+    assert channel_enabled(off, required=True) is False
+    # 没写过这个键（升上来的老库 / 全新安装）→ 服务端要求即开
+    assert channel_enabled(ClientConfig(), required=True) is True
+    # 显式写 true 时 required 不改变结论
+    on = ClientConfig(extra={"feature_flags": {facts.CHANNEL_FLAG: True}})
+    assert channel_enabled(on, required=False) is True
+    assert channel_enabled(on, required=True) is True
 
 
 # ─────────────────────────────────────────────────────────── poll 循环
@@ -493,13 +507,46 @@ def test_daemon_starts_channel_thread_when_flag_enabled(daemon_env, monkeypatch)
     assert daemon.status()["channel"]["running"] is False
 
 
-def test_daemon_has_no_channel_by_default(daemon_env, monkeypatch):
+def _stop_channel_thread(daemon) -> None:
+    """把默认开启的通道线程收干净（用例里不 join 会不会影响下一条用例）。"""
+    try:
+        daemon._stop_channel()
+    except Exception:                                  # pragma: no cover - 防御
+        pass
+
+
+def test_daemon_starts_channel_by_default(daemon_env, monkeypatch):
+    """P4：发布默认配置下通道**起来**（修前这里是「默认不起」）。"""
     paths, store, credentials, mock, make_daemon = daemon_env
     from djb_node import daemon as daemon_module
 
     StubChannel.instances = []
     monkeypatch.setattr(daemon_module, "ChannelClient", StubChannel)
     daemon = make_daemon(paths, store, credentials, mock)
+    daemon.start()
+    try:
+        assert len(StubChannel.instances) == 1
+        assert daemon._channel is not None
+        status = daemon.status()
+        assert status["channel"]["enabled"] is True
+        assert status["channel"]["wanted"] is True
+        assert status["channel"]["required"] is False
+        assert status["flags"][facts.CHANNEL_FLAG]["enabled"] is True
+    finally:
+        _stop_channel_thread(daemon)
+        daemon.stop()
+
+
+def test_daemon_has_no_channel_when_explicitly_disabled(daemon_env, monkeypatch):
+    """Kill switch 仍然有效：显式写盘 false ⇒ 不建线程、不起通道（回滚路径）。"""
+    paths, store, credentials, mock, make_daemon = daemon_env
+    from djb_node import daemon as daemon_module
+
+    StubChannel.instances = []
+    monkeypatch.setattr(daemon_module, "ChannelClient", StubChannel)
+    daemon = make_daemon(paths, store, credentials, mock)
+    daemon.config.extra = {**dict(daemon.config.extra or {}),
+                           "feature_flags": {facts.CHANNEL_FLAG: False}}
     daemon.start()
     try:
         assert StubChannel.instances == []
@@ -549,6 +596,75 @@ def test_wire_completed_payload_is_json_and_matches_contract(paths, credentials)
     assert wire["usage_source"] in ("actual", "estimated")
     assert isinstance(wire["tokens_in"], int) and isinstance(wire["tokens_out"], int)
     assert not (set(wire) & LEGACY_FIELDS)
+
+
+# ───────────────────────────────────────────── P4 落点 B：心跳协商 channel_required
+def test_heartbeat_channel_required_is_ignored_when_payload_is_not_bool(daemon_env,
+                                                                      monkeypatch):
+    """加性字段：缺字段 / 字符串 / null 一律忽略（老云端不发也不能改变行为）。"""
+    paths, store, credentials, mock, make_daemon = daemon_env
+    from djb_node import daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module, "ChannelClient", StubChannel)
+    daemon = make_daemon(paths, store, credentials, mock)
+    daemon.start()
+    try:
+        daemon._stop_channel()
+        for payload in ({}, {"channel_required": None}, {"channel_required": "true"},
+                        {"channel_required": 1}):
+            daemon._apply_channel_required(payload, daemon._now())
+            assert daemon._channel_required is False
+        assert store.get_kv(facts.CHANNEL_REQUIRED_KV) is None
+    finally:
+        daemon.stop()
+
+
+def test_heartbeat_channel_required_is_persisted_and_survives_restart(daemon_env,
+                                                                     monkeypatch):
+    """要求落盘到 store kv：重启后服务端的要求依然成立（否则又回到 E2E-04）。"""
+    paths, store, credentials, mock, make_daemon = daemon_env
+    from djb_node import daemon as daemon_module
+
+    StubChannel.instances = []
+    monkeypatch.setattr(daemon_module, "ChannelClient", StubChannel)
+    daemon = make_daemon(paths, store, credentials, mock)
+    daemon.start()
+    try:
+        daemon._apply_channel_required({"channel_required": True}, daemon._now())
+        assert daemon._channel_required is True
+        assert store.get_kv(facts.CHANNEL_REQUIRED_KV)["required"] is True
+        assert daemon.status()["channel"]["required"] is True
+        assert daemon.status()["channel"]["wanted"] is True
+    finally:
+        _stop_channel_thread(daemon)
+        daemon.stop()
+    # 新进程（= 重启）从 kv 读回要求，不需要再等一次心跳
+    again = make_daemon(paths, store, credentials, mock)
+    assert again._channel_required is True
+    assert again._channel_wanted() is True
+
+
+def test_heartbeat_channel_required_does_not_override_explicit_disable(daemon_env,
+                                                                      monkeypatch):
+    """Kill switch 优先：本地显式关闭时，服务端要求也不会把通道拉起来（回滚必须可靠）。"""
+    paths, store, credentials, mock, make_daemon = daemon_env
+    from djb_node import daemon as daemon_module
+
+    StubChannel.instances = []
+    monkeypatch.setattr(daemon_module, "ChannelClient", StubChannel)
+    daemon = make_daemon(paths, store, credentials, mock)
+    daemon.config.extra = {**dict(daemon.config.extra or {}),
+                           "feature_flags": {facts.CHANNEL_FLAG: False}}
+    daemon.start()
+    try:
+        assert StubChannel.instances == []
+        daemon._apply_channel_required({"channel_required": True}, daemon._now())
+        assert daemon._channel_required is True      # 要求本身记下来（如实上报）
+        assert StubChannel.instances == []           # 但不覆盖本地关闭
+        status = daemon.status()["channel"]
+        assert status["required"] is True and status["wanted"] is False
+    finally:
+        daemon.stop()
 
 
 def test_wire_failed_payload_matches_contract(paths, credentials):
