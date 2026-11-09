@@ -45,7 +45,7 @@ def test_status_exposes_flag_with_three_fields(paths, store, credentials, mock, 
         flag = status["flags"][facts.PROBE_FLAG_PERIODIC]
         assert flag["enabled"] is True                      # 0.2.5 起默认开
         assert flag["owner"] == "client-seat"
-        assert flag["expire_at"] == "2026-12-15T00:00:00+08:00"
+        assert flag["expire_at"] == "2027-06-30T00:00:00+08:00"
         assert flag["rollback_rule"]
         assert status["probe"]["periodic_enabled"] is True
         # P6 + C-01b：基础周期已降到 half-fresh ⇒ 间隔 == cap == 450，且**永不越过 cap**

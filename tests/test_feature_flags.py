@@ -33,7 +33,7 @@ EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30",
                     facts.MACHINE_PROFILE_FLAG: "2027-06-30",
                     # ROUND3 / C-01b：批准窗口写到「日期时间 + 时区」（DECISIONS.md §D-R3-01），
                     # 登记表原样保留这个写法，求值只取该时区里的日期（config._parse_expire_at）
-                    facts.PROBE_FLAG_PERIODIC: "2026-12-15T00:00:00+08:00"}
+                    facts.PROBE_FLAG_PERIODIC: "2027-06-30T00:00:00+08:00"}
 
 
 def test_every_flag_has_three_fields_and_default_off():
@@ -179,9 +179,9 @@ def test_probe_periodic_flag_is_the_registered_default_on_case():
     spec = flag_spec(facts.PROBE_FLAG_PERIODIC)
     assert spec["default"] is True
     assert spec["owner"] == "client-seat"
-    assert spec["expire_at"] == "2026-12-15T00:00:00+08:00"
+    assert spec["expire_at"] == "2027-06-30T00:00:00+08:00"   # 2026-11-09 复核续期（原 12-15）
     assert "djb flags --disable" in spec["rollback_rule"]
-    assert _parse_expire_at(spec["expire_at"]) == date(2026, 12, 15)
+    assert _parse_expire_at(spec["expire_at"]) == date(2027, 6, 30)
     # 干净 home（没有任何显式配置、没有环境变量）下就是开着的
     assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC) is True
 
@@ -212,10 +212,14 @@ def test_env_var_overrides_config_and_default(monkeypatch):
 
 
 def test_env_var_cannot_resurrect_expired_flag(monkeypatch):
-    """到期是硬闸门：环境变量写 true 也不能把过期开关重新打开（fail-closed 优先）。"""
+    """到期是硬闸门：环境变量写 true 也不能把过期开关重新打开（fail-closed 优先）。
+
+    「到期日」从开关自己的 expire_at 推（+1 天），续期后本用例仍然成立 —— 写死日期
+    会让每次复核续期都要改测试，反而容易改错。
+    """
     monkeypatch.setenv(flag_env_name(facts.PROBE_FLAG_PERIODIC), "true")
-    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC,
-                        today=date(2026, 12, 16)) is False
+    expired_day = _parse_expire_at(flag_spec(facts.PROBE_FLAG_PERIODIC)["expire_at"]) + timedelta(days=1)
+    assert feature_flag(ClientConfig(), facts.PROBE_FLAG_PERIODIC, today=expired_day) is False
 
 
 def test_flag_readers_inherit_expiry(monkeypatch):

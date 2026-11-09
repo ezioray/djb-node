@@ -25,6 +25,6 @@ DEFAULT_ON_APPROVED: dict[str, str] = {
         "ROUND3-20261109 DECISIONS.md §D-R3-01（Lead 签发）：默认关闭 ⇒ 探针 15 min 过期即掉容量，"
         "供方只能人工 djb upstream probe 续命（Windows 0.2.4 真机 status 原文见"
         " reports/ROUND3-20261109/client/win-probe.json）。三字段：owner=client-seat /"
-        " expire_at=2026-12-15T00:00:00+08:00 / rollback_rule=djb flags --disable 或"
+        " expire_at=2027-06-30T00:00:00+08:00（2026-11-09 复核续期，原 2026-12-15） / rollback_rule=djb flags --disable 或"
         " DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false 或 revert ⇒ 仍是真开关",
 }

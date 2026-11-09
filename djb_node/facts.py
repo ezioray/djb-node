@@ -636,12 +636,12 @@ FLAG_REQUIRED_FIELDS: tuple[str, ...] = ("owner", "expire_at", "rollback_rule", 
 FEATURE_FLAGS["client.probe.periodic.enabled"] = {
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-15T00:00:00+08:00",
+    "expire_at": "2027-06-30T00:00:00+08:00",
     "rollback_rule": "环境变量 DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false 或配置 "
                      "feature_flags[\"client.probe.periodic.enabled\"]=false（djb flags --disable）"
                      "即停周期复探，只保留手动 probe（djb upstream probe），公告按已存 "
                      "last_probe_at 判新鲜；或 git revert 本提交",
-    "description": "客户端周期复探（L2/L3），0.2.5 起默认开启（显式关闭仍生效）",
+    "description": "客户端周期复探（L2/L3），0.2.5 起默认开启（显式关闭仍生效）；2026-11-09 复核：续期至 2027-06-30（原 2026-12-15 会在 12-16 静默 fail-closed，见 reports/RLS-20261109-CLIENT-025/DECISION-PROBE-FLAG-RENEWAL.md）",
 }
 PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
 
