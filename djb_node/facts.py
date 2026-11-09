@@ -241,18 +241,26 @@ UPDATE_KEYRING: tuple[dict[str, str], ...] = (
         "key_id": "djb-e2e-2026-11-02",
         "pubkey_hex": "cecc3a253872f8e60b630d57d94e96433aecdfb227d49b74605cc5925e0add73",
         "state": "transition",
-        "note": "旧 E2E 锚：私钥在 NAS 上，按**已泄露**处理。只用于把存量客户端迁到生产钥；"
-                "迁移完成立即加入 UPDATE_REVOKED_KEY_IDS（不要静默接受）",
+        "note": "旧 E2E 锚：私钥在 NAS 上，按**已泄露**处理。**默认已吊销**（见 "
+                "UPDATE_REVOKED_KEY_IDS）；仅在 owner 书面 + incident 备案的应急场景，"
+                "才允许临时把 UPDATE_TRANSITION_OVERRIDE 打开并把 key_id 从吊销表移除。",
     },
 )
 UPDATE_TRANSITION_UNTIL = "2026-11-24"
-"""过渡锚（state=transition）的最后接受日期（UTC，含当日）= 今天 + 14 天。
+"""transition 锚的**硬上限**（UTC，含当日）：即使 owner 应急覆盖也不得越过这一天。"""
+UPDATE_REVOKED_KEY_IDS: tuple[str, ...] = ("djb-e2e-2026-11-02",)
+"""已吊销 key_id（优先于 state）。
 
-旧 E2E 私钥在 NAS（已泄露态），不能长期默认接受；到期即硬失败，
-迁移完成的标志 = 把这个 key_id 加进 UPDATE_REVOKED_KEY_IDS。
+RC8 安全裁决（lead 2026-11-10 B9）：旧 E2E 私钥在 NAS（已泄露态），**默认立即吊销**，
+不做静默过渡。存量客户端的自动更新本来就被 dl 502 / 无签名阻断，手动安装包是主路径；
+吊销后旧钥签的清单一律拒装（fail-closed，不会装坏包）。
 """
-UPDATE_REVOKED_KEY_IDS: tuple[str, ...] = ()
-"""已吊销 key_id（优先于 state）。轮换收尾 / 泄露处置 = 往这里加一个字符串。"""
+UPDATE_TRANSITION_OVERRIDE = False
+"""**仅应急**：True 时允许已吊销的 transition 锚在 UPDATE_TRANSITION_UNTIL 之前临时可用。
+
+开启条件（缺一不可）：owner 书面批准 + incident 备案 + 显式发布说明；
+默认 False（= 默认吊销、旧钥一律拒）。任何把这里改成 True 的提交都必须同时改 EVIDENCE。
+"""
 UPDATE_KEY_ID = "djb-prod-2026-11-20"
 """primary 锚标识（写进 status / 诊断包便于对账）。"""
 UPDATE_PUBLIC_KEY_HEX = "b8361ccd7dd9f8f9f44bbd69dd6afa3231ca9e6daa6a57543efc3736731adf9b"

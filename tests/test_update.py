@@ -108,8 +108,12 @@ def test_builtin_public_key_is_valid_and_fingerprint_matches():
     assert ring.primary().key_id == facts.UPDATE_KEY_ID
     assert {a.key_id for a in ring.anchors} == {"djb-prod-2026-11-20", "djb-e2e-2026-11-02"}
     assert ring.state_of("djb-e2e-2026-11-02") == "transition"
+    # B9 安全裁决：旧 E2E 锚**默认已吊销**（不静默过渡）
+    assert "djb-e2e-2026-11-02" in ring.revoked
+    assert ring.unusable_reason("djb-e2e-2026-11-02") == "已吊销"
     view = ring.to_dict()
-    assert view["scheme"] == "ed25519" and view["revoked"] == []
+    assert view["scheme"] == "ed25519"
+    assert view["revoked"] == ["djb-e2e-2026-11-02"]      # B9：默认吊销
     # RC8 安全口径（lead 2026-11-10）：primary 是**占位**公钥（仓库内无对应私钥），
     # 发布门禁必须 False，直到 owner 注入离线签名机生成的最终公钥。
     assert ring.placeholders == ("djb-prod-2026-11-20",)
@@ -133,7 +137,9 @@ def test_sec_auditor_fixture_cross_verification(monkeypatch):
     artifact_path = os.path.join(fixture, "artifact.bin")
     manifest = json.loads(open(manifest_path, encoding="utf-8").read())
     data = open(artifact_path, "rb").read()
-    # fixture 是过渡期旧钥（E2E）签的：走钥环 resolve，验证「双钥过渡」真的兼容旧清单
+    # fixture 是旧 E2E 钥签的。生产默认已吊销该钥（B9），这里**仅为本测试**临时恢复，
+    # 目的是验证「客户端 Ed25519 实现能与安全席独立实现互验」；不是发布口径。
+    monkeypatch.setattr(facts, "UPDATE_REVOKED_KEY_IDS", ())
     anchor = update.keyring_anchors().resolve("djb-e2e-2026-11-02")
     body = update.canonical_json(manifest["payload"]).encode("utf-8")
     update._check_signature(body, manifest["signature"], anchor, what="清单")

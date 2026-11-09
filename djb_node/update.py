@@ -117,6 +117,7 @@ class AnchorSet:
     revoked: tuple[str, ...] = ()
     transition_until: str = ""
     placeholders: tuple[str, ...] = ()
+    transition_override: bool = False
 
     def state_of(self, key_id: str) -> str:
         for known, state in self.states:
@@ -136,6 +137,11 @@ class AnchorSet:
     def unusable_reason(self, key_id: str) -> str | None:
         """该 key_id 不可用的原因；可用返回 None（吊销 > 占位 > 过渡到期）。"""
         if key_id in self.revoked:
+            # 应急覆盖：仅 transition 锚、且硬上限日期未到（owner 书面 + incident 才允许）
+            if self.transition_override and self.state_of(key_id) == "transition":
+                if self._expired(key_id):
+                    return "过渡期已结束（" + str(self.transition_until) + "）"
+                return None
             return "已吊销"
         if key_id in self.placeholders:
             return "占位公钥（owner 尚未注入最终生产公钥）"
@@ -205,6 +211,7 @@ def keyring_anchors() -> AnchorSet:
         revoked=tuple(getattr(facts, "UPDATE_REVOKED_KEY_IDS", ()) or ()),
         transition_until=str(getattr(facts, "UPDATE_TRANSITION_UNTIL", "") or ""),
         placeholders=placeholders,
+        transition_override=bool(getattr(facts, "UPDATE_TRANSITION_OVERRIDE", False)),
     )
 
 
@@ -308,6 +315,11 @@ def verify_manifest(manifest: Any, anchor: Any) -> dict[str, Any]:
     if not isinstance(signature, str) or not SIG_RE.match(signature):
         raise UpdateError("更新清单签名缺失或格式非法")
     anchor_set = _as_anchor(anchor)
+    # 形态先行：钥环只要有 ed25519 锚，hmac 形态一律按"签名降级"拒（不等到取钥阶段）
+    if (any(item.scheme == facts.UPDATE_SIGNATURE_ALG_ED25519 for item in anchor_set.anchors)
+            and not signature.startswith(facts.UPDATE_ED25519_PREFIX)):
+        raise UpdateError("更新清单签名形态非法（要求 "
+                          + facts.UPDATE_ED25519_PREFIX + "…）")
     body = canonical_json(payload).encode("utf-8")
     declared_key = payload.get("key_id")
     if declared_key is not None:
