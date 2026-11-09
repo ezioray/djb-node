@@ -218,12 +218,47 @@ UPDATE_SIGNATURE_ALG_ED25519 = "ed25519"
 # `~/.djb/secrets/e2e/update-signing.key` 0600，客户端永远不持有）。
 # 原来 `UpdateManager.signing_key()` 会在本地随机自生成一把 HMAC 密钥并自动使用——
 # 那等于「客户端自己造信任锚」，任何拿到本机文件的人都能签出「合法」更新（审计 P1-3）。
-UPDATE_PUBLIC_KEY_HEX = "cecc3a253872f8e60b630d57d94e96433aecdfb227d49b74605cc5925e0add73"
-"""内置 Ed25519 公钥（32 字节，hex）。公钥可入仓；私钥不入仓、不入对话、不进诊断包。"""
-UPDATE_KEY_ID = "djb-e2e-2026-11-02"
-"""公钥标识（轮换时改这里 + `UPDATE_PUBLIC_KEY_HEX`；写进 status / 诊断包便于对账）。"""
-UPDATE_PUBLIC_KEY_FINGERPRINT = "30171de47e02"
-"""公钥指纹 sha256(raw pubkey)[:12]，与安全席登记的指纹一致（status 里如实展示）。"""
+#
+# RC8（2026-11-10）起信任锚从「单钥」升级为**钥环 + 双钥过渡 + 吊销**：
+#   * 唯一信任来源是 `UPDATE_KEYRING`（**只放公钥**；私钥只在离线签名机/KMS，
+#     不入仓、不进对话、不进诊断包）；
+#   * `state="primary"` = 当前生产锚；`state="transition"` = 旧锚，只在
+#     `UPDATE_TRANSITION_UNTIL`（含当日）之前被接受，过期是硬失败（不静默降级）；
+#   * 轮换收尾 / 泄露处置：把 key_id 加进 `UPDATE_REVOKED_KEY_IDS` 即吊销（优先于 state）；
+#   * `UPDATE_KEY_ID` / `UPDATE_PUBLIC_KEY_HEX` / `UPDATE_PUBLIC_KEY_FINGERPRINT` 只是
+#     primary 的扁平视图（status / 诊断 / 老调用方兼容），**不要在别处另立信任锚**。
+UPDATE_KEYRING: tuple[dict[str, str], ...] = (
+    {
+        "key_id": "djb-prod-2026-11-20",
+        "pubkey_hex": "b8361ccd7dd9f8f9f44bbd69dd6afa3231ca9e6daa6a57543efc3736731adf9b",
+        "state": "primary",
+        "placeholder": "true",
+        "note": "**占位公钥，仓库内无对应私钥（生成后已销毁）**，绝不能用于签名；"
+                "owner 用离线签名机生成最终钥后，仅替换 pubkey_hex 并去掉 placeholder，"
+                "release gate 才放行（ops/release/update_anchor.py）",
+    },
+    {
+        "key_id": "djb-e2e-2026-11-02",
+        "pubkey_hex": "cecc3a253872f8e60b630d57d94e96433aecdfb227d49b74605cc5925e0add73",
+        "state": "transition",
+        "note": "旧 E2E 锚：私钥在 NAS 上，按**已泄露**处理。只用于把存量客户端迁到生产钥；"
+                "迁移完成立即加入 UPDATE_REVOKED_KEY_IDS（不要静默接受）",
+    },
+)
+UPDATE_TRANSITION_UNTIL = "2026-11-24"
+"""过渡锚（state=transition）的最后接受日期（UTC，含当日）= 今天 + 14 天。
+
+旧 E2E 私钥在 NAS（已泄露态），不能长期默认接受；到期即硬失败，
+迁移完成的标志 = 把这个 key_id 加进 UPDATE_REVOKED_KEY_IDS。
+"""
+UPDATE_REVOKED_KEY_IDS: tuple[str, ...] = ()
+"""已吊销 key_id（优先于 state）。轮换收尾 / 泄露处置 = 往这里加一个字符串。"""
+UPDATE_KEY_ID = "djb-prod-2026-11-20"
+"""primary 锚标识（写进 status / 诊断包便于对账）。"""
+UPDATE_PUBLIC_KEY_HEX = "b8361ccd7dd9f8f9f44bbd69dd6afa3231ca9e6daa6a57543efc3736731adf9b"
+"""primary 内置 Ed25519 公钥（32 字节 hex，当前为**占位**）。公钥可入仓；私钥不入仓。"""
+UPDATE_PUBLIC_KEY_FINGERPRINT = "9639ce9ad4fe"
+"""primary 公钥指纹 sha256(raw pubkey)[:12]（占位值，换真钥后同步更新）。"""
 UPDATE_TEST_ENV = "DJB_ENV"
 UPDATE_TEST_ENV_VALUE = "test"
 """test-only mock 验签的环境门：必须显式 `DJB_ENV=test`。"""

@@ -73,9 +73,12 @@ SECRET_VALUE_RE = re.compile(
     r"|Bearer\s+[A-Za-z0-9._-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.)"
 )
 REQUIRED_COLUMNS = ("node_id", "gateway", "preset", "port")
+#: RC8：机房版默认更新源 = **签名更新清单**（tkbank.ai）。dl.aitokenmall.ai 是 502，禁用。
+#: inventory 里显式给 update_source 则覆盖；给绝对路径也允许（离线/内网镜像）。
+DEFAULT_UPDATE_SOURCE = "https://tkbank.ai/download/files/update-manifest.json"
 OPTIONAL_DEFAULTS: dict[str, str] = {
     "update_channel": "stable",
-    "update_source": "",
+    "update_source": DEFAULT_UPDATE_SOURCE,
     "log_level": "info",
     "yield_enabled": "true",
     "labels": "{}",
@@ -244,7 +247,8 @@ def load_inventory(path: str) -> list[Node]:
             if log_level not in LOG_LEVELS:
                 raise FleetError("第 " + str(row_no) + " 行 log_level 必须是 "
                                  + "/".join(LOG_LEVELS))
-            update_source = row.get("update_source") or ""
+            # RC8：机房版默认走签名更新清单（tkbank.ai）；CSV 里显式给值则覆盖
+            update_source = (row.get("update_source") or "").strip() or DEFAULT_UPDATE_SOURCE
             if update_source and not (update_source.startswith(("http://", "https://"))
                                       or update_source.startswith("/")):
                 raise FleetError("第 " + str(row_no) + " 行 update_source 只允许 http(s) URL 或绝对路径")

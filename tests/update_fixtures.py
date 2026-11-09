@@ -80,7 +80,15 @@ def build_source(tmp_path, *, version: str = "0.2.0", **kwargs: Any) -> str:
 
 
 def use_test_anchor(monkeypatch) -> None:
-    """把内置信任锚指向测试公钥（只影响本测试进程）。"""
+    """把内置信任钥环指向测试公钥（只影响本测试进程）。
+
+    RC8 起信任来源是 facts.UPDATE_KEYRING（钥环），所以这里**同时**改钥环与
+    primary 扁平视图；生产钥/过渡钥/吊销在测试里一律不生效（避免测试无意依赖真钥）。
+    """
+    monkeypatch.setattr(facts, "UPDATE_KEYRING", (
+        {"key_id": TEST_KEY_ID, "pubkey_hex": TEST_PUBLIC_KEY.hex(), "state": "primary"},
+    ))
+    monkeypatch.setattr(facts, "UPDATE_REVOKED_KEY_IDS", ())
     monkeypatch.setattr(facts, "UPDATE_PUBLIC_KEY_HEX", TEST_PUBLIC_KEY.hex())
     monkeypatch.setattr(facts, "UPDATE_KEY_ID", TEST_KEY_ID)
 
