@@ -230,12 +230,11 @@ UPDATE_SIGNATURE_ALG_ED25519 = "ed25519"
 UPDATE_KEYRING: tuple[dict[str, str], ...] = (
     {
         "key_id": "djb-prod-2026-11-20",
-        "pubkey_hex": "b8361ccd7dd9f8f9f44bbd69dd6afa3231ca9e6daa6a57543efc3736731adf9b",
+        "pubkey_hex": "7d008ca092ba0eb22881c59cf293465b208f53e0ca2543e715ddb965dc1349b8",
         "state": "primary",
-        "placeholder": "true",
-        "note": "**占位公钥，仓库内无对应私钥（生成后已销毁）**，绝不能用于签名；"
-                "owner 用离线签名机生成最终钥后，仅替换 pubkey_hex 并去掉 placeholder，"
-                "release gate 才放行（ops/release/update_anchor.py）",
+        "note": "生产主锚（owner 离线签名机生成；私钥不离开签名机）。"
+                "公钥已注入，release gate READY（ops/release/update_anchor.py）；"
+                "签名只由离线签名机执行，仓库内无私钥。",
     },
     {
         "key_id": "djb-e2e-2026-11-02",
@@ -263,10 +262,10 @@ UPDATE_TRANSITION_OVERRIDE = False
 """
 UPDATE_KEY_ID = "djb-prod-2026-11-20"
 """primary 锚标识（写进 status / 诊断包便于对账）。"""
-UPDATE_PUBLIC_KEY_HEX = "b8361ccd7dd9f8f9f44bbd69dd6afa3231ca9e6daa6a57543efc3736731adf9b"
-"""primary 内置 Ed25519 公钥（32 字节 hex，当前为**占位**）。公钥可入仓；私钥不入仓。"""
-UPDATE_PUBLIC_KEY_FINGERPRINT = "9639ce9ad4fe"
-"""primary 公钥指纹 sha256(raw pubkey)[:12]（占位值，换真钥后同步更新）。"""
+UPDATE_PUBLIC_KEY_HEX = "7d008ca092ba0eb22881c59cf293465b208f53e0ca2543e715ddb965dc1349b8"
+"""primary 内置 Ed25519 公钥（32 字节 hex；owner 离线签名机生成）。公钥可入仓；私钥不入仓。"""
+UPDATE_PUBLIC_KEY_FINGERPRINT = "d80ec52a2e80"
+"""primary 公钥指纹 sha256(raw pubkey)[:12]，与 UPDATE_KEYRING 同步。"""
 UPDATE_TEST_ENV = "DJB_ENV"
 UPDATE_TEST_ENV_VALUE = "test"
 """test-only mock 验签的环境门：必须显式 `DJB_ENV=test`。"""
