@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import time
 from datetime import timedelta
 
@@ -22,7 +23,7 @@ import pytest
 
 from djb_node import facts, protocol, quotes
 from djb_node.api import NodeApi
-from djb_node.cli import main
+from djb_node.cli import main, preset_upstream_kind
 from djb_node.config import Paths, load_config, save_config
 from djb_node.errors import UsageError
 from djb_node.httpclient import HttpClient
@@ -365,6 +366,64 @@ def test_cli_upstream_add_b_requires_explicit_kind(ready, capsys):
                  "https://agg.example.com/v1", "--models", "gpt-4o"])
     assert code == facts.EXIT_USAGE
     assert "--kind" in capsys.readouterr().err
+
+
+def _apply_official_supply_preset(paths) -> None:
+    """把 `profiles/official-supply/config.json` 的关键项写进本机配置（不动别的键）。"""
+    config = load_config(paths)
+    config.extra["upstream.kind"] = facts.RELAY_KIND
+    config.extra.setdefault("feature_flags", {})[facts.RELAY_FLAG] = True
+    save_config(paths, config)
+
+
+def test_profile_preset_pins_third_party_relay(ready):
+    """预置档真的把 kind 固定成 third_party_relay（P3 的「固定」不是文案）。"""
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    profile = json.loads((repo / "profiles" / "official-supply" / "config.json")
+                         .read_text(encoding="utf-8"))
+    assert profile["extra"]["upstream.kind"] == facts.RELAY_KIND == "third_party_relay"
+    assert profile["extra"]["quotes.period_s"] == facts.QUOTES_PERIOD_DEFAULT_S
+    assert profile["extra"]["quotes.ttl_s"] == facts.QUOTE_TTL_MULTIPLE * \
+        facts.QUOTES_PERIOD_DEFAULT_S
+
+
+def test_preset_upstream_kind_reads_flat_and_nested():
+    """两种写法都认；没写 = None（普通客户端仍然必须显式 --kind）。"""
+    assert preset_upstream_kind({"extra": {"upstream.kind": "third_party_relay"}}) \
+        == "third_party_relay"
+    assert preset_upstream_kind({"upstream": {"kind": "enterprise_gateway"}}) \
+        == "enterprise_gateway"
+    assert preset_upstream_kind({}) is None
+    assert preset_upstream_kind(None) is None
+
+
+def test_preset_upstream_kind_rejects_unknown_value():
+    """配置写错要当场报，不能静默退回服务端默认 enterprise_gateway。"""
+    with pytest.raises(UsageError) as excinfo:
+        preset_upstream_kind({"extra": {"upstream.kind": "relay-ish"}})
+    assert "upstream.kind" in str(excinfo.value)
+
+
+def test_cli_upstream_add_b_uses_preset_kind(ready, store, mock, capsys):
+    """预置档机器上，`--access B` 省略 `--kind` 也按 third_party_relay 接入。"""
+    _point_at_mock(ready, mock)
+    _apply_official_supply_preset(ready)
+    code = main(["upstream", "add", "--access", "B", "--base-url",
+                 "https://agg.example.com/v1", "--models", "gpt-4o", "--json"])
+    assert code == 0
+    payload = _json_out(capsys)
+    assert payload["upstream"]["access_type"] == "B"
+    assert store.upstreams()[0].upstream_kind == facts.RELAY_KIND
+
+
+def test_cli_upstream_add_b_preset_kind_cannot_drift(ready, capsys):
+    """预置档是承诺：显式给别的 --kind 直接拒绝（本次不创建上游）。"""
+    _apply_official_supply_preset(ready)
+    code = main(["upstream", "add", "--access", "B", "--kind", "enterprise_gateway",
+                 "--base-url", "https://agg.example.com/v1", "--models", "gpt-4o"])
+    assert code == facts.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "预置档" in err and facts.RELAY_KIND in err
 
 
 def test_cli_upstream_add_b_with_kind_is_accepted(ready, store, mock, capsys):

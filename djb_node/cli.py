@@ -1170,6 +1170,38 @@ def _upstream_line(item: dict[str, Any]) -> str:
     return " · ".join(parts) + " · 模型 " + models + " · " + probe
 
 
+def preset_upstream_kind(config: Any) -> str | None:
+    """预置档**固定**的接入类型（``extra["upstream.kind"]``；平铺与嵌套写法都认）。
+
+    P3/P5（CR-20261106-OFFICIAL-SUPPLY-01）：官方特供版预置档要求所有聚合上游都按
+    ``third_party_relay`` 接入 —— 把这一条写进预置档，比让每台机器的人记参数可靠；
+    没写（普通客户端）就仍然是「B 类必须显式 ``--kind``」，不做静默默认。
+
+    值非法 → :class:`UsageError`：配置写错要当场报，绝不能静默退回「服务端默认
+    ``enterprise_gateway``」那条错路。
+    """
+    extra = getattr(config, "extra", None)
+    if not isinstance(extra, dict):
+        # 形状等价的 mapping（config.json 的 {"extra": {...}} 或 extra 本身）也认
+        if not isinstance(config, dict):
+            return None
+        nested_extra = config.get("extra")
+        extra = dict(nested_extra) if isinstance(nested_extra, dict) else dict(config)
+    value = extra.get("upstream.kind")
+    if value is None:
+        nested = extra.get("upstream")
+        if isinstance(nested, dict):
+            value = nested.get("kind")
+    if value is None:
+        return None
+    kind = str(value).strip()
+    if kind not in facts.UPSTREAM_KINDS:
+        raise UsageError("预置档 upstream.kind=" + repr(value) + " 不认识（可选："
+                         + " / ".join(facts.UPSTREAM_KINDS)
+                         + "）；请改 config.json 或删掉该键")
+    return kind
+
+
 def cmd_upstream(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
     credentials = CredentialStore(paths)
@@ -1179,7 +1211,20 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         # P3（CR-20261106-OFFICIAL-SUPPLY-01）：`access=B` 不显式给 `--kind` 时，服务端会
         # 把 kind 默认推成 `enterprise_gateway`（`app/supply/facts.py:31-32`）——中转站随即
         # 被当成「企业网关」，`ignored_kinds` / 策略分流全部判错。所以这里**拒绝静默套默认值**。
-        if validate_access_type(args.access) == "B" and not getattr(args, "kind", None):
+        #
+        # 唯一例外是**预置档**（`profiles/official-supply/config.json` 的 `upstream.kind`）：
+        # 预置档已经把 kind **固定**成 third_party_relay，此时 `--kind` 可省略；给了别的值
+        # 直接拒绝（预置档是承诺，不是默认值，不能在命令行上悄悄漂走）。
+        access = validate_access_type(args.access)
+        kind = getattr(args, "kind", None)
+        preset_kind = preset_upstream_kind(config)
+        if preset_kind and access == "B":       # 预置档只约定 B 类（聚合上游）的 kind
+            if kind and kind != preset_kind:
+                raise UsageError("本机是预置档，接入类型已固定为 " + preset_kind
+                                 + "（当前 --kind " + str(kind) + "）：要换类型请改 "
+                                 "config.json 的 upstream.kind 后重试（本次未创建上游）")
+            kind = preset_kind
+        if access == "B" and not kind:
             raise UsageError("B 类接入必须显式 --kind（中转站用 " + facts.RELAY_KIND
                              + "）：不显式指定会被默认当成 enterprise_gateway，"
                              "策略分流与 ignored_kinds 会全部判错（本次未创建上游）")
@@ -1187,15 +1232,15 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         if getattr(args, "secret_stdin", False):
             secret = sys.stdin.readline().strip()
         relay_profile = None
-        if getattr(args, "kind", None) == facts.RELAY_KIND:
+        if kind == facts.RELAY_KIND:
             relay_mgr = RelayManager(store, credentials, config=config)
             if not relay_mgr.enabled():
                 raise UsageError("relay 接入开关关闭（默认关闭）：先 djb flags --enable "
                                  + facts.RELAY_FLAG + " 再添加（本次未创建上游）")
         record = manager.add(access_type=args.access, base_url=args.base_url,
                              models=args.models, secret=secret, protocol=args.protocol,
-                             upstream_kind=getattr(args, "kind", None))
-        if getattr(args, "kind", None) == facts.RELAY_KIND:
+                             upstream_kind=kind)
+        if kind == facts.RELAY_KIND:
             relay_mgr = RelayManager(store, credentials, config=config)
             relay_profile = relay_mgr.add(
                 base_url=args.base_url, upstream_id=record.id,

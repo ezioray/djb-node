@@ -12,6 +12,7 @@
       "client.quotes.publish.enabled": true
     },
     "quotes.period_s": 60,
-    "quotes.ttl_s": 120
+    "quotes.ttl_s": 120,
+    "upstream.kind": "third_party_relay"
   }
 }
