@@ -47,7 +47,7 @@ from . import plan_router
 from . import quotes as quotes_mod
 from . import store as store_module
 from . import tokens as tokens_mod
-from .update import UpdateManager
+from .update import UpdateManager, apply_exit_code
 from .upstream import (UpstreamManager, a2_prompt, parse_models, probe_upstream,
                        validate_access_type, validate_base_url, validate_min_price)
 from .util import (ensure_dir, iso, new_token, parse_iso, redact_text, utcnow)
@@ -1972,9 +1972,8 @@ def cmd_update(args: argparse.Namespace) -> int:
                                   if value.get("installed")
                                   else "未安装：" + str(value.get("state")) + " · "
                                   + str(value.get("message"))))
-        if result.get("state") == "failed_verify":
-            return facts.EXIT_VERIFY
-        return 0
+        # RC8：统一映射（failed_verify→7、download_failed→6、其它→0）
+        return apply_exit_code(result)
     result = manager.check()
     _emit(result, as_json=_json_flag(args),
           text=lambda value: ("更新：" + str(value.get("state"))

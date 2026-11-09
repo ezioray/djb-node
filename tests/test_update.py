@@ -96,14 +96,28 @@ def test_builtin_public_key_is_valid_and_fingerprint_matches():
     assert ed25519.is_valid_public_key_hex(facts.UPDATE_PUBLIC_KEY_HEX)
     raw = bytes.fromhex(facts.UPDATE_PUBLIC_KEY_HEX)
     assert hashlib.sha256(raw).hexdigest()[:12] == facts.UPDATE_PUBLIC_KEY_FINGERPRINT
-    assert facts.UPDATE_KEY_ID == "djb-e2e-2026-11-02"
+    assert facts.UPDATE_KEY_ID == "djb-prod-2026-11-20"
+    assert not facts.UPDATE_KEY_ID.startswith("djb-e2e")      # 生产锚不得再是 E2E 名
     # 内置公钥 != 测试公钥（防止「拿测试密钥当生产锚」）
     assert raw != TEST_PUBLIC_KEY
     anchor = ed25519_anchor()
     assert anchor.to_dict() == {"scheme": "ed25519", "key_id": facts.UPDATE_KEY_ID,
                                 "key_fingerprint": facts.UPDATE_PUBLIC_KEY_FINGERPRINT}
+    # 钥环：primary + transition 双钥，primary 必须是生产锚
+    ring = update.keyring_anchors()
+    assert ring.primary().key_id == facts.UPDATE_KEY_ID
+    assert {a.key_id for a in ring.anchors} == {"djb-prod-2026-11-20", "djb-e2e-2026-11-02"}
+    assert ring.state_of("djb-e2e-2026-11-02") == "transition"
+    view = ring.to_dict()
+    assert view["scheme"] == "ed25519" and view["revoked"] == []
+    # RC8 安全口径（lead 2026-11-10）：primary 是**占位**公钥（仓库内无对应私钥），
+    # 发布门禁必须 False，直到 owner 注入离线签名机生成的最终公钥。
+    assert ring.placeholders == ("djb-prod-2026-11-20",)
+    ready, reason = update.anchor_release_ready(ring)
+    assert ready is False and "占位" in reason
     # to_dict 不含任何密钥材料
-    assert facts.UPDATE_PUBLIC_KEY_HEX not in json.dumps(anchor.to_dict())
+    assert facts.UPDATE_PUBLIC_KEY_HEX not in json.dumps(view)
+    assert all("pubkey" not in item for item in view["keys"])
 
 
 def test_sec_auditor_fixture_cross_verification(monkeypatch):
@@ -119,7 +133,8 @@ def test_sec_auditor_fixture_cross_verification(monkeypatch):
     artifact_path = os.path.join(fixture, "artifact.bin")
     manifest = json.loads(open(manifest_path, encoding="utf-8").read())
     data = open(artifact_path, "rb").read()
-    anchor = ed25519_anchor()
+    # fixture 是过渡期旧钥（E2E）签的：走钥环 resolve，验证「双钥过渡」真的兼容旧清单
+    anchor = update.keyring_anchors().resolve("djb-e2e-2026-11-02")
     body = update.canonical_json(manifest["payload"]).encode("utf-8")
     update._check_signature(body, manifest["signature"], anchor, what="清单")
     update._check_signature(data, manifest["payload"]["artifacts"][0]["signature"], anchor,
@@ -251,12 +266,13 @@ def test_status_and_no_rollback(paths, store, clock):
 def test_fail_closed_without_builtin_public_key(tmp_path, paths, store, clock, monkeypatch):
     """内置公钥缺失 -> 拒绝验签；不安装、不改版本、不本地生成密钥（旧的自动生成路径已删）。"""
     use_test_anchor(monkeypatch)
+    monkeypatch.setattr(facts, "UPDATE_KEYRING", ())
     monkeypatch.setattr(facts, "UPDATE_PUBLIC_KEY_HEX", "")
     manager = UpdateManager(paths, store, source="", client_version="0.1.0", now=clock)
     manager.source = build_source(tmp_path)
     check = manager.check()
     assert check["state"] == "failed_verify"
-    assert "公钥缺失" in check["message"]
+    assert "钥环为空" in check["message"] or "公钥缺失" in check["message"]
     result = manager.apply()
     assert result["installed"] is False and result["state"] == "failed_verify"
     assert store.install().version == "0.1.0"
@@ -265,6 +281,8 @@ def test_fail_closed_without_builtin_public_key(tmp_path, paths, store, clock, m
 
 
 def test_invalid_builtin_public_key_fails_closed(paths, store, clock, monkeypatch):
+    monkeypatch.setattr(facts, "UPDATE_KEYRING", (
+        {"key_id": "bad-key", "pubkey_hex": "zz" * 32, "state": "primary"},))
     monkeypatch.setattr(facts, "UPDATE_PUBLIC_KEY_HEX", "zz" * 32)
     manager = UpdateManager(paths, store, source="", now=clock)
     with pytest.raises(UpdateError):

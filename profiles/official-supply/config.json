@@ -2,7 +2,7 @@
   "gateway_url": "https://gateway.example.invalid",
   "mirror_port": 1717,
   "update_channel": "stable",
-  "update_source": "https://update.example.invalid",
+  "update_source": "https://tkbank.ai/download/files/update-manifest.json",
   "log_level": "info",
   "yield_enabled": false,
   "extra": {
