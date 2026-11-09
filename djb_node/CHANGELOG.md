@@ -6,6 +6,32 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.3.0 · 2026-11-10
+
+RC8 **全客户端同步版本**：Windows onefile / macOS arm64 dmg / Linux 源码包 / 机房端离线包 / 官方特供版
+五通道统一 `0.3.0`、同一 commit、同一 `djb_node.__version__`、同一 `update_source` 与同一份 MANIFEST。
+**没有**协议契约变更（`openapi.yaml` 未动），**没有**新增运行时依赖。
+
+### 安全（更新链）
+- 更新信任锚改为**钥环**（`facts.UPDATE_KEYRING`：primary + transition）：清单声明 `key_id` 时**精确取钥**，
+  未知/已吊销/过渡到期的 key_id 一律拒；制品签名与清单钥绑定。
+- primary 当前是**占位公钥**（仓库内无对应私钥）：`ops/release/update_anchor.py` 的 release gate 拒绝签名/发版，
+  直到 owner 在离线签名机生成最终公钥并注入（`ops/release/set-update-anchor.py`）。
+- 旧 E2E 锚 `djb-e2e-2026-11-02` **默认吊销**（`UPDATE_REVOKED_KEY_IDS`）；应急覆盖
+  `UPDATE_TRANSITION_OVERRIDE` 默认关，且不得越过 `2026-11-24` 硬上限。
+- 下载分类修正：制品 HTTP 非 200 => `state=download_failed`（退出码 6），不再冒充 `failed_verify`（7）。
+
+### 分发
+- 默认 `update_source` 指向 `https://tkbank.ai/download/files/update-manifest.json`
+  （official-supply 预置档 / 机房版 fleet 默认）；`ops/fnos/install-linux-client.sh`
+  新增显式 `--update-source` 参数（**默认不写 config**，保持原安装行为）。
+- 机房版离线包签名统一 Ed25519（`openssl pkeyutl -rawin`；OpenSSL 3 不支持 dgst+Ed25519），
+  `verify.sh` 默认严格验签（有签名无公钥即失败）。
+
+### 测试
+- 新增 T1 四发行版 × 三制品矩阵、T2 核心链路（假网关 + `--port 17171`）、T3-a 离线验签 16 用例；
+  CI 增加 pytest(3.10/3.11/3.12) / 验签矩阵 / 私钥泄漏自检 / L0 矩阵 job。
+
 ## 0.2.5 · 2026-11-09
 
 ROUND3（C-01b）+ 基线红收敛。**没有**协议/契约变更（`openapi.yaml` 未动），也**没有**新增运行时依赖。
