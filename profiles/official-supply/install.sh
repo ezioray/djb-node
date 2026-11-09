@@ -15,7 +15,7 @@
 #
 # 用法：
 #   sudo ./install.sh --gateway https://gateway.example.com
-#   sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.0-py3-none-any.whl
+#   sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.2.5-py3-none-any.whl
 #   sudo ./install.sh --gateway https://gateway.example.com --start
 #   ./install.sh --dry-run                       # 只打印将执行的动作（不需要 root）
 #
@@ -163,8 +163,9 @@ say ""
 say "下一步（三条，缺一不可）："
 say "  1) 写入节点密钥（交互输入，不进 shell 历史）："
 say "     su -s /bin/sh $RUN_USER -c \"DJB_HOME=$HOME_DIR $PREFIX/venv/bin/djb auth --set-key -\""
-say "  2) 接一个聚合上游（中转站必须显式 --kind third_party_relay）："
-say "     $PREFIX/venv/bin/djb upstream add --access B --kind third_party_relay \\"
+say "  2) 接一个聚合上游（本预置档已把 kind 固定成 third_party_relay，--kind 可省略；"
+say "     换成别的值会被拒绝——预置档是承诺，不是默认值）："
+say "     $PREFIX/venv/bin/djb upstream add --access B \\"
 say "         --base-url https://agg.example.com/v1 --models gpt-4o,gpt-4o-mini --secret-stdin"
 say "  3) 体检 + 干跑 + 开跑："
 say "     djb upstream probe --id <id> && djb quotes publish --dry-run"

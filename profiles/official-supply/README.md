@@ -11,6 +11,7 @@
 | 运行身份 | 系统用户 `djb-supply`（非 root，`nologin`） |
 | 入站端口 | **无**（只绑 `127.0.0.1:1717`，调度不走入站） |
 | 默认开启 | `client.relay.enabled`、`client.probe.periodic.enabled`、`client.quotes.publish.enabled` |
+| 客户端版本 | **0.2.5**（与 Windows / macOS / Linux 三端同一份源码、同一个 `djb_node.__version__`） |
 | 报价参数 | 周期 60 s · TTL 120 s（**TTL 恒等于 2 × 周期**） |
 
 > 本文只讲「怎么把这台机器变成能接单的供方节点」。客户端通用命令见仓库根
@@ -30,6 +31,14 @@ getent passwd djb-supply || echo "还没有 djb-supply 用户（install.sh 会�
 
 1. **一台机器一个节点**。节点身份由 `(platform, hardware_fingerprint)` 唯一确定，
    同一台机器跑两个 daemon 只会互相顶掉/被服务端判重复；要多节点请加机器。
+   真撞上了也不会是一句抽象 409：客户端把它翻成可执行指引（`djb status` 的 `下一步`）——
+
+   | 服务端返回 | 含义 | 客户端给的下一步 |
+   | --- | --- | --- |
+   | `40903` | 同指纹已注册且已绑定账户，本次又没带有效密钥（INV-01 防凭据接管） | ① 原机还有密钥 → `djb auth --set-key -` 复用；② 重装/换机丢了密钥 → 原账户解绑或 `djb auth --bind <码>`；③ 要多节点 → 加机器 |
+
+   这条是**永久错误**：客户端不会自动重试注册（重试既不会好，也拿不到别人的身份），
+   必须由人先解绑或复用密钥。
 2. **一个节点可以挂多个上游**（多个聚合站/自建站都行），云端按 `(access, model, unit)`
    取报价，同一个模型只认**最新一条**；客户端已经帮你收敛成「同模型取最低价一条」。
 3. **计量单位只有一个**：`unit = "token"`。它不是价格单位，别改成
@@ -45,7 +54,7 @@ getent passwd djb-supply || echo "还没有 djb-supply 用户（install.sh 会�
 sudo ./install.sh --gateway https://gateway.example.com
 
 # 离线装（把 wheel 一起带过去）
-sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.0-py3-none-any.whl
+sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.2.5-py3-none-any.whl
 
 # 先看会做什么（不需要 root，不改任何东西）
 ./install.sh --gateway https://gateway.example.com --dry-run
@@ -76,7 +85,12 @@ sudo -u djb-supply DJB_HOME=/var/lib/djb-official-supply \
 
 B 类接入**必须显式**给 `--kind`：不给的话服务端会把 kind 默认推成
 `enterprise_gateway`，中转站会被策略当成"企业网关"，`ignored_kinds` / 策略分流会全部判错。
-客户端现在直接拒绝这种"静默套默认值"的添加（P3）：
+客户端现在直接拒绝这种"静默套默认值"的添加（P3）。
+
+**本预置档把这一条固定了**：`config.json` 的 `extra["upstream.kind"] = "third_party_relay"`，
+所以在这台机器上 `--kind` 可以省略（客户端按预置档的值接入，不是服务端默认值）；
+显式给一个**别的** `--kind` 会被拒绝（预置档是承诺，不能在命令行上悄悄漂走）。
+普通客户端（没有预置档）仍然必须自己写 `--kind`。
 
 ```sh
 # 中转站（第三方聚合）——密钥从 stdin 读，避免进 shell 历史
@@ -162,6 +176,55 @@ djb status --json | jq .quotes
 daemon 日志每轮一行 `event="quotes.publish"`，只有数字（行数/新建/复用/失败/跳过计数），
 不含价格与模型名。
 
+### 5.1 探针失败即停发（P4 的运行期门控）
+
+relay 的「更严证明」不是一句注释，而是**每一轮报价前都算**的两道闸：
+
+| 闸 | 判据 | 不满足时 |
+| --- | --- | --- |
+| 探针结论 | 模型 `inference_ok is True`（`djb upstream probe` 真的打通过一次） | 该模型不发，计 `skipped.not_probed` |
+| 新鲜度 | `last_probe_at` 距今 ≤ **600 s**（比云侧 900 s 更保守 300 s） | 该模型不发，计 `skipped.stale_probe` |
+
+所以「上游挂了」不需要人工停报价：探针一旦失败，下一轮就自动不发该模型；
+周期复探（本档默认开启）负责在恢复后自动把它放回来。要立刻全停就用 §7 的回滚第一步。
+
+巡检动作（建议每天一次，或价格/上游有变动时）：
+
+```sh
+# ① 干跑：本轮要发什么、为什么跳过（离线，不上行）
+djb quotes publish --dry-run
+
+# ② 看「探针类」跳过是否在涨（涨 = 上游不稳/探针没跑起来）
+djb status --json | jq '.quotes.skipped'
+```
+
+判据：`skipped.not_probed` / `skipped.stale_probe` 只应在「刚接上游、还没 probe」
+或「上游真的故障」时非 0；两者长期非 0 说明周期复探没开或上游不可用。
+
+### 5.2 毛利巡检：`negative_margin=0` 是硬门
+
+对客价必须 ≥ 成本价（倒挂绝不发）。巡检有两条入口，判据逐字一致：
+
+```sh
+# 客户端侧（本档）——价格与门控的离线自证：TTL/零价/倒挂/候选集
+#   ① ttl_s == 2 × period_s；② zero_cost_skipped > 0 且 negative_margin == 0；
+#   ③ 只有「社区无候选」的模型被发价；④（--live）自营节点进候选集
+./verify.sh                       # 全离线；--live 才真发价（运维在预发执行）
+
+# 运维侧（真实用量）——按窗口算负毛利并输出禁报名单
+python3 margin_check.py --node-id <节点id> --window-min 60 --json
+```
+
+判据（任一不满足 = 停 cron / 停发，先查价格表再谈重新开）：
+
+| 输出 | 合格值 | 不合格怎么办 |
+| --- | --- | --- |
+| `counts.negative_margin` | **0** | >0 = 倒挂（成本涨了没调价 / 加价 ≤ 0）→ 立刻停发，修价格表后复算 |
+| `counts.zero_cost_skipped` | **> 0** | =0 说明 P1 的零价闸没被触发过（夹具/上游变了），要核对成本源 |
+| `margin_check` 退出码 | `0`（无负毛利） | 非 0 → 看 `newly_denied`，这些模型下一轮起不再报价 |
+
+两条都是**离线可复算**的：价格表 + 用量夹具在，结论就可重放（不需要生产凭据）。
+
 ---
 
 ## 6. 常见错误对照
@@ -177,6 +240,8 @@ daemon 日志每轮一行 `event="quotes.publish"`，只有数字（行数/新�
 | 报错 `ttl_s 必须 = 2 × 发布周期` | 手工改了 `config.json` 的 `quotes.ttl_s` | 改周期请**同时**把 `ttl_s` 设为 2×，例如周期 90 → `ttl_s: 180`；否则 daemon **fail-closed**（不建线程、不上行） |
 | 报错 `B 类接入必须显式 --kind` | `upstream add --access B` 少了 `--kind` | 中转站用 `--kind third_party_relay` |
 | `quotes publish` 报"开关关闭" | `client.quotes.publish.enabled` 被关了 | `djb flags --enable client.quotes.publish.enabled` |
+| `djb status` 下一步说「硬件指纹已在服务端注册过」 | 同机重复注册（服务端 `40903`，一机一节点） | 原机还有密钥 → `djb auth --set-key -` 复用；丢了 → 原账户解绑或 `djb auth --bind <码>`；要多节点 → 加机器 |
+| 干跑 `跳过：stale_probe` 长期不降 | 周期复探被关了 / 上游不可达 | `djb flags --enable client.probe.periodic.enabled`；仍不降看上游 `/models` 是否可达 |
 | 服务端 401 | 密钥错/被轮换 | `djb auth --pair` 重新生成，或 `--set-key` 重设 |
 | 服务端 404 节点不存在 | 密钥对应的节点在服务端不存在 | 先 `djb auth --bind <码>` 或重新注册 |
 
