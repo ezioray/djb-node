@@ -68,6 +68,10 @@ class MockServer:
         self.register_state = "active"
         self.register_returns_key = True
         self.fail_register_count = 0
+        # P5（CR-20261106-OFFICIAL-SUPPLY-01）：注册唯一键冲突。非 None 时注册端点按云侧
+        # 40903 的真实形状回包（`{"error":{...,"code":40903,"message":...,"node_id":...}}`）。
+        self.register_conflict_code: int | None = None
+        self.register_conflict_message = "该设备已注册并已绑定账户：请在原账户解绑或联系管理员（INV-01）"
         self.policy_override: dict[str, Any] | None = None
         self.fail_heartbeat_count = 0
         self.fail_receipts_count = 0
@@ -195,6 +199,10 @@ class MockServer:
                     if outer.fail_register_count > 0:
                         outer.fail_register_count -= 1
                         self._error(500, 50001, "mock register failure")
+                        return
+                    if outer.register_conflict_code is not None:
+                        self._error(409, outer.register_conflict_code,
+                                    outer.register_conflict_message, node_id=NODE_ID)
                         return
                     payload = {"node_id": NODE_ID, "state": outer.register_state,
                                "policy_version": outer.policy_version,

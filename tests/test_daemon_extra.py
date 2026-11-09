@@ -53,6 +53,67 @@ def test_register_without_key_requires_manual_key(paths, store, credentials, moc
         daemon.stop()
 
 
+def test_register_fingerprint_conflict_gives_actionable_guidance(paths, store, credentials,
+                                                                 mock, clock):
+    """P5（CR-20261106-OFFICIAL-SUPPLY-01）：同指纹已注册（云侧 40903）→ 可读指引 + 不重试。
+
+    一机一节点的第一现场就在这里：冲突必须变成「怎么办」，而不是一个抽象 409；而且
+    这是永久错误，自动重试只会把日志刷成噪声（也不能靠重试拿到别人的身份）。
+    """
+    _add_upstream(store, mock)
+    mock.register_conflict_code = facts.REGISTER_CONFLICT_CODE
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        snapshot = daemon.machine.snapshot
+        assert snapshot.state == "error"
+        assert snapshot.detail.get("register_conflict") is True
+        assert snapshot.detail.get("code") == facts.REGISTER_CONFLICT_CODE
+        assert snapshot.detail.get("reason_code") == "fingerprint_bound"
+        next_step = snapshot.next_step or ""
+        # 指引必须可执行：复用密钥 / 绑定归属 / 加机器，三选一都在
+        for token in ("硬件指纹", "一台机器只跑一个节点", "--set-key", "--bind", "加机器"):
+            assert token in next_step, token
+        # 服务端原话保留（云侧 INV-01 的「原账户解绑」不能说丢就丢）
+        assert "已绑定账户" in next_step
+        # 冲突时绝不落密钥：否则等于凭指纹接管别人的节点
+        assert not credentials.client_key()
+        # fail-closed：同一冲突只发生 1 次注册请求，推进时钟也不再来一遍
+        def registrations() -> int:
+            return len([item for item in mock.requests
+                        if item["path"] == "/api/v1/node/register"])
+        assert registrations() == 1
+        clock.advance(600)
+        daemon.tick(clock())
+        # 再推进一个心跳周期也不会重打注册（永久冲突不靠重试解决）
+        assert registrations() == 1
+        # 没有密钥就不可能接单：无论停在 error 还是后续的 paused，都不能是 online
+        assert daemon.machine.snapshot.state != "online"
+        assert not credentials.client_key()
+    finally:
+        daemon.stop()
+
+
+def test_register_conflict_without_fingerprint_code_still_guides(paths, store, credentials,
+                                                                 mock, clock):
+    """非 40903 的 409（其它状态冲突）也走同一条可读指引，但不冒充指纹冲突。"""
+    _add_upstream(store, mock)
+    mock.register_conflict_code = 40919
+    mock.register_conflict_message = "节点状态不允许该动作"
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        snapshot = daemon.machine.snapshot
+        assert snapshot.state == "error"
+        assert snapshot.detail.get("register_conflict") is True
+        assert snapshot.detail.get("code") == 40919
+        assert "reason_code" not in snapshot.detail
+        assert "节点状态不允许该动作" in (snapshot.next_step or "")
+        assert "一台机器只跑一个节点" in (snapshot.next_step or "")
+    finally:
+        daemon.stop()
+
+
 def test_offline_bootstrap_then_recover(paths, store, credentials, mock, clock):
     _add_upstream(store, mock)
     config = ClientConfig(gateway_url="http://127.0.0.1:1", mirror_port=1717)

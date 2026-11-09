@@ -33,8 +33,9 @@ from . import quotes as quotes_mod
 from .api import NodeApi, PolicyFetch
 from .channel import ChannelClient, channel_enabled
 from .config import ClientConfig, Paths, feature_flag, load_config, load_config_strict
-from .errors import (AuthError, DjbError, ForbiddenError, NetworkError, NotInstalledError,
-                     PolicyError, PortInUseError, RateLimitError, UsageError)
+from .errors import (AuthError, ConflictError, DjbError, ForbiddenError, NetworkError,
+                     NotInstalledError, PolicyError, PortInUseError, RateLimitError,
+                     UsageError)
 from .httpclient import HttpClient
 from .limits import Decision, Limiter, YieldDetector, YieldResult
 from .logging_setup import event, setup_logging
@@ -547,6 +548,12 @@ class Daemon:
     def _register(self) -> bool:
         try:
             result = self.api.register(hardware_fingerprint=hardware_fingerprint())
+        except ConflictError as exc:
+            # P5（CR-20261106-OFFICIAL-SUPPLY-01 §3）：唯一键冲突 = 同一台机器/同一个硬件指纹
+            # 已经注册过（云侧 40903，INV-01 防凭据接管）。这是「一机一节点」踩坑的第一现场，
+            # 必须给可读指引而不是抽象 409，也**不进网络重试**（重试只会把冲突刷成噪声）。
+            self._register_conflict(exc)
+            return False
         except DjbError as exc:
             event("daemon.register_failed", level="warning", error=type(exc).__name__,
                   code=exc.code)
@@ -571,6 +578,31 @@ class Daemon:
         self.store.set_kv("node", {"node_id": node_id, "state": result.get("state"),
                                    "registered_at": iso(self._now())})
         return True
+
+    def _register_conflict(self, exc: ConflictError) -> None:
+        """唯一键冲突 → 可读指引（P5）；**只 fail，不重试、不清任何本地状态**。
+
+        为什么单独一条路径：云侧 409 有多个来源（状态迁移、端口占用……），但注册端点上的
+        409 只有一种业务含义 —— 这个硬件指纹已经有节点了。把它混进「注册失败」里，用户看到的
+        是 HTTP 文案，不知道下一步该 `--set-key` 复用、`--bind` 归属，还是干脆加机器。
+        """
+        code = int(exc.code)
+        server_said = str(exc.message or "").strip()
+        hint = facts.REGISTER_CONFLICT_HINT
+        next_step = (server_said + " · " + hint) if server_said else hint
+        detail: dict[str, Any] = {"register_conflict": True, "code": code,
+                                  "http_status": int(exc.details.get("status") or 409)}
+        if code == facts.REGISTER_CONFLICT_CODE:
+            detail["reason_code"] = "fingerprint_bound"
+        event("daemon.register_conflict", level="warning", code=code,
+              http_status=detail["http_status"])
+        self.machine.fail(next_step=next_step, detail=detail)
+        self._persist()
+
+    def _register_conflict_pending(self) -> bool:
+        """当前是否卡在「硬件指纹已注册」的永久冲突上（用于抑制自动重试）。"""
+        detail = self.machine.snapshot.detail or {}
+        return bool(detail.get("register_conflict"))
 
     def run(self, *, max_cycles: int | None = None) -> int:
         if not self._started:
@@ -1164,8 +1196,10 @@ class Daemon:
             self.api = self._api_factory(self.config.gateway_url,
                                          self.credentials.client_key())
         if not self.credentials.client_key():
-            # 离线注册重试：只对网络/限流失败重试（未知状态不重建密钥，M15 §7）
-            if moment >= self._next_heartbeat_at:
+            # 离线注册重试：只对网络/限流失败重试（未知状态不重建密钥，M15 §7）。
+            # P5：「硬件指纹已被占用」是**永久性**错误（一机一节点），自动重试只会把日志
+            # 刷成噪声、也不会自己变好 —— 必须先由人复用密钥 / 解绑 / 加机器，故不再重试。
+            if moment >= self._next_heartbeat_at and not self._register_conflict_pending():
                 if self._register():
                     if self.api is not None:
                         self.api.client_key = self.credentials.client_key()
