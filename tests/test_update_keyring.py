@@ -180,13 +180,37 @@ def test_placeholder_primary_is_never_usable(monkeypatch):
     assert ready is True
 
 
-def test_transition_window_is_short():
-    """旧 E2E 私钥在 NAS（已泄露态）：过渡期必须是短窗，且 <= 60 天。"""
+def test_legacy_anchor_default_revoked():
+    """B9 安全裁决：旧 E2E 锚默认已吊销 —— 不静默过渡、不接受旧钥签名。"""
+    ring = keyring_anchors()                        # 真实 facts，不做任何 patch
+    assert "djb-e2e-2026-11-02" in ring.revoked
+    assert ring.unusable_reason("djb-e2e-2026-11-02") == "已吊销"
+    with pytest.raises(UpdateError) as excinfo:
+        ring.resolve("djb-e2e-2026-11-02")
+    assert "已吊销" in str(excinfo.value)
+    with pytest.raises(UpdateError):
+        verify_manifest(build_manifest(key_id="djb-e2e-2026-11-02"), ring)
+    # 硬上限日期仍在（即使 owner 应急覆盖也不得越过）
     import datetime as _dt
-    last_day = _dt.date.fromisoformat(facts.UPDATE_TRANSITION_UNTIL)
-    today = _dt.datetime.now(_dt.timezone.utc).date()
-    assert last_day > today, "过渡期已过期：应显式加 UPDATE_REVOKED_KEY_IDS 而不是延长"
-    assert (last_day - today).days <= 60, "过渡期过长（旧钥是已泄露态）"
+    assert _dt.date.fromisoformat(facts.UPDATE_TRANSITION_UNTIL) > _dt.datetime.now(
+        _dt.timezone.utc).date()
+
+
+def test_transition_override_is_emergency_only(monkeypatch):
+    """应急开关：默认关；打开且未过硬上限时，已吊销的 transition 锚才临时可用。"""
+    monkeypatch.setattr(facts, "UPDATE_REVOKED_KEY_IDS", (TEST_KEY_ID,))
+    monkeypatch.setattr(facts, "UPDATE_TRANSITION_UNTIL", "2099-12-31")
+    monkeypatch.setattr(facts, "UPDATE_TRANSITION_OVERRIDE", False)
+    monkeypatch.setattr(facts, "UPDATE_KEYRING", (
+        {"key_id": "prod-x", "pubkey_hex": OTHER_PUBLIC_KEY.hex(), "state": "primary"},
+        {"key_id": TEST_KEY_ID, "pubkey_hex": TEST_PUBLIC_KEY.hex(), "state": "transition"},
+    ))
+    assert keyring_anchors().unusable_reason(TEST_KEY_ID) == "已吊销"
+    monkeypatch.setattr(facts, "UPDATE_TRANSITION_OVERRIDE", True)
+    assert keyring_anchors().unusable_reason(TEST_KEY_ID) is None
+    # 硬上限过了：应急覆盖也无效
+    monkeypatch.setattr(facts, "UPDATE_TRANSITION_UNTIL", "2020-01-01")
+    assert keyring_anchors().unusable_reason(TEST_KEY_ID) == "过渡期已结束（2020-01-01）"
 
 
 # ─────────────────────────────────────────── status 视图

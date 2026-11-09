@@ -123,6 +123,14 @@ if [ -n "${DJB_OFFLINE_SIGNING_KEY:-}" ]; then
         echo "build.sh: 设置了签名私钥但没有 openssl" >&2
         exit 2
     fi
+    # RC8：离线包签名统一 Ed25519（与客户端更新链同算法）。
+    # 为什么不用 openssl dgst：OpenSSL 3 对 Ed25519 直接报 "Key type not supported"（实测 3.0.20）。
+    key_type=$(openssl pkey -in "$DJB_OFFLINE_SIGNING_KEY" -noout -text 2>/dev/null | head -1)
+    case "$key_type" in
+        *ED25519*) : ;;
+        *) echo "build.sh: 私钥不是 Ed25519（当前：$key_type）；离线包签名只接受 Ed25519" >&2
+           exit 2 ;;
+    esac
     SIGNED=1
 fi
 
@@ -172,7 +180,9 @@ manifest = {
          "size": os.path.getsize(os.path.join(out, name))}
         for name in payload
     ],
-    "signature": ({"algorithm": "openssl-dgst-sha256", "file": "sha256sums.sig"}
+    "signature": ({"algorithm": "ed25519",
+                   "key_id": os.environ.get("DJB_OFFLINE_KEY_ID") or "unspecified",
+                   "file": "sha256sums.sig"}
                   if signed else None),
 }
 with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as handle:
@@ -193,16 +203,21 @@ PY
 
 # ── 5) 签名（可选）
 if [ "$SIGNED" = "1" ]; then
-    openssl dgst -sha256 -sign "$DJB_OFFLINE_SIGNING_KEY" \
-        -out "$OUT/sha256sums.sig" "$OUT/sha256sums"
+    openssl pkeyutl -sign -inkey "$DJB_OFFLINE_SIGNING_KEY" -rawin \
+        -in "$OUT/sha256sums" -out "$OUT/sha256sums.sig"
     chmod 0644 "$OUT/sha256sums.sig"
-    echo "build.sh: 已签名（openssl dgst -sha256 -sign，私钥来自 DJB_OFFLINE_SIGNING_KEY）"
-    echo "          验签需要 DJB_OFFLINE_VERIFY_KEY=<公钥 PEM>"
+    echo "build.sh: 已签名（Ed25519 / openssl pkeyutl -rawin，私钥来自 DJB_OFFLINE_SIGNING_KEY）"
+    echo "          验签需要 DJB_OFFLINE_VERIFY_KEY=<公钥 PEM>（key_id=${DJB_OFFLINE_KEY_ID:-unspecified}）"
 else
     echo "build.sh: 未签名，仅校验哈希（如需签名：DJB_OFFLINE_SIGNING_KEY=<私钥 PEM> ./build.sh）"
 fi
 
-# ── 6) 自检：用 verify.sh 验一遍自己刚打的包
-"$OUT/verify.sh"
+# ── 6) 自检：用 verify.sh 验一遍自己刚打的包（签了名就把公钥导出来自验，别靠"降级为仅哈希"）
+if [ "$SIGNED" = "1" ]; then
+    openssl pkey -in "$DJB_OFFLINE_SIGNING_KEY" -pubout -out "$WORK/selfcheck.pub.pem" 2>/dev/null
+    DJB_OFFLINE_VERIFY_KEY="$WORK/selfcheck.pub.pem" "$OUT/verify.sh"
+else
+    "$OUT/verify.sh"
+fi
 echo "build.sh: 完成 -> $OUT"
 ls -l "$OUT"

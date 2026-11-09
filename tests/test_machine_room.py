@@ -456,28 +456,43 @@ def test_offline_package_signature_roundtrip(tmp_path: Path) -> None:
         pytest.skip("没有 openssl，跳过签名往返测试")
     key = tmp_path / "sign.pem"
     pub = tmp_path / "verify.pem"
-    subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt",
-                    "rsa_keygen_bits:2048", "-out", str(key)],
+    # RC8：离线包签名统一 Ed25519（openssl dgst 对 Ed25519 在 OpenSSL 3 直接失败）
+    subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(key)],
                    check=True, capture_output=True)
     subprocess.run(["openssl", "pkey", "-in", str(key), "-pubout", "-out", str(pub)],
                    check=True, capture_output=True)
     out = tmp_path / "pkg"
     built = run([str(OFFLINE / "build.sh"), "--wheel", str(fake_wheel(tmp_path)),
                  "--out", str(out)],
-                env={"PYTHON": sys.executable, "DJB_OFFLINE_SIGNING_KEY": str(key)})
+                env={"PYTHON": sys.executable, "DJB_OFFLINE_SIGNING_KEY": str(key),
+                     "DJB_OFFLINE_KEY_ID": "djb-prod-test"})
     assert built.returncode == 0, built.stdout + built.stderr
     assert (out / "sha256sums.sig").is_file()
     manifest = json.loads(read(out / "manifest.json"))
     assert manifest["signature"]["file"] == "sha256sums.sig"
+    assert manifest["signature"]["algorithm"] == "ed25519"
+    assert manifest["signature"]["key_id"] == "djb-prod-test"
 
     good = run([str(out / "verify.sh")], env={"DJB_OFFLINE_VERIFY_KEY": str(pub)})
     assert good.returncode == 0, good.stdout + good.stderr
     assert "签名校验通过" in good.stdout
 
-    # 有签名但没公钥：默认告警继续；STRICT=1 拒绝
-    assert run([str(out / "verify.sh")]).returncode == 0
-    strict = run([str(out / "verify.sh")], env={"DJB_OFFLINE_STRICT": "1"})
-    assert strict.returncode != 0
+    # RC8：有签名但没公钥 -> **默认拒绝**（不再静默降级为仅哈希）；显式 STRICT=0 才允许
+    assert run([str(out / "verify.sh")]).returncode != 0
+    lenient = run([str(out / "verify.sh")], env={"DJB_OFFLINE_STRICT": "0"})
+    assert lenient.returncode == 0, lenient.stdout + lenient.stderr
+    assert "DJB_OFFLINE_STRICT=0" in lenient.stdout
+
+    # RC8：非 Ed25519 私钥必须被 build.sh 直接拒（不许"签了但验不了"）
+    rsa = tmp_path / "rsa.pem"
+    subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt",
+                    "rsa_keygen_bits:2048", "-out", str(rsa)],
+                   check=True, capture_output=True)
+    rejected = run([str(OFFLINE / "build.sh"), "--wheel", str(fake_wheel(tmp_path)),
+                    "--out", str(tmp_path / "rsa-pkg")],
+                   env={"PYTHON": sys.executable, "DJB_OFFLINE_SIGNING_KEY": str(rsa)})
+    assert rejected.returncode == 2
+    assert "Ed25519" in rejected.stderr + rejected.stdout
 
     # 改动 sha256sums -> 签名必然失败
     sums = out / "sha256sums"
