@@ -114,11 +114,12 @@ def test_builtin_public_key_is_valid_and_fingerprint_matches():
     view = ring.to_dict()
     assert view["scheme"] == "ed25519"
     assert view["revoked"] == ["djb-e2e-2026-11-02"]      # B9：默认吊销
-    # RC8 安全口径（lead 2026-11-10）：primary 是**占位**公钥（仓库内无对应私钥），
-    # 发布门禁必须 False，直到 owner 注入离线签名机生成的最终公钥。
-    assert ring.placeholders == ("djb-prod-2026-11-20",)
+    # RC8 安全口径（lead 2026-11-10）：owner 已注入离线签名机生成的最终公钥，
+    # primary 不再是占位，发布门禁 release_ready=True（旧 E2E 仍默认吊销）。
+    assert ring.placeholders == ()
     ready, reason = update.anchor_release_ready(ring)
-    assert ready is False and "占位" in reason
+    assert ready is True
+    assert reason.startswith("primary=djb-prod-2026-11-20")
     # to_dict 不含任何密钥材料
     assert facts.UPDATE_PUBLIC_KEY_HEX not in json.dumps(view)
     assert all("pubkey" not in item for item in view["keys"])
