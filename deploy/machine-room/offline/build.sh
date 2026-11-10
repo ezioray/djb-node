@@ -6,6 +6,7 @@
 # 产物（默认落在 deploy/machine-room/offline/dist/）：
 #   djb_node-<version>-py3-none-any.whl   本仓 wheel（零第三方运行时依赖）
 #   install.sh                            离线安装脚本（pip --no-index --find-links）
+#   config.template.json                  0.3.1：显式 update_source/edition 的配置模板
 #   verify.sh                             哈希/签名校验脚本
 #   manifest.json                         版本 + 文件清单 + 每个文件的 sha256 + 签名声明
 #   sha256sums                            上面四个文件（含 manifest 自己以外的全部）的哈希清单
@@ -59,6 +60,13 @@ esac
 
 VERSION=$(PYTHONPATH="$REPO" "$PYTHON" -c 'import djb_node; print(djb_node.__version__)')
 [ -n "$VERSION" ] || { echo "build.sh: 读不到 djb_node.__version__" >&2; exit 2; }
+
+# 0.3.1（RC8.3-C）：机房通道的显式更新源。单一真源是 djb_node/update_source.py 的
+# MANIFEST_URL；DJB_OFFLINE_UPDATE_SOURCE 只给「内网镜像」场景覆盖用（覆盖值会写进清单）。
+DEFAULT_UPDATE_SOURCE=$(PYTHONPATH="$REPO" "$PYTHON" -c \
+    'from djb_node import update_source; print(update_source.MANIFEST_URL)')
+[ -n "$DEFAULT_UPDATE_SOURCE" ] || { echo "build.sh: 读不到 update_source.MANIFEST_URL" >&2; exit 2; }
+UPDATE_SOURCE=${DJB_OFFLINE_UPDATE_SOURCE:-$DEFAULT_UPDATE_SOURCE}
 echo "build.sh: djb-node $VERSION -> $OUT"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/djb-offline-build.XXXXXX")
@@ -106,11 +114,26 @@ fi
 
 # ── 2) 组装载荷（先清旧载荷，避免旧 wheel 混进新包）
 mkdir -p "$OUT"
-rm -f "$OUT"/djb_node-*.whl "$OUT"/sha256sums "$OUT"/sha256sums.sig "$OUT"/manifest.json
+rm -f "$OUT"/djb_node-*.whl "$OUT"/sha256sums "$OUT"/sha256sums.sig "$OUT"/manifest.json \
+      "$OUT"/config.template.json
 cp "$WHEEL" "$OUT"/
 cp "$HERE/install.sh" "$HERE/verify.sh" "$OUT"/
 chmod 0755 "$OUT/install.sh" "$OUT/verify.sh"
 chmod 0644 "$OUT/$(basename "$WHEEL")"
+
+# 2b) 配置模板（0.3.1）：把 update_source / edition 显式写出来，install.sh 复制它即可
+cat > "$OUT/config.template.json" <<EOF
+{
+  "gateway_url": "https://api.example.invalid",
+  "mirror_port": 1717,
+  "update_channel": "stable",
+  "update_source": "${UPDATE_SOURCE}",
+  "edition": "machine-room",
+  "log_level": "info",
+  "yield_enabled": false
+}
+EOF
+chmod 0644 "$OUT/config.template.json"
 
 # ── 3) 签名声明（有私钥才签名；绝不硬编码密钥）
 SIGNED=0
@@ -135,7 +158,8 @@ if [ -n "${DJB_OFFLINE_SIGNING_KEY:-}" ]; then
 fi
 
 # ── 4) manifest.json + sha256sums（用 python 写，避免 sha256sum/shasum 差异）
-DJB_BUILD_SIGNED=$SIGNED "$PYTHON" - "$OUT" "$VERSION" "$REPO" <<'PY'
+DJB_BUILD_SIGNED=$SIGNED DJB_BUILD_UPDATE_SOURCE="$UPDATE_SOURCE" \
+    "$PYTHON" - "$OUT" "$VERSION" "$REPO" <<'PY'
 import hashlib
 import json
 import os
@@ -156,7 +180,7 @@ wheel = sorted(name for name in os.listdir(out)
                if name.startswith("djb_node-%s-" % version) and name.endswith(".whl"))
 if len(wheel) != 1:
     sys.exit("manifest: 期望恰好一个 wheel，实际 %d 个" % len(wheel))
-payload = [wheel[0], "install.sh", "verify.sh"]
+payload = [wheel[0], "install.sh", "verify.sh", "config.template.json"]
 
 try:
     import tomllib
@@ -170,6 +194,10 @@ manifest = {
     "name": "djb-node",
     "version": version,
     "kind": "offline",
+    "channel": "machine-room",
+    "edition": "machine-room",
+    # 0.3.1（RC8.3-C）：机房通道显式更新源。为空说明构建参数坏了 —— 宁可构建失败。
+    "update_source": os.environ.get("DJB_BUILD_UPDATE_SOURCE", ""),
     "requires_python": requires,
     "runtime_dependencies": [],
     "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -198,7 +226,12 @@ with open(os.path.join(out, "sha256sums"), "w", encoding="utf-8") as handle:
     handle.writelines(lines)
 os.chmod(os.path.join(out, "sha256sums"), 0o644)
 os.chmod(os.path.join(out, "manifest.json"), 0o644)
-print("manifest: %d 个文件（wheel=%s）" % (len(targets), wheel[0]))
+expected = os.environ.get("DJB_BUILD_UPDATE_SOURCE", "")
+if not expected:
+    sys.exit("manifest: 构建参数里缺 update_source（0.3.1 起机房通道必须显式）")
+if manifest["update_source"] != expected:
+    sys.exit("manifest: 写出的 update_source 与构建参数不一致")
+print("manifest: %d 个文件（wheel=%s，update_source 已显式）" % (len(targets), wheel[0]))
 PY
 
 # ── 5) 签名（可选）
@@ -219,5 +252,6 @@ if [ "$SIGNED" = "1" ]; then
 else
     "$OUT/verify.sh"
 fi
+echo "build.sh: update_source = $UPDATE_SOURCE（manifest.json / config.template.json 均已显式）"
 echo "build.sh: 完成 -> $OUT"
 ls -l "$OUT"

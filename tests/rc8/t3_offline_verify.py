@@ -38,8 +38,10 @@ PRIMARY_SEED = bytes.fromhex("7f" * 32)
 PRIMARY_ID = "test-primary-0001"
 LEGACY_SEED = bytes.fromhex("11" * 32)
 LEGACY_ID = "test-legacy-0002"
+# CURRENT/TARGET 必须相等或 TARGET 更高：更新器不接受降级安装（28cf9d1 的原意），
+# 所以 TARGET 不能是历史版本号。版本发布提交会同时抬这两处。
 CURRENT_VERSION = "0.3.3"
-TARGET_VERSION = "0.2.6"
+TARGET_VERSION = "0.3.3"
 
 RESULTS: list[tuple[str, bool, str]] = []
 

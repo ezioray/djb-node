@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any
 
-from . import facts
+from . import facts, update_source
 from .platform.paths import default_home as _platform_default_home
 from .util import clamp, ensure_dir, file_mode, read_json, write_json
 
@@ -136,6 +136,10 @@ class ClientConfig:
     mirror_port: int = facts.MIRROR_PORT
     update_channel: str = facts.DEFAULT_UPDATE_CHANNEL
     update_source: str = ""              # 空 = 内置 mock 源（S1）；可填 URL / 本地目录
+    #: 发行通道档（0.3.1 新增，RC8.3-C）：consumer / machine-room / official-supply。
+    #: 空 = 0.3.0 老配置（不改变任何行为）。只在「显式给档位」时用来落默认 update_source，
+    #: 见 djb_node.update_source.resolve()。旧客户端读到它会当未知字段放进 extra，无害。
+    edition: str = ""
     log_level: str = facts.DEFAULT_LOG_LEVEL
     yield_enabled: bool = facts.DEFAULT_YIELD_ENABLED
     extra: dict[str, Any] = field(default_factory=dict)
@@ -148,6 +152,9 @@ class ClientConfig:
             raise ValueError("update_channel 必须是 " + "/".join(facts.UPDATE_CHANNELS))
         if self.log_level not in facts.LOG_LEVELS:
             raise ValueError("log_level 必须是 " + "/".join(facts.LOG_LEVELS))
+        if self.edition and self.edition not in update_source.editions():
+            raise ValueError("edition 必须是 " + "/".join(update_source.editions())
+                             + "（当前 " + repr(self.edition) + "）")
 
     def to_dict(self) -> dict[str, Any]:
         base = {
@@ -158,6 +165,8 @@ class ClientConfig:
             "log_level": self.log_level,
             "yield_enabled": bool(self.yield_enabled),
         }
+        if self.edition:                      # 0.3.1 新增；空则**不写**，保持 0.3.0 配置形状
+            base["edition"] = self.edition
         if self.extra:
             base["extra"] = dict(self.extra)
         return base
@@ -167,7 +176,7 @@ class ClientConfig:
         """tolerant reader：未知字段进 extra，非法值回落默认（不因脏配置崩溃）。"""
         raw = dict(raw or {})
         config = cls()
-        for name in ("gateway_url", "update_channel", "update_source", "log_level"):
+        for name in ("gateway_url", "update_channel", "update_source", "log_level", "edition"):
             value = raw.get(name)
             if isinstance(value, str) and value.strip():
                 setattr(config, name, value.strip())
@@ -178,7 +187,7 @@ class ClientConfig:
         if isinstance(enabled, bool):
             config.yield_enabled = enabled
         known = {"gateway_url", "mirror_port", "update_channel", "update_source",
-                 "log_level", "yield_enabled"}
+                 "log_level", "yield_enabled", "edition"}
         extra = raw.get("extra")
         if isinstance(extra, dict):
             config.extra = dict(extra)
@@ -235,7 +244,7 @@ def load_config_strict(paths: Paths) -> ClientConfig:
         if value is not None and value not in allowed:
             raise ValueError(name + " 必须是 " + "/".join(allowed)
                              + "（当前 " + repr(value) + "）")
-    for name in ("gateway_url", "update_source"):
+    for name in ("gateway_url", "update_source", "edition"):
         value = raw.get(name)
         if value is not None and not isinstance(value, str):
             raise ValueError(name + " 必须是字符串（当前 " + type(value).__name__ + "）")
