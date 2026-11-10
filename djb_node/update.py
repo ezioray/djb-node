@@ -31,7 +31,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from . import ed25519, facts
+from . import ed25519, facts, update_source
 from .config import Paths, feature_flag, load_config
 from .errors import NetworkError, UpdateError
 from .httpclient import HttpClient
@@ -412,6 +412,7 @@ class UpdateManager:
                  client_version: str = facts.CLIENT_VERSION,
                  http: HttpClient | None = None,
                  config: Any = None,
+                 edition: str = "",
                  now: Callable[[], datetime] = utcnow) -> None:
         self.paths = paths
         self.store = store
@@ -419,6 +420,7 @@ class UpdateManager:
         self.channel = channel if channel in facts.UPDATE_CHANNELS \
             else facts.DEFAULT_UPDATE_CHANNEL
         self.client_version = client_version
+        self.edition = edition or ""
         self.http = http or HttpClient(timeout=15.0)
         self._config = config
         self._now = now
@@ -529,11 +531,15 @@ class UpdateManager:
             anchor_info = {"scheme": None, "key_id": None, "key_fingerprint": None}
             anchor_available = False
             anchor_error = str(exc)
+        resolved = update_source.resolve(self.source, edition=self.edition)
         return {"channel": self.channel, "current_version": install.version,
                 "recorded_current": state.current_version, "next_version": state.next_version,
                 "rollback_to": state.rollback_to, "verify_state": state.verify_state,
                 "bucket": install.bucket, "checked_at": state.checked_at,
                 "source": self.source or "(mock: versions/mock-manifest.json)",
+                # 0.3.1（RC8.3-C）：更新源显式化 —— 只加字段，不动既有键
+                "source_kind": resolved.kind, "source_origin": resolved.origin,
+                "edition": resolved.edition, "source_channel": resolved.channel,
                 "signature": {**anchor_info, "available": anchor_available,
                               "error": anchor_error,
                               "mock": bool(self.mock_requested())}}

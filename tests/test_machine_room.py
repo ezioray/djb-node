@@ -35,6 +35,7 @@ FLEET = DEPLOY / "fleet" / "djb-fleet.py"
 sys.path.insert(0, str(REPO))
 from djb_node import __version__ as CLIENT_VERSION            # noqa: E402
 from djb_node import facts                                  # noqa: E402
+from djb_node import update_source as UPDATE_SOURCE          # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────── 工具
@@ -425,6 +426,7 @@ def test_offline_package_build_verify_and_tamper(tmp_path: Path) -> None:
     names = sorted(item.name for item in out.iterdir())
     assert "manifest.json" in names and "sha256sums" in names
     assert "verify.sh" in names and "install.sh" in names
+    assert "config.template.json" in names                # 0.3.1：机房通道的显式载体
     assert "sha256sums.sig" not in names                  # 没有密钥就不该有签名
 
     manifest = json.loads(read(out / "manifest.json"))
@@ -433,7 +435,14 @@ def test_offline_package_build_verify_and_tamper(tmp_path: Path) -> None:
     assert manifest["kind"] == "offline"
     assert manifest["runtime_dependencies"] == []
     assert manifest["signature"] is None
-    assert len(manifest["files"]) == 3
+    # 0.3.1（RC8.3-C）：wheel + install.sh + verify.sh + config.template.json
+    assert len(manifest["files"]) == 4
+    assert manifest["channel"] == "machine-room"
+    assert manifest["edition"] == "machine-room"
+    assert manifest["update_source"] == UPDATE_SOURCE.MANIFEST_URL
+    template = json.loads(read(out / "config.template.json"))
+    assert template["update_source"] == UPDATE_SOURCE.MANIFEST_URL
+    assert template["edition"] == "machine-room"
 
     ok = run([str(out / "verify.sh")])
     assert ok.returncode == 0, ok.stdout + ok.stderr
@@ -449,6 +458,37 @@ def test_offline_package_build_verify_and_tamper(tmp_path: Path) -> None:
         assert broken.returncode != 0, name
         target.write_bytes(original)
         assert run([str(out / "verify.sh")]).returncode == 0
+
+
+def test_offline_install_writes_explicit_update_source(tmp_path: Path) -> None:
+    """0.3.1：--djb-home 必须落出**显式 update_source** 的 config.json，dry-run 不写盘。"""
+    out = tmp_path / "pkg"
+    built = run([str(OFFLINE / "build.sh"), "--wheel", str(fake_wheel(tmp_path)),
+                 "--out", str(out)], env={"PYTHON": sys.executable})
+    assert built.returncode == 0, built.stdout + built.stderr
+
+    home = tmp_path / "djb-home"
+    dry = run([str(out / "install.sh"), "--python", sys.executable, "--dry-run",
+               "--djb-home", str(home), "--gateway", "https://gw.example.invalid"])
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert not home.exists()                       # dry-run 一律不写盘
+    assert "config.json" in dry.stdout
+
+    mirror = "https://mirror.internal.example/update-manifest.json"
+    # --config-only：只写配置、不碰 pip（机房真机上 wheel 由镜像铺；测试里假 wheel 装不了）
+    done = run([str(out / "install.sh"), "--python", sys.executable, "--config-only",
+                "--djb-home", str(home), "--gateway", "https://gw.example.invalid",
+                "--update-source", mirror])
+    assert done.returncode == 0, done.stdout + done.stderr
+    config = json.loads(read(home / "config.json"))
+    assert config["update_source"] == mirror       # 显式参数优先于包内模板
+    assert config["edition"] == "machine-room"
+    assert config["gateway_url"] == "https://gw.example.invalid"
+    assert oct(home.stat().st_mode & 0o777) == "0o700"
+    assert oct((home / "config.json").stat().st_mode & 0o777) == "0o600"
+    # 缺 --djb-home 必须拒（不猜安装位置）
+    bad = run([str(out / "install.sh"), "--python", sys.executable, "--config-only"])
+    assert bad.returncode == 2
 
 
 def test_offline_package_signature_roundtrip(tmp_path: Path) -> None:

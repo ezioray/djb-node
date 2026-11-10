@@ -21,7 +21,7 @@ import time
 import unicodedata
 from typing import Any, Callable
 
-from . import __version__, facts, pidfile
+from . import __version__, facts, pidfile, update_source
 from .api import NodeApi
 from .attest import AttestationManager
 from .channel import channel_enabled
@@ -121,6 +121,20 @@ def cmd_init(args: argparse.Namespace) -> int:
         config.mirror_port = int(args.port)
     if getattr(args, "channel", None):
         config.update_channel = args.channel
+    edition = getattr(args, "edition", None)
+    edition_note = ""
+    if edition:
+        # 0.3.1（RC8.3-C）：显式给档位 = 明确要该通道的签名更新源。
+        # 已有**自定义**源（内网镜像 / 本地目录）不覆盖 —— 那是运维刻意的选择。
+        config.edition = str(edition).strip()
+        known_sources = {item.update_source for item in update_source.channels()}
+        current = config.update_source.strip()
+        if getattr(args, "update_source", None) is None:
+            if not current or current in known_sources:
+                config.update_source = update_source.default_source(config.edition)
+            else:
+                edition_note = ("保留已有自定义 update_source（--edition 只登记档位，"
+                                "不改源；要改请显式 --update-source）")
     if getattr(args, "update_source", None) is not None:
         config.update_source = str(args.update_source).strip()
     if getattr(args, "log_level", None):
@@ -165,6 +179,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "home": paths.home,
         "initialized": True,
         "config": config.to_dict(),
+        "update_source": update_source.resolve(config.update_source,
+                                               edition=config.edition).to_dict(),
         "install": store.install().to_dict(),
         "profile": store.profile().to_dict(),
         "env": report.to_dict() if report else None,
@@ -183,6 +199,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("  预设 " + store.profile().preset + " · 并发 " + str(store.profile().concurrent)
               + " · 日配额 " + str(store.profile().daily_tokens) + " tokens")
         print("  本机镜像将监听 127.0.0.1:" + str(config.mirror_port) + "/v1（仅回环）")
+        resolved = update_source.resolve(config.update_source, edition=config.edition)
+        print("  更新源 " + resolved.label()
+              + ("（档位 " + config.edition + "）" if config.edition else ""))
+        if edition_note:
+            print("  注意：" + edition_note)
         if report is not None:
             print("")
             print(report.text())
@@ -1950,6 +1971,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     manager = UpdateManager(paths, store,
                             source=source if source is not None else config.update_source,
                             channel=getattr(args, "channel", None) or config.update_channel,
+                            edition=config.edition,
                             http=HttpClient(timeout=20.0),
                             # 开关求值需要 config（mock 验签三条件之一）；生产路径用不到
                             config=config)
@@ -2311,6 +2333,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--port", type=int, help="本机镜像端口（1024–65535，默认 1717）")
     init.add_argument("--channel", choices=facts.UPDATE_CHANNELS, help="更新频道")
     init.add_argument("--update-source", help="更新源（URL / 本地目录；留空用 mock 源）")
+    init.add_argument("--edition", choices=update_source.editions(),
+                      help="发行档位：落该通道的显式签名更新源（consumer/machine-room/"
+                           "official-supply）；--update-source 优先级更高")
     init.add_argument("--log-level", choices=facts.LOG_LEVELS, help="日志级别")
     init.add_argument("--preset", choices=facts.PRESETS, help="预设：省心 / 均衡 / 全力以赴")
     init.add_argument("--daily-tokens", type=int, help="日配额（10000–100000000）")

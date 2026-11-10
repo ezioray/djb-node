@@ -6,6 +6,57 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.3.1 · 2026-11-11
+
+RC8.3-C **收口版**：把 0.3.0 留下的 P1（五通道 `update_source` 未显式化）与 B7（CI `linux-matrix`
+占位）关掉。**没有**协议契约变更（`openapi.yaml` 未动），**没有**新增运行时依赖，
+**没有**改动更新信任锚（验签仍由 `facts.UPDATE_KEYRING` 的 Ed25519 钥环负责）。
+
+### 五通道更新源显式化（P1-3 收口）
+- 新增 `djb_node/update_source.py`：五通道契约单一真源（channel / edition / carrier /
+  update_source），五通道**指向同一份签名清单**——多份清单 = 多套签名 = 回滚面翻倍。
+- 客户端侧显式化：`resolve()` 返回 `origin ∈ {config, edition, mock}`、
+  `kind ∈ {official-manifest, file, custom, mock}`；`djb update --status` 新增
+  `source_kind` / `source_origin` / `edition` / `source_channel` 四个**只加不改**的字段。
+- `djb init --edition {consumer|machine-room|official-supply}`：显式落该通道的签名更新源；
+  `--update-source` 优先级更高；**已有自定义源（内网镜像/本地目录）不会被 `--edition` 覆盖**。
+- 载体补齐（0.3.0 时只有 official-supply 有）：
+  - 机房版：`offline/config.template.json` + `manifest.json#update_source` +
+    `install.sh --update-source/--djb-home/--config-only`（装完直接落 0600 的 config.json）；
+  - Windows：`ci/pkgbuild.py --kind windows-assets` 产出 `config.json` + 带
+    `--update-source` 的 `start-windows.bat`（并入 zip 的步骤见发布单 §Windows）；
+  - Linux 源码包 / official-supply：`VERSION.txt#update_source` + `README-INSTALL.txt`
+    里那条带 `--edition/--update-source` 的 init 命令。
+- **0.3.0 兼容**：`update_source` 为空且没给 edition → 仍走 mock（不联网）；写回配置形状不变
+  （没有 edition 时不写 `edition` 键）；旧客户端读到 `edition` 当未知字段进 `extra`；0.3.0 的
+  `update-manifest.json`（不含 `key_id`）照旧可验签。
+- 人读输出（`env` / `--version` / `--help` / 打包器 stdout）**不打印清单 URL**：
+  构建自检对 `tkbank.ai` 是硬护栏（命中即不出包），完整 URL 只在 `update --status --json`
+  与 `BUILD_RESULT` 的机器可读字段里。
+
+### CI / 构建（B7 去占位）
+- 新增仓内打包器 `ci/pkgbuild.py`（`linux-src` / `official-supply` / `machine-room-offline` /
+  `windows-assets`）：从 commit 出包（`git archive` 白名单）、内置启动器、`VERSION.txt`、
+  `SHA256SUMS.txt`、自检（`./djb --version` + `tkbank.ai` 护栏）、拒绝写发布面。
+  与 `ops/release/build/*.sh` 的区别：前者假设 NAS 工作区布局，CI 里跑不了。
+- 新增 `ci/check_pkg_manifest.py`：包内自洽（`VERSION.txt` / `SHA256SUMS.txt` / wheel）+
+  **五个包逐个断言显式 `update_source`** + 可选与 MANIFEST 草案逐项对齐。
+- `.github/workflows/ci.yml`：新增 `package` job（4 kind 并行构建 + 上传 artifact）；
+  `linux-matrix-l0` 从「无制品就 exit 0」改成**下载真实制品 → 缺制品即失败**，
+  再跑 T1 矩阵（4 发行版 × 3 制品容器校验）。
+
+### 测试
+- 新增 `tests/test_update_source.py`（38 例）：通道表/分类/解析优先级、0.3.0 兼容、
+  CLI `init --edition`、`update --status` 新字段、四个打包 kind 的载体断言、发布面保护。
+- `tests/test_machine_room.py`：离线包清单从 3 文件变 4（新增 `config.template.json`），
+  新增「`--djb-home` 落显式 update_source / `--dry-run` 不写盘 / `--config-only` 缺参数即拒」。
+- 基线红修正（随 96194dc 回合）：`test_update.py` 的占位公钥断言改为「owner 已注入真实锚」。
+
+### 已知未闭（不阻塞发版，见发布单）
+- Windows Authenticode：无 EV 证书 ⇒ 仍 `unsigned-test`；SmartScreen 首启会拦一次。
+- macOS：0.3.1 只给构建脚本与验收清单；真 dmg + 公证需 Apple 凭据（owner/djb-release）。
+- 自动更新放量仍是 `rollout.wave=1`（5%）；wave 2 需 owner 在 24h 观察后决定。
+
 ## 0.3.0 · 2026-11-10
 
 RC8 **全客户端同步版本**：Windows onefile / macOS arm64 dmg / Linux 源码包 / 机房端离线包 / 官方特供版

@@ -268,7 +268,7 @@ class Daemon:
         self.update = UpdateManager(paths, self.store, source=self.config.update_source,
                                     channel=self.config.update_channel,
                                     client_version=facts.CLIENT_VERSION, http=self.http,
-                                    config=self.config, now=now)
+                                    config=self.config, edition=self.config.edition, now=now)
         self.server = LocalApiServer(self, token=self.token, port=self.port, http=self.http,
                                         settings=self.config.extra)
         self._stop_event = threading.Event()
@@ -783,11 +783,12 @@ class Daemon:
                 applied.append("log_level")
             except (OSError, ValueError) as exc:            # pragma: no cover - 防御
                 notes.append("日志级别未切换：" + (str(exc) or type(exc).__name__))
-        for name in ("update_channel", "update_source"):
+        for name in ("update_channel", "update_source", "edition"):
             if name in changed:
                 applied.append(name)
         self.update.source = fresh.update_source
         self.update.channel = fresh.update_channel
+        self.update.edition = fresh.edition
         if "extra" in changed:
             # 镜像端点用 extra 做行为开关（如 tokens.compare）；直接换掉旧字典
             self.server.settings = dict(fresh.extra or {})
