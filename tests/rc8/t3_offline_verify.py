@@ -38,8 +38,11 @@ PRIMARY_SEED = bytes.fromhex("7f" * 32)
 PRIMARY_ID = "test-primary-0001"
 LEGACY_SEED = bytes.fromhex("11" * 32)
 LEGACY_ID = "test-legacy-0002"
-CURRENT_VERSION = "0.3.1"
-TARGET_VERSION = "0.3.1"
+# 已装版本 = 包版本（跟着 __version__ 走，不再手工同步）
+CURRENT_VERSION = facts.CLIENT_VERSION
+# 目标版本必须是**比已装版本大**的合成版本：用同一个号会让 update 判 up_to_date，
+# 「能装」的三个正例会全部假红灯（0.3.1 定版时踩过）。它不对应任何真实制品。
+TARGET_VERSION = "0.3.2"
 
 RESULTS: list[tuple[str, bool, str]] = []
 
