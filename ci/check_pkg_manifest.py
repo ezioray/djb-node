@@ -77,13 +77,16 @@ class Checks:
 
 
 def read_tar_text(path: Path, suffix: str) -> str:
-    """取包内**顶层目录**下名为 suffix 的文件内容（找不到返回空串）。"""
+    """取包内**顶层目录**下相对路径为 suffix 的文件内容（找不到返回空串）。
+
+    suffix 可以带子目录（如 ``profiles/official-supply/config.json``）。
+    """
     with tarfile.open(path, "r:gz") as handle:
         for member in handle.getmembers():
             if not member.isfile():
                 continue
             parts = member.name.split("/")
-            if len(parts) == 2 and parts[1] == suffix:
+            if len(parts) >= 2 and "/".join(parts[1:]) == suffix:
                 extracted = handle.extractfile(member)
                 if extracted is not None:
                     return extracted.read().decode("utf-8", "replace")
@@ -95,8 +98,8 @@ def tar_members(path: Path) -> dict[str, tarfile.TarInfo]:
         return {member.name: member for member in handle.getmembers() if member.isfile()}
 
 
-def verify_inner_sha256sums(path: Path, names: list[str], top: str) -> list[str]:
-    """包内 SHA256SUMS.txt（``<sha>  <rel>``）与实际内容比对。"""
+def verify_inner_sha256sums(path: Path, top: str) -> list[str]:
+    """包内 SHA256SUMS.txt（``<sha>  <rel>``）与实际内容**逐项**比对（含子目录）。"""
     problems: list[str] = []
     text = read_tar_text(path, "SHA256SUMS.txt")
     if not text.strip():
@@ -107,26 +110,28 @@ def verify_inner_sha256sums(path: Path, names: list[str], top: str) -> list[str]
             continue
         digest, _, name = line.partition("  ")
         listed[name.strip()] = digest.strip()
+    actual: dict[str, str] = {}
     with tarfile.open(path, "r:gz") as handle:
         for member in handle.getmembers():
             if not member.isfile():
                 continue
-            parts = member.name.split("/")
-            if len(parts) != 2 or parts[0] != top:
+            prefix = top + "/"
+            if not member.name.startswith(prefix):
+                problems.append("包内文件不在顶层目录下：" + member.name)
                 continue
-            rel = parts[1]
+            rel = member.name[len(prefix):]
             if rel == "SHA256SUMS.txt":
                 continue
-            if rel not in listed:
-                problems.append("SHA256SUMS.txt 漏了 " + rel)
-                continue
             extracted = handle.extractfile(member)
-            digest = sha256_bytes(extracted.read() if extracted else b"")
-            if digest != listed[rel]:
-                problems.append("SHA256SUMS.txt 与实际内容不符：" + rel)
-    for rel in listed:
-        if rel not in names:
+            actual[rel] = sha256_bytes(extracted.read() if extracted else b"")
+    for rel, digest in sorted(listed.items()):
+        if rel not in actual:
             problems.append("SHA256SUMS.txt 列了不存在的文件：" + rel)
+        elif actual[rel] != digest:
+            problems.append("SHA256SUMS.txt 与实际内容不符：" + rel)
+    for rel in sorted(actual):
+        if rel not in listed:
+            problems.append("SHA256SUMS.txt 漏了 " + rel)
     return problems
 
 
@@ -138,15 +143,14 @@ def check_linux_like(check: Checks, path: Path, *, version: str, edition: str,
     check.expect(len(tops) == 1, "包顶层目录不唯一：" + ", ".join(sorted(tops)))
     top = next(iter(tops)) if tops else ""
     check.expect(top == path.name[: -len(".tar.gz")], "顶层目录名与文件名不一致：" + top)
-    rels = {name.split("/", 1)[1] for name in names
-            if name.startswith(top + "/") and name.count("/") == 1}
+    rels = {name.split("/", 1)[1] for name in names if name.startswith(top + "/")}
     for required in ("djb", "VERSION.txt", "README-INSTALL.txt", "SHA256SUMS.txt",
                      "djb_node/__init__.py", "pyproject.toml"):
         check.expect(required in rels, "包内缺 " + required)
     if supply:
         for required in ("install.sh", "config.json", "djb-official-supply.service",
                          "README.md"):
-            check.expect("profiles/official-supply/" + required in names,
+            check.expect("profiles/official-supply/" + required in rels,
                          "包内缺 profiles/official-supply/" + required)
 
     version_txt = read_tar_text(path, "VERSION.txt")
@@ -174,7 +178,7 @@ def check_linux_like(check: Checks, path: Path, *, version: str, edition: str,
                      "official-supply config.json update_source 不是显式官方清单")
         check.expect(config.get("edition") == "official-supply",
                      "official-supply config.json 缺 edition=official-supply")
-    problems = verify_inner_sha256sums(path, sorted(rels), top)
+    problems = verify_inner_sha256sums(path, top)
     for item in problems:
         check.failures.append(item)
 
@@ -270,7 +274,11 @@ def load_manifest(path: Path) -> tuple[str, dict[str, dict]]:
     body = payload.get("payload", payload)
     version = str(body.get("version") or "")
     rows = {}
-    for item in body.get("artifacts") or body.get("channels") or []:
+    # channels = 对外通道制品；carrier_assets = 载体资产包（Windows/macOS 构建输入），
+    # 两者都在 --pkg-dir 里，都要能对上 sha256/size。
+    items = list(body.get("artifacts") or []) + list(body.get("channels") or []) \
+        + list(body.get("carrier_assets") or [])
+    for item in items:
         file_name = item.get("file") or str(item.get("url", "")).rsplit("/", 1)[-1]
         if file_name:
             rows[file_name] = item
