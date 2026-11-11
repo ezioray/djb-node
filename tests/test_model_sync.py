@@ -126,7 +126,7 @@ def test_flag_default_off_with_three_fields():
     assert facts.MODEL_SYNC_FLAG == "client.model_sync.enabled"
     assert spec["default"] is False
     assert spec["owner"] == "client-seat"
-    assert spec["expire_at"] == "2026-12-31"
+    assert spec["expire_at"] == "2027-06-30"
     assert "停拉取" in str(spec["rollback_rule"])
     assert spec.get("description") and "desc" not in spec
     on = ClientConfig(extra={"feature_flags": {facts.MODEL_SYNC_FLAG: True}})

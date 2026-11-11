@@ -26,7 +26,7 @@ def clean_registry(monkeypatch):
 @pytest.fixture
 def flag(monkeypatch):
     monkeypatch.setitem(facts.FEATURE_FLAGS, ipc.FLAG, {
-        "default": True, "owner": "client-seat", "expire_at": "2026-12-31",
+        "default": True, "owner": "client-seat", "expire_at": "2027-06-30",
         "rollback_rule": "关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好",
     })
 

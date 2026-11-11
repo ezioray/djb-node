@@ -14,6 +14,13 @@
 | 客户端版本 | **0.3.3**（与 Windows / macOS / Linux 三端同一份源码、同一个 `djb_node.__version__`） |
 | 报价参数 | 周期 60 s · TTL 120 s（**TTL 恒等于 2 × 周期**） |
 
+> ⚠ **这三项靠 `facts.FEATURE_FLAGS[*].expire_at` 续期，不是靠本 profile 的 `true` 保命。**
+> 开关到期后 `config.feature_flag()` 先判 `flag_expired()` 再读配置，profile 里写 `true` 会被
+> 直接压成关闭（`flag_expired` 优先），届时本档位表现为「报价环不启动 / relay 入口消失」，
+> 而配置看起来完全正常。0.3.4 已把三项的 `expire_at` 续到 **2027-06-30**（与全表 10 个 12-31
+> 开关同批）；续期窗口临近时由 `tests/test_official_supply_profile.py` 的到期哨兵先红。
+> 排查口径：`djb flags --json | grep -A2 '<flag 名>'` 看 `expire_at`，不要只看 config.json。
+
 > 本文只讲「怎么把这台机器变成能接单的供方节点」。客户端通用命令见仓库根
 > `README-CLIENT.md`；机制与取舍见 `design/17-官方供给与价格配置-设计方案-v1.md` §15。
 

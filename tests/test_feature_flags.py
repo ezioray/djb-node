@@ -17,8 +17,8 @@ from djb_node.config import (ClientConfig, _parse_expire_at, feature_flag, flag_
 from djb_node.relay import relay_enabled
 from tests.feature_flag_policy import DEFAULT_ON_APPROVED
 
-EXPIRE_DAY = date(2026, 12, 31)   # facts.FEATURE_FLAGS 全表统一的到期日
-AFTER_EXPIRE = date(2027, 1, 1)
+EXPIRE_DAY = date(2027, 6, 30)    # facts.FEATURE_FLAGS 全表统一的到期日（0.3.4 续期后）
+AFTER_EXPIRE = date(2027, 7, 1)
 
 
 def make_config(**extra) -> ClientConfig:
@@ -27,7 +27,7 @@ def make_config(**extra) -> ClientConfig:
     return config
 
 
-#: 各开关自己的到期日（默认 2026-12-31；按任务单另定的在这里列明）
+#: 各开关自己的到期日（默认 2027-06-30；按任务单另定的在这里列明）
 EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30",
                     # M3 机器画像上报：跟 E2E 周期一起，2027-06-30 前必须收敛成默认开或删掉
                     facts.MACHINE_PROFILE_FLAG: "2027-06-30",
@@ -48,7 +48,7 @@ def test_every_flag_has_three_fields_and_default_off():
                 assert str(spec.get(field_name, "")).strip(), name + " 例外仍需 " + field_name
         else:
             assert spec["default"] is False, name + " 必须默认关闭（要开口子请登记 DEFAULT_ON_APPROVED + 批准依据）"
-        assert spec["expire_at"] == EXPIRE_OVERRIDES.get(name, "2026-12-31")
+        assert spec["expire_at"] == EXPIRE_OVERRIDES.get(name, "2027-06-30")
         assert "desc" not in spec, name + " 不要用 desc 字段（统一 description）"
 
 

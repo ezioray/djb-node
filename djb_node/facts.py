@@ -599,7 +599,7 @@ TOKEN_COMPARE_FLAG = "client.token.compare.enabled"
 TOKEN_COMPARE_FLAG_META: dict[str, object] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后只记录上游 usage、不做本地比较",
     "description": "真实请求路径做本地 token 计数与上游 usage 的差异检测（>1% 记 token_mismatch）",
 }
@@ -611,14 +611,14 @@ FEATURE_FLAGS[TOKEN_COMPARE_FLAG] = TOKEN_COMPARE_FLAG_META
 # ── M17 §9 开关（Lead 合并：与 C8 共用同一个 FEATURE_FLAGS 登记表）
 FEATURE_FLAGS["client.relay.enabled"] = {
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 隐藏 relay 接入；已有配置只读、不删除",
     "default": False,
     "description": "第三方中转站接入（M17 §4 / C11），默认关闭",
 }
 FEATURE_FLAGS["supply.attestation.enabled"] = {
     "owner": "platform",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 回退 L2 可达性判定；已有路由/账本不变；已存证明保留只读",
     "default": False,
     "description": "模型身份证明（M17 §5 / C12 客户端侧线索采集），默认关闭",
@@ -651,7 +651,7 @@ PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
 FEATURE_FLAGS["client.quotes.publish.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 停发新报价（daemon 报价环不启动、CLI publish 拒发）；"
                      "已发报价 ≤ TTL 自然过期，不改账本、无残留",
     "description": "客户端周期报价发布（design/17 §15；TTL=2×周期），默认关闭",
@@ -667,7 +667,7 @@ QUOTES_FLAG = "client.quotes.publish.enabled"
 FEATURE_FLAGS["client.channel.enabled"] = {
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": ("显式写盘 false 即停长轮询、退回无通道模式（已取 job 尽力回传后停止；"
                       "本地显式关闭优先于服务端 channel_required）。"
                       "回滚=djb flags --disable client.channel.enabled + 重启 daemon"),
@@ -713,7 +713,7 @@ CHANNEL_REQUIRED_KV = "channel"
 FEATURE_FLAGS["client.model_sync.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后停拉取、保留已应用版本（本地 model_sync.json 只读不删）",
     "description": "客户端模型/tokenizer 同步（M18b）：拉签名 bundle、校验后热应用，默认关闭",
 }
@@ -752,7 +752,7 @@ MODEL_SYNC_DRIFT_FIELDS: tuple[str, ...] = ("tokenizer_family", "tokenizer_versi
 FEATURE_FLAGS["client.notifications.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后停拉取、保留本地消息与待补发读态（本地只读不删）",
     "description": "客户端消息中心（C16）：拉取站内信、未读/已读/ack、离线补拉，默认关闭",
 }
@@ -772,7 +772,7 @@ FEATURE_FLAGS[MACHINE_PROFILE_FLAG] = {
 FEATURE_FLAGS[UPDATE_MOCK_FLAG] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭即回到内置公钥验签（唯一信任锚）；mock 不产生任何持久状态，"
                      "已安装版本与回滚点不变",
     "description": "自动更新验签的 test-only HMAC mock（必须同时满足 DJB_ENV=test + "
@@ -816,7 +816,7 @@ NOTIFICATIONS_ACTIONS: tuple[str, ...] = ("read", "ack")
 FEATURE_FLAGS["client.tray.control.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后托盘暂停/恢复退回命令指南；不改变 daemon 状态，不写离线偏好",
     "description": "托盘用户确认后暂停/恢复；先读状态、独立回读、到期强制关闭",
 }
@@ -828,7 +828,7 @@ FEATURE_FLAGS["client.ipc.windows.enabled"] = {
     # 关掉即回到「控制不可用 + 可行动提示」，不退回 TCP、不改 daemon 运行偏好。
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": ("关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好。回滚=成对改动：default→False 且 ipc_windows.py 的 tripwire 判据改回 `is not False`（只改一处=半截回滚：tripwire 会 fail closed，所有 Windows 控制用例会以「开关不可用」skip）"),
     "description": "Windows同SID/session/integrity安全命名管道；不解禁GUI托盘控制",
 }

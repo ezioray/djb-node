@@ -152,7 +152,7 @@ def test_flag_default_on_with_three_fields_and_kill_switch():
     spec = facts.FEATURE_FLAGS[facts.CHANNEL_FLAG]
     assert spec["default"] is True
     assert spec["owner"] == "client-seat"
-    assert spec["expire_at"] == "2026-12-31"
+    assert spec["expire_at"] == "2027-06-30"
     assert "停长轮询" in str(spec["rollback_rule"])
     assert spec.get("description")
     assert "desc" not in spec

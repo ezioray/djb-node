@@ -181,7 +181,7 @@ def test_feature_flag_carries_owner_expire_and_rollback():
             assert meta.get(field), (name, field)
     flag = facts.FEATURE_FLAGS[facts.TOKEN_COMPARE_FLAG]
     assert flag["owner"] == "client-seat"
-    assert flag["expire_at"] == "2026-12-31"
+    assert flag["expire_at"] == "2027-06-30"
     assert "只记录上游 usage" in str(flag["rollback_rule"])
     assert "desc" not in flag                     # 形状统一：description
     assert facts.TOKEN_COMPARE_FLAG_META is flag   # 元数据只定义一次

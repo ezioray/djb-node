@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+"""特供档 profile 的开关到期哨兵（0.3.4 / task-30）。
+
+## 为什么需要这个文件
+
+`profiles/official-supply/config.json` 用 `extra.feature_flags` 显式开了三个开关：
+`client.relay.enabled`、`client.probe.periodic.enabled`、`client.quotes.publish.enabled`。
+但 `config.feature_flag()` 的求值顺序是 **先判 `flag_expired()`，再读配置**
+（`djb_node/config.py:335-350`，口径见 `tests/test_feature_flags.py`）：
+
+    到期 → 强制关闭，**配置里的 `true` 一点用都没有**
+
+于是「profile 写 `true`」≠「这个档位一直能用」。2026-12-31 那批开关到期时，
+特供档的表现是：报价环不启动 / relay 入口消失，而 `config.json` 看起来完全正常
+（`reports/NEXT-20261112/impl/88-FLAG-EXPIRY.md` §6.3/§6.4 已核实）。
+
+本文件的三个断言把这件事变成 CI 红灯，而不是客户侧的功能静默消失：
+1. profile 里出现的每个开关都必须真的登记在 `facts.FEATURE_FLAGS`（拼错 = 静默无效）；
+2. 这些开关的 `expire_at` 距今天必须还有余量（< 90 天就红，留一个发布窗口的提前量）；
+3. 业务模式锁：relay / quotes.publish 必须仍被显式打开（特供档的主用上游类型是
+   `third_party_relay`，靠默认值是 False，删掉这两行等于把档位打回普通客户端）。
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+from datetime import date
+
+import pytest
+
+from djb_node import facts
+from djb_node.config import _parse_expire_at, flag_expired
+
+PROFILE = pathlib.Path(__file__).resolve().parents[1] / "profiles" / "official-supply" / "config.json"
+
+#: 到期余量下限：小于这个天数就红，给「改 facts + 重出包 + 客户升级」留一个窗口。
+EXPIRY_MARGIN_DAYS = 90
+
+#: 特供档的业务模式锁（删掉就不是特供档了，见本文件 §3）。
+PROFILE_REQUIRED_ON = ("client.relay.enabled", "client.quotes.publish.enabled")
+
+
+def _profile_flags() -> dict[str, bool]:
+    raw = json.loads(PROFILE.read_text(encoding="utf-8"))
+    return dict(raw["extra"]["feature_flags"])
+
+
+def test_profile_flags_are_all_registered():
+    """profile 写错开关名 = 静默无效（tolerant reader 不报错），必须在这里拦住。"""
+    flags = _profile_flags()
+    assert flags, "profile 应当显式开启至少一个开关"
+    unknown = sorted(set(flags) - set(facts.FEATURE_FLAGS))
+    assert not unknown, "profile 里的开关未登记在 facts.FEATURE_FLAGS：" + "、".join(unknown)
+    for name, value in flags.items():
+        assert value is True, name + " 在 profile 里只应该写 true（false 直接删行更清楚）"
+
+
+def test_profile_flags_have_expiry_margin():
+    """到期哨兵：profile 依赖的开关必须还有余量，否则续期窗口一到就静默掉功能。"""
+    flags = _profile_flags()
+    today = date.today()
+    for name in sorted(flags):
+        expire_at = facts.FEATURE_FLAGS[name].get("expire_at")
+        expires = _parse_expire_at(expire_at)
+        assert expires is not None, name + " 的 expire_at 不合法：" + str(expire_at)
+        remaining = (expires - today).days
+        assert remaining >= EXPIRY_MARGIN_DAYS, (
+            name + " 只剩 " + str(remaining) + " 天到期（expire_at=" + str(expire_at) + "）；"
+            "到期后 profile 的 true 会被 flag_expired 压成关闭（特供档掉报价/relay）。"
+            "处理：续 facts.FEATURE_FLAGS 的 expire_at + 重出包，并同步本测试的余量口径。")
+        assert not flag_expired(name, today=today), name + " 已经到期"
+
+
+def test_profile_keeps_third_party_relay_business_locks():
+    """relay / quotes.publish 必须显式开：两者 facts 默认是 False，删行 = 档位失效。"""
+    flags = _profile_flags()
+    for name in PROFILE_REQUIRED_ON:
+        assert flags.get(name) is True, name + " 是特供档的业务模式锁，profile 不能删"
+        assert facts.FEATURE_FLAGS[name]["default"] is False, name + " 若改成默认开，本断言要复核"

@@ -33,7 +33,7 @@
 
 ## 4. 治理、接线与启动失败
 
-canonical `facts.FEATURE_FLAGS['client.ipc.windows.enabled']`：default=false；owner=client-seat；expire_at=2026-12-31（UTC，次日起强制关）；rollback_rule=`关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好`。取值统一config.feature_flag，额外严格expiry检查。由factory注入enabled callable：每次调用重新load_config(paths)读非敏感本地配置、验证flag metadata（default=false、owner、expire_at与rollback_rule齐全）和UTC expiry，任何读取/解析失败关闭；不加watcher。连接前、每次dispatch前重新检查当前配置/expiry；关后停止接受控制，不改user_paused，不伪造控制响应。
+canonical `facts.FEATURE_FLAGS['client.ipc.windows.enabled']`：default=false；owner=client-seat；expire_at=2027-06-30（UTC，次日起强制关）；rollback_rule=`关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好`。取值统一config.feature_flag，额外严格expiry检查。由factory注入enabled callable：每次调用重新load_config(paths)读非敏感本地配置、验证flag metadata（default=false、owner、expire_at与rollback_rule齐全）和UTC expiry，任何读取/解析失败关闭；不加watcher。连接前、每次dispatch前重新检查当前配置/expiry；关后停止接受控制，不改user_paused，不伪造控制响应。
 
 新增 factory 在 Windows 选择命名管道，关闭或能力不支持抛现有 UsageError/NotRunningError的明确“Windows控制不可用”，**不得执行getuid/Unix路径fallback**。POSIX路径和接口保持原样。Windows daemon启动在修改运行状态/绑定镜像端口前完成transport配置检查；只对本次启动失败回收已创建control/listener，恢复本次写入前的runtime/state；不调用完整stop()导致其他工作副作用。
 
