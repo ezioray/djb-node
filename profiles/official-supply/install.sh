@@ -35,6 +35,7 @@ PREFIX=/opt/djb-official-supply
 RUN_USER=djb-supply
 UNIT_PATH=/etc/systemd/system/djb-official-supply.service
 GATEWAY=""
+UPDATE_SOURCE="https://tkbank.ai/download/files/update-manifest.json"
 WHEEL=""
 DO_START=0
 DRY_RUN=0
@@ -55,6 +56,7 @@ run() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --gateway) GATEWAY=${2:?--gateway 需要 URL}; shift 2 ;;
+        --update-source) UPDATE_SOURCE=${2:?--update-source 需要 URL}; shift 2 ;;
         --home) HOME_DIR=${2:?--home 需要目录}; shift 2 ;;
         --prefix) PREFIX=${2:?--prefix 需要目录}; shift 2 ;;
         --user) RUN_USER=${2:?--user 需要用户名}; shift 2 ;;
@@ -101,11 +103,15 @@ else
     else
         # 原子写：临时文件 -> mv，并且先落成 0600 再改属主
         tmp=$(mktemp "$HOME_DIR/.config.json.XXXXXX")
-        sed "s#https://gateway.example.invalid#$GATEWAY#" "$HERE/config.json" > "$tmp"
+        # 两个字段都要落到正式环境：gateway_url 由 --gateway 决定；
+        # update_source 决定客户端能不能自动升级（旧版保持 example.invalid 会永远升不了）。
+        sed -e "s#\"gateway_url\": \"[^\"]*\"#\"gateway_url\": \"$GATEWAY\"#" \
+            -e "s#\"update_source\": \"[^\"]*\"#\"update_source\": \"$UPDATE_SOURCE\"#" \
+            "$HERE/config.json" > "$tmp"
         chmod 600 "$tmp"
         chown "$RUN_USER:$RUN_USER" "$tmp"
         mv -f "$tmp" "$HOME_DIR/config.json"
-        say "√ 已写配置：$HOME_DIR/config.json（gateway_url=$GATEWAY）"
+        say "√ 已写配置：$HOME_DIR/config.json（gateway_url=$GATEWAY，update_source=$UPDATE_SOURCE）"
     fi
 fi
 

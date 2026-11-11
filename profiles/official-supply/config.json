@@ -1,5 +1,5 @@
 {
-  "gateway_url": "https://gateway.example.invalid",
+  "gateway_url": "https://tkbank.ai",
   "mirror_port": 1717,
   "update_channel": "stable",
   "update_source": "https://tkbank.ai/download/files/update-manifest.json",

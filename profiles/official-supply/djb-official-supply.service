@@ -12,7 +12,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 [Unit]
 Description=DJB 联脑 官方特供版节点（供方：报价发布）
-Documentation=https://example.invalid/djb/official-supply
+Documentation=https://tkbank.ai
 After=network-online.target
 Wants=network-online.target
 # 状态目录不存在就不启动（避免以空身份跑起来被服务端判未注册）
