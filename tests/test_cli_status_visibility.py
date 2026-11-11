@@ -224,3 +224,21 @@ def test_pause_detail_text_renders_only_triggering_yield_signals():
             {"source": "battery", "state": "ok", "detail": ""}]})
     assert "让路（thermal）" in text and "thermal：温度 88℃" in text
     assert "battery" not in text                   # 只解释**触发**的那一条
+
+# ─────────────────────────────────── 顶层 edition（W6 演练 R-3）
+def test_status_json_carries_edition_without_changing_old_fields(home, capsys):
+    """`djb status --json` 顶层要有 `edition`（只加不改：旧字段一个不少）。
+
+    W6 演练要按 `status --json` 认档位；没有这个字段时只能去翻 `config.json`。
+    """
+    import json
+    from djb_node.cli import main
+    assert main(["init", "--no-env", "--edition", "official-supply"]) == 0
+    capsys.readouterr()
+    assert main(["status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["edition"] == "official-supply"
+    # 旧字段必须还在（daemon 未运行也要如实回答）
+    for key in ("state", "daemon_running", "version", "channel", "probe", "install"):
+        assert key in payload, "旧字段丢了：" + key
+    assert payload["daemon_running"] is False

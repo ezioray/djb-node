@@ -672,6 +672,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         payload["daemon_running"] = True
     except NotRunningError:
         payload = _offline_status(paths, store)
+    # R-3（0.3.4）：顶层补 `edition`——**只加不改**，旧字段一个不动。
+    # daemon 分支的 payload 由 daemon 给（目前不含 edition），所以在这里兜底；
+    # 将来 daemon 自己带上时 `setdefault` 不会覆盖它的值。
+    payload.setdefault("edition", load_config(paths).edition)
     if getattr(args, "show_token", False):
         try:
             payload["local_token"] = ControlClient(paths).call({"cmd": "token"},

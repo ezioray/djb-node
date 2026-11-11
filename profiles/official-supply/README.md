@@ -56,15 +56,26 @@ getent passwd djb-supply || echo "还没有 djb-supply 用户（install.sh 会�
 
 ## 1. 装（一条命令）
 
-```sh
-# 在线装（从 PyPI / 内网源取 djb-node）
-sudo ./install.sh --gateway https://gateway.example.com
+`--gateway` **仍然必填**（防止手滑装出一台连不上任何地方的机器）。交付的
+`profiles/official-supply/config.json` 里 `gateway_url` 已经是生产 `https://tkbank.ai`：
 
-# 离线装（把 wheel 一起带过去）
-sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.4-py3-none-any.whl
+* **生产装机**：`--gateway https://tkbank.ai`（和交付值一致，写一遍是为了留痕）；
+* **测试 / 预发装机**：`--gateway <测试地址>` **覆盖**，否则会连到生产；
+* 装完自查：`djb status --json | grep -E '"edition"|"gateway'`，
+  以及 `djb update --status --json` 的 `edition` / `source_channel` 不为空。
+
+```sh
+# 生产装 · 在线（从 PyPI / 内网源取 djb-node）
+sudo ./install.sh --gateway https://tkbank.ai
+
+# 生产装 · 离线（把 wheel 一起带过去）
+sudo ./install.sh --gateway https://tkbank.ai --wheel ./djb_node-0.3.4-py3-none-any.whl
+
+# 装测试 / 预发：--gateway 覆盖成交付 config 以外的地址（不改就还是生产）
+./install.sh --gateway https://test.example.com --dry-run
 
 # 先看会做什么（不需要 root，不改任何东西）
-./install.sh --gateway https://gateway.example.com --dry-run
+./install.sh --gateway https://tkbank.ai --dry-run
 ```
 
 `install.sh` **幂等**：重跑不会重建用户、不会覆盖已有 `config.json`、
@@ -274,8 +285,10 @@ djb auth --unbind --yes
 
 ## 8. 安全边界（这版刻意做到最小）
 
-* **无凭据进制品**：`config.json` / unit / 本 README 里没有任何真实域名或密钥，
-  `https://gateway.example.invalid` 是不可解析占位域（RFC 6761），必须替换；
+* **无凭据进制品**：`config.json` / unit / 本 README 里没有任何密钥；
+  **交付的 `config.json` 的 `gateway_url` 就是生产地址 `https://tkbank.ai`**（特供档是生产指向，
+  不是占位域）——想装到测试/预发环境，**必须**用 `--gateway <测试地址>` 显式覆盖，
+  否则这台机器会连到生产；
 * **凭据只在 0600 文件**：上游密钥走 `--secret-stdin`，节点密钥走 `auth --set-key -`，
   都不进 shell 历史、不进日志、不进提交；
 * **无入站**：daemon 只绑 `127.0.0.1:1717`，云侧调度通过出站心跳/报价完成；

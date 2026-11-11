@@ -77,3 +77,85 @@ def test_profile_keeps_third_party_relay_business_locks():
     for name in PROFILE_REQUIRED_ON:
         assert flags.get(name) is True, name + " 是特供档的业务模式锁，profile 不能删"
         assert facts.FEATURE_FLAGS[name]["default"] is False, name + " 若改成默认开，本断言要复核"
+
+
+# ─────────────────────────────────── install.sh：升级必须带档位（W6 演练 R-2 / R-4）
+INSTALL_SH = PROFILE.parent / "install.sh"
+
+
+def test_install_sh_syntax_ok():
+    """`bash -n`：脚本语法先过关（改 `--edition` 时不至于把 heredoc 弄坏）。"""
+    import shutil
+    import subprocess
+    bash = shutil.which("bash")
+    if bash is None:                                  # pragma: no cover - 极简环境
+        pytest.skip("没有 bash")
+    result = subprocess.run([bash, "-n", str(INSTALL_SH)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_install_sh_passes_edition_to_init():
+    """W6 演练 R-2：`djb init` 必须带 `--edition official-supply`（dry-run 打印也要带）。
+
+    漏了它的后果：0.3.3 的 config 没有 `edition` 字段，升级后 `update --status` 的
+    `edition` / `source_channel` 为空，自动升级只剩 config 里的 URL 一条线索。
+    """
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    init_lines = [line for line in text.splitlines() if "init --no-env" in line]
+    assert len(init_lines) >= 2, "应有 dry-run 与真跑两条 init 调用"
+    for line in init_lines:
+        assert "--edition official-supply" in line, "缺档位：" + line.strip()
+
+
+def test_install_sh_hints_edition_on_existing_config():
+    """W6 演练 R-4：已有配置不覆盖时，要提示「升级请确认 edition」。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    idx = text.index("已有配置，不覆盖")
+    tail = text[idx:idx + 700]
+    assert "djb init --edition official-supply" in tail
+
+
+def _run_cli(args: list[str], home: pathlib.Path) -> None:
+    import os
+    import subprocess
+    import sys
+    env = dict(os.environ)
+    env["DJB_HOME"] = str(home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run([sys.executable, "-B", "-m", "djb_node.cli"] + args,
+                            cwd=str(PROFILE.parents[2]), env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+
+
+def test_upgrade_from_0_3_3_config_lands_edition(tmp_path):
+    """R-2 的回归测：0.3.3 的 config（无 edition）+ 新的 init 命令 → edition 落地且不丢字段。
+
+    这里用**真 CLI**（`init --no-env --edition official-supply`）跑一遍，而不是只断言文本：
+    演练里漏的正是「文本改了但命令没生效」这一类。
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    legacy = {
+        "gateway_url": "https://tkbank.ai",
+        "mirror_port": 1717,
+        "update_channel": "stable",
+        "update_source": "https://tkbank.ai/download/files/update-manifest.json",
+        "log_level": "info",
+        "yield_enabled": False,
+        "extra": {"feature_flags": {"client.relay.enabled": True,
+                                    "client.quotes.publish.enabled": True,
+                                    "client.probe.periodic.enabled": True},
+                  "quotes.period_s": 60, "quotes.ttl_s": 120,
+                  "upstream.kind": "third_party_relay"},
+    }
+    (home / "config.json").write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    _run_cli(["init", "--no-env", "--edition", "official-supply"], home)
+
+    data = json.loads((home / "config.json").read_text(encoding="utf-8"))
+    assert data["edition"] == "official-supply"                 # ← 演练里漏的就是这一条
+    assert data["gateway_url"] == legacy["gateway_url"]         # 不覆盖服务端地址
+    assert data["update_source"] == legacy["update_source"]     # 已有的官方源原样保留
+    assert data["extra"]["upstream.kind"] == "third_party_relay"  # 业务模式不被 init 弄丢
+    assert data["extra"]["feature_flags"]["client.relay.enabled"] is True
