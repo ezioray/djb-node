@@ -36,5 +36,5 @@
     cli.py        djb 全命令面
 """
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 MODULE_ID = "M15"

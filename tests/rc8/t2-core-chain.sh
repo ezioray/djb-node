@@ -4,7 +4,7 @@
 # 127.0.0.1:17171 /v1/health /v1/models / quotes show（publish 需 --quotes）。
 #
 # 用法：
-#   bash tests/rc8/t2-core-chain.sh --pkg /path/djb-node-0.3.3-linux-x64-src.tar.gz [--port 17171] [--quotes]
+#   bash tests/rc8/t2-core-chain.sh --pkg /path/djb-node-0.3.4-linux-x64-src.tar.gz [--port 17171] [--quotes]
 #
 # 纪律（写死，别改）：
 #   * 只跑本机假网关（tests/rc8/t2_gateway.py，默认 127.0.0.1:18190）；

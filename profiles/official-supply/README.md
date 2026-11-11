@@ -11,7 +11,7 @@
 | 运行身份 | 系统用户 `djb-supply`（非 root，`nologin`） |
 | 入站端口 | **无**（只绑 `127.0.0.1:1717`，调度不走入站） |
 | 默认开启 | `client.relay.enabled`、`client.probe.periodic.enabled`、`client.quotes.publish.enabled` |
-| 客户端版本 | **0.3.3**（与 Windows / macOS / Linux 三端同一份源码、同一个 `djb_node.__version__`） |
+| 客户端版本 | **0.3.4**（与 Windows / macOS / Linux 三端同一份源码、同一个 `djb_node.__version__`） |
 | 报价参数 | 周期 60 s · TTL 120 s（**TTL 恒等于 2 × 周期**） |
 
 > ⚠ **这三项靠 `facts.FEATURE_FLAGS[*].expire_at` 续期，不是靠本 profile 的 `true` 保命。**
@@ -61,7 +61,7 @@ getent passwd djb-supply || echo "还没有 djb-supply 用户（install.sh 会�
 sudo ./install.sh --gateway https://gateway.example.com
 
 # 离线装（把 wheel 一起带过去）
-sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.3-py3-none-any.whl
+sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.4-py3-none-any.whl
 
 # 先看会做什么（不需要 root，不改任何东西）
 ./install.sh --gateway https://gateway.example.com --dry-run

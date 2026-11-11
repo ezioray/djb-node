@@ -2,7 +2,7 @@
 """R3 pure tests first. No native calls unless explicitly marked native."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 import ctypes
 import json
@@ -39,7 +39,10 @@ def test_flag_default_expiry_and_metadata(flag, monkeypatch):
     # 显式关掉 ⇒ 立刻失效（kill switch）
     assert not ipc.windows_ipc_enabled({"feature_flags": {ipc.FLAG: False}},
                                        today=date(2026, 10, 31))
-    assert not ipc.windows_ipc_enabled(config, today=date(2027, 1, 1))
+    # 到期日跟着 facts 走（0.3.4 已续到 2027-06-30）：用「到期次日」判失效，避免写死日期后自坏
+    expires = date.fromisoformat(facts.FEATURE_FLAGS[ipc.FLAG]["expire_at"])
+    assert not ipc.windows_ipc_enabled(config, today=expires + timedelta(days=1))
+    assert ipc.windows_ipc_enabled(config, today=expires)      # 到期日当天仍有效
     # default 的合法值是「与发布决策一致」（2026-11-05 起为 True）；改回 False ⇒ fail closed
     for field, invalid in (("default", False), ("owner", ""), ("expire_at", "bad"),
                            ("rollback_rule", "")):

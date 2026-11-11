@@ -6,6 +6,71 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.3.4 · 2026-11-12
+
+**到期墙 + 五通道版**（RC10 配套）。版本号 `__version__` / `pyproject.toml` / Helm `appVersion`
+同源升到 `0.3.4`；`tests/rc8/t3_offline_verify.py` 的 `CURRENT_VERSION` 改为跟随
+`facts.CLIENT_VERSION`（不再手工同步）。**没有**协议契约变更（`openapi.yaml` 未动），
+**没有**新增运行时依赖，**没有**改动更新信任锚。
+
+### 到期墙（10 个开关 → 2027-06-30）
+- `facts.FEATURE_FLAGS` 里 10 条 `expire_at` 由 `2026-12-31` 改为 `2027-06-30`：
+  `client.token.compare` / `client.channel` / `client.ipc.windows` / `client.model_sync` /
+  `client.notifications` / `client.quotes.publish` / `client.relay` / `client.tray.control` /
+  `client.update.mock_signature` / `supply.attestation`（均以 `.enabled` 结尾）。
+  到期语义是「强制为关闭」：`config.feature_flag()` 先判 `flag_expired()` 再读配置，
+  所以**靠配置/环境变量续命无效**，只能重出包。
+- 其中 `client.channel.enabled`（default=True）到期会让**所有未升级客户端接不到单**
+  （派单 150 s 超时 → 503，而 `djb status` 仍显示接单=是）；`client.ipc.windows.enabled`
+  （default=True）到期让 Windows 控制不可用。
+- `client.probe.periodic.enabled` 0.3.3 已续到 2027-06-30，本次不动。
+- 同步硬编码断言：`test_feature_flags`（EXPIRE_DAY / AFTER_EXPIRE / 默认值）、
+  `test_channel_client` / `test_model_sync` / `test_notifications` / `test_token_compare` /
+  `test_windows_ipc`（fixture 的假元数据一起改，避免 12-31 后测试自坏）、
+  `ipc_windows.py` 注释、`tests/windows_control.py` docstring、`docs/rfc/windows-control-ipc.md`。
+
+### 特供档（official-supply）到期哨兵
+- 新增 `tests/test_official_supply_profile.py`（3 例）：profile 显式开启的开关必须已登记在
+  `facts.FEATURE_FLAGS`；到期余量 < 90 天即红；`client.relay` / `client.quotes.publish`
+  是业务模式锁（默认 False，不能从 profile 删）。目的：把「profile 写 true 但开关到期后被压成关」
+  变成 CI 红灯，而不是客户侧报价环静默不启动。
+- `profiles/official-supply/README.md`：写明三项靠 `facts` 续期、不是 profile 的 `true` 保命，
+  并给排查口径（`djb flags --json` 看 `expire_at`）。
+- profile 本身**不改**：三个 `true` 保留（`relay` / `quotes.publish` 的默认值是 False，删了就掉档位；
+  `probe.periodic` 默认已是 True，保留仅为显式）。
+
+### 五通道更新源 + `--edition`（cherry-pick 28cf9d1、ffffeb2）
+- 新增 `djb_node/update_source.py`：五通道契约单一真源；`resolve()` 给
+  `origin ∈ {config, edition, mock}`、`kind ∈ {official-manifest, file, custom, mock}`。
+- `djb init --edition {consumer|machine-room|official-supply}`：落该通道的签名更新源
+  （`--update-source` 优先级更高，已有自定义源不被覆盖）；`config.edition` 空则不写回，
+  0.3.0 配置形状不变。`djb update --status` 增 `source_kind` / `source_origin` / `edition` /
+  `source_channel`（只加不改）。
+- 载体补齐：机房版 `offline/config.template.json` + `manifest.json#update_source` +
+  `install.sh --update-source/--djb-home/--config-only`；Windows `config.json` +
+  `start-windows.bat`；Linux 源码包 / official-supply 的 `VERSION.txt#update_source` +
+  `README-INSTALL.txt` 的 `--edition` init 命令。
+- 新增仓内打包器 `ci/pkgbuild.py`（linux-src / official-supply / machine-room-offline /
+  windows-assets，从 commit 出包 + 自检 + 拒绝写发布面）与 `ci/check_pkg_manifest.py`。
+- 人读输出不打印清单 URL（构建自检对 `tkbank.ai` 是硬护栏），完整 URL 只在
+  `update --status --json` 里。
+- 机房版 fleet 模板补 `"edition": "machine-room"`（`deploy/machine-room/fleet/config.json.template`）：
+  批量铺机时也带档位，`update --status` 能显示 `origin=config` 之外的 edition 归属。
+
+### 合并说明
+- 两个 cherry-pick 的冲突全在版本号与 CHANGELOG：按 0.3.3 基线解（版本保留 0.3.3，由本版次统一抬到 0.3.4），
+  CHANGELOG 按 `0.3.3 → 0.3.2 → 0.3.1 → 0.3.0` 时间倒序合并（0.3.1 段此前不在主线）。
+- `tests/rc8/t3_offline_verify.py` 取 incoming 方案（`CURRENT_VERSION = facts.CLIENT_VERSION`），
+  `TARGET_VERSION` 由 `0.3.2` 抬到 `0.3.5`（必须比已装版本大，否则 update 判 up_to_date）。
+
+### 未做 / 跨仓
+- **未构建任何制品、未发布、未上传**。构建在 QA 通过后进行（`ci/pkgbuild.py` 已就位）。
+- 云端同名开关 `supply.attestation.enabled`（`app/integrity/features.py`）仍 `2026-12-31`，
+  待 88 号 §8「批次 2」在 cloud 仓同步，否则出现「客户端采、云端不认」。
+- `client.update.mock_signature.enabled` 续期仅为消除到期噪声，**必须保持默认关闭**
+  （它是验签旁路，开 = 安全事故）。
+- macOS dmg 需 Apple 凭据与公证，不在本版次（`--edition` 代码路径已就绪）。
+
 ## 0.3.3 · 2026-11-12
 
 **到期修复版**（RC10 配套）。**没有**协议契约变更（`openapi.yaml` 未动），**没有**新增运行时依赖；

@@ -15,7 +15,7 @@
 #
 # 用法：
 #   sudo ./install.sh --gateway https://gateway.example.com
-#   sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.3-py3-none-any.whl
+#   sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.4-py3-none-any.whl
 #   sudo ./install.sh --gateway https://gateway.example.com --start
 #   ./install.sh --dry-run                       # 只打印将执行的动作（不需要 root）
 #
