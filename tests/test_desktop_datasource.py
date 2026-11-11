@@ -552,3 +552,49 @@ def test_no_cloud_reason_distinguishes_registered_but_unbound(tmp_path):
     account = source.snapshot(sections=("account",)).sections["account"]
     assert "未登录节点" in account["note"]
     assert "已注册但未绑定账号" in account["note"]
+
+
+# ─────────────────────────── 接入配置「节点标识」三级回退（P0-node，2026-11-12）
+# 背景：注册只写凭据（secure.CredentialStore.set_node）+ 状态库（daemon 的 set_kv("node")），
+# 不写 access.json；接入配置页若只读 AccessConfig.node_id，注册成功的机器也永远显示「—」，
+# 客户就拿不到网页端绑定要填的节点 ID。
+def test_access_section_reads_node_id_from_credentials_when_config_empty(tmp_path):
+    """凭证有 node_id 而 access.json 没有 → 用凭证里的值（且投影不变）。"""
+    from djb_node.config import Paths
+    from djb_node.secure import CredentialStore
+
+    paths = Paths(str(tmp_path))
+    paths.prepare()
+    CredentialStore(paths).set_node("nd_from_credentials", "djb_ck_test_0001")
+
+    section = make_source(tmp_path)._access_section()      # 默认 store_factory 打不开 → 只能走凭证
+
+    assert section["node_id"] == "nd_from_credentials"
+    assert section["node_id_source"] == "credentials"
+    assert section["config"]["node_id"] == "—"             # 旧投影保持原样（没填就是「—」）
+
+
+def test_access_section_falls_back_to_store_kv_node(tmp_path):
+    """凭证也没有时，第三级用状态库 ``kv("node")``（daemon 注册后写入）。"""
+    from djb_node.config import Paths
+    from djb_node.store import Store
+
+    paths = Paths(str(tmp_path))
+    paths.prepare()
+    store = Store.create(paths.db_file, version="0.1.0")
+    store.set_kv("node", {"node_id": "nd_from_store", "state": "active",
+                          "registered_at": "2026-11-12T00:00:00+0800"})
+
+    section = make_source(tmp_path, store_factory=Store)._access_section()
+
+    assert section["node_id"] == "nd_from_store"
+    assert section["node_id_source"] == "store"
+
+
+def test_access_section_without_any_node_id_stays_empty(tmp_path):
+    """三者都没有 → 空字符串（视图据此显示「先启动一次」，不编占位 ID）。"""
+    section = make_source(tmp_path)._access_section()
+
+    assert section["node_id"] == ""
+    assert section["node_id_source"] == ""
+    assert section["config"]["node_id"] == "—"

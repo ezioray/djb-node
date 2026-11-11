@@ -1325,6 +1325,31 @@ def _access(snapshot: Snapshot) -> View:
     binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
     bound = _binding_bound(binding)
     valid = access.get("valid")
+    # 节点标识：数据层已按 access.json → 本机凭据 → 状态库 三级回退（datasource._resolve_node_id）。
+    # 只有用户手填的（source == "config"）才可编辑；服务端下发的一律只读——否则「保存并回读」
+    # 会把展示文案当值写回 access.json（动作执行前会把所有可编辑字段收成草稿）。
+    node_id = str(access.get("node_id") or "")
+    node_source = str(access.get("node_id_source") or "")
+    if not node_id:
+        # 老调用方（demo 数据 / FakeDataSource / 旧快照）没有新字段：退回 config 里的手填值，
+        # 保证行为与 0.3.2 一致；真数据源总会带 node_id（含三级回退结果）。
+        from_config = str(config.get("node_id") or "")
+        if from_config and from_config != "—":
+            node_id, node_source = from_config, "config"
+    if node_id:
+        node_hint = ("网页端绑定要填这个 ID（本机只读）" if node_source != "config"
+                     else "网页端绑定要填这个 ID")
+        node_field = Field("节点标识", node_id, key="node_id",
+                           editable=node_source == "config", hint=node_hint)
+    else:
+        node_field = Field("节点标识", "先启动一次", key="node_id",
+                           hint="首次启动会自动注册节点并下发节点 ID；网页端绑定要填它")
+    # 「节点绑定」卡的副标题也带节点 ID（云端口径优先；``display()`` 的占位「—」不算值）
+    card_node = str(binding.get("node_id") or "").strip()
+    for candidate in (config.get("node_id"), node_id):
+        text = str(candidate or "").strip()
+        if not card_node and text and text != "—":
+            card_node = text
     return View(
         key="access", title="接入配置",
         subtitle="保存 → daemon reload → 回读一致",
@@ -1333,9 +1358,9 @@ def _access(snapshot: Snapshot) -> View:
                     else _flag(valid, "通过校验", "有字段需修正"), "",
                     "amber" if access.get("saved") is False or not valid else "mint"),
                Card("节点绑定", _flag(bound if bound is not None else None, "已绑定", "未绑定"),
-                    str(binding.get("node_id") or config.get("node_id") or "—"), "default")),
+                    card_node or "—", "default")),
         fields=(
-            Field("节点标识", str(config.get("node_id") or "—"), key="node_id", editable=True),
+            node_field,
             Field("节点凭证", str(config.get("node_secret") or "—"), key="node_secret",
                   editable=True, secret=True, hint="掩码显示；粘贴新值才会覆盖"),
             Field("API Key", str(config.get("api_key") or "—"), key="api_key",
@@ -1351,6 +1376,8 @@ def _access(snapshot: Snapshot) -> View:
                   key="anthropic_base_url", editable=True),
         ),
         actions=(Action("access.save", "保存并回读", primary=True),
+                 Action("access.copy_node_id", "复制节点 ID", enabled=bool(node_id),
+                        reason="还没有节点 ID：先启动一次客户端"),
                  Action("access.reload", "请求 daemon 重载")),
         unavailable=_missing(snapshot, ("access",)),
         notes=(str(access.get("note") or ""),

@@ -323,6 +323,19 @@ class DesktopController:
     def _act_access_save(self, *, confirm=None) -> ActionResult:
         return self.save_access()
 
+    def _act_access_copy_node_id(self, *, confirm=None) -> ActionResult:
+        """复制节点 ID（网页端绑定要填的那个）：只读快照，不写真机、不发请求。
+
+        节点 ID 由服务端在注册时下发，落在本机凭据 / 状态库里（``datasource._resolve_node_id``
+        已做三级回退）；这里只把它交给剪贴板，取不到就说清下一步。
+        """
+        access = self.snapshot.get("access")
+        node_id = str(access.get("node_id") or "") if isinstance(access, Mapping) else ""
+        if not node_id:
+            return ActionResult("暂不可用（还没有节点 ID：先启动一次客户端，注册后自动生成）",
+                                ok=False)
+        return ActionResult("已复制节点 ID：" + node_id, effect="copy", payload=node_id)
+
     def _act_agent_save(self, *, confirm=None) -> ActionResult:
         return self.save_agent()
 
