@@ -237,7 +237,9 @@ def test_feature_flag_shape_and_default_on():
     spec = facts.FEATURE_FLAGS[facts.PROBE_FLAG_PERIODIC]
     assert spec["default"] is True
     assert spec["owner"] == "client-seat"
-    assert spec["expire_at"] == "2026-12-15T00:00:00+08:00"
+    # 2026-11-09 复核续期（原 2026-12-15，见 reports/RLS-20261109-CLIENT-025/
+    # DECISION-PROBE-FLAG-RENEWAL.md）；与 test_daemon_probe.py 同一口径。
+    assert spec["expire_at"] == "2027-06-30T00:00:00+08:00"
     assert spec["rollback_rule"]
     assert "last_probe_at" in spec["rollback_rule"]
     assert flag_spec(facts.PROBE_FLAG_PERIODIC)["owner"] == "client-seat"

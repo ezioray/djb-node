@@ -38,7 +38,7 @@ PRIMARY_SEED = bytes.fromhex("7f" * 32)
 PRIMARY_ID = "test-primary-0001"
 LEGACY_SEED = bytes.fromhex("11" * 32)
 LEGACY_ID = "test-legacy-0002"
-CURRENT_VERSION = "0.3.2"
+CURRENT_VERSION = "0.3.3"
 TARGET_VERSION = "0.2.6"
 
 RESULTS: list[tuple[str, bool, str]] = []

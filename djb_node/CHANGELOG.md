@@ -6,6 +6,27 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.3.3 · 2026-11-12
+
+**到期修复版**（RC10 配套）。**没有**协议契约变更（`openapi.yaml` 未动），**没有**新增运行时依赖；
+版本号 `djb_node.__version__` / `pyproject.toml` / Helm `appVersion` 三处同源升到 `0.3.3`。
+
+### 修复
+- **探针开关到期续期**：`client.probe.periodic.enabled` 的 `expire_at` 由 `2026-12-15` 改为
+  `2027-06-30`（`facts.py`）。原值会在 **2026-12-16 起静默 fail-closed**：`FeatureSwitch` 先判期
+  再看 env，到期后 `DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=true` 也救不回来 ⇒ 周期复探关闭
+  ⇒ 探针 15 min 过期后供方容量归零，而 `djb status` 仍显示「接单=是」。
+  依据 `reports/RLS-20261109-CLIENT-025/DECISION-PROBE-FLAG-RENEWAL.md`（cherry-pick `e88e815`）。
+- 测试口径随之改为**从 `expire_at` 推导到期日**（+1 天），下次续期不再需要改测试逻辑；
+  并补齐 `tests/test_upstream_gating.py` 中同一条写死 `2026-12-15` 的断言（上游 `e88e815`
+  漏改该文件，pick 后该用例会转红）。
+
+### 影响面
+- 仅影响 **0.3.3 及之后**的构建。已分发的 0.3.2 包内仍是 `2026-12-15`，**必须在 12-15 前替换**，
+  否则到期后现网供方会静默掉容量（不报错，只表现为没人接单）。
+- 回滚：`git revert` 本版本，或回退到 0.3.2 制品；开关本身可用
+  `DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false` / `djb flags --disable` 立即停用。
+
 ## 0.3.2 · 2026-11-11
 
 RC9 **生产分发**（Windows x64 便携包 + Linux x64 源码包）。**没有**协议契约变更（`openapi.yaml` 未动），

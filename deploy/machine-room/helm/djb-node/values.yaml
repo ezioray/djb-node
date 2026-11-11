@@ -10,7 +10,7 @@
 image:
   # 占位仓库：换成机房的私有 registry（不要写生产域名进仓库）
   repository: registry.example.invalid/djb-node
-  # tag 留空 -> 用 .Chart.AppVersion（0.3.2）。镜像本身用固定补丁版本的基础镜像。
+  # tag 留空 -> 用 .Chart.AppVersion（0.3.3）。镜像本身用固定补丁版本的基础镜像。
   tag: ""
   pullPolicy: IfNotPresent
 
