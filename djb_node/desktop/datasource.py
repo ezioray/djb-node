@@ -375,6 +375,7 @@ class LocalDataSource:
     def __init__(self, home: str | os.PathLike | None = None, *,
                  runner: Callable[[Sequence[str]], Mapping[str, Any]] | None = None,
                  cloud: Any | None = None,
+                 cloud_factory: Callable[[str], Any] | None = None,
                  which: Callable[[str], str | None] = shutil.which,
                  facts: Callable[[], Mapping[str, Any]] = local_facts,
                  bench: Callable[..., Mapping[str, Any]] = benchmark,
@@ -386,6 +387,15 @@ class LocalDataSource:
         self._home = Path(home or resolve_home(None))
         self._runner = runner or self._cli_runner
         self._cloud = cloud
+        # 首启竞态（2026-11-11 正式环境实测）：桌面端先起 daemon（只等控制口 ping 通），
+        # 再构造本对象；此刻 daemon 往往还没完成节点注册，client_key 尚未落盘 →
+        # cloud 为 None。旧实现此后永不重建，账户页就一直停在「未登录节点」，
+        # 只有重启窗口才恢复。这里留一个"每轮刷新重试一次"的装配入口。
+        if cloud is None and cloud_factory is None:
+            from .nodecloud import NodeCloudClient
+            cloud_factory = NodeCloudClient.from_home
+        self._cloud_factory = cloud_factory
+        self._cloud_probed = False
         self._offline_reason = ""          # 本轮刷新已确认的「连不上」原因（跨域复用）
         self._which = which
         self._facts = facts
@@ -487,6 +497,7 @@ class LocalDataSource:
         }
         collected: dict[str, Any] = {}
         self._offline_reason = ""
+        self._cloud_probed = False         # 每轮刷新给「重新装配云端客户端」一次机会
         for name in wanted:
             collected[name] = self._safe(name, loader[name])
         return Snapshot(sections=collected,
@@ -542,13 +553,46 @@ class LocalDataSource:
     def _gpu(self) -> Mapping[str, Any]:
         return gpu_devices(which=self._which)
 
+    def _ensure_cloud(self) -> Any | None:
+        """按本机凭据惰性装配云端客户端；同一轮刷新只尝试一次。
+
+        首启时 daemon 刚被拉起、注册还没完成 → ``client_key`` 尚未落盘 → 首次装配
+        必然拿不到客户端。等 daemon 注册完成后再点「刷新」，本方法会重新读凭据并接上，
+        **不需要重启窗口**（旧实现把 None 固化在对象里，只能重启）。
+        """
+        if self._cloud is not None:
+            return self._cloud
+        if self._cloud_probed or self._cloud_factory is None:
+            return None
+        self._cloud_probed = True
+        try:
+            self._cloud = self._cloud_factory(str(self._home))
+        except Exception:                  # 凭据 / 配置坏了也不该让窗口打不开
+            self._cloud = None
+        return self._cloud
+
+    def _no_cloud_reason(self) -> str:
+        """没登录节点时的原因：区分「本机还没注册」与「注册了但没绑定账号」。"""
+        node_id = ""
+        try:
+            from ..config import Paths
+            from ..secure import CredentialStore
+            node_id = str(CredentialStore(Paths(str(self._home))).node_id() or "")
+        except Exception:
+            node_id = ""
+        if node_id:
+            return "云端未接通（未登录节点：节点已注册但未绑定账号）"
+        return "云端未接通（未登录节点：本机尚未注册节点）"
+
     def _cloud_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
-        if self._cloud is None:
-            raise ProviderError("云端未接通（未登录节点）", hint="完成配对后重试")
+        cloud = self._ensure_cloud()
+        if cloud is None:
+            raise ProviderError(self._no_cloud_reason(), hint="完成节点绑定后重试")
         # 本轮刷新里若已经确认「连不上云端」，剩下的域直接沿用同一个原因（不再各等一次超时）
         if self._offline_reason:
             raise ProviderError(self._offline_reason, hint="网络恢复后点「刷新」重试")
-        handler = getattr(self._cloud, method, None)
+        handler = getattr(cloud, method, None)
+
         if handler is None:
             raise ProviderError("云端接口未接线（" + method + "）", hint="等待平台提供该接口")
         try:
@@ -579,9 +623,13 @@ class LocalDataSource:
 
     def _cloud_pages(self, kind: str, method: str) -> dict[str, Any]:
         """按 ``page.next_cursor`` 取全量（客户端负责翻页上限）；无 ``fetch`` 的桩只取单页。"""
+        cloud = self._ensure_cloud()
+        if cloud is None:
+            raise ProviderError(self._no_cloud_reason(), hint="完成节点绑定后重试")
         if self._offline_reason:
             raise ProviderError(self._offline_reason, hint="网络恢复后点「刷新」重试")
-        fetch = getattr(self._cloud, "fetch", None) if self._cloud is not None else None
+        fetch = getattr(cloud, "fetch", None)
+
         if callable(fetch):
             try:
                 payload = fetch(kind)

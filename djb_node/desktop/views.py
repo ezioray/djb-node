@@ -1354,7 +1354,9 @@ def _access(snapshot: Snapshot) -> View:
                  Action("access.reload", "请求 daemon 重载")),
         unavailable=_missing(snapshot, ("access",)),
         notes=(str(access.get("note") or ""),
-               "配置文件：" + str(access.get("path") or "—") + "（0600，只在本机）"),
+               "配置文件：" + str(access.get("path") or "—") + "（0600，只在本机）",
+               "该文件只存本机接入配置（上游地址 / 收款地址 / 价格模式），"
+               "不含账号登录态；账户资料要等节点绑定后从云端读取。"),
     )
 
 
@@ -1448,7 +1450,16 @@ def _account(snapshot: Snapshot) -> View:
     identity = str(node_id or email or "—")
     identity_meta = str(profile.get("state") or profile.get("role") or "—")
     bound = _account_bound(profile, security, binding)
-    can_bind = bound is not True and not unavailable
+    # 绑定入口**不能**被「本域暂不可用」挡掉：未登录时账户域本来就取不到云端数据，
+    # 而那正是最需要「绑定网页端」的时刻（2026-11-11 正式环境实测：账户页只剩一行
+    # 「账户资料暂不可用」，按钮全被隐藏，用户没有任何可点的下一步）。
+    can_bind = bound is not True
+    if unavailable and can_bind:
+        # unavailable 是 tuple（每个不可用数据域一条原因）：只给账户这一条追加可操作解释，
+        # 别把整页顶部变成一长串。
+        unavailable = tuple(
+            item + "（按下方步骤绑定后即可读取账户资料；不是配置损坏）" if index == 0 else item
+            for index, item in enumerate(unavailable))
     twofa = profile.get("twofa_enabled", profile.get("mfa_enabled"))
     if bound is not None:
         second = Card("节点绑定", _flag(bound, "已绑定", "未绑定"),

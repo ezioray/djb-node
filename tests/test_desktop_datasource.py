@@ -501,3 +501,54 @@ def _cli_stub(tmp_path, name, body):
     script.write_text("#!/usr/bin/env python3\nimport sys\n" + body + "\n", encoding="utf-8")
     script.chmod(0o755)
     return script
+
+
+# ──────────────────────────────────────────── 首启竞态：云端客户端必须能"后装配"
+def _late_cloud_source(tmp_path, factory):
+    """构造一个只取 account 域的数据源（不跑 CLI / GPU / 环境检测）。"""
+    return ds.LocalDataSource(home=tmp_path, cloud_factory=factory,
+                              runner=lambda argv: {"state": "stopped"},
+                              facts=lambda: {}, which=lambda name: None,
+                              bench=lambda **kw: {})
+
+
+def test_cloud_is_reassembled_after_daemon_registration(tmp_path):
+    """正式环境实测（0.3.0）：首帧 daemon 还没注册完 → cloud=None；注册落盘后点「刷新」
+    必须自动接上，**不能只在重启窗口后才恢复**。"""
+    from djb_node.config import Paths
+    from djb_node.secure import CredentialStore
+
+    calls = []
+
+    class FakeCloud:
+        def profile(self):
+            return {"node_id": "n_late", "state": "pending"}
+
+    def factory(home):
+        calls.append(home)
+        return None if len(calls) == 1 else FakeCloud()
+
+    source = _late_cloud_source(tmp_path, factory)
+    first = source.snapshot(sections=("account",)).sections["account"]
+    assert "未登录节点" in first["note"] and "本机尚未注册节点" in first["note"]
+
+    # daemon 注册完成：node_id + client_key 落盘（这一步真实发生在首启后几秒内）
+    CredentialStore(Paths(str(tmp_path))).set_node("n_late", "djb_ck_late_0001")
+
+    second = source.snapshot(sections=("account",)).sections["account"]
+    assert not isinstance(second, ds.Unavailable)
+    assert second["profile"]["node_id"] == "n_late"
+    assert second["note"] == ""
+    assert len(calls) == 2                      # 每轮刷新重新装配一次，不无限重试
+
+
+def test_no_cloud_reason_distinguishes_registered_but_unbound(tmp_path):
+    """「未登录节点」要分两种：本机还没注册 / 注册了但没绑定账号。"""
+    from djb_node.config import Paths
+    from djb_node.secure import CredentialStore
+
+    CredentialStore(Paths(str(tmp_path))).set_node("n_registered", "djb_ck_reg_0001")
+    source = _late_cloud_source(tmp_path, lambda home: None)
+    account = source.snapshot(sections=("account",)).sections["account"]
+    assert "未登录节点" in account["note"]
+    assert "已注册但未绑定账号" in account["note"]

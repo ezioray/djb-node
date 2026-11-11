@@ -986,3 +986,21 @@ def test_unique_iid_never_repeats_and_keeps_plain_key():
     used.add("a#2")
     assert unique_iid("a", used) == "a#3"
     assert unique_iid("", used) == ""      # 空 key 交给 Tk 自动编号
+
+
+def test_account_bind_entry_survives_unavailable_account_domain():
+    """正式环境实测（0.3.0）：未登录时账户域本身不可用，账户页只剩一行「暂不可用」，
+    绑定按钮被一起藏掉 → 用户没有任何可点的下一步。绑定入口必须与「域不可用」解耦。"""
+    snapshot = ds.FakeDataSource({
+        "account": ds.Unavailable("云端未接通（未登录节点：本机尚未注册节点）"),
+        "access": {"binding": {"state": "unbound"}},
+    }, source="test").snapshot()
+    view = vw.build_view("account", snapshot)
+    keys = [action.key for action in view.actions]
+    assert "account.bind" in keys and "account.open_web" in keys
+    bind = next(action for action in view.actions if action.key == "account.bind")
+    assert bind.primary is True
+    text = view.plain_text()
+    assert "绑定网页端" in text
+    assert "不是配置损坏" in text                     # 红字旁边给出可操作解释
+    assert "账户/节点 → 生成绑定码" in text            # 可照抄的步骤仍在
