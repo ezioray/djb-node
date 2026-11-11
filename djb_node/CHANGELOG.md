@@ -6,6 +6,23 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.3.2 · 2026-11-11
+
+RC9 **生产分发**（Windows x64 便携包 + Linux x64 源码包）。**没有**协议契约变更（`openapi.yaml` 未动），
+**没有**新增运行时依赖；版本号 `djb_node.__version__` / `pyproject.toml` / Helm `appVersion` 三处同源升到 `0.3.2`。
+
+### 修复
+- 官方特供预置档 `profiles/official-supply/config.json` 的 `gateway_url` 由占位域
+  `https://gateway.example.invalid` 改为正式环境 `https://tkbank.ai`（与 `update_source` 同源；
+  0.3.0 分发物仍带占位域，是本轮的发布缺陷）。
+- 桌面端首启竞态：daemon 尚未注册完成时账户页永久显示「未登录节点」、绑定入口被藏（`9cdb002`）。
+
+### 分发
+- Windows 便携包内置 `config.json`：显式 `gateway_url=https://tkbank.ai` +
+  `update_source=https://tkbank.ai/download/files/update-manifest.json`，不再依赖空值（内置 mock 源）。
+- 未签名：owner 已接受公测阶段 Windows 未签名出包，清单如实标 `unsigned-test`（不再等 EV 证书）。
+- `tests/rc8/t3_offline_verify.py` 的 `CURRENT_VERSION` 常量随版本同步到 `0.3.2`。
+
 ## 0.3.0 · 2026-11-10
 
 RC8 **全客户端同步版本**：Windows onefile / macOS arm64 dmg / Linux 源码包 / 机房端离线包 / 官方特供版
