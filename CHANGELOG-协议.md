@@ -3,6 +3,75 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.10.0 · 2026-11-12 · MINOR（只加：RC10 每模型开通 + 出价 4 个操作 / 3 个 schema）
+
+**版本 / 日期 / 类型**：1.10.0 · 2026-11-12 · MINOR（+4 操作 / +3 path 模板 / +3 schema，既有字段 0 改动）。
+
+**影响面**：① 新增 `GET /api/v1/user/model-bids`（`getUserModelBids`）、
+`GET /api/v1/user/model-bids/{model}`（`getUserModelBid`）、
+`PUT /api/v1/user/model-bids/{model}`（`updateUserModelBid`）、
+`PUT /api/v1/user/model-bids/_default`（`updateUserModelBidDefault`）；② 新增 schema
+`ModelBid` / `ModelBidUpdate` / `ModelBidList`；③ **不新增错误码**：未开通 / 未设价 /
+上限低于市场价统一 `403 + 40303`，由 `error.details.cause` 区分
+（`model_not_enabled` / `bid_not_configured` / `bid_below_market`）；额度不足仍 402/40201。
+
+**语义**：`_default`（内部 `model='*'`）缺省为「允许」——未配置的模型按供方报价正常成交，
+**绝不 fail-closed**。所有主机 / 客户端 / API Key 共用账户级一份设置。
+
+**兼容矩阵**：旧客户端不调用即回到今天行为；新端点受开关 `scheduling.model_bid`（默认关）控制，
+开关关时路由表与响应逐字节不变（QA 已实测）。路径参数为 `{model:path}`，含 `/` 的模型可寻址。
+
+**复核人**：lead（实现与 QA 见 `reports/NEXT-20261112/impl/82-CLOUD-BIDS.md`、`85-QA-BIDS.md`）。
+
+> **欠账（非本次引入）**：1.9.0 的条目缺失（权威 spec 已有 271 路径，本 CHANGELOG 停在 1.8.3；
+> 差集为 46 条 admin 路径）。由 spec owner 补 1.9.0 条目后再恢复「条目=版本」门禁。
+
+## 1.9.0 · 2026-11-11 · MINOR（补记：RC9 已发布内容，2026-11-12 追溯登记）
+
+**版本 / 日期 / 类型**：1.9.0 · 2026-11-11 · MINOR（+43 path 模板 / +25 schema，既有字段 0 改动）。
+**补记说明**：原条目在 RC9 发布时漏登（`91-RC10-RELEASE-PACKAGE.md` D-4 / 审计 R4 断档）；本条目按
+`repos/djb-cloud/spec/openapi.yaml@1.8.2` 与工作区权威 `spec/openapi.yaml@1.10.0` 的机器 diff 追溯补写，
+实现基线为 `rel/rc9-cloud@5408039`，**不代表新增变更**。
+
+**影响面**：
+- 管理面 34 条：账户检索/邀请/验证（`/admin/accounts/{id}` 系 4 条）、管理员会话（`/admin/me`、`/admin/admins`）、
+  角色变更审批 3 条、账本 PoR「无背书负债」3 条与手工充值 topups 5 条、定价 display/suggested books 15 条、
+  工单队列 4 条、出款 tx-request/tx-submit 2 条（合计 34）。
+- 用户/公开面 9 条：工单 5 条（`/support/tickets*`、`/support/verify`）、注册邀请确认、节点建议价、
+  公开模型价目、出入金异常、onboarding。
+- 新增 schema 25 个（SupportTicket 系 11、定价 display/suggested 系 6、PayoutTx 系 4、其余 4 个）；
+  错误面新增 `SupportFeatureDisabledError`（404 可判别），**不新增 4xx 码**。
+
+**兼容矩阵**：全部为加性 path/schema；旧客户端不调用即不受影响；未知 enum/字段按 tolerant reader 忽略。
+`x-djb-availability` 未改，`/v1/*` 网关面零变化。**无破坏性变更，无需 MAJOR。**
+
+**复核人**：待评审（原发布复核记录缺失，补记不追认当时评审）。
+
+## 1.8.3 · 2026-11-09 · MINOR（只加：M08 出款两阶段 2 个操作 / 4 个 schema）
+
+**版本 / 日期 / 类型**：1.8.3 · 2026-11-09 · MINOR（+2 操作 / +4 schema，0 路径改动既有字段）。
+
+**影响面**：① 新增 `POST /api/v1/admin/treasury/payouts/{id}/tx-requests`
+（`buildTreasuryPayoutTxRequests`，`201`）与 `POST /api/v1/admin/treasury/payouts/{id}/tx-submit`
+（`submitTreasuryPayoutSignedTx`，`200`）；② 新增 4 个 schema：`PayoutTxRequest`、
+`PayoutTxRequestBatch`、`PayoutTxSubmitRequest`、`PayoutTxSubmitResult`。既有 34 个 M08 操作、
+路径、字段、状态码**逐字不变**（`/broadcast` 保留：HSM 联签路径仍走它）。
+
+**为什么**：真钱出款缺中间那一段。`/broadcast` 要么要求批次已有 HSM 联签的
+`signing_request_id`，要么让调用方直接塞一个 txid ——「服务端出未签名参数 → 签名机离线签 →
+提交 raw_tx 广播」没有接口，等于「打开出款 = 手工填 txid」。新增两阶段把服务进程**始终不碰
+私钥**这件事做成可执行路径：构单只出参数 + 摘要（不动钱），提交做 `keccak256` + RLP 逐字段
+比对后才广播，账本零写入。契约依据 `changes/CHG-2026-11-09-M08-TWOPHASE.md`。
+
+**兼容矩阵**：纯加性（同一 MAJOR 内只加不改）。旧客户端不受影响；`qty_minor` /
+`max_fee_per_gas` / `max_priority_fee_per_gas` 用字符串（JS 53 位安全），`nonce` / `gas_limit`
+用整数；`422` 复用既有 `42210` 号段并以 `reason` 区分（`below_min_payout` /
+`request_mismatch`），未新造码。
+
+**复核**：lead（2026-11-09，工作区复核；实现分支 `feat/m08-twophase-20261109`，证据
+`reports/RC7-20261109/M08-TWOPHASE.md`）；推送/发布由 release-manager 在批准窗口内执行，
+本工作区不 push、不部署。
+
 ## 1.8.1 · 2026-11-07 · PATCH（标注型：`/v1/batches*` 部署可用性标记 + `wallet-drafts` 409 reason 说明）
 
 **版本 / 日期 / 类型**：1.8.1 · 2026-11-07 · PATCH（0 路径 / 0 操作 / 0 schema 变化）。

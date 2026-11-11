@@ -32,7 +32,15 @@ info:
   # `checkout`（收银台会话：provider / pay_url / qr），仅 POST /api/v1/pay/orders 的 201
   # 创建响应返回；0 路径 / 0 操作变化，1 个 schema 加 1 个 optional 属性，无删改。
   # 旧客户端忽略之即回到今天的行为；不给 checkout 的服务端（或重放请求）视为「无收银台会话」。
-  version: 1.8.2
+  # 2026-11-12 加性变更（MINOR，RC10 / 每模型开通+出价）：
+  # 新增 4 个操作（3 条 path 模板）：`GET /user/model-bids`（列表）、
+  # `GET|PUT /user/model-bids/{model}`、`PUT /user/model-bids/_default`（全局默认行，
+  # 等价于 `{model}='*'`，单独列出以给控制面稳定 URL）；新增 schema 3 个
+  # （ModelBid / ModelBidUpdate / ModelBidList）；错误面**不新增码**——
+  # 未开通 / 未设价 / 上限低于市场价统一 `403 + 40303`，由 `details.cause` 区分
+  # （`model_not_enabled` / `bid_not_configured` / `bid_below_market`）。
+  # 语义约束：`_default` 缺省为「允许」，未配置的模型按供方报价正常成交（绝不 fail-closed）。
+  version: 1.10.0
   # 2026-11-04 审计：此处原先硬编码「157 路径 / 181 操作」——那是 node 快照期的数字，
   # 与文件实测（213/252）不符，且每次加性变更都会让它更假。规模数字一律由
   # `reports/RC-2026-11-03/audit/tools/check-spec-single-source.py` 现算，不写进正文。
@@ -117,6 +125,14 @@ paths:
           content:
             application/json:
               schema: {}
+
+    post:
+      operationId: rc8_post_api_v1_admin_accounts
+      summary: RC8 additive endpoint (POST /api/v1/admin/accounts)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
 
   /api/v1/admin/ledger/summary:
     get:
@@ -2483,6 +2499,118 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ── RC10 · 每模型开通 + 出价（账户级；所有主机/客户端/API Key 共用一份）────────
+  /api/v1/user/model-bids:
+    get:
+      tags: [user]
+      summary: 列出本账户的每模型开通/出价设置（含全局默认行）
+      operationId: getUserModelBids
+      description: |
+        账户级设置：同一账户下的所有主机、客户端、API Key 共用一份（不是按 Key / 按机器）。
+        返回 `default`（`model='*'` 的全局默认行，默认「允许」）+ `items`（逐模型设置）。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 设置列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelBidList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/model-bids/_default:
+    put:
+      tags: [user]
+      summary: 更新全局默认（未单独配置的模型：允许 / 拒绝，可选全局上限）
+      operationId: updateUserModelBidDefault
+      description: |
+        等价于 `PUT /api/v1/user/model-bids/%2A`（`model='*'`）。**部分更新**：只改请求体里给出的
+        字段；内容没变则不写库、`version` 与 `updated_at` 都不动（幂等）。
+        `enabled=false` 表示「未单独配置的模型一律拒绝」（403/40303 cause=bid_not_configured），
+        默认是 `true`（允许）：打开开关不会让存量客户突然不可用。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelBidUpdate' }
+      responses:
+        '200':
+          description: 更新后的全局默认
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelBid' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '424': { description: 需要二次认证（step-up；仅在 model_bid.put_step_up 打开时） }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/user/model-bids/{model}:
+    get:
+      tags: [user]
+      summary: 读取单个模型的设置（未设置 → enabled=true、无上限、version=0）
+      operationId: getUserModelBid
+      description: |
+        `model` 会被归一化（小写 + 折叠空白）；`_default` 作为 `'*'` 的别名接受。
+        `configured=false` 表示既没设价也没开实时价 —— 此时按供方报价正常成交。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: model
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+          description: 模型 slug（`_default` = 全局默认行）
+      responses:
+        '200':
+          description: 该模型的设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelBid' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [user]
+      summary: 部分更新单个模型的设置（内容不变 → 幂等，不升版本）
+      operationId: updateUserModelBid
+      description: |
+        只改请求体里给出的字段（`enabled` / `bid_min` / `bid_max` / `use_realtime` /
+        `realtime_multiplier_bp` / `currency`）。响应带 `changed` 标记本次是否真的落库。
+        `enabled=false` → 该模型的调用返回 `403/40303`（`details.cause=model_not_enabled`）。
+      security:
+        - userBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - name: model
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelBidUpdate' }
+      responses:
+        '200':
+          description: 更新后的设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelBid' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '424': { description: 需要二次认证（step-up；仅在 model_bid.put_step_up 打开时） }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /api/v1/provider/quote-settings:
     get:
       tags: [provider]
@@ -3441,6 +3569,14 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+    get:
+      operationId: rc8_get_api_v1_admin_accounts_id_roles
+      summary: RC8 additive endpoint (GET /api/v1/admin/accounts/{id}/roles)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
 
   /api/v1/admin/tenants/{id}/quotas:
     post:
@@ -7165,6 +7301,145 @@ paths:
         '424': { $ref: '#/components/responses/StepUpRequired' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /api/v1/admin/treasury/payouts/{id}/tx-requests:
+    post:
+      tags: [admin]
+      operationId: buildTreasuryPayoutTxRequests
+      summary: 构单：出未签名交易参数 + 请求摘要（两阶段出款第一步）
+      description: |
+        只**出参数**，不动钱：不写账本、不改批次状态、不落 `chain_tx_id`。请求体必须为空对象
+        （收款人 / 金额 / nonce 全部由库里的批次明细推导，客户端没有可调项）。
+
+        前置：批次 `checked` / `signed`（否则 `409` + `illegal_transition`）；明细全部 `pending`
+        （否则 `409` + `item_not_pending`）；净额合计与批次一致（否则 `409` + `amount_mismatch`）；
+        单笔 ≥ 50 USDT（否则 `422` + `42210`，`reason=below_min_payout`）；对账闸门平
+        （否则 `409` + `40916`）；执行器须为**外部签名机模式**（否则 `409` + `executor_not_ready`）。
+
+        **nonce 不复用**：从 `eth_getTransactionCount(hot, "pending")` 起按明细顺序递增并落库；
+        重复调用返回同一批 `built` 记录（同一 nonce），不二次取号。构单有效期由
+        `DJB_CHAIN_SIGN_REQUEST_TTL` 决定（默认 900s，最小 60s）；过期后重新构单才换 nonce。
+        金额字段一律字符串（JS 53 位安全），`nonce` / `gas_limit` 为整数。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 分润批次号 `batch_no`。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '201':
+          description: 构单已就绪（`status=built`，可离线签名）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutTxRequestBatch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: |
+            单笔出款低于下限（`42210` / `reason=below_min_payout`）；提交期的同码不同因见
+            `/tx-submit`（`reason=request_mismatch`）。
+            结构与类型错误仍走 `400`（两者不混用）。
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [error]
+                properties:
+                  error:
+                    type: object
+                    additionalProperties: true
+                    required: [type, code, message, request_id, reason]
+                    properties:
+                      type: { type: string, enum: [invalid_request_error] }
+                      code: { type: integer, enum: [42210] }
+                      message: { type: string }
+                      request_id: { type: string }
+                      reason: { type: string, enum: [below_min_payout] }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/admin/treasury/payouts/{id}/tx-submit:
+    post:
+      tags: [admin]
+      operationId: submitTreasuryPayoutSignedTx
+      summary: 提交已签名交易（两阶段出款第三步：验签 → 广播 → 落状态）
+      description: |
+        请求体只接受 `request_id` / `raw_tx` / `tx_hash`；收款人、金额、nonce **只认库里的构单**，
+        提交时改不了。服务端先 `keccak256(raw_tx)` + RLP 逐字段比对构单，再核白名单 / 单笔 /
+        日累计，最后交执行器广播；任何一道不过都**不广播、不改状态、不落 txid**。
+
+        同一 `request_id` 只能提交一次（二次 → `409` + `request_consumed`）；构单过期 →
+        `409` + `request_expired`；构单不存在或不属于该批次 → `409` + `request_not_found`；
+        已签交易与构单不符（含 `tx_hash` 与 `raw_tx` 不符）→ `422` + `42210`，
+        `reason=request_mismatch`。广播成功才在**同一事务**里把构单置 `submitted`、明细置 `sent`
+        并落 `chain_tx_id`；全部 sent 时批次置 `broadcast`。账本零写入。
+
+        `action=replayed` 表示执行器认定该笔早已 sent（例如先走过 `/broadcast`）：原样回既有
+        `tx_hash`，不改状态。审计只记 `request_id` / `tx_hash` / 明细数，**不记 `raw_tx`**。
+      security: [{ adminBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 分润批次号 `batch_no`。
+          schema: { type: string }
+        - $ref: '#/components/parameters/AdminStepUp'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutTxSubmitRequest' }
+      responses:
+        '200':
+          description: 已提交（`action=broadcast/replayed/recovered`）
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutTxSubmitResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: |
+            已签交易与构单不符（`42210` / `reason=request_mismatch`，含 `tx_hash` 与 `raw_tx` 不符、
+            构单摘要被改写）；构单期的同码不同因见 `/tx-requests`（`reason=below_min_payout`）。
+            结构与类型错误仍走 `400`（两者不混用）。
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [error]
+                properties:
+                  error:
+                    type: object
+                    additionalProperties: true
+                    required: [type, code, message, request_id, reason]
+                    properties:
+                      type: { type: string, enum: [invalid_request_error] }
+                      code: { type: integer, enum: [42210] }
+                      message: { type: string }
+                      request_id: { type: string }
+                      reason: { type: string, enum: [request_mismatch] }
+        '424': { $ref: '#/components/responses/StepUpRequired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /api/v1/admin/treasury/payouts/{id}/settle:
     post:
       tags: [admin]
@@ -8469,6 +8744,610 @@ paths:
           description: 开关 `wallet_draft` 关闭
 
 
+  # RC8 additive endpoints (2026-11-10) — MINOR 1.9.0; generated from app.openapi()
+  /api/v1/admin/accounts/{id}:
+    get:
+      operationId: rc8_get_api_v1_admin_accounts_id
+      summary: RC8 additive endpoint (GET /api/v1/admin/accounts/{id})
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/accounts/{id}/invite:
+    post:
+      operationId: rc8_post_api_v1_admin_accounts_id_invite
+      summary: RC8 additive endpoint (POST /api/v1/admin/accounts/{id}/invite)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/accounts/{id}/invites:
+    get:
+      operationId: rc8_get_api_v1_admin_accounts_id_invites
+      summary: RC8 additive endpoint (GET /api/v1/admin/accounts/{id}/invites)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/accounts/{id}/verify:
+    post:
+      operationId: rc8_post_api_v1_admin_accounts_id_verify
+      summary: RC8 additive endpoint (POST /api/v1/admin/accounts/{id}/verify)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/admins:
+    get:
+      operationId: rc8_get_api_v1_admin_admins
+      summary: RC8 additive endpoint (GET /api/v1/admin/admins)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/ledger/topups:
+    get:
+      operationId: rc8_get_api_v1_admin_ledger_topups
+      summary: RC8 additive endpoint (GET /api/v1/admin/ledger/topups)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+    post:
+      operationId: rc8_post_api_v1_admin_ledger_topups
+      summary: RC8 additive endpoint (POST /api/v1/admin/ledger/topups)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/ledger/topups/limits:
+    get:
+      operationId: rc8_get_api_v1_admin_ledger_topups_limits
+      summary: RC8 additive endpoint (GET /api/v1/admin/ledger/topups/limits)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/ledger/topups/{id}:
+    get:
+      operationId: rc8_get_api_v1_admin_ledger_topups_id
+      summary: RC8 additive endpoint (GET /api/v1/admin/ledger/topups/{id})
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/ledger/topups/{id}/approve:
+    post:
+      operationId: rc8_post_api_v1_admin_ledger_topups_id_approve
+      summary: RC8 additive endpoint (POST /api/v1/admin/ledger/topups/{id}/approve)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/me:
+    get:
+      operationId: rc8_get_api_v1_admin_me
+      summary: RC8 additive endpoint (GET /api/v1/admin/me)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/display-books:
+    get:
+      operationId: rc8_get_api_v1_admin_pricing_display_books
+      summary: RC8 additive endpoint (GET /api/v1/admin/pricing/display-books)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/display-books/{version}:
+    get:
+      operationId: rc8_get_api_v1_admin_pricing_display_books_version
+      summary: RC8 additive endpoint (GET /api/v1/admin/pricing/display-books/{version})
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/display-books/{version}/preview:
+    get:
+      operationId: rc8_get_api_v1_admin_pricing_display_books_version_preview
+      summary: RC8 additive endpoint (GET /api/v1/admin/pricing/display-books/{version}/preview)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/display-books/{version}/publish:
+    post:
+      operationId: rc8_post_api_v1_admin_pricing_display_books_version_publish
+      summary: RC8 additive endpoint (POST /api/v1/admin/pricing/display-books/{version}/publish)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/display-books/{version}/rollback:
+    post:
+      operationId: rc8_post_api_v1_admin_pricing_display_books_version_rollback
+      summary: RC8 additive endpoint (POST /api/v1/admin/pricing/display-books/{version}/rollback)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/display-drafts:
+    post:
+      operationId: rc8_post_api_v1_admin_pricing_display_drafts
+      summary: RC8 additive endpoint (POST /api/v1/admin/pricing/display-drafts)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/suggested-books:
+    get:
+      operationId: rc8_get_api_v1_admin_pricing_suggested_books
+      summary: RC8 additive endpoint (GET /api/v1/admin/pricing/suggested-books)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/suggested-books/{version}:
+    get:
+      operationId: rc8_get_api_v1_admin_pricing_suggested_books_version
+      summary: RC8 additive endpoint (GET /api/v1/admin/pricing/suggested-books/{version})
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/suggested-books/{version}/publish:
+    post:
+      operationId: rc8_post_api_v1_admin_pricing_suggested_books_version_publish
+      summary: RC8 additive endpoint (POST /api/v1/admin/pricing/suggested-books/{version}/publish)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/suggested-books/{version}/rollback:
+    post:
+      operationId: rc8_post_api_v1_admin_pricing_suggested_books_version_rollback
+      summary: RC8 additive endpoint (POST /api/v1/admin/pricing/suggested-books/{version}/rollback)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/suggested-drafts:
+    post:
+      operationId: rc8_post_api_v1_admin_pricing_suggested_drafts
+      summary: RC8 additive endpoint (POST /api/v1/admin/pricing/suggested-drafts)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/pricing/suggested-state:
+    get:
+      operationId: rc8_get_api_v1_admin_pricing_suggested_state
+      summary: RC8 additive endpoint (GET /api/v1/admin/pricing/suggested-state)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/roles/changes:
+    get:
+      operationId: rc8_get_api_v1_admin_roles_changes
+      summary: RC8 additive endpoint (GET /api/v1/admin/roles/changes)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+    post:
+      operationId: rc8_post_api_v1_admin_roles_changes
+      summary: RC8 additive endpoint (POST /api/v1/admin/roles/changes)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/roles/changes/{id}/approve:
+    post:
+      operationId: rc8_post_api_v1_admin_roles_changes_id_approve
+      summary: RC8 additive endpoint (POST /api/v1/admin/roles/changes/{id}/approve)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/admin/roles/changes/{id}/reject:
+    post:
+      operationId: rc8_post_api_v1_admin_roles_changes_id_reject
+      summary: RC8 additive endpoint (POST /api/v1/admin/roles/changes/{id}/reject)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/auth/register/invite/confirm:
+    post:
+      operationId: rc8_post_api_v1_auth_register_invite_confirm
+      summary: RC8 additive endpoint (POST /api/v1/auth/register/invite/confirm)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/node/pricing/suggested:
+    get:
+      operationId: rc8_get_api_v1_node_pricing_suggested
+      summary: RC8 additive endpoint (GET /api/v1/node/pricing/suggested)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/public/model-prices:
+    get:
+      operationId: rc8_get_api_v1_public_model_prices
+      summary: RC8 additive endpoint (GET /api/v1/public/model-prices)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/treasury/deposits/exceptions:
+    get:
+      operationId: rc8_get_api_v1_treasury_deposits_exceptions
+      summary: RC8 additive endpoint (GET /api/v1/treasury/deposits/exceptions)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/user/onboarding:
+    get:
+      operationId: rc8_get_api_v1_user_onboarding
+      summary: RC8 additive endpoint (GET /api/v1/user/onboarding)
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+
+  /api/v1/admin/ledger/por/unbacked-liabilities:
+    get:
+      operationId: rc8_get_admin_ledger_por_unbacked_liabilities
+      summary: RC8 E19 无资产支撑贷方报表
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+  /api/v1/admin/ledger/por/unbacked-liabilities/signoffs:
+    get:
+      operationId: rc8_get_admin_ledger_por_unbacked_liabilities_signoffs
+      summary: RC8 E19 PoR owner 签字记录
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+  /api/v1/admin/ledger/por/unbacked-liabilities/signoff:
+    post:
+      operationId: rc8_post_admin_ledger_por_unbacked_liabilities_signoff
+      summary: RC8 E19 PoR owner 签字
+      tags: [rc8]
+      responses:
+        '200':
+          description: OK
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 工单 v2（support）· 匿名可提 + 登录同名一队列（2026-11-11 lead 裁决）
+  #
+  # 与既有 `/api/v1/tickets`（F9 ticket_center）**并存但语义不重叠**：F9 退役中，
+  # v2 是唯一真源；两套路径互不引用，F9 的 schema / 端点一行未动。
+  #
+  # 开关：`DJB_FF_SUPPORT_TICKETS` 关 → 下列路径**一律 404**（沿用 F9 的 404 口径，
+  # 不返回 403，避免暴露"这个功能存在但你没权限"）。
+  # ────────────────────────────────────────────────────────────────────────
+  /api/v1/support/tickets:
+    post:
+      operationId: createSupportTicket
+      summary: 提交工单（匿名可提；登录用户邮箱已可信可免验证）
+      description: |
+        **匿名可调用**：不带 bearer 时 `security` 走匿名分支，仍需填 `email`（只用于发验证信，
+        服务端只存 HMAC 哈希，不存明文）。返回里**不回显**邮箱、哈希、内部主键。
+
+        登录用户（带 `userBearer`）由服务端显式决定 `require_verify`：
+        邮箱已可信 → 直接 `open` 并进入运营队列；否则仍需验证。
+        调用方**不能**通过请求体自行跳过验证（请求体里没有这个字段）。
+
+        `public_id` 是对客短号（12 位 Crockford base32，随机不可枚举），也是匿名用户后续
+        读单的凭据；内部 uuid 不下发。
+
+        发信闸门（`DJB_FF_SUPPORT_EMAIL`）与工单开关解耦：闸门关/超限时 `verification.status`
+        为粗粒度值（`sent` / `pending` / `skipped`），**不下发**配额、阈值、剩余次数。
+        工单**不会**因为发信失败而回滚。
+      tags: [Support]
+      security: [{userBearer: []}, {}]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: >-
+            可选幂等键（表单 nonce / UUID 均可，1..64 位 `[A-Za-z0-9_.:~-]`）。
+            同一 `Idempotency-Key` + 同一邮箱**只认一次**：重复提交返回**原工单号**
+            （`verification.replayed=true`），且**不会**再发第二封验证信
+            （否则双击会吃掉"每邮箱 2 封/日"的额度）。
+          schema: {type: string, minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9_.:~-]+$"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SupportTicketCreateRequest"}
+      responses:
+        "201":
+          description: 已受理（`ticket.status` 为 `pending_verify` 或 `open`）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportTicketCreated"}
+        "400": {description: "40001 字段不合法（超长只回 max_length / actual_length，不回正文）"}
+        "404":
+          description: "40401 开关 support_tickets 关闭；error.reason=feature_disabled（与记录不存在可判别）"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+        "429": {description: "42901 rate_limited（每 IP / 每邮箱各自口径，不公开阈值），带 Retry-After"}
+    get:
+      operationId: listMySupportTickets
+      summary: 我的工单列表（仅登录用户；游标分页）
+      description: 只返回鉴权主体本人的工单（`account_id` 匹配），按 `created_at DESC, id DESC`。
+      tags: [Support]
+      security: [{userBearer: []}]
+      parameters:
+        - {name: status, in: query, required: false, schema: {$ref: "#/components/schemas/SupportTicketStatus"}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: cursor, in: query, required: false, schema: {type: string}}
+        - {$ref: "#/components/parameters/RequestId"}
+      responses:
+        "200":
+          description: 工单列表
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportTicketList"}
+        "400": {description: "40001 limit / status / cursor 非法"}
+        "401": {description: "40101 未认证"}
+        "404":
+          description: "40401 开关 support_tickets 关闭；error.reason=feature_disabled"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+
+  /api/v1/support/tickets/{public_id}:
+    get:
+      operationId: getSupportTicket
+      summary: 读单（客户侧；匿名凭 public_id，登录凭本人身份）
+      description: |
+        匿名用户凭 `public_id` 读自己的单（能力式凭据，不可枚举）；登录用户必须是本人单。
+        **未验证单（`pending_verify`）一律 404**：不承认存在，避免"猜号探测"。
+        客户侧会话只含 `visibility=public` 的消息，内部备注在 SQL 层就被过滤。
+      tags: [Support]
+      security: [{userBearer: []}, {}]
+      parameters:
+        - {name: public_id, in: path, required: true, schema: {type: string, pattern: "^[0-9A-HJKMNP-TV-Z]{10,16}$"}}
+      responses:
+        "200":
+          description: 工单 + 会话（内部备注不下发）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportTicketThread"}
+        "404":
+          description: "40401 不存在 / 未验证 / 越权 —— 开关关闭时 error.reason=feature_disabled（其余情况无该字段）"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+        "429": {description: "42901 rate_limited（防猜号），带 Retry-After"}
+
+  /api/v1/support/tickets/{public_id}/messages:
+    post:
+      operationId: replySupportTicket
+      summary: 客户追加消息
+      description: |
+        客户侧只能写 `visibility=public`（请求体没有这个字段，服务端固定）。
+        `closed` 状态拒绝追加：409 `reason=ticket_closed`（沿用既有 reason，不新增码）。
+        未验证单 404（同读单口径）。
+      tags: [Support]
+      security: [{userBearer: []}, {}]
+      parameters:
+        - {name: public_id, in: path, required: true, schema: {type: string, pattern: "^[0-9A-HJKMNP-TV-Z]{10,16}$"}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SupportTicketMessageCreateRequest"}
+      responses:
+        "201":
+          description: 已追加
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportTicketMessageCreated"}
+        "400": {description: "40001 body 不合法"}
+        "404":
+          description: "40401 不存在 / 未验证 / 越权 —— 开关关闭时 error.reason=feature_disabled"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+        "409": {description: "40919 reason=ticket_closed"}
+
+  /api/v1/support/verify:
+    post:
+      operationId: verifySupportTicketEmail
+      summary: 验证邮箱（点邮件里的链接后调用）
+      description: |
+        令牌只出现在邮件正文里，服务端只存它的 HMAC；**令牌放进请求体而不是 URL**，
+        避免出现在代理日志与 Referer。验证成功后工单从 `pending_verify` 转 `open` 并进队列。
+        重复提交同一令牌幂等（返回当前状态，不报错）。
+        失效/过期/未投递一律 404，**不区分**是哪种（不给探测者反馈）。
+      tags: [Support]
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SupportVerifyRequest"}
+      responses:
+        "200":
+          description: 验证结果（幂等）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportVerifyResult"}
+        "400": {description: "40001 token 缺失 / 形状不合法"}
+        "404":
+          description: "40401 令牌无效 / 过期 / 未投递 —— 开关关闭时 error.reason=feature_disabled"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+        "429": {description: "42901 rate_limited（防令牌爆破），带 Retry-After"}
+
+  /api/v1/admin/support/tickets:
+    get:
+      operationId: listSupportQueue
+      summary: 运营队列（**唯一**队列，含匿名与登录）
+      description: |
+        默认**不含** `pending_verify`（未验证单一律不进队列，D4）；即便显式传
+        `status=pending_verify` 也返回空集，不退化成全表。
+        按 `status` + `created_at DESC` 取，队列不含会话正文（只有聚合计数）。
+      tags: [Admin, Support]
+      security: [{adminBearer: []}]
+      parameters:
+        - {name: status, in: query, required: false, schema: {$ref: "#/components/schemas/SupportTicketStatus"}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: before, in: query, required: false, schema: {type: string, format: date-time}}
+        - {$ref: "#/components/parameters/RequestId"}
+      responses:
+        "200":
+          description: 队列
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportTicketQueue"}
+        "400": {description: "40001 status / limit / before 非法"}
+        "401": {description: "40101 未认证"}
+        "403": {description: "40301 缺 scope：support.read"}
+        "404":
+          description: "40401 开关 support_tickets 关闭；error.reason=feature_disabled（与记录不存在可判别）"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+
+  /api/v1/admin/support/tickets/{public_id}:
+    get:
+      operationId: getSupportQueueTicket
+      summary: 运营读单条（含内部备注）
+      description: |
+        队列只给聚合计数，正文在这里取。后台**必须**走本路径，**不得**借用用户凭据读
+        `/api/v1/support/tickets/{public_id}`：用户面只认用户主体（API Key / M01），
+        `adminBearer` 会被当成匿名，凡是绑定账号的单一律 404 —— 那样后台的权限模型就是假的。
+
+        与用户面的另一处差别：本路径返回 `visibility=internal` 的条目（运营内部备注）。
+        `pending_verify` 的单在两处都是 404（未验证不入队，D4 的必然结果，不是缺陷）。
+      tags: [Admin, Support]
+      security: [{adminBearer: []}]
+      parameters:
+        - {name: public_id, in: path, required: true, schema: {type: string, pattern: "^[0-9A-HJKMNP-TV-Z]{10,16}$"}}
+        - {$ref: "#/components/parameters/RequestId"}
+      responses:
+        "200":
+          description: 工单 + 会话（含 internal）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportQueueTicketThread"}
+        "401": {description: "40101 未认证"}
+        "403": {description: "40301 缺 scope：support.read"}
+        "404":
+          description: "40401 不存在 / 未验证（pending_verify）/ 开关关闭（开关关闭时 error.reason=feature_disabled）"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+
+  /api/v1/admin/support/tickets/{public_id}/messages:
+    post:
+      operationId: replySupportQueueTicket
+      summary: 运营回复 / 内部备注
+      description: |
+        `visibility=internal` 的备注只对运营可见（客户读路径在 SQL 层过滤）。
+        客户侧正文**不进日志、不进审计**（审计只记 id / 长度 / 角色）。
+      tags: [Admin, Support]
+      security: [{adminBearer: []}]
+      parameters:
+        - {name: public_id, in: path, required: true, schema: {type: string, pattern: "^[0-9A-HJKMNP-TV-Z]{10,16}$"}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SupportTicketReplyRequest"}
+      responses:
+        "201":
+          description: 已写入
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportTicketMessageCreated"}
+        "400": {description: "40001 body / visibility 不合法"}
+        "401": {description: "40101 未认证"}
+        "403": {description: "40301 缺 scope：support.reply"}
+        "404":
+          description: "40401 工单不存在 —— 开关关闭时 error.reason=feature_disabled"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+
+  /api/v1/admin/support/tickets/{public_id}/state:
+    post:
+      operationId: setSupportTicketState
+      summary: 工单状态迁移（幂等）
+      description: |
+        合法迁移见本域状态机；非法迁移 409 `reason=illegal_transition`（附 current / target）；
+        同态重复提交幂等 `changed=false`（不写库、不改 updated_at）。
+        **任何状态都不允许回到 `pending_verify`**（不能"退回未验证"）。
+      tags: [Admin, Support]
+      security: [{adminBearer: []}]
+      parameters:
+        - {name: public_id, in: path, required: true, schema: {type: string, pattern: "^[0-9A-HJKMNP-TV-Z]{10,16}$"}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SupportTicketStateChangeRequest"}
+      responses:
+        "200":
+          description: 迁移结果
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportTicketStateChange"}
+        "400": {description: "40001 status 缺失 / 非枚举值"}
+        "401": {description: "40101 未认证"}
+        "403": {description: "40301 缺 scope：support.reply"}
+        "404":
+          description: "40401 工单不存在 —— 开关关闭时 error.reason=feature_disabled"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SupportFeatureDisabledError"}
+        "409": {description: "40919 reason=illegal_transition（附 current / target）"}
+
+
 components:
 
   securitySchemes:
@@ -8836,6 +9715,257 @@ components:
                   message: {type: string}
                   request_id: {type: string}
   schemas:
+    # ── 工单 v2（support）──── 2026-11-11 加性新增，既有 schema 一行未动 ──────
+    SupportTicketKind:
+      type: string
+      enum: [fault, billing, security, idea]
+    SupportTicketStatus:
+      type: string
+      enum: [pending_verify, open, pending_user, resolved, closed]
+      description: "`pending_verify` 永不进运营队列（D4）"
+    SupportTicketVisibility:
+      type: string
+      enum: [public, internal]
+      description: "internal = 内部备注，仅运营可见（客户读路径 SQL 层过滤）"
+    SupportTicket:
+      type: object
+      description: "对客工单视图：**不含**内部 uuid、email_hash、ip_hash、email_ct"
+      required: [public_id, kind, title, status, created_at, updated_at]
+      properties:
+        public_id: {type: string, pattern: "^[0-9A-HJKMNP-TV-Z]{10,16}$"}
+        kind: {$ref: "#/components/schemas/SupportTicketKind"}
+        title: {type: string, maxLength: 200}
+        status: {$ref: "#/components/schemas/SupportTicketStatus"}
+        account_bound:
+          type: boolean
+          description: "true = 登录用户单（不暴露 account_id 本身）"
+        created_at: {type: string, format: date-time}
+        verified_at: {type: [string, "null"], format: date-time, description: "pending_verify 时为 null"}
+        updated_at: {type: string, format: date-time}
+    SupportTicketCreateRequest:
+      type: object
+      required: [email, kind, title, body]
+      properties:
+        email: {type: string, format: email, maxLength: 254, description: "只用于发验证信；库里只存 HMAC 哈希"}
+        kind: {$ref: "#/components/schemas/SupportTicketKind"}
+        title: {type: string, minLength: 1, maxLength: 200}
+        body: {type: string, minLength: 1, maxLength: 8000, description: "不进日志 / 不进审计"}
+        source_path: {type: [string, "null"], maxLength: 200, description: "提交页路径，可选"}
+        honeypot:
+          type: string
+          description: >-
+            反机器人陷阱字段：**真人留空**。非空时服务端静默丢弃（仍回 201，不落库，
+            回包里的 `public_id` 是**从未写库**的随机串），并打点计数（不含个人数据）。
+            前端**必须**满足三条，否则会误伤真人（密码管理器/自动填充会写可见输入框）：
+            视觉隐藏（离屏或 `aria-hidden="true"`）、`tabindex="-1"`、`autocomplete="off"`；
+            **不要**只写 `display:none` 却仍让自动填充可写入。
+    SupportTicketVerification:
+      type: object
+      description: "发信闸门的**粗粒度**结论（不下发配额、阈值、剩余次数）"
+      required: [status]
+      properties:
+        status:
+          type: string
+          description: >-
+            **发信闸门的原始结论（闭集）**，不是"三态糊一糊"。`sent` 才算真发出；
+            `transport_not_wired` / `failed` 表示**没发出去**；`skipped_*` 表示按规则跳过。
+            `not_needed` 表示该单**根本不需要验证**（登录用户提单），与 `pending`（等待中 /
+            无发信记录）严格区分。**加值等于改契约**（须走 patch diff）；客户端不得把非 `sent` 当成功。
+
+            **通用约定（所有闭集适用）**：客户端遇到**未知** `status` 值必须按"未验证"保守处理
+            ——既不得显示"已发送"，也不得显示"已验证"。这样后端加值时不会把老客户端带进沟里。
+          enum: [sent, pending, skipped_flag, transport_not_wired, failed,
+                 skipped_cap, skipped_quota, not_needed]
+        expires_at: {type: [string, "null"], format: date-time, description: "sent 时有值"}
+        notice_code:
+          type: [string, "null"]
+          description: >-
+            **机器可读**提示码（稳定、可断言）。Web 端（djb-web）**只认本字段**并按语言渲染；
+            `sent` / `skipped_flag` / `not_needed` 时为 `null`（`not_needed` 无可告知的事就不给码）。
+            加值等于改契约。
+          enum: [transport_unavailable, rate_limited]
+        notice:
+          type: [string, "null"]
+          description: >-
+            兜底**文本**（中文，给 CLI / SDK / 无模板客户端用），不含任何数字（配额、阈值、
+            剩余次数都不下发）。Web 端不要直接展示本字段，请用 `notice_code` 渲染。
+            **禁止**在此字段或 `status` 里谎报"已发送"。
+          maxLength: 120
+        replayed:
+          type: boolean
+          default: false
+          description: "幂等回放：本次请求命中同一 Idempotency-Key，未新建工单、未再发信"
+    SupportTicketCreated:
+      type: object
+      required: [request_id, ticket, verification]
+      properties:
+        request_id: {type: string}
+        ticket: {$ref: "#/components/schemas/SupportTicket"}
+        verification: {$ref: "#/components/schemas/SupportTicketVerification"}
+    SupportTicketMessage:
+      type: object
+      required: [id, author_role, body, visibility, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        author_role: {type: string, enum: [user, ops]}
+        author_id:
+          type: [string, "null"]
+          description: >-
+            **仅运营侧返回**（内部追责）。用户面响应里**整个字段不出现**——字段缺席比值为 null
+            更干脆，免得将来有人"补全"成工号回显。
+        body: {type: string, maxLength: 8000, description: "用户正文：不进日志 / 不进审计"}
+        visibility: {$ref: "#/components/schemas/SupportTicketVisibility"}
+        created_at: {type: string, format: date-time}
+    SupportTicketMessageCreateRequest:
+      type: object
+      required: [body]
+      properties:
+        body: {type: string, minLength: 1, maxLength: 8000}
+    SupportTicketReplyRequest:
+      type: object
+      required: [body]
+      properties:
+        body: {type: string, minLength: 1, maxLength: 8000}
+        visibility: {$ref: "#/components/schemas/SupportTicketVisibility"}
+    SupportTicketMessageCreated:
+      type: object
+      required: [request_id, message]
+      properties:
+        request_id: {type: string}
+        message: {$ref: "#/components/schemas/SupportTicketMessage"}
+    SupportTicketThread:
+      type: object
+      required: [request_id, ticket, messages]
+      properties:
+        request_id: {type: string}
+        ticket: {$ref: "#/components/schemas/SupportTicket"}
+        messages:
+          type: array
+          description: "客户侧只含 visibility=public，按 created_at, id 升序"
+          items: {$ref: "#/components/schemas/SupportTicketMessage"}
+    SupportTicketList:
+      type: object
+      required: [request_id, data, page]
+      properties:
+        request_id: {type: string}
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/SupportTicket"}
+        page: {$ref: "#/components/schemas/TicketPage"}
+    SupportTicketQueueItem:
+      type: object
+      description: "运营队列项：含对客工单 + 只读聚合（不含会话正文）"
+      required: [ticket, message_count, public_message_count]
+      properties:
+        ticket: {$ref: "#/components/schemas/SupportTicket"}
+        message_count: {type: integer, minimum: 0, description: "含内部备注"}
+        public_message_count: {type: integer, minimum: 0, description: "客户可见条数"}
+        last_message_at: {type: [string, "null"], format: date-time}
+    SupportTicketQueue:
+      type: object
+      required: [request_id, data, page]
+      properties:
+        request_id: {type: string}
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/SupportTicketQueueItem"}
+        page: {$ref: "#/components/schemas/TicketPage"}
+    SupportTicketStateChangeRequest:
+      type: object
+      required: [status]
+      properties:
+        status: {$ref: "#/components/schemas/SupportTicketStatus"}
+    SupportTicketStateChange:
+      type: object
+      required: [request_id, ticket, changed]
+      properties:
+        request_id: {type: string}
+        ticket: {$ref: "#/components/schemas/SupportTicket"}
+        changed: {type: boolean, description: "false = 同态幂等（未写库、未改 updated_at）"}
+    SupportVerifyRequest:
+      type: object
+      required: [token]
+      properties:
+        token: {type: string, minLength: 16, maxLength: 128, description: "邮件里的令牌；只在请求体，不进 URL"}
+    SupportFeatureDisabledError:
+      type: object
+      description: >-
+        开关关闭时的 404 响应体。共享 `Error` 信封里 `error.code` 与"记录不存在"同为 `40401`，
+        若只凭状态码，前端会把"功能未开放"渲染成"记录不存在"——两者的运营动作完全不同
+        （申请权限/等开关 vs 查记录）。因此本域 404 额外给**可判别**字段：
+        `error.reason="feature_disabled"` 与本域开关名 `error.feature`。
+        共享 `Error` schema 未做任何修改（它 `additionalProperties: true`，故本结构向后兼容）。
+
+        ⚠️ **隐式承重依赖（写在这里，因为两年后收紧它的人不会来读工单域）**：
+        本 schema 与"404 + reason==feature_disabled → 功能未开放"这条前端判别**都依赖**
+        `Error.error.additionalProperties: true`。**一旦有人把它收紧成 `false`**，后端输出的
+        `reason` / `feature` 会被判为非法字段，本域 404 判别立即失效，全站 404 话术随之错乱
+        （运营会把"功能未开放"读成"记录不存在"）。要收紧它，必须先把这两个字段提升进
+        共享 `Error` 的 `properties`，并同步前端判别规则。
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, code, message, request_id, reason]
+          properties:
+            type: {type: string, enum: [FeatureDisabled]}
+            code: {type: integer, enum: [40401]}
+            reason: {type: string, enum: [feature_disabled]}
+            feature: {type: string, description: "本域开关名（当前恒为 support_tickets）"}
+            message: {type: string, description: "人类可读；程序判断一律用 code + reason"}
+            request_id: {type: string}
+    SupportQueueTicketThread:
+      type: object
+      description: >-
+        运营单条读的响应。**与用户面的关键差别**：`messages[]` 含 `visibility=internal`
+        （运营内部备注）。
+
+        ⚠️ **设计来源，务必照着实现**：`visibility=internal` 的条目对**用户完全不可见**。
+        因此前端**必须**在视觉上把它与对外回复区分开（例如标记「内部 · 用户看不到」），
+        **不得**把 internal 条目当成"已经和用户沟通过了"的证据。
+        这条事故形态是真实存在的：运营写了一条给同事看的话，回用户时以为用户已经看到了。
+        契约写在这里，是因为不写下来，三年后没人分得清这是设计还是疏漏。
+      required: [request_id, ticket, messages]
+      properties:
+        request_id: {type: string}
+        ticket: {$ref: "#/components/schemas/SupportTicket"}
+        message_count: {type: integer, minimum: 0, description: "含内部备注"}
+        public_message_count: {type: integer, minimum: 0, description: "客户可见条数"}
+        last_message_at: {type: [string, "null"], format: date-time}
+        messages:
+          type: array
+          description: >-
+            按 `created_at, id` 升序的**混排**（internal 与 public 按时间交织）。
+            每条**必带** `visibility`：禁止靠位置或"内容口气"推断可见性。
+          items: {$ref: "#/components/schemas/SupportTicketMessage"}
+        verification:
+          type: object
+          description: >-
+            该单**最后一次**发信动作的结论（只读）。给详情页说人话用；
+            `status` / `notice_code` 都是闭集，**不要**用 `verified_at is null` 反推
+            "验证信没发"——那个字段为空也可能是别的路径造成的，用空字段反推状态就是猜。
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [sent, pending, skipped_flag, transport_not_wired, failed,
+                     skipped_cap, skipped_quota, not_needed]
+              description: >-
+                `not_needed` = 该单**根本不需要验证**（如登录用户提单，邮箱视为可信，未发信）；
+                此时 `notice_code` 与 `notice` 均为 null（无可告知的事就不给码）。
+                **与 `pending` 严格区分**：`pending` 是"等待中/无发信记录"，`not_needed` 是
+                "不需要"。让一个值承担两种含义，就是逼前端瞎猜该不该提示"去查收验证信"。
+            notice_code:
+              type: [string, "null"]
+              enum: [transport_unavailable, rate_limited]
+            expires_at: {type: [string, "null"], format: date-time}
+    SupportVerifyResult:
+      type: object
+      required: [request_id, public_id, status]
+      properties:
+        request_id: {type: string}
+        public_id: {type: string, pattern: "^[0-9A-HJKMNP-TV-Z]{10,16}$"}
+        status: {$ref: "#/components/schemas/SupportTicketStatus"}
 
 
 
@@ -10855,6 +11985,94 @@ components:
         applies_to_nodes:
           type: array
           items: { type: string }
+
+    ModelBid:
+      type: object
+      additionalProperties: true
+      required: [model, enabled, bid_min, bid_max, use_realtime, realtime_multiplier_bp,
+                 currency, version, configured]
+      properties:
+        model:
+          type: string
+          description: 模型 slug；`*` 表示全局默认行（`_default` 别名）。
+        enabled:
+          type: boolean
+          description: |
+            `false` ⇒ 该模型的调用返回 `403/40303`（`details.cause=model_not_enabled`）。
+            `_default` 行的 `false` 表示「未单独配置的模型一律拒绝」（cause=bid_not_configured）。
+        bid_min:
+          type: [string, 'null']
+          pattern: '^[0-9]+(\.[0-9]+)?$'
+          description: 出价下限（USD / 百万 token 的十进制字符串）；`null` = 不设（等价 0）。
+        bid_max:
+          type: [string, 'null']
+          pattern: '^[0-9]+(\.[0-9]+)?$'
+          description: 出价上限；`null` = 不设上限（旧行为：任何报价都可成交）。
+        use_realtime:
+          type: boolean
+          description: 上限跟随报价簿实时最低 ask × `realtime_multiplier_bp`。
+        realtime_multiplier_bp:
+          type: integer
+          minimum: 1000
+          maximum: 20000
+          description: 实时价倍率（万分比）：10000 = 1.00×。
+        currency: { type: string, enum: [USD] }
+        version:
+          type: integer
+          minimum: 0
+          description: 内容版本；`0` = 从未设置。内容不变时不增长（PUT 幂等）。
+        updated_at: { type: [string, 'null'], format: date-time }
+        is_default:
+          type: boolean
+          description: 该对象是否是全局默认行。
+        configured:
+          type: boolean
+          description: 是否设过价（`bid_min`/`bid_max`/`use_realtime` 任一）。`false` = 按供方报价成交。
+        reference_price:
+          type: [object, 'null']
+          additionalProperties: true
+          description: 只读参考：当前该模型的最低有效报价（`{amount, unit}`），无报价时 `null`。
+        effective_max:
+          type: [string, 'null']
+          description: 只读：如果现在路由，实际生效的上限（含实时价换算）。
+        effective_min:
+          type: [string, 'null']
+          description: 只读：实际生效的下限。
+        price_source:
+          type: [string, 'null']
+          enum: [bid_settings, realtime, ask_fallback, ask_missing, null]
+          description: |
+            只读：生效口径来源；同一值会出现在调用的 `x-djb-price-source` 响应头。
+            `ask_fallback` = 实时价取不到、降级为静态上限；`ask_missing` = 实时价取不到且无静态兜底。
+
+    ModelBidUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: 部分更新（只改给出的字段）；同体重复提交是幂等的。
+      properties:
+        enabled: { type: boolean }
+        bid_min:
+          type: [string, 'null']
+          pattern: '^[0-9]+(\.[0-9]+)?$'
+        bid_max:
+          type: [string, 'null']
+          pattern: '^[0-9]+(\.[0-9]+)?$'
+        use_realtime: { type: boolean }
+        realtime_multiplier_bp: { type: integer, minimum: 1000, maximum: 20000 }
+        currency: { type: string, enum: [USD] }
+
+    ModelBidList:
+      type: object
+      additionalProperties: true
+      required: [currency, count, default, items]
+      properties:
+        currency: { type: string, enum: [USD] }
+        count: { type: integer, minimum: 0 }
+        default: { $ref: '#/components/schemas/ModelBid' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ModelBid' }
 
     QuoteSettings:
       type: object
@@ -14355,6 +15573,81 @@ components:
           minLength: 1
           maxLength: 128
           description: 达确认的交易号；空则沿用批次已保存的 `chain_tx_id`。
+
+    PayoutTxRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, item_id, to, qty_minor, nonce, gas_limit, max_fee_per_gas,
+                 max_priority_fee_per_gas, data, digest, expires_at]
+      properties:
+        request_id: { type: string, format: uuid }
+        item_id: { type: string, format: uuid }
+        to:
+          type: string
+          description: 收款地址（= 明细 `payee_address`，小写）。
+        qty_minor:
+          type: string
+          description: 金额（最小单位，字符串避免 JS 53 位精度问题）。
+        nonce: { type: integer, minimum: 0 }
+        gas_limit: { type: integer, minimum: 1 }
+        max_fee_per_gas:
+          type: string
+          description: legacy（EIP-155）视图下的 gas_price（协议当前只签 legacy 交易）。
+        max_priority_fee_per_gas:
+          type: string
+          description: 与 `max_fee_per_gas` 同值（legacy 交易没有独立 priority fee）。
+        data:
+          type: string
+          description: calldata；ERC20 transfer 的 data 由 to/qty 确定性推导，这里留空串。
+        digest:
+          type: string
+          description: 构单摘要（待签请求 canonical JSON 的 keccak256；提交时重算比对）。
+        expires_at: { type: string, format: date-time }
+
+    PayoutTxRequestBatch:
+      type: object
+      additionalProperties: false
+      required: [batch_id, chain_id, hot_address, expires_at, requests]
+      properties:
+        batch_id: { type: string }
+        chain_id: { type: integer }
+        hot_address:
+          type: string
+          description: 热钱包地址（交易 from；私钥不在服务进程）。
+        expires_at: { type: string, format: date-time }
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/PayoutTxRequest' }
+
+    PayoutTxSubmitRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, raw_tx, tx_hash]
+      properties:
+        request_id: { type: string, format: uuid }
+        raw_tx:
+          type: string
+          minLength: 1
+          maxLength: 131072
+          description: 已签名交易（`0x` + hex）。服务端只留 sha256，不落原文、不进日志与审计。
+        tx_hash:
+          type: string
+          description: 32 字节交易哈希（`0x` + 64 hex）；必须与 `raw_tx` 自洽。
+
+    PayoutTxSubmitResult:
+      type: object
+      additionalProperties: false
+      required: [batch_id, item_id, request_id, tx_hash, action, batch_status]
+      properties:
+        batch_id: { type: string }
+        item_id: { type: string, format: uuid }
+        request_id: { type: string, format: uuid }
+        tx_hash: { type: string }
+        action:
+          type: string
+          enum: [broadcast, replayed, recovered]
+          description: replayed = 执行器认定该笔早已 sent，原样回既有 tx_hash 且不改状态。
+        batch_status: { type: string }
 
     SigningRequest:
       type: object
