@@ -921,6 +921,38 @@ class LocalDataSource:
                 "node": {"node_id": node.get("node_id"), "bound": node.get("bound")},
                 "note": note}
 
+    def _resolve_node_id(self, config: AccessConfig) -> tuple[str, str]:
+        """节点标识的三级回退：``access.json`` → 本机凭据 → 状态库 ``kv("node")``。
+
+        为什么需要回退：注册只写凭据（``secure.py`` 的 ``CredentialStore.set_node``）和
+        状态库（``daemon.py`` 的 ``store.set_kv("node", …)``），**不写** ``access.json``；
+        而接入配置页历史上只读 ``AccessConfig.node_id``（手填字段）→ 注册成功的机器上
+        GUI 永远显示「—」，客户拿不到网页端绑定要填的节点 ID。
+
+        返回 ``(node_id, source)``；``source`` ∈ ``{"config","credentials","store",""}``，
+        供视图区分「用户手填（可编辑）」与「服务端下发（只读）」。
+        任何一级读不到都只是往下走，绝不抛栈（页面必须能打开）。
+        """
+        if config.node_id:
+            return str(config.node_id), "config"
+        try:
+            from ..config import Paths
+            from ..secure import CredentialStore
+            stored = CredentialStore(Paths(str(self._home))).node_id()
+        except Exception:                  # 凭据文件坏了 / 密钥环不可用：继续降级
+            stored = None
+        if stored:
+            return str(stored), "credentials"
+        try:
+            node = self._store().get_kv("node")
+        except Exception:                  # 没有 state.db / schema 未建：当没有
+            node = None
+        if isinstance(node, Mapping):
+            value = str(node.get("node_id") or "")
+            if value:
+                return value, "store"
+        return "", ""
+
     def _access_section(self) -> Mapping[str, Any]:
         config = self._access.load()
         binding: Mapping[str, Any] | None = None
@@ -934,8 +966,11 @@ class LocalDataSource:
         # 文件不存在 ≠ 通过校验：没保存过就说没保存过，避免「通过校验」误导
         saved = bool(getattr(self._access, "path", None)
                      and Path(self._access.path).exists())
+        resolved, source = self._resolve_node_id(config)
         return {"config": config.display(), "valid": _valid(config) if saved else None,
                 "saved": saved, "binding": binding,
+                # 只增字段：``config`` 投影保持原样（秘密仍掩码），供旧调用方无痛
+                "node_id": resolved, "node_id_source": source,
                 "note": note, "path": str(self._access.path)}
 
     def _yield(self) -> Mapping[str, Any]:

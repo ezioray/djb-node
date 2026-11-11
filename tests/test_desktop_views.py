@@ -1004,3 +1004,76 @@ def test_account_bind_entry_survives_unavailable_account_domain():
     assert "绑定网页端" in text
     assert "不是配置损坏" in text                     # 红字旁边给出可操作解释
     assert "账户/节点 → 生成绑定码" in text            # 可照抄的步骤仍在
+
+
+# ─────────────────────────── 接入配置：节点 ID 上屏 + 复制（P0-node，2026-11-12）
+def _access_snapshot(*, node_id="", source="", secrets=False):
+    """接入配置页快照：只覆盖 access 域，其余沿用 demo 数据。
+
+    ``node_id`` / ``source`` 由 datasource._resolve_node_id 产出（config/credentials/store/""）。
+    """
+    config = ac.AccessConfig(node_secret="djb_ck_live_secret_value" if secrets else "",
+                             api_key=SECRET if secrets else "").display()
+    sections = dict(demo_snapshot().sections)
+    sections["access"] = {"config": config, "valid": True, "saved": True, "binding": None,
+                          "node_id": node_id, "node_id_source": source,
+                          "note": "", "path": "~/.djb/desktop/access-config.json"}
+    return ds.Snapshot(sections)
+
+
+def test_access_shows_node_id_from_credentials_readonly_and_copyable():
+    """凭证里有 node_id 而 access.json 没有：页面要显示真值，且只读 + 可一键复制。
+
+    只读是必须的：动作执行前会把所有可编辑字段收成草稿（app._on_action），
+    节点 ID 若可编辑，「保存并回读」就会把展示值写回 access.json。
+    """
+    view = vw.build_view("access", _access_snapshot(node_id="nd_from_credentials",
+                                                   source="credentials"))
+    field = next(item for item in view.fields if item.key == "node_id")
+    assert field.value == "nd_from_credentials"
+    assert field.editable is False and "只读" in field.hint
+    action = next(item for item in view.actions if item.key == "access.copy_node_id")
+    assert action.enabled is True
+    assert "nd_from_credentials" in view.plain_text()
+
+
+def test_access_without_node_id_asks_to_start_once():
+    """两者都没有 → 显示「先启动一次」（不是「—」），复制动作置灰并说明原因。"""
+    view = vw.build_view("access", _access_snapshot())
+    field = next(item for item in view.fields if item.key == "node_id")
+    assert field.value == "先启动一次"
+    assert field.editable is False
+    action = next(item for item in view.actions if item.key == "access.copy_node_id")
+    assert action.enabled is False and "先启动一次" in action.reason
+    assert "先启动一次" in view.plain_text()
+
+
+def test_access_secrets_stay_masked_after_node_id_change():
+    """加了节点 ID 之后，秘密字段仍然只显示掩码，明文不上屏。"""
+    view = vw.build_view("access", _access_snapshot(node_id="nd_x", source="credentials",
+                                                   secrets=True))
+    text = view.plain_text()
+    assert SECRET not in text
+    assert "djb_ck_live_secret_value" not in text
+    secrets = {field.key: field for field in view.fields if field.secret}
+    assert "…" in secrets["api_key"].value and "…" in secrets["node_secret"].value
+
+
+def test_access_node_id_keeps_legacy_config_value_for_demo_snapshots():
+    """没有新字段的调用方（demo / FakeDataSource）行为不变：仍显示 config 里的手填值。"""
+    view = vw.build_view("access", demo_snapshot())
+    field = next(item for item in view.fields if item.key == "node_id")
+    assert field.value == "node-7c31"
+    assert field.editable is True          # 手填值保持可编辑（与 0.3.2 一致）
+
+
+def test_access_copy_node_id_action_returns_clipboard_payload(tmp_path):
+    """动作只把节点 ID 交给剪贴板（effect=copy），不写配置、不发请求。"""
+    snapshot = _access_snapshot(node_id="nd_copy_me", source="credentials")
+    controller = make_controller(tmp_path, sections=dict(snapshot.sections))
+    result = controller.action("access.copy_node_id")
+    assert result.ok and result.effect == "copy" and result.payload == "nd_copy_me"
+
+    empty = make_controller(tmp_path, sections=dict(_access_snapshot().sections))
+    missing = empty.action("access.copy_node_id")
+    assert missing.ok is False and "先启动一次" in missing.message
