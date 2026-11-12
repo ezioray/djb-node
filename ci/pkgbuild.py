@@ -21,19 +21,36 @@ CI 里 checkout 出来的就是仓本身，没有 `$WS/repos` 这一层，也没
 
 ## 用法
 
-    python3 ci/pkgbuild.py --kind linux-src        --out /tmp/pkg
-    python3 ci/pkgbuild.py --kind official-supply  --out /tmp/pkg
+    export SOURCE_DATE_EPOCH=$(git show -s --format=%ct <sha>)       # 0.3.5 起必填
+    python3 ci/pkgbuild.py --kind linux-src --out /tmp/pkg
+    python3 ci/pkgbuild.py --kind official-supply --out /tmp/pkg
     python3 ci/pkgbuild.py --kind machine-room-offline --out /tmp/pkg
-    python3 ci/pkgbuild.py --kind windows-assets   --out /tmp/pkg   # 载体，不是 exe
-    python3 ci/pkgbuild.py --kind linux-src --plan                   # 只校验入参、不写盘
+    python3 ci/pkgbuild.py --kind windows-assets --out /tmp/pkg     # 载体，不是 exe
+    python3 ci/pkgbuild.py --kind linux-src --plan                  # 只校验入参、不写盘
+    python3 ci/pkgbuild.py --kind linux-src --allow-wallclock       # 仅本地冒烟
 
 每个 kind 结束时打印一行 ``BUILD_RESULT {...}``（CI 用它取 sha256 / bytes）。
+
+## 可复现（0.3.5 / B-PREP P1）
+
+同一 commit + 同一 ``SOURCE_DATE_EPOCH`` 必须得到**字节相同**的 tar.gz。
+三个不确定性来源逐个钉死：
+
+* ``built_at``：有 ``SOURCE_DATE_EPOCH`` 就用它（UTC），没有才退回墙钟；
+* tar 成员 mtime 归一到 epoch（uid/gid/uname/gname 早已归一）；
+* gzip 头 mtime=0 且不写文件名（等价 ``gzip -n``）—— 否则每次构建包头都不同。
+
+CI 里请显式 ``export SOURCE_DATE_EPOCH=$(git show -s --format=%ct <sha>)``。
+**没设就拒**（退出码 2）：默认路径不允许"悄悄退回墙钟"，那等于默认不可复现；
+只在本地冒烟时用 ``--allow-wallclock`` 显式放行，产物 ``VERSION.txt`` 里会写
+``built_at_source : wallclock`` 自证。
 
 退出码：0 成功 · 2 参数/输入不合格 · 3 构建或自检失败 · 4 护栏违规。
 """
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -93,6 +110,51 @@ def git(*args: str, cwd: Path | None = None) -> str:
     return result.stdout
 
 
+def source_epoch() -> int:
+    """``SOURCE_DATE_EPOCH``（reproducible-builds 约定）。取值不合法就拒，不悄悄退回墙钟。"""
+    raw = (os.environ.get("SOURCE_DATE_EPOCH") or "").strip()
+    if not raw:
+        return 0
+    try:
+        epoch = int(raw)
+    except ValueError:
+        die("SOURCE_DATE_EPOCH 不是整数：" + raw, 2)
+    if epoch < 0:
+        die("SOURCE_DATE_EPOCH 不能为负：" + raw, 2)
+    return epoch
+
+
+def build_timestamp(epoch: int) -> str:
+    """built_at 只有一个来源：给了 epoch 就由 epoch 推出，没给才用墙钟。"""
+    moment = datetime.fromtimestamp(epoch, timezone.utc) if epoch else datetime.now(timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def tar_normalize(epoch: int):
+    """tar 成员归一：属主归零 + mtime 钉到 epoch（epoch=0 时保留原 mtime，兼容老行为）。"""
+    def norm(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        if epoch:
+            info.mtime = epoch
+        return info
+    return norm
+
+
+def write_targz(root: Path, archive: Path, *, arcname: str, epoch: int) -> None:
+    """写字节可复现的 tar.gz：成员过滤 + gzip 头 mtime=0（等价 ``gzip -n``）。
+
+    不用 ``tarfile.open(mode="w:gz")``：它拿不到 gzip 头的时间戳，两次构建头就不同。
+    ``gzip.GzipFile(fileobj=...)`` 不传 filename ⇒ 头里也不写文件名。
+    """
+    tmp = archive.with_name(archive.name + ".tmp")
+    with open(tmp, "wb") as raw, \
+            gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz, \
+            tarfile.open(fileobj=gz, mode="w") as handle:
+        handle.add(str(root), arcname=arcname, filter=tar_normalize(epoch))
+    tmp.replace(archive)
+
+
 @dataclass
 class Plan:
     kind: str
@@ -108,6 +170,8 @@ class Plan:
     update_source: str
     whitelist: tuple[str, ...] = field(default_factory=tuple)
     notes: list[str] = field(default_factory=list)
+    epoch: int = 0                      # SOURCE_DATE_EPOCH（0=未设，须 --allow-wallclock 才放行）
+    built_at_source: str = "wallclock"  # source-date-epoch | wallclock（写进 VERSION.txt 自证）
 
 
 def module_version() -> str:
@@ -135,7 +199,8 @@ def channel_spec(channel: str) -> dict:
     return module.spec(channel).to_dict()
 
 
-def build_plan(kind: str, out_dir: Path, *, version: str, sha: str, now: str) -> Plan:
+def build_plan(kind: str, out_dir: Path, *, version: str, sha: str, now: str,
+               epoch: int = 0, built_at_source: str = "wallclock") -> Plan:
     specs = {
         "linux-src": ("consumer-linux-src", WHITELIST_CONSUMER),
         "official-supply": ("official-supply", WHITELIST_SUPPLY),
@@ -170,7 +235,8 @@ def build_plan(kind: str, out_dir: Path, *, version: str, sha: str, now: str) ->
     plan = Plan(kind=kind, version=version, commit=resolved, describe=describe, built_at=now,
                 stem=stem, out=out_dir, channel=str(spec["channel"]),
                 edition=str(spec["edition"]), platform=str(spec["platform"]),
-                update_source=str(spec["update_source"]), whitelist=tuple(whitelist))
+                update_source=str(spec["update_source"]), whitelist=tuple(whitelist),
+                epoch=epoch, built_at_source=built_at_source)
     if plan.update_source != update_source_constant():
         plan.notes.append("通道源与 MANIFEST_URL 不一致（应改 update_source.py 而不是打包器）")
     return plan
@@ -185,6 +251,7 @@ def version_txt(plan: Plan, *, method: str) -> str:
         "commit           : " + plan.commit,
         "git describe     : " + plan.describe,
         "built_at         : " + plan.built_at,
+        "built_at_source  : " + plan.built_at_source,
         "platform         : " + plan.platform,
         "signature_status : unsigned-test (no code signing; TEST BUILD)",
         "build_method     : " + method,
@@ -303,14 +370,7 @@ def build_linux_like(plan: Plan) -> dict:
         (root / "README-INSTALL.txt").write_text(readme_install(plan), encoding="utf-8")
         files = write_sha256sums(root)
         archive = root_out / (plan.stem + ".tar.gz")
-        tmp = archive.with_suffix(".tar.gz.tmp")
-        with tarfile.open(tmp, "w:gz") as handle:
-            def norm(info: tarfile.TarInfo) -> tarfile.TarInfo:
-                info.uid = info.gid = 0
-                info.uname = info.gname = ""
-                return info
-            handle.add(str(root), arcname=plan.stem, filter=norm)
-        tmp.replace(archive)
+        write_targz(root, archive, arcname=plan.stem, epoch=plan.epoch)
         checks = selfcheck(plan, root)
         (root_out / (plan.stem + ".tar.gz.sha256")).write_text(
             sha256_file(archive) + "  " + archive.name + "\n", encoding="utf-8")
@@ -348,8 +408,9 @@ def build_machine_room_offline(plan: Plan) -> dict:
         (root / "README-INSTALL.txt").write_text(readme_install(plan), encoding="utf-8")
         write_sha256sums(root)
         archive = root_out / (plan.stem + ".tar.gz")
-        with tarfile.open(archive, "w:gz") as handle:
-            handle.add(str(root), arcname=plan.stem)
+        # 与 linux 侧同一把「可复现」尺子：成员 mtime 归一 + gzip 头 mtime=0。
+        # 注意：包内 wheel 是 zip，自带时间戳，所以这条通道**仍不保证**字节复现（见 B-PREP 残余风险）。
+        write_targz(root, archive, arcname=plan.stem, epoch=plan.epoch)
         (root_out / (plan.stem + ".tar.gz.sha256")).write_text(
             sha256_file(archive) + "  " + archive.name + "\n", encoding="utf-8")
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -419,14 +480,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="", help="输出目录（默认 build/pkg）")
     parser.add_argument("--version", default="", help="版本（默认取 djb_node.__version__）")
     parser.add_argument("--sha", default="HEAD", help="源码 commit（默认 HEAD）")
+    parser.add_argument("--allow-wallclock", action="store_true",
+                        help="允许不设 SOURCE_DATE_EPOCH（默认拒绝：墙钟构建不可复现，产物会标 "
+                             "built_at_source=wallclock，只用于本地冒烟）")
     parser.add_argument("--plan", action="store_true", help="只校验入参并打印计划，不写盘")
     args = parser.parse_args(argv)
 
     version = args.version or module_version()
     out = Path(args.out or (REPO / "build" / "pkg"))
     check_release_surface(out)
-    built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    plan = build_plan(args.kind, out, version=version, sha=args.sha, now=built_at)
+    epoch = source_epoch()
+    if epoch == 0 and not args.allow_wallclock:
+        die("未设 SOURCE_DATE_EPOCH：可复现构建必须显式给时间戳，否则 built_at / 成员 mtime / "
+            "gzip 头随墙钟变，同一 commit 两次构建 sha 不同。\n"
+            "  正解：export SOURCE_DATE_EPOCH=$(git show -s --format=%ct <sha>)\n"
+            "  确实要墙钟（本地冒烟）：加 --allow-wallclock，产物会自证 built_at_source=wallclock", 2)
+    if epoch == 0:
+        say("!! WARNING: --allow-wallclock —— 本产物用墙钟时间，**不可字节复现**，"
+            "只能本地冒烟，不得进发布面。")
+        print("!! WARNING: wallclock build —— not reproducible; smoke test only.",
+              file=sys.stderr, flush=True)
+    built_at = build_timestamp(epoch)
+    plan = build_plan(args.kind, out, version=version, sha=args.sha, now=built_at, epoch=epoch,
+                      built_at_source="source-date-epoch" if epoch else "wallclock")
     say("== kind     " + plan.kind + "（channel=" + plan.channel + " edition=" + plan.edition
         + "）")
     say("== 版本     " + plan.version + "  commit " + plan.commit)
@@ -449,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
     say("BUILD_RESULT " + json.dumps({
         "kind": plan.kind, "channel": plan.channel, "edition": plan.edition,
         "version": plan.version, "commit": plan.commit, "built_at": plan.built_at,
+        "built_at_source": plan.built_at_source,
         "update_source": plan.update_source, **result,
     }, ensure_ascii=False, sort_keys=True))
     return 0
