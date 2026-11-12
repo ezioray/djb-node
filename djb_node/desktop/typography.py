@@ -231,7 +231,7 @@ def resolve_scale(*, env: object = None, prefs: object = None,
 
 
 def round_px(value: float) -> int:
-    """设计 px → 实际整数 px（至少 1）：**与 0.3.4 逐档等价**，用 ``round()``。
+    """设计 px → 实际整数 px（至少 1）：**同一设计值下与 0.3.4 逐档等价**，用 ``round()``。
 
     为什么不用 ``floor(x + 0.5)``（半进位）：Tk 只认整数像素，换一套取整就会在 ``.5``
     边界上悄悄改外观 —— ``display`` @1.15（34.5：0.3.4 → **34**，半进位 → 35）、

@@ -120,7 +120,7 @@ class Fonts:
 
         取整**统一走** :func:`typography.round_px`，它继承 0.3.4 的 ``int(round(...))``
         （银行家舍入）：Tk 只认整数像素字号，而且换一套取整会在 ``.5`` 边界上改外观
-        （``display``@1.15：34.5 → 34，不是 35）。逐档等价见
+        （``display``@1.15：34.5 → 34，不是 35）。**同一设计值下**逐档等价见
         ``tests/test_desktop_px_wiring.py::test_rounding_matches_0_3_4_at_every_scale``。
         """
         return typography.round_px(float(value) * self.scale)
