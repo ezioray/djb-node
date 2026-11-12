@@ -11,7 +11,9 @@
 0.3.4 的字号是「7 档 + 表格特例」的散量（``ui_kit.PX_*``，被 ``tests/test_desktop_typography.py``
 逐值钉死）。0.3.5 要换成**带行高/字距/字重**的 token，属于渲染层改造（T4），本轮纵切片只落
 数据结构与不变量，**不接线**：``ui_kit`` 一个字节不动，UI 外观零变化，现有 13 个视图的投影与
-截图基线不受影响。接线时把 ``ui_kit.PX_*`` 改成 ``typography.px("body")`` 一行一处即可。
+截图基线不受影响。**别把它当成「一行一处」的替换**：T4 要删掉 ``ui_kit.PX_*`` 49 行
+（69 处引用），并补一张 0.3.4 的 7 档 → 本模块 9 档的映射表（``PX_TITLE/PX_CARD`` 这类
+名字与值同时变），工作量在设计文档里记为 T4 的 2.5 人日。
 
 三条硬规则（违反即排版退化，:func:`violations` 会报出来）
 =========================================================
@@ -69,13 +71,21 @@ class TypeToken:
     line: float
     weight: str                 # "normal" | "bold"（Tk 只有这两档）
     family: str = "sans"        # "sans" | "mono"
-    tracking: float = 0.0       # 字距（px）；正数疏、负数紧
+    #: 字距（px，正数疏/负数紧）。
+    # 实现自定，待设计确认；Tk 不支持 letter-spacing，渲染层暂不消费。
+    # （Tk 的 ``tkinter.font.Font`` 没有字距参数，``Text`` tag 也没有 letter-spacing；
+    #   真要落地只能拆字画到 Canvas 上，代价与收益未评估 ⇒ 本轮只作为数据保留，
+    #   因此这 5 个值目前是「渲染层无法承载的死数据」，不要拿它去调外观。）
+    tracking: float = 0.0
     usage: str = ""
     #: ``line`` 的语义：``"line"`` = 行盒高度；``"row"`` = 表格行高（兼作行盒）
     line_kind: str = "line"
 
 
 #: 字阶表 = 01-FONT-TYPO §2.2 逐行誊写（顺序即层级，勿随手插档）。
+#:
+#: 注意 ``tracking`` 一列**不在设计文档里**（§2.2 只有 px/行高/字重三列）：这 5 个值是
+#: 实现自定，待设计确认；Tk 不支持 letter-spacing，渲染层暂不消费。
 TOKEN_ORDER: tuple[str, ...] = (
     "display", "hero", "h1", "h2", "body", "small", "micro", "table", "mono",
 )
@@ -238,7 +248,11 @@ def scaled_line(name: str, scale: float = DEFAULT_SCALE) -> int:
 
 
 def scaled_tracking(name: str, scale: float = DEFAULT_SCALE) -> float:
-    """字距（px，保留 2 位小数）。夹到该档字号的 ±8%，避免极端档位把字顶到重叠。"""
+    """字距（px，保留 2 位小数）。夹到该档字号的 ±8%，避免极端档位把字顶到重叠。
+
+    **预留接口**：Tk 不支持 letter-spacing（见 :class:`TypeToken.tracking` 的注释），
+    渲染层暂不调用本函数；它存在只是为了把设计值原样带过 T4，且夹取规则有测试兜底。
+    """
     item = token(name)
     factor, _ = _clamp_scale(scale)
     limit = item.px * 0.08
