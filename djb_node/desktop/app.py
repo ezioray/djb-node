@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""桌面主窗口（Tk）：侧栏 12 视图 + 内容区 + 状态栏；逻辑全在 controller。
+"""桌面主窗口（Tk）：侧栏 13 页（IA 五组，可回滚四组）+ 内容区 + 状态栏；逻辑全在 controller。
 
 约束
 ====
@@ -30,8 +30,9 @@ from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
+from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
 from . import platform_ui
-from .views import (NAV_SECTIONS, VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
+from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
                     Metric, RailCard, Row, Table, View, page_kicker)
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
@@ -53,11 +54,75 @@ NAV_ICONS = {
 
 #: 页头眉标：**组名 / 页名** 两级（B3），如 ``RUN / OVERVIEW``。
 #:
-#: 数据口径在 :func:`djb_node.desktop.views.page_kicker`（组名来自 ``NAV_SECTIONS``），
-#: 这里只做「13 个视图各一条」的派生，不再手写第二份表；整串 ASCII，走 mono 不会跳基线。
+#: 这是 **0.3.4 口径**的派生（组名来自 ``views.NAV_SECTIONS``），保留给旧调用方与截图基线；
+#: 窗口实际用的是实例级 ``self._ia_kickers``（跟着 ``DJB_UI_IA`` 走，回滚时与本表逐项相等）。
 PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 
 TOP_NAV_KEYS = VIEW_KEYS
+
+# ── IA 接线（第三轮）：侧栏 / 快捷键 / 窄窗下拉 / 页头眉标全部由 ``ia.py`` 驱动
+#
+# 数据源只有一处：:mod:`djb_node.desktop.ia`。``DJB_UI_IA=legacy`` 回滚到 0.3.4 的 4 组 13 页
+# （``ia.IA_SECTIONS_LEGACY`` 与 ``views.NAV_SECTIONS`` 逐项相等，测试钉住）；未设/未识别 = 方案 A。
+# 本节所有函数都是**纯数据**（不碰 Tk），canonical 断言在 ``tests/test_desktop_ia_wiring.py``。
+
+
+def ia_state(raw: object = None, *, env: Mapping[str, str] | None = None) -> ia.IaDecision:
+    """裁决当前 IA 模式：``DJB_UI_IA=legacy`` 回 0.3.4，其余/未设 = 方案 A（5 组）。"""
+    source: Mapping[str, str] = os.environ if env is None else env
+    return ia.resolve_ia(source.get("DJB_UI_IA") if raw is None else raw)
+
+
+def nav_order(decision: ia.IaDecision) -> tuple[str, ...]:
+    """侧栏顺序 = 快捷键顺序 = 窄窗下拉顺序（一个数组三处共用）。"""
+    return ia.flat_keys(decision.sections)
+
+
+def nav_kicker(decision: ia.IaDecision, key: str) -> str:
+    """页头眉标「组名 / 页名」：组名取**当前生效表**里的所属组（回滚时自然是旧组名）。"""
+    spec = ia.page(key)
+    section = next((part for part in decision.sections if key in part.keys), None)
+    return (section.micro + " / " + spec.kicker) if section is not None else spec.kicker
+
+
+def nav_plan(decision: ia.IaDecision) -> tuple[tuple[ia.SectionSpec, tuple[tuple[str, str, str, str], ...]], ...]:
+    """侧栏渲染计划：(分组, ((key, 标题, 图标, 徽标), ...))——纯数据，可无窗口逐项断言。"""
+    plan = []
+    for section in decision.sections:
+        # 徽标只在方案 A 显示：legacy 回滚必须与 0.3.4 **逐项相等**（旧版没有 BETA）
+        items = tuple((key, ia.page(key).title, NAV_ICONS.get(key, "dot"),
+                       "BETA" if (ia.page(key).beta and decision.mode != "legacy") else "")
+                      for key in section.keys)
+        plan.append((section, items))
+    return tuple(plan)
+
+
+def nav_combo_values(decision: ia.IaDecision) -> tuple[str, ...]:
+    """窄窗导航下拉的取值（``1 · 总览``）：顺序与侧栏一致，编号即 Ctrl+N。"""
+    return tuple(str(index) + " · " + ia.page(key).title
+                 for index, key in enumerate(nav_order(decision), start=1))
+
+
+def route_for(key: str, renderable: Any) -> tuple[str, Any]:
+    """视图路由：``("view", key)`` / ``("placeholder", PageSpec)`` / ``("unknown", None)``。
+
+    IA 注册表（``ia.PAGES``）里可以出现**还没有渲染实现**的页：这类页给占位空态，
+    不许把窗口打崩；不在注册表里的 key 按老行为回到当前页（深链校验仍走 ia.page）。
+    """
+    try:
+        spec = ia.page(key)
+    except KeyError:
+        return ("unknown", None)
+    if key in renderable:
+        return ("view", key)
+    return ("placeholder", spec)
+
+
+def placeholder_view(spec: ia.PageSpec) -> View:
+    """占位页的空态：说清「已进 IA、内容待实现」，不是报错也不是「暂无数据」。"""
+    subtitle = spec.subtitle or "该页已纳入 IA 基线，内容实现排在后续切片。"
+    return View(key=spec.key, title=spec.title, subtitle=subtitle,
+                notes=("占位页：导航可达、空态渲染（非故障、非无数据）。",))
 
 #: 视图切换快捷键（B5）：Ctrl+1…9 直达前 9 项，Ctrl+Shift+1…4 直达后 4 项。
 #:
@@ -211,6 +276,11 @@ class DesktopApp:
         self._bus = bus
         self._on_quit = on_quit
         self._unsubscribe = None
+        # IA 模式在构造时定一次：DJB_UI_IA=legacy → 0.3.4 四组；其余 → 方案 A 五组。
+        # 侧栏 / Ctrl+N / 窄窗下拉 / 页头眉标全部读这里，不在别处再派生第二份顺序。
+        self._ia = ia_state()
+        self._ia_order = nav_order(self._ia)
+        self._ia_kickers = {key: nav_kicker(self._ia, key) for key in self._ia_order}
         self._nav_buttons: dict[str, Any] = {}
         self._fields: dict[str, Any] = {}
         self._row_notes: dict[str, str] = {}
@@ -323,8 +393,7 @@ class DesktopApp:
         # 窄窗导航下拉（<760 时替代侧栏；一个视图都不少）
         self._nav_combo = self._ttk.Combobox(
             self._page_actions, state="readonly", takefocus=True, width=18,
-            values=[str(i) + " · " + VIEW_TITLES[key]
-                    for i, key in enumerate(VIEW_KEYS, start=1)])
+            values=list(nav_combo_values(self._ia)))
         self._nav_combo.bind("<<ComboboxSelected>>", self._on_nav_combo)
         self._nav_combo.pack(side="right")
         self._nav_combo.pack_forget()
@@ -450,8 +519,8 @@ class DesktopApp:
         self._nav_inner.bind("<Configure>", self._on_nav_inner_resize)
         self._nav_canvas.bind("<Configure>", self._on_nav_canvas_resize)
         self._nav_section_headers: dict[str, Any] = {}
-        for index, section in enumerate(NAV_SECTIONS):
-            self._render_nav_section(section, first=index == 0)
+        for index, (section, items) in enumerate(nav_plan(self._ia)):
+            self._render_nav_section(section, items, first=index == 0)
         kit.Divider(side, color=dual.color("line")).pack(fill="x", padx=12)
         foot = tk.Frame(side, background=ground)
         foot.pack(fill="x", padx=16, pady=(8, 10))
@@ -482,10 +551,14 @@ class DesktopApp:
             return self._fonts.mono(px, bold=bold)
         return self._fonts.sans(px, bold=bold)
 
-    def _render_nav_section(self, section: Any, *, first: bool = False) -> None:
+    def _render_nav_section(self, section: Any,
+                            items: tuple[tuple[str, str, str, str], ...] = (),
+                            *, first: bool = False) -> None:
         """一个分组：micro 档分组头（拉丁微标 + 中文组名）+ 该组导航项。
 
-        只是给既有 :class:`ui_kit.NavItem` 加一层结构；选中态/图标/窄窗下拉都不变。
+        分组/顺序/标题/徽标全部来自 :func:`nav_plan`（IA 单一数据源）；本方法只负责画。
+        ``BETA`` 徽标走 :class:`ui_kit.NavItem` 自带的右侧计数位（等宽 micro 档），
+        与「暂不可用」的置灰是两件事：BETA 可点，只是标明能力滞后。
         """
         kit, tk = self._kit, self._tk
         ground = dual.color("surface3")
@@ -498,9 +571,9 @@ class DesktopApp:
                  foreground=dual.color("muted_text"), background=ground,
                  anchor="w").pack(side="left", padx=(6, 0))
         self._nav_section_headers[section.key] = head
-        for key in section.keys:
-            item = kit.NavItem(self._nav_inner, text=VIEW_TITLES[key],
-                               icon=NAV_ICONS.get(key, "dot"), ground=ground,
+        for key, label, icon, badge in items:
+            item = kit.NavItem(self._nav_inner, text=label, icon=icon, count=badge,
+                               ground=ground,
                                command=lambda name=key: self.show_view(name))
             item.pack(fill="x", pady=1)
             self._nav_buttons[key] = item
@@ -705,7 +778,7 @@ class DesktopApp:
     def _bind_keys(self) -> None:
         self._root.bind("<F5>", lambda _e: self.refresh())
         # B5：13 个视图全部可键盘直达（Ctrl+1…9 / Ctrl+Shift+1…4）+ 前后循环兜底
-        for sequence, key in view_shortcut_bindings():
+        for sequence, key in view_shortcut_bindings(keys=self._ia_order):
             self._root.bind(sequence, lambda _e, name=key: self.show_view(name))
         self._root.bind("<Control-Prior>", lambda _e: self._step_view(-1))
         self._root.bind("<Control-Next>", lambda _e: self._step_view(1))
@@ -715,18 +788,29 @@ class DesktopApp:
     def _step_view(self, step: int) -> None:
         """Ctrl+PageUp/PageDown：按 IA 顺序前后切（13 个视图循环，不依赖键盘布局）。"""
         try:
-            key = self._controller.next_view(int(step)).key
+            current = self._ia_order.index(self._controller.view)
+            key = self._ia_order[(current + int(step)) % len(self._ia_order)]
         except Exception:                            # pragma: no cover - 控制器异常
             return
         self.show_view(key)
 
     # ── 渲染
     def show_view(self, key: str) -> View:
-        """切视图并立即完成布局（截图脚本依赖这一点）。"""
-        try:
-            view = self._controller.show(key)
-        except ValueError:
+        """切视图并立即完成布局（截图脚本依赖这一点）。
+
+        IA 注册表里还没有渲染实现的页 → 占位空态（可点、可截图、不崩）；
+        完全未知的 key → 回到当前页（与 0.3.4 的 ``ValueError`` 行为一致）。
+        """
+        route, payload = route_for(key, VIEW_TITLES)
+        if route == "unknown":
             return self._controller.current()
+        if route == "placeholder":
+            view = placeholder_view(payload)
+        else:
+            try:
+                view = self._controller.show(key)
+            except ValueError:                       # pragma: no cover - 与 route 双保险
+                return self._controller.current()
         self._render(view)
         self._sync_nav(key)
         self._update_status()
@@ -997,7 +1081,7 @@ class DesktopApp:
         value = str(self._nav_combo.get() or "")
         if "·" in value:
             index = value.split("·", 1)[0].strip()
-            for position, key in enumerate(VIEW_KEYS, start=1):
+            for position, key in enumerate(self._ia_order, start=1):
                 if str(position) == index:
                     self.show_view(key)
                     return
@@ -1008,8 +1092,8 @@ class DesktopApp:
         combo = getattr(self, "_nav_combo", None)
         if combo is not None:
             try:                                           # 窄窗下拉与侧栏保持同一状态
-                index = VIEW_KEYS.index(key) + 1
-                combo.set(str(index) + " · " + VIEW_TITLES[key])
+                index = self._ia_order.index(key) + 1
+                combo.set(str(index) + " · " + ia.page(key).title)
             except Exception:                              # pragma: no cover - 视图名变了
                 pass
 
@@ -1069,8 +1153,14 @@ class DesktopApp:
         self._snapshot_label.configure(text="数据截至 " + stamp)
 
     def _status_line(self) -> str:
-        """状态条左侧消息：窄窗只留前两段（否则会挤到右侧的 GPU/版本上去）。"""
+        """状态条左侧消息：窄窗只留前两段（否则会挤到右侧的 GPU/版本上去）。
+
+        ``DJB_UI_IA`` 写了但没识别（``ia.ignored``）时追加一句：不静默当默认。
+        """
         line = sync_shortcut_hint(self._controller.status_line())
+        decision = getattr(self, "_ia", None)
+        if decision is not None and getattr(decision, "ignored", False):
+            line = line + " · DJB_UI_IA=" + str(decision.raw) + " 未识别，已按 share 生效"
         if not getattr(self, "_narrow", False):
             return line
         parts = [part.strip() for part in line.split("·") if part.strip()]
@@ -1143,7 +1233,7 @@ class DesktopApp:
         self._clear()
         self._view_title.configure(text=view.title)
         self._set_font(self._page_kicker,
-                       PAGE_KICKERS.get(view.key, view.key.upper()), kit.px("micro"))
+                       self._ia_kickers.get(view.key, view.key.upper()), kit.px("micro"))
         pad = (12, 6) if self._rendered_narrow else (26, 6)
         self._content_pad = pad
         body = tk.Frame(self._content, background=dual.color("bg"), bd=0, highlightthickness=0)

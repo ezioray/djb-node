@@ -73,8 +73,8 @@ VIEW_TITLES: dict[str, str] = {
 class NavSection:
     """侧栏分组（IA 的中间层）：一个使用场景 = 一段连续视图。
 
-    渲染层只按 :data:`NAV_SECTIONS` 排侧栏，不再假设 ``VIEWS`` 是平铺列表；
-    新增/调整视图时改这里一处，顺序、分组头、页头面包屑同时跟着变。
+    **这是 0.3.4 的 4 组基线**：0.3.5 起侧栏由 :mod:`djb_node.desktop.ia` 驱动
+    （``DJB_UI_IA=legacy`` 才回到本表），此处仅作回滚/对照保留，不要再往这里加视图。
     """
 
     #: 组 key（英文小写，给测试/样式用）

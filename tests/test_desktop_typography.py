@@ -236,7 +236,8 @@ def test_kit_styles_fonts_survive_garbage_collection():
 
 @needs_tk
 def test_ttk_fonts_are_the_ramp_sizes():
-    """§2.4 的硬数字：Treeview 11 / Heading 10 bold / Entry·Combobox·Button·Scrollbar 12。"""
+    """§2.4 的硬数字（0.3.5 设计值）：Treeview **12**（table）/ Heading **12** bold（small）/
+    Entry·Combobox·Button·Scrollbar 12（``small`` 设计值 12.5，按 0.3.4 的 ``round()`` 渲染 12）。"""
     from tkinter import ttk
 
     from djb_node.desktop import ui_kit
@@ -246,8 +247,8 @@ def test_ttk_fonts_are_the_ramp_sizes():
         style = ui_kit.apply_kit_styles(root, ttk)
         fonts = ui_kit.fonts_for(root)
         expect = {
-            "Treeview": ("table", -11, "normal"),
-            "Treeview.Heading": ("heading", -10, "bold"),
+            "Treeview": ("table", -12, "normal"),
+            "Treeview.Heading": ("heading", -12, "bold"),
             "TEntry": ("small", -12, "normal"),
             "TCombobox": ("small", -12, "normal"),
             "TButton": ("small", -12, "normal"),
@@ -271,7 +272,7 @@ def test_ttk_fonts_are_the_ramp_sizes():
 
 @needs_tk
 def test_default_font_option_points_at_the_named_body_font():
-    """§2.4：``option_add("*Font")`` 指向 ``DJB.Body``（13px），不再是 11pt 点值。"""
+    """§2.4：``option_add("*Font")`` 指向 ``DJB.Body``（**14px**，0.3.5 设计值），不再是 11pt 点值。"""
     import tkinter as tk
     from tkinter import ttk
 
@@ -283,7 +284,7 @@ def test_default_font_option_points_at_the_named_body_font():
         fonts = ui_kit.fonts_for(root)
         label = tk.Label(root, text="正文")
         assert str(label.cget("font")) == "DJB.Body", label.cget("font")
-        assert _configured_px(root, "DJB.Body") == -13
+        assert _configured_px(root, "DJB.Body") == -14
         assert fonts.named["body"].actual("family") == fonts.sans_family
     finally:
         root.destroy()
@@ -309,13 +310,13 @@ def test_kit_fonts_win_over_the_gui_theme_point_sizes():
         assert str(before.cget("font")) != "DJB.Body"
         ui_kit.apply_kit_styles(root, ttk)
         assert str(tk.Label(root, text="正文").cget("font")) == "DJB.Body"
-        assert _configured_px(root, "DJB.Body") == -13
+        assert _configured_px(root, "DJB.Body") == -14
         # 换肤会再写一次点值 —— 这就是「换肤后要重新 apply_kit_styles」的原因
         dual.apply(root, ttk, "night")
         assert str(tk.Label(root, text="正文").cget("font")) != "DJB.Body"
         ui_kit.apply_kit_styles(root, ttk)
         assert str(tk.Label(root, text="正文").cget("font")) == "DJB.Body"
-        assert _configured_px(root, "DJB.Body") == -13
+        assert _configured_px(root, "DJB.Body") == -14
     finally:
         root.destroy()
 

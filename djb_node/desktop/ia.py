@@ -5,9 +5,9 @@
 §4 兼容（视图 key 不变、``DJB_UI_IA=legacy`` 回旧顺序）、§5 量化验收。
 
 **本轮只落数据 + 纯函数**：:mod:`djb_node.desktop.views` 一个字节不动，
-``NAV_SECTIONS`` 仍是 0.3.4 的 4 组 ⇒ 侧栏外观、截图基线、13 个视图投影全不变；
-接线（侧栏渲染改读本模块）属于 T4，届时删掉 ``views.NAV_SECTIONS`` 改从
-:func:`nav_sections` 取即可，回滚键是 ``DJB_UI_IA=legacy``。
+**接线状态（第三轮，已接）**：``app.py`` 的侧栏 / ``Ctrl+1…9`` / 窄窗下拉 / 页头眉标
+全部由本模块驱动（``app.nav_plan`` / ``nav_order`` / ``nav_kicker`` / ``nav_combo_values``）；
+``views.NAV_SECTIONS`` 只作为 **0.3.4 回滚基线**保留，回滚键是 ``DJB_UI_IA=legacy``。
 
 5 组方案 A（§2 逐字誊写）
 ==========================
