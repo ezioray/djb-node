@@ -3,6 +3,54 @@
 > 规则：同一 MAJOR 内只加不改；破坏性变更走 MAJOR 并提前 ≥90 天通告。
 > 每条必须写全：版本 / 日期 / 类型 / 影响面 / 兼容矩阵 / 复核人。
 
+## 1.11.0 · 2026-11-12 · MINOR（路由型 + Anthropic 兼容面 + 供方按模型申报）
+
+**版本 / 日期 / 类型**：1.11.0 · 2026-11-12 · MINOR。
+规模：**275 路径 / 323 操作 / 392 schema**（较 1.10.0 加 4 路径 / 5 操作 / 14 schema；
+全部为新增，既有 path / operation / 字段零删改）。
+
+**影响面**（全部加性，缺省行为 = 1.10.0）：
+
+1. `POST /v1/chat/completions`：新增可选请求字段 `djb_route`（`cheap|fast|reliable|balanced`
+   或 `{strategy: ...}`，缺省 `balanced`；只在 `model: djb/auto` 时有意义）。`djb/auto`
+   为新增保留 slug（开关 `gateway.routed_models` 默认关）：开关关时 404/40401，绝不静默
+   改单模型；开关开时从 M04 目录取候选，空候选 fail-closed 503/50901；新增
+   `X-DJB-Route*` 诊断头（不含价格 / 节点 / 内部成本）。组合降级不再静默：补登
+   `X-DJB-Composition-Downgraded-From` + 新增 `X-DJB-Degraded: 1` 与
+   `error.djb_composition_downgraded_from`。
+2. `GET /v1/models`：`Model` 新增可选 `kind`（`chat|image|video`，缺失不猜）与
+   `call_modes`（`single` / `routed`，真实模型恒 `["single"]`）；开关打开时末尾追加
+   `djb/auto`（`kind=chat`、`call_modes=["routed"]`）。
+3. **新增 `POST /v1/messages`**（Anthropic Messages 兼容面，开关
+   `gateway.anthropic_messages` 默认关；关闸时 404，与 1.10.0 逐字节一致）：
+   支持 `x-api-key` 与 Bearer 双鉴权、`stream=true` 的 6 类 Anthropic SSE 事件；
+   `cache_control` / `top_k` 剥离并在 `x-djb-ignored-fields` 留痕，`tools` / `thinking`
+   按 16-ANTHROPIC-COMPAT-DECISIONS 返回 400；错误用 Anthropic envelope。
+   新增 1 个 securityScheme（`AnthropicApiKey`）与 6 个 schema。
+4. **新增供方按模型申报 3 路径 / 4 操作**（开关 `scheduling.model_bid.provider` /
+   `scheduling.model_bid.recommend` 默认关）：
+   `GET /api/v1/user/provider/ask-settings`、
+   `GET|PUT /api/v1/user/provider/ask-settings/{model}`、
+   `GET /api/v1/user/provider/recommended-prices/{model}`；新增 8 个 schema
+   （`ProviderAskSetting*` / `Recommendation*` / `MarketQuote` / `BaselineBand` /
+   `EffectivePrice`）。推荐值只读、显式 adopt 才落库；`enabled=false` = 撤单。
+
+**兼容矩阵**：
+- 旧客户端：未知字段 / 头按 tolerant reader 忽略；单模型请求与 1.10.0 逐字节一致
+  （开关默认关；回归用例覆盖）。
+- 新客户端：以 `call_modes` 判断 `djb/auto`；以 `X-DJB-Route-*` 做诊断，必须容忍缺失
+  与未知 reason；Anthropic 客户端按官方 SDK 读取 `request-id` / SSE 事件。
+- SDK 生成器：无破坏性变化；`djb_route` 为 `oneOf`（string / object），只支持单类型时
+  按 string 处理；`/v1/messages` 与供方端点均为新增 operation。
+
+**复核**：routing / anthropic / provider 三份实现报告与 spec delta 见
+`reports/CLIENT-UX-20261112/impl/`（`ROUTING-IMPL.md`、`ANTHROPIC-IMPL.md`、
+`PROVIDER-BIDS-IMPL.md` 及对应 `*-SPEC-DELTA.yaml`）。本工作区不 push、不部署；
+推送 / 发布由 release-manager 在批准窗口内执行。
+
+> 注：本副本自 1.8.1 之后未收录 1.9.0 / 1.10.0 条目（历史缺口，非本次改动引入）；
+> 1.11.0 的计数以当前 `spec/openapi.yaml` 实测为准（275 / 323 / 392）。
+
 ## 1.10.0 · 2026-11-12 · MINOR（只加：RC10 每模型开通 + 出价 4 个操作 / 3 个 schema）
 
 **版本 / 日期 / 类型**：1.10.0 · 2026-11-12 · MINOR（+4 操作 / +3 path 模板 / +3 schema，既有字段 0 改动）。
