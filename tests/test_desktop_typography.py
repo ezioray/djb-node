@@ -261,11 +261,40 @@ def test_ttk_fonts_are_the_ramp_sizes():
             assert _configured_px(root, spec) == px, (name, _configured_px(root, spec))
             actual = root.tk.call("font", "actual", spec)
             assert weight in tuple(actual), (name, actual)
-        # 行高按裁决保持 26
-        assert int(style.lookup("Kit.Treeview", "rowheight")) == 26
+        # 行高已接 typography.table 的行盒 28（0.3.4 写死 26）
+        assert int(style.lookup("Kit.Treeview", "rowheight")) == 28
         # 表头必须是 sans（不许再给 heading 单独 mono）
         assert style.lookup("Kit.Treeview.Heading", "font") == fonts.named_name("heading")
         assert fonts.named["heading"].actual("family") == fonts.sans_family
+    finally:
+        root.destroy()
+
+
+@needs_tk
+def test_treeview_row_holds_the_glyphs_without_clipping():
+    """行高 28 要**真的**容得下 table 字号的字形（不是只看常量）：linespace ≤ 行高 - 6。"""
+    from tkinter import ttk
+
+    from djb_node.desktop import ui_kit
+
+    root = _new_root()
+    try:
+        style = ui_kit.apply_kit_styles(root, ttk)
+        fonts = ui_kit.fonts_for(root)
+        row = int(style.lookup("Kit.Treeview", "rowheight"))
+        space = int(root.tk.call("font", "metrics", fonts.named_name("table"), "-linespace"))
+        assert row == ui_kit.table_rowheight(fonts.scale) == 28
+        assert space <= row - 6, (space, row)          # 上下各留 ≥3px，不贴边
+        tree = ttk.Treeview(root, style="Kit.Treeview", columns=("tokens",),
+                            show="tree headings", height=3)
+        tree.heading("#0", text="收据")
+        tree.insert("", "end", iid="i1", text="rcpt_0001", values=("1,500",))
+        tree.pack(fill="both", expand=True)
+        root.update_idletasks()
+        x, y, width, height = tree.bbox("i1")
+        assert height == row, (height, row)            # 项高 == 行高：没被压扁
+        assert width > 0 and tree.identify_row(y + 1) == "i1"   # 行内可命中，没裁掉
+        assert tree.identify_column(x + width - 2) in ("#1", "#0")
     finally:
         root.destroy()
 

@@ -28,6 +28,12 @@
 把它落成本模块的一张数据表，才能在不改代码的前提下回滚——否则「回滚」只是文档上的字。
 :data:`IA_SECTIONS_LEGACY` 与 0.3.4 的 ``views.NAV_SECTIONS`` 逐项一致，
 ``tests/test_desktop_ia_registry.py`` 会断言这一点（漂移即红）。
+
+⚠️ **legacy 表只用于回滚，不参与合规判定**：``violations(IA_SECTIONS_LEGACY)`` 会返回
+**6 条「不合规」**（4 条注册表 section 与分组表不一致 + 首组首项不是 ``token_plan`` +
+GPU 在第 3 项），那是**故意的**——它就是 0.3.4 的原样，用来兜「回滚到旧顺序」这条退路。
+合规口径只对 :data:`IA_SECTIONS_SHARE`（``violations()`` 默认参数）生效，且必须为 0 条；
+下位复核看到 legacy 那 6 条不要当成 IA 实现有 bug。
 """
 from __future__ import annotations
 

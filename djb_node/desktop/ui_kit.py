@@ -48,8 +48,18 @@ __all__ = [
 # ``tests/test_desktop_px_wiring.py``（那里是 0.3.4 口径的唯一边界）。
 #
 # 两条例外（裁决与理由见 ``reports/RM-20261113/M1-PROGRESS.md`` §8）：
-#   * **表格**：0.3.4 是 11px 特例，现并入 ``table``（12px；行高 28 **待接**，当前 ``rowheight`` 仍 26）；
+#   * **表格**：0.3.4 是 11px 特例，现并入 ``table``（12px；行高 28 已接 ``rowheight``）；
 #   * **mono**：0.3.4 **没有**对应档位（当时等宽借微标 10px），现在 ``mono`` 是独立 token（12px）。
+def table_rowheight(scale: float = 1.0) -> int:
+    """表格行高（``ttk.Treeview`` 的 ``rowheight``）= ``typography.table`` 的行盒高度 28。
+
+    0.3.4 写死 26（当时字号 11）；0.3.5 的 ``table`` 是 12px / 行高 28（01-FONT-TYPO §2.3），
+    行盒与字号同源 ⇒ 不会出现「字号涨了行高没涨、下沿被裁」。取整与字号同一条规则
+    （``typography.round_px``，继承 0.3.4 的 ``int(round(...))``），所以 100%/125% 各档一致。
+    """
+    return typography.scaled_line("table", scale)
+
+
 def px(name: str) -> float:
     """按档位名取设计字号（px@96dpi）。渲染层取字号的**唯一**入口。"""
     return typography.px(name)
@@ -1082,7 +1092,7 @@ def apply_kit_styles(root: Any, ttk: Any) -> Any:
     style.configure("Kit.Treeview", background=theme.color("surface"),
                     fieldbackground=theme.color("surface"),
                     foreground=theme.color("ink2"), font=fonts.named_name("table"),
-                    rowheight=26, borderwidth=0, relief="flat")
+                    rowheight=table_rowheight(fonts.scale), borderwidth=0, relief="flat")
     style.map("Kit.Treeview",
               background=[("selected", theme.color("violet3"))],
               foreground=[("selected", theme.color("violet_text"))])
