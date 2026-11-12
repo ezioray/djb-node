@@ -26,6 +26,19 @@ from tests.update_fixtures import build_manifest, use_test_anchor
 REPO = Path(__file__).resolve().parent.parent
 
 
+def _head_sha() -> str:
+    """pkgbuild 的 --sha 自 0.3.5 起必填且要 40 位全 sha（P2）。"""
+    return subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"],
+                                   text=True).strip()
+
+
+def _pkg_env() -> dict:
+    """pkgbuild 自 0.3.5 起拒绝无 SOURCE_DATE_EPOCH 的构建（P1 复核修）：测试按提交时间给。"""
+    epoch = subprocess.check_output(
+        ["git", "-C", str(REPO), "show", "-s", "--format=%ct", "HEAD"], text=True).strip()
+    return {**os.environ, "SOURCE_DATE_EPOCH": epoch}
+
+
 # ─────────────────────────────────────────────────────────── 通道表本身
 def test_five_channels_are_explicit_and_point_to_one_manifest():
     channels = update_source.channels()
@@ -219,8 +232,8 @@ def test_update_status_reports_source_kind_and_origin(paths, store) -> None:
 def _pkgbuild_plan(tmp_path: Path, kind: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(REPO / "ci" / "pkgbuild.py"), "--kind", kind,
-         "--plan", "--out", str(tmp_path / "pkg")],
-        cwd=str(REPO), capture_output=True, text=True, timeout=120)
+         "--plan", "--out", str(tmp_path / "pkg"), "--sha", _head_sha()],
+        cwd=str(REPO), capture_output=True, text=True, timeout=120, env=_pkg_env())
 
 
 @pytest.mark.parametrize("kind,channel", [
@@ -241,8 +254,8 @@ def test_pkgbuild_refuses_release_surface(tmp_path) -> None:
     target = REPO.parent / "ops" / "rc" / "artifacts" / "downloads"
     result = subprocess.run(
         [sys.executable, str(REPO / "ci" / "pkgbuild.py"), "--kind", "linux-src",
-         "--plan", "--out", str(target)],
-        cwd=str(REPO), capture_output=True, text=True, timeout=120)
+         "--plan", "--out", str(target), "--sha", _head_sha()],
+        cwd=str(REPO), capture_output=True, text=True, timeout=120, env=_pkg_env())
     assert result.returncode == 2
     assert "发布面" in result.stderr
 
@@ -250,8 +263,8 @@ def test_pkgbuild_refuses_release_surface(tmp_path) -> None:
 def test_windows_assets_carry_explicit_source(tmp_path) -> None:
     result = subprocess.run(
         [sys.executable, str(REPO / "ci" / "pkgbuild.py"), "--kind", "windows-assets",
-         "--out", str(tmp_path / "out")],
-        cwd=str(REPO), capture_output=True, text=True, timeout=300)
+         "--out", str(tmp_path / "out"), "--sha", _head_sha()],
+        cwd=str(REPO), capture_output=True, text=True, timeout=300, env=_pkg_env())
     assert result.returncode == 0, result.stdout + result.stderr
     stem = re.search(r"BUILD_RESULT (\{.*\})", result.stdout)
     assert stem, result.stdout
@@ -275,8 +288,8 @@ def test_machine_room_offline_package_declares_source(tmp_path) -> None:
     """机房离线包：manifest.json / config.template.json 都必须显式写出 update_source。"""
     result = subprocess.run(
         [sys.executable, str(REPO / "ci" / "pkgbuild.py"),
-         "--kind", "machine-room-offline", "--out", str(tmp_path / "out")],
-        cwd=str(REPO), capture_output=True, text=True, timeout=900)
+         "--kind", "machine-room-offline", "--out", str(tmp_path / "out"), "--sha", _head_sha()],
+        cwd=str(REPO), capture_output=True, text=True, timeout=900, env=_pkg_env())
     assert result.returncode == 0, (result.stdout + result.stderr)[-2500:]
     payload = json.loads(re.search(r"BUILD_RESULT (\{.*\})", result.stdout).group(1))
     assert payload["manifest_update_source"] == update_source.MANIFEST_URL

@@ -176,8 +176,21 @@ jobs:
         with: { python-version: '3.11' }
       - name: 装构建后端（wheel 构建用；运行时不依赖）
         run: pip -q install build wheel setuptools
+      # 0.3.5（B-PREP P1/P2）：--sha 必填 40 位；SOURCE_DATE_EPOCH 钉住 built_at/成员 mtime，
+      # 重跑同 commit 必须得同 sha。用 commit 自己的 committer time，不取 pipeline 墙钟。
+      # BUILD_SHA：PR 事件下 github.sha 是 **merge commit**（refs/pull/N/merge），拿它当 --sha
+      # 会把 provenance 写成没进过任何分支的合成提交 ⇒ 优先取 PR head.sha，push/tag 才用 github.sha。
+      # 注：fork PR 若 head.sha 不在 checkout 的图里，`git show` 会失败、但 echo 本身仍 rc=0，
+      # 写进 GITHUB_ENV 的是**空值**；真正拦住的是下一步构建——--sha 收到空串 ⇒ rc=2 拒绝
+      # （fail-closed，不会静默写错 provenance）。
+      - name: 固定构建时间戳（可复现构建）
+        env:
+          BUILD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${BUILD_SHA}")" >> "$GITHUB_ENV"
       - name: 构建 ${{ matrix.kind }}
-        run: python ci/pkgbuild.py --kind ${{ matrix.kind }} --out dist
+        env:
+          BUILD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python ci/pkgbuild.py --kind ${{ matrix.kind }} --out dist --sha "${BUILD_SHA}"
       - name: 制品自检（包内自洽 + 显式 update_source）
         run: python ci/check_pkg_manifest.py --pkg-dir dist --require ${{ matrix.kind }}
       - name: 上传制品
