@@ -341,8 +341,9 @@ class DesktopApp:
         self._fonts = kit.fonts_for(self._root, scale=self._scale)
         kit.apply_kit_styles(self._root, self._ttk)
         if self._scale != 1.0:
-            try:                                   # 行高跟着字号一起放大（26 → 32@125%）
-                self._ttk.Style().configure("Kit.Treeview", rowheight=self._px(26))
+            try:                                   # 行高跟着字号一起放大（28 → 35@125%）；口径同 ui_kit.table_rowheight
+                self._ttk.Style().configure(
+                    "Kit.Treeview", rowheight=kit.table_rowheight(self._scale))
                 # 必须从**基常量**派生：原地写 self._px(NavItem.HEIGHT) 会让类属性
                 # 每开一个窗口就再乘一次 scale（34→35→36→…），同进程第二个窗口起布局漂移。
                 kit.NavItem.HEIGHT = self._px(kit.NAV_ITEM_HEIGHT)

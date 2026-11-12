@@ -23,6 +23,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pathlib
+
 import pytest
 
 from djb_node.desktop import typography as T
@@ -264,3 +266,42 @@ def test_renderer_has_no_numeric_font_size_literal():
                     and not isinstance(first.value, bool):
                 offenders.append(f"{path.name}:{node.lineno} {name}({first.value})")
     assert not offenders, "渲染层出现数字字号字面量：" + "; ".join(offenders)
+
+
+# ── 表格行高（0.3.4 写死 26 → typography.table 的 28）
+def test_table_rowheight_is_the_table_line_of_28():
+    """``rowheight`` 不再是 26：等于 ``typography.table`` 的行盒 28。"""
+    assert ui_kit.table_rowheight(1.0) == 28
+    assert ui_kit.table_rowheight(1.0) == T.scaled_line("table", 1.0)
+    assert T.token("table").line == 28.0 and T.token("table").px == 12.0
+
+
+def test_table_rowheight_follows_every_scale_with_the_same_rounding():
+    """0.80–1.60 全档：行高 == ``scaled_line("table")``（与字号同一条取整规则）。"""
+    for scale in SCALES:
+        assert ui_kit.table_rowheight(scale) == T.scaled_line("table", scale)
+    assert ui_kit.table_rowheight(1.25) == 35              # 28 × 1.25，且 ≠ 0.3.4 的 26
+    assert ui_kit.table_rowheight(0.9) == 25
+
+
+def test_table_rowheight_leaves_room_for_the_glyphs():
+    """不裁字：行高 ≥ 1.5× 字号（且 ≥ 字号 + 8px 上下留白），全档成立。"""
+    for scale in SCALES:
+        row = ui_kit.table_rowheight(scale)
+        px = T.scaled_px("table", scale)
+        assert row >= px + 8, (scale, row, px)
+        assert row >= int(px * 1.5), (scale, row, px)
+        assert T.scaled_line("table", scale) == T.round_px(T.token("table").line * scale)
+
+
+def test_no_rowheight_literal_left_in_the_renderer():
+    """渲染层不许再有裸的行高字面量（26 / 28 都只能来自 ``table_rowheight``）。"""
+    import inspect
+    for module in (ui_kit,):
+        source = inspect.getsource(module)
+        assert "rowheight=26" not in source
+        assert "rowheight=28" not in source
+    app_source = pathlib.Path(ui_kit.__file__).with_name("app.py").read_text()
+    assert "rowheight=self._px(26)" not in app_source
+    assert "rowheight=self._px(28)" not in app_source
+    assert "rowheight=kit.table_rowheight(self._scale)" in app_source
