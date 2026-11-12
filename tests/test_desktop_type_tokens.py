@@ -149,11 +149,18 @@ def test_readability_presets_match_the_design():
     assert T.READABILITY_PRESETS == {"compact": 0.9, "standard": 1.0, "large": 1.15}
 
 
-def test_scaled_px_rounds_half_up_not_bankers():
-    """12.5 必须变 13（``round(12.5) == 12`` 会让 small 掉回 0.3.4 的值）。"""
-    assert T.scaled_px("small", 1.0) == 13
+def test_scaled_px_rounds_exactly_like_0_3_4():
+    """取整继承 0.3.4 的 ``int(round(...))``（银行家舍入）——**外观零变化优先**。
+
+    所以 ``small`` 的设计值 12.5 在 1.0 档下渲染仍是 **12**（与 0.3.4 的 12 一致），
+    设计值不回退；要「靠取整把 12.5 抬成 13」会牵连 ``display``@1.15 / ``h1``@1.25
+    两处旧值（34/22 会变 35/23），不可接受，见
+    ``tests/test_desktop_px_wiring.py::test_rounding_matches_0_3_4_at_every_scale``。
+    """
+    assert T.scaled_px("small", 1.0) == 12            # 12.5 → round → 12（= 0.3.4）
     assert T.scaled_px("body", 1.0) == 14
-    assert T.scaled_px("body", 1.25) == 18            # 17.5 → 18
+    assert T.scaled_px("body", 1.25) == 18            # 17.5 → 18（偶数侧）
+    assert T.scaled_px("display", 1.15) == 34         # 34.5 → 34（0.3.4 同值）
     assert T.scaled_px("small", 1.15) == 14           # 14.375 → 14
     assert T.scaled_line("body", 1.25) == 28          # 27.5 → 28
 

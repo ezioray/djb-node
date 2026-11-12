@@ -48,7 +48,7 @@ __all__ = [
 # ``tests/test_desktop_px_wiring.py``（那里是 0.3.4 口径的唯一边界）。
 #
 # 两条例外（裁决与理由见 ``reports/RM-20261113/M1-PROGRESS.md`` §8）：
-#   * **表格**：0.3.4 是 11px 特例，现并入 ``table``（12px；行高 28 兼 Treeview rowheight）；
+#   * **表格**：0.3.4 是 11px 特例，现并入 ``table``（12px；行高 28 **待接**，当前 ``rowheight`` 仍 26）；
 #   * **mono**：0.3.4 **没有**对应档位（当时等宽借微标 10px），现在 ``mono`` 是独立 token（12px）。
 def px(name: str) -> float:
     """按档位名取设计字号（px@96dpi）。渲染层取字号的**唯一**入口。"""
@@ -118,8 +118,10 @@ class Fonts:
     def px(self, value: float) -> int:
         """设计 px → 实际整数 px（乘 ``scale``，至少 1）。
 
-        取整**统一走** :func:`typography.round_px`（半进位）：Tk 只认整数像素字号，
-        各处各自 ``round()`` 会让 ``small``（12.5）在不同调用点得到 12 或 13 两种值。
+        取整**统一走** :func:`typography.round_px`，它继承 0.3.4 的 ``int(round(...))``
+        （银行家舍入）：Tk 只认整数像素字号，而且换一套取整会在 ``.5`` 边界上改外观
+        （``display``@1.15：34.5 → 34，不是 35）。逐档等价见
+        ``tests/test_desktop_px_wiring.py::test_rounding_matches_0_3_4_at_every_scale``。
         """
         return typography.round_px(float(value) * self.scale)
 

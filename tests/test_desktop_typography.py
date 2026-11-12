@@ -378,8 +378,8 @@ def test_scale_hook_multiplies_px_and_defaults_to_one():
         assert base.px(ui_kit.px("h1")) == 18
         assert _configured_px(root, base.sans(ui_kit.px("h1"))) == -18
         scaled = ui_kit.Fonts(root, scale=1.25)
-        assert scaled.px(ui_kit.px("h1")) == 23          # 18 × 1.25 = 22.5 → 半进位 23
-        assert _configured_px(root, scaled.sans(ui_kit.px("h1"))) == -23
+        assert scaled.px(ui_kit.px("h1")) == 22          # 18 × 1.25 = 22.5 → round() 22（0.3.4 同）
+        assert _configured_px(root, scaled.sans(ui_kit.px("h1"))) == -22
         # 非法注入不静默缩成 0
         assert ui_kit.Fonts(root, scale=0).scale == 1.0
         assert ui_kit.Fonts(root, scale=-2).scale == 1.0

@@ -25,7 +25,8 @@
    （:func:`assert_text_ok` 会抛 :class:`TypographyError`，不做静默降级）。
 
 行高口径：``line`` 是**行盒高度**（px@96dpi，实际乘 ``scale``）；``table`` 这一档的 ``line``
-兼作 ``ttk.Treeview`` 的 ``rowheight``（01-FONT-TYPO §2.3），因此它比同字号文本高。
+（28）设计上兼作 ``ttk.Treeview`` 的 ``rowheight``（01-FONT-TYPO §2.3），但**待接**：
+当前 ``rowheight`` 仍硬编码 26（`app.py:275`），本轮字号接线未动它。
 """
 from __future__ import annotations
 
@@ -230,13 +231,20 @@ def resolve_scale(*, env: object = None, prefs: object = None,
 
 
 def round_px(value: float) -> int:
-    """四舍五入到整像素、至少 1（12.5 → 13）。**不用 Python 的 banker's rounding**：
-    ``round(12.5) == 12`` 会让 small 掉回 0.3.4 的值，字阶差就白设计了。
+    """设计 px → 实际整数 px（至少 1）：**与 0.3.4 逐档等价**，用 ``round()``。
 
-    渲染层（``ui_kit.Fonts.px``）也必须走这里：Tk 只认整数像素字号，若各处各自
-    ``round()``，同一档会在不同调用点算出 12/13 两种值。
+    为什么不用 ``floor(x + 0.5)``（半进位）：Tk 只认整数像素，换一套取整就会在 ``.5``
+    边界上悄悄改外观 —— ``display`` @1.15（34.5：0.3.4 → **34**，半进位 → 35）、
+    ``h1`` @1.25（22.5：0.3.4 → **22**，半进位 → 23）。0.3.4 的 ``ui_kit.Fonts.px``
+    就是 ``int(round(float(v) * scale))``（Python 的银行家舍入），这里**原样继承**，
+    并由 ``tests/test_desktop_px_wiring.py::test_rounding_matches_0_3_4_at_every_scale``
+    在 0.80–1.60 逐点钉住。
+
+    副作用（已在 M1-PROGRESS §9.7 记录）：``small`` 的设计值是 12.5，但 1.0 档下
+    ``round(12.5) == 12`` ⇒ 渲染与 0.3.4 完全一致。**设计值保留 12.5，渲染值由本函数派生**，
+    不为「让 12.5 变成 13」而改取整语义。
     """
-    return max(1, int(math.floor(float(value) + 0.5)))
+    return max(1, int(round(float(value))))
 
 
 def scaled_px(name: str, scale: float = DEFAULT_SCALE) -> int:

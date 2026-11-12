@@ -15,8 +15,8 @@
 3. **两条例外显式断言**：``PX_TABLE`` 11 → ``table`` 12（0.3.4 的表格特例档并入正表），
    ``mono`` 无 0.3.4 对应（当时等宽借微标 10px，现在独立 12px）。
 
-另附三条守门：角色字体派生（``ROLE_FONTS``）、Tk 取整（12.5 → 13 而不是 12）、
-渲染层不许出现数字字号字面量（AST 扫描 ``djb_node/desktop/*.py``）。
+另附守门：角色字体派生（``ROLE_FONTS``）、**取整公式与 0.3.4 在 0.80–1.60 全档逐点等价**
+（属性测试，回退成半进位即红）、渲染层不许出现数字字号字面量（AST 扫描）。
 """
 from __future__ import annotations
 
@@ -157,15 +157,93 @@ def test_role_fonts_are_derived_from_typography():
     assert Fonts.ROLE_FONTS["heading"] == ("sans", T.px("small"), True)
 
 
-def test_fonts_px_rounds_half_up_so_small_really_is_13():
-    """Tk 只认整数字号：``small`` 12.5 必须变 13（``round(12.5)`` 会给 12，等于没接线）。"""
-    fonts = ui_kit.Fonts.__new__(ui_kit.Fonts)      # 只测纯换算，不建窗口
-    fonts.scale = 1.0
-    assert fonts.px(T.px("small")) == 13
+def _old_px(value: float, scale: float) -> int:
+    """0.3.4 的取整原文（``release/0.3.4-r2 @58dff50`` · ``ui_kit.Fonts.px``）。
+
+    故意**逐字复制**而不是 import：它是历史基线，不能被今天的实现「顺手修好」——
+    一旦这里的副本与 ``ui_kit`` 一起被改，属性测试就失去意义。
+    """
+    return max(1, int(round(float(value) * scale)))
+
+
+#: 0.3.4 的 8 个真值（7 档 + 表格特例）——取整语义按**同一个输入**逐点比
+LEGACY_VALUES: dict[str, float] = {name: value for name, (value, _) in LEGACY_CONSTANTS.items()}
+
+#: 0.80 … 1.60，步长 0.05（17 档）
+SCALES: tuple[float, ...] = tuple(round(0.80 + 0.05 * i, 2) for i in range(17))
+
+
+def _fonts_at(scale: float) -> ui_kit.Fonts:
+    """只测纯换算：绕开 ``__init__``（不需要 Tk 根窗口）。"""
+    fonts = ui_kit.Fonts.__new__(ui_kit.Fonts)
+    fonts.scale = scale
+    return fonts
+
+
+@pytest.mark.parametrize("name", sorted(LEGACY_VALUES))
+def test_rounding_matches_0_3_4_at_every_scale(name):
+    """属性测试：8 个旧值 × 17 个 scale，**旧公式 vs 新公式逐点差必须为 0**。
+
+    为什么会有差：0.3.4 用 ``int(round(x))``（银行家舍入），若换成 ``floor(x+0.5)``
+    （半进位），``.5`` 边界就会各抬 1px —— ``display``@1.15（34.5 → 34 / 35）、
+    ``h1``@1.25（22.5 → 22 / 23）。那不是「外观不变」，是**某个缩放档悄悄变了 1px**。
+    """
+    value = LEGACY_VALUES[name]
+    got = {scale: _fonts_at(scale).px(value) for scale in SCALES}
+    want = {scale: _old_px(value, scale) for scale in SCALES}
+    diff = {scale: (want[scale], got[scale]) for scale in SCALES if want[scale] != got[scale]}
+    assert diff == {}, f"{name} 与 0.3.4 不一致（scale: 旧→新）：{diff}"
+
+
+def test_rounding_property_covers_every_point_and_has_no_blind_spot():
+    """守属性测试本身：17 档 × 8 值 = 136 个点，且两处历史分歧点**确实**在网格里。"""
+    assert len(SCALES) == 17 and SCALES[0] == 0.8 and SCALES[-1] == 1.6
+    assert len(LEGACY_VALUES) == 8
+    assert 1.15 in SCALES and 1.25 in SCALES and 0.85 in SCALES
+    # 分歧点必须落在网格上，否则属性测试会「恰好」绕开它们
+    assert _old_px(30, 1.15) == 34 and _old_px(18, 1.25) == 22
+
+
+def test_the_two_historical_divergence_points_stay_at_0_3_4_values():
+    """点名哨兵：``display``@1.15 = **34**、``h1``@1.25 = **22**（半进位会变 35 / 23）。"""
+    assert _fonts_at(1.15).px(LEGACY_VALUES["PX_DISPLAY"]) == 34
+    assert _fonts_at(1.25).px(LEGACY_VALUES["PX_HERO"]) == 22      # hero 的 0.3.4 值就是 18
+    assert _fonts_at(1.25).px(T.px("h1")) == 22                    # 新档位 18 @1.25 同为 22
+    # 反证：半进位实现会得到什么（证明这条断言确实能抓到回退）
+    assert [int(__import__("math").floor(v * 1.15 + 0.5)) for v in (30,)] == [35]
+    assert [int(__import__("math").floor(v * 1.25 + 0.5)) for v in (18,)] == [23]
+
+
+def test_only_the_two_exceptions_may_differ_from_0_3_4_rendering():
+    """渲染值口径：除 table（并入正表）与 mono（无旧档）外，7 档的**取整语义**必须与旧版一致。
+
+    * ``table``：0.3.4 的 11px 特例并入 12px ⇒ 每个 scale 都不同（**例外①**，有意）；
+    * ``mono``：0.3.4 没有独立档位（借微标 10px）⇒ 无旧基线可对（**例外②**）；
+    * 其余 7 档：设计值可能不同（§9.1 的 delta，属设计变更），但**取整公式**逐点相同。
+    """
+    legacy = {token for _, token in LEGACY_CONSTANTS.values()}
+    assert legacy - {"table"} == set(T.TOKEN_ORDER) - {"mono", "table"}
+    # 例外①：table 的渲染值每个 scale 都比 0.3.4 的 11px 特例大（12 > 11）
+    for scale in SCALES:
+        assert _fonts_at(scale).px(T.px("table")) >= _old_px(11, scale)
+    # 例外②：mono 无 0.3.4 对应
+    assert "mono" not in legacy
+    # 非例外的 7 档：取整公式逐点 0 差（用各自 0.3.4 值比）
+    for legacy_name, (value, token_name) in LEGACY_CONSTANTS.items():
+        if token_name == "table":
+            continue
+        for scale in SCALES:
+            assert _fonts_at(scale).px(value) == _old_px(value, scale), (legacy_name, scale)
+
+
+def test_fonts_px_keeps_the_0_3_4_rounding():
+    """Tk 只认整数字号，取整必须与 0.3.4 同：``small`` 设计值 12.5 在 1.0 档渲染 **12**。"""
+    fonts = _fonts_at(1.0)
+    assert fonts.px(T.px("small")) == 12             # 12.5 → 12（银行家舍入，= 0.3.4）
     assert fonts.px(T.px("body")) == 14
-    fonts.scale = 1.25
-    assert fonts.px(T.px("h1")) == 23                # 18 × 1.25 = 22.5 → 23
-    assert fonts.px(0) == 1                          # 至少 1px
+    assert _fonts_at(1.25).px(T.px("h1")) == 22       # 22.5 → 22（偶数侧）
+    assert _fonts_at(1.15).px(T.px("display")) == 34  # 34.5 → 34
+    assert fonts.px(0) == 1                           # 至少 1px
 
 
 def test_renderer_has_no_numeric_font_size_literal():
