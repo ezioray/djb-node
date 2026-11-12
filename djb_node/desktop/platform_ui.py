@@ -613,7 +613,7 @@ def font_size_arg(px: int, *, scale: float = 1.0, dpi: float = 96.0) -> int:
     ``tk scaling`` 再做一次映射，实际观感必须真机复核（报告里标「未验证」）。
 
     为什么不用 ``tk scaling`` 自己算：那个值要窗口存在才能读，而字号常量在 import 期就要
-    定值（``ui_kit.PX_*``）；把「读 scaling」放进渲染路径会让字体缓存失效、切换屏幕后
+    定值（``ui_kit.px("body")`` 这类档位名）；把「读 scaling」放进渲染路径会让字体缓存失效、切换屏幕后
     不刷新。用它做**一次性校准**是后续工作，不在本轮（见报告 P1 未验证项）。
 
     ``scale`` 是 DPI 缩放倍数（:func:`ui_scale` / :func:`system_scale`）：Tk 的像素字号

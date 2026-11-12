@@ -5,8 +5,9 @@
 §2.2 字阶表 / §2.4 排版规则 / §2.5 可读性三档 / §5 风险（scale 夹取）。
 
 全部是**纯函数断言**，不开窗口（``typography`` 模块不 import tkinter，本文件也不会）。
-0.3.4 的旧断言仍在 ``tests/test_desktop_typography.py``（它钉住 ``ui_kit.PX_*`` 的现值）——
-本轮是**新增** token 模块、不接线，所以那组必须继续全绿：两者同时通过 = 外观零变化。
+0.3.4 的旧断言在 ``tests/test_desktop_typography.py``（T4 起它改为断言「``ui_kit`` 不再有
+字号真值、全部由本模块派生」），旧名 → 档位的映射与两条例外见
+``tests/test_desktop_px_wiring.py``。
 """
 from __future__ import annotations
 
@@ -47,18 +48,24 @@ def test_table_line_is_the_row_height():
     assert T.scaled_line("table", 1.0) == 28
 
 
-def test_delta_against_0_3_4_is_the_intended_one():
-    """相对 0.3.4 的**有意**变更，逐项钉死（防止有人把 +1 改回去或改错方向）。"""
-    from djb_node.desktop import ui_kit
+#: 0.3.4 的字号真值（``ui_kit`` 里已删除，这里作为**历史口径**保留在测试里）。
+#: 顺序即 0.3.4 的字阶；用它算「有意变更」的 delta，防止有人把 +1 改回去或改错方向。
+OLD_0_3_4: dict[str, float] = {
+    "display": 30, "hero": 18, "h1": 19, "h2": 13,
+    "body": 13, "small": 12, "micro": 10, "table": 11,
+}
 
-    assert (ui_kit.PX_DISPLAY, T.px("display")) == (30, 30)          # 不变
-    assert (ui_kit.PX_HERO, T.px("hero")) == (18, 20)                # +2
-    assert (ui_kit.PX_TITLE, T.px("h1")) == (19, 18)                 # -1
-    assert (ui_kit.PX_CARD, T.px("h2")) == (13, 15)                  # +2
-    assert (ui_kit.PX_BODY, T.px("body")) == (13, 14)                # +1
-    assert (ui_kit.PX_SMALL, T.px("small")) == (12, 12.5)            # +0.5
-    assert (ui_kit.PX_MICRO, T.px("micro")) == (10, 11)              # +1（CJK 下限）
-    assert (ui_kit.PX_TABLE, T.px("table")) == (11, 12)              # +1
+
+def test_delta_against_0_3_4_is_the_intended_one():
+    """相对 0.3.4 的**有意**变更，逐项钉死（旧值不再从 ``ui_kit`` 读取）。"""
+    assert T.px("display") == OLD_0_3_4["display"]          # 不变
+    assert T.px("hero") - OLD_0_3_4["hero"] == 2            # 18 → 20
+    assert T.px("h1") - OLD_0_3_4["h1"] == -1               # 19 → 18
+    assert T.px("h2") - OLD_0_3_4["h2"] == 2                # 13 → 15
+    assert T.px("body") - OLD_0_3_4["body"] == 1            # 13 → 14
+    assert T.px("small") - OLD_0_3_4["small"] == 0.5        # 12 → 12.5
+    assert T.px("micro") - OLD_0_3_4["micro"] == 1          # 10 → 11（CJK 下限）
+    assert T.px("table") - OLD_0_3_4["table"] == 1          # 11 → 12（例外①，见 px_wiring）
 
 
 # ────────────────────────────────────────────────────────────── 不变量

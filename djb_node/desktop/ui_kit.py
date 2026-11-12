@@ -19,7 +19,8 @@
 排版（R2 裁决 01-FONT-DECISION）
 ================================
 
-* 字号一律用**负数字号（像素）**：``-13`` = 13px，字阶只有 :data:`PX_*` 那几档。
+* 字号一律用**负数字号（像素）**：``-13`` = 13px；档位只有 :mod:`typography` 那 9 档，
+  取字号一律 :func:`px`（0.3.4 的 ``PX_*`` 常量已删除，见本文件「字阶」一节）。
 * **中文不许进 mono**：要画字符串就调 :meth:`Fonts.for_text`（ASCII → mono，其余 → sans）。
   手写 ``fonts.mono()`` 只允许出现在「确定是 ASCII」的地方（回执号/时间戳/版本/快捷键）。
 * 字重只有 normal / bold；用颜色（``muted_text``）做层级，不靠加粗。
@@ -31,44 +32,27 @@ import tkinter as tk
 from tkinter import font as tkfont
 from typing import Any, Callable, Iterable, Sequence
 
-from . import theme, ui_geom
+from . import theme, typography, ui_geom
 
 __all__ = [
-    "Bars", "Button", "Chip", "Divider", "Fonts", "Gauge", "Icon", "NavItem", "PX_BODY",
-    "PX_BODY_S", "PX_CARD", "PX_CJK_MIN", "PX_DISPLAY", "PX_H1", "PX_HERO", "PX_MICRO",
-    "PX_MICRO_CJK", "PX_NAV", "PX_NUM", "PX_NUM_L", "PX_NUM_XL", "PX_SMALL", "PX_TABLE",
-    "PX_TITLE", "RoundedCard", "SectionHead", "StatCell", "Switch",
-    "apply_kit_styles", "fonts_for",
+    "Bars", "Button", "Chip", "Divider", "Fonts", "Gauge", "Icon", "NavItem", "RoundedCard",
+    "SectionHead", "StatCell", "Switch", "apply_kit_styles", "fonts_for", "px",
 ]
 
-# ── 字阶（px；R2 裁决 01-FONT-DECISION §2.1：只保留 7 档）
+# ── 字阶：**唯一来源**是 :mod:`djb_node.desktop.typography`
 #
-# 下表是**唯一**的字号来源：渲染层不许再写裸数字字号（``sans(14)`` 那种）。
-# 7 档 = 30 / 19 / 18 / 13 / 12 / 10，外加「表格正文 11」这一档**特例**
-# （设计 9px 在 CJK 上糊、10px 又比微标还小，见 01-FONT-DECISION §2.1 末段）。
-# 字重只两档：标题与关键数字 bold，正文/说明/微标 normal（§2.3）。
-PX_DISPLAY = 30     # 仪表环中心大数字                    bold
-PX_TITLE = 19       # 页头标题                            bold
-PX_HERO = 18        # 主卡标题                            bold
-PX_CARD = 13        # 卡片标题 / 关键数值                  bold
-PX_BODY = 13        # 正文                                normal
-PX_SMALL = 12       # 按钮、辅助说明                       normal
-PX_MICRO = 10       # 微标、表头、版本号（含中文也用它，sans）normal / 表头 bold
-PX_TABLE = 11       # 表格正文（特例档；行高 26 不变）      normal
-
-#: 含中文时的**最小**字号：中文在 10px 以下会糊成一团（§1 F1 的根因就是 8px 塞中文）
-PX_CJK_MIN = PX_MICRO
-
-# ── 兼容别名：调用方（app.py / views.py 投影层）不改签名，值收敛到上面 7 档
-PX_H1 = PX_TITLE          # 旧名：页头标题（原 18）
-PX_BODY_S = PX_SMALL      # 旧名：按钮/次级正文（原 12）
-PX_NAV = PX_SMALL         # 旧名：侧栏导航项（原 12）
-PX_NUM = PX_BODY          # 旧名：指标数值（原 13）
-PX_NUM_L = PX_TITLE       # 旧名：四宫格数值（原 19）
-PX_NUM_XL = PX_DISPLAY    # 旧名：仪表环数字（原 30）
-#: 旧名：含中文的微标。**保留为别名**只为不打断调用方签名；
-#: 渲染层改用 :meth:`Fonts.for_text`（含中文 → sans 10px），不许再拿它把中文塞进 mono。
-PX_MICRO_CJK = PX_MICRO
+# 0.3.4 曾在这里定义 8 个真值常量（30/19/18/13/13/12/10 + 表格 11）和 7 个旧名别名
+# （``PX_H1`` / ``PX_BODY_S`` / ``PX_NAV`` / ``PX_NUM`` / ``PX_NUM_L`` / ``PX_NUM_XL`` /
+# ``PX_MICRO_CJK``）。T4 起**全部删除**：渲染层只写档位名（``px("body")``），本模块
+# 不再有任何字号字面量。旧名 → 档位的映射与「值等价」断言在
+# ``tests/test_desktop_px_wiring.py``（那里是 0.3.4 口径的唯一边界）。
+#
+# 两条例外（裁决与理由见 ``reports/RM-20261113/M1-PROGRESS.md`` §8）：
+#   * **表格**：0.3.4 是 11px 特例，现并入 ``table``（12px；行高 28 兼 Treeview rowheight）；
+#   * **mono**：0.3.4 **没有**对应档位（当时等宽借微标 10px），现在 ``mono`` 是独立 token（12px）。
+def px(name: str) -> float:
+    """按档位名取设计字号（px@96dpi）。渲染层取字号的**唯一**入口。"""
+    return typography.px(name)
 
 
 class Fonts:
@@ -90,19 +74,18 @@ class Fonts:
     ``scale=1.25`` 时 30px → 38px。默认 1.0，本轮不接线（由 lead 合并后注入）。
     """
 
-    #: 角色 → ``(族, px, bold)``；ttk 样式与 option 数据库都引用这些名字
-    ROLE_FONTS: dict[str, tuple[str, int, bool]] = {
-        "body": ("sans", PX_BODY, False),
-        "small": ("sans", PX_SMALL, False),
-        "micro": ("sans", PX_MICRO, False),
-        "heading": ("sans", PX_MICRO, True),
-        "table": ("sans", PX_TABLE, False),
-        "mono": ("mono", PX_MICRO, False),
-        "nav": ("sans", PX_NAV, False),
-        "card": ("sans", PX_CARD, True),
-        "title": ("sans", PX_TITLE, True),
-        "hero": ("sans", PX_HERO, True),
-        "display": ("sans", PX_DISPLAY, True),
+    #: 角色 → (族, 设计字号, 是否 bold)；ttk 样式与 option 数据库都引用这些名字。
+    #: 全部**派生自** :mod:`djb_node.desktop.typography`：
+    #: 角色到档位的对应关系在 ``typography.ROLE_TOKEN_MAP``（表头 ``heading`` 例外地取
+    #: ``small`` 的字号 + bold，见 ``typography.ROLE_WEIGHT_OVERRIDE``）。
+    #: 本文件不再出现任何字号字面量；改字号只能改 ``typography.TYPES`` 一处。
+    ROLE_FONTS: dict[str, tuple[str, float, bool]] = {
+        role: (
+            "mono" if typography.token(target).family == "mono" else "sans",
+            typography.px(target),
+            (typography.ROLE_WEIGHT_OVERRIDE.get(role) or typography.weight(target)) == "bold",
+        )
+        for role, target in typography.ROLE_TOKEN_MAP.items()
     }
 
     #: 角色的 Tcl 具名字体（``option_add`` / ``style.configure`` 只认名字）
@@ -132,11 +115,15 @@ class Fonts:
             self.named[role] = self._build(self.NAMES[role], kind, px, bold)
 
     # ── 取字体
-    def px(self, value: int) -> int:
-        """设计 px → 实际 px（乘 ``scale``，至少 1）。"""
-        return max(1, int(round(float(value) * self.scale)))
+    def px(self, value: float) -> int:
+        """设计 px → 实际整数 px（乘 ``scale``，至少 1）。
 
-    def _build(self, name: str | None, kind: str, px: int, bold: bool) -> Any:
+        取整**统一走** :func:`typography.round_px`（半进位）：Tk 只认整数像素字号，
+        各处各自 ``round()`` 会让 ``small``（12.5）在不同调用点得到 12 或 13 两种值。
+        """
+        return typography.round_px(float(value) * self.scale)
+
+    def _build(self, name: str | None, kind: str, px: float, bold: bool) -> Any:
         family = self.mono_family if kind == "mono" else self.sans_family
         weight = "bold" if bold else "normal"
         size = -self.px(px)
@@ -164,7 +151,7 @@ class Fonts:
         self._cache[key] = font
         return font
 
-    def _get(self, family: str, px: int, weight: str) -> Any:
+    def _get(self, family: str, px: float, weight: str) -> Any:
         size = -abs(self.px(px))
         key = (family, size, weight, "")
         if key not in self._cache:
@@ -175,14 +162,14 @@ class Fonts:
                 self._cache[key] = (family, size, weight)
         return self._cache[key]
 
-    def sans(self, px: int = PX_BODY, *, bold: bool = False) -> Any:
+    def sans(self, px: float = typography.px("body"), *, bold: bool = False) -> Any:
         return self._get(self.sans_family, px, "bold" if bold else "normal")
 
-    def mono(self, px: int = PX_MICRO, *, bold: bool = False) -> Any:
+    def mono(self, px: float = typography.px("micro"), *, bold: bool = False) -> Any:
         return self._get(self.mono_family, px, "bold" if bold else "normal")
 
-    def for_text(self, text: Any, px: int = PX_MICRO, *, bold: bool = False) -> Any:
-        """按**这段文字**选族：纯 ASCII → mono；含任何非 ASCII → sans（中文最小 10px）。
+    def for_text(self, text: Any, px: float = typography.px("micro"), *, bold: bool = False) -> Any:
+        """按**这段文字**选族：纯 ASCII → mono；含任何非 ASCII → sans（中文最小 = ``typography.CJK_MIN_PX``，11px）。
 
         为什么需要它：等宽族（Cascadia Mono / Menlo / DejaVu Sans Mono）**没有 CJK 字形**，
         Tk 会静默逐字回退到 CJK 族，但**字号仍是等宽那一档**，于是中文糊成一团、中英基线跳。
@@ -190,7 +177,7 @@ class Fonts:
         raw = "" if text is None else str(text)
         if raw.isascii():
             return self.mono(px, bold=bold)
-        return self.sans(max(int(px), PX_CJK_MIN), bold=bold)
+        return self.sans(max(typography.round_px(px), typography.CJK_MIN_PX), bold=bold)
 
     def named_name(self, role: str) -> Any:
         """该角色可放进 ``option_add`` / ``style.configure`` 的字体值（名字或元组）。"""
@@ -540,7 +527,7 @@ class Chip(tk.Canvas):
     }
 
     def __init__(self, master: Any, text: str, *, tone: str = "muted",
-                 ground: str | None = None, px: int = PX_MICRO_CJK, mono: bool = False,
+                 ground: str | None = None, px: float = typography.px("micro"), mono: bool = False,
                  pad: int = 6, height: int = 16, radius: int = 4,
                  outline: str | None = None, **kwargs: Any) -> None:
         self.tone = tone
@@ -599,7 +586,7 @@ class Button(tk.Canvas):
     }
 
     def __init__(self, master: Any, text: str, command: Callable[[], None] | None = None, *,
-                 kind: str = "ghost", ground: str | None = None, px: int = PX_BODY_S,
+                 kind: str = "ghost", ground: str | None = None, px: float = typography.px("small"),
                  height: int = 30, pad: int = 11, radius: int = 6,
                  enabled: bool = True, **kwargs: Any) -> None:
         self.kind = kind
@@ -763,13 +750,13 @@ class Gauge(tk.Canvas):
             self.create_arc(*box, start=start, extent=extent, style=tk.ARC,
                             outline=theme.chart("mint_bright"), width=self.ring)
         center = self.size / 2.0
-        big = fonts.sans(PX_NUM_XL, bold=True)
+        big = fonts.sans(typography.px("display"), bold=True)
         self.create_text(center, center - 4, text=self._value,
                          fill=theme.color("ink"), font=big, anchor="center")
         if self._label:
             self.create_text(center, center + 20, text=self._label,
                              fill=theme.color("muted_text"),
-                             font=fonts.for_text(self._label, PX_MICRO), anchor="center")
+                             font=fonts.for_text(self._label, typography.px("micro")), anchor="center")
 
 
 class Bars(tk.Canvas):
@@ -853,7 +840,7 @@ class Bars(tk.Canvas):
             anchor = "w" if index == 0 else ("e" if index == len(labels) - 1 else "center")
             self.create_text(round(positions[index], 1), baseline + 7, text=label,
                              anchor=anchor, fill=theme.color("muted_text"),
-                             font=fonts.for_text(label, PX_MICRO))
+                             font=fonts.for_text(label, typography.px("micro")))
 
 
 class StatCell(tk.Frame):
@@ -865,13 +852,13 @@ class StatCell(tk.Frame):
     """
 
     def __init__(self, master: Any, *, label: str, value: str, unit: str = "",
-                 note: str = "", ground: str | None = None, value_px: int = PX_NUM_L,
+                 note: str = "", ground: str | None = None, value_px: float = typography.px("h1"),
                  value_tone: str | None = None, mono_value: bool = False,
                  align: str = "w", **kwargs: Any) -> None:
         self.ground = ground or theme.color("surface")
         super().__init__(master, background=self.ground, bd=0, highlightthickness=0, **kwargs)
         fonts = fonts_for(master)
-        tk.Label(self, text=label, font=fonts.sans(PX_MICRO),
+        tk.Label(self, text=label, font=fonts.sans(typography.px("micro")),
                  foreground=theme.color("muted_text"), background=self.ground,
                  anchor=align).pack(anchor=align, fill="x")
         line = tk.Frame(self, background=self.ground)
@@ -893,7 +880,7 @@ class StatCell(tk.Frame):
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor=align).pack(side="left" if align == "w" else "right")
         if note:
-            tk.Label(self, text=note, font=fonts.sans(PX_MICRO),
+            tk.Label(self, text=note, font=fonts.sans(typography.px("micro")),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor=align, justify="left").pack(anchor=align, fill="x", pady=(1, 0))
 
@@ -903,14 +890,14 @@ class SectionHead(tk.Frame):
 
     def __init__(self, master: Any, *, kicker: str = "", title: str = "", subtitle: str = "",
                  ground: str | None = None, right: Callable[[Any], Any] | None = None,
-                 title_px: int = PX_CARD, **kwargs: Any) -> None:
+                 title_px: float = typography.px("h2"), **kwargs: Any) -> None:
         self.ground = ground or theme.color("surface")
         super().__init__(master, background=self.ground, bd=0, highlightthickness=0, **kwargs)
         fonts = fonts_for(master)
         left = tk.Frame(self, background=self.ground)
         left.pack(side="left", fill="x", expand=True)
         if kicker:
-            tk.Label(left, text=kicker, font=fonts.for_text(kicker, PX_MICRO),
+            tk.Label(left, text=kicker, font=fonts.for_text(kicker, typography.px("micro")),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor="w").pack(anchor="w")
         if title:
@@ -918,7 +905,7 @@ class SectionHead(tk.Frame):
                      foreground=theme.color("ink"), background=self.ground,
                      anchor="w", justify="left").pack(anchor="w", pady=(3, 0))
         if subtitle:
-            tk.Label(left, text=subtitle, font=fonts.sans(PX_MICRO),
+            tk.Label(left, text=subtitle, font=fonts.sans(typography.px("micro")),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor="w").pack(anchor="w", pady=(3, 0))
         if right is not None:
@@ -1024,9 +1011,9 @@ class NavItem(tk.Canvas):
         text_color = theme.color("ink") if self.active else theme.color("ink2")
         if not self.compact:
             self.create_text(34, height / 2.0, text=self.text, anchor="w",
-                             fill=text_color, font=fonts.sans(PX_NAV))
+                             fill=text_color, font=fonts.sans(typography.px("small")))
         if self.count and not self.compact:
-            count_font = fonts.mono(PX_MICRO)
+            count_font = fonts.mono(typography.px("micro"))
             label = str(self.count)
             badge_w = fonts.measure(label, count_font) + 10
             x0 = width - badge_w - 6

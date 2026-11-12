@@ -38,7 +38,7 @@ __all__ = [
     "ROLE_TOKEN_MAP", "ROLE_WEIGHT_OVERRIDE", "TYPES", "TOKEN_ORDER", "TypeToken",
     "TypographyError", "ScaleDecision", "assert_text_ok", "cjk_latin_spacing", "has_cjk",
     "ellipsize", "line_height", "px", "resolve_scale", "scaled_line", "scaled_px",
-    "scaled_tracking", "token", "tracking", "violations", "weight",
+    "round_px", "scaled_tracking", "token", "tracking", "violations", "weight",
 ]
 
 #: CJK 最小字号（px@96dpi）：低于它就是糊，不是「小」。
@@ -229,22 +229,26 @@ def resolve_scale(*, env: object = None, prefs: object = None,
                          ignored=tuple(ignored))
 
 
-def _round_px(value: float) -> int:
+def round_px(value: float) -> int:
     """四舍五入到整像素、至少 1（12.5 → 13）。**不用 Python 的 banker's rounding**：
-    ``round(12.5) == 12`` 会让 small 掉回 0.3.4 的值，字阶差就白设计了。"""
+    ``round(12.5) == 12`` 会让 small 掉回 0.3.4 的值，字阶差就白设计了。
+
+    渲染层（``ui_kit.Fonts.px``）也必须走这里：Tk 只认整数像素字号，若各处各自
+    ``round()``，同一档会在不同调用点算出 12/13 两种值。
+    """
     return max(1, int(math.floor(float(value) + 0.5)))
 
 
 def scaled_px(name: str, scale: float = DEFAULT_SCALE) -> int:
     """设计 px → 实际整数 px（乘 ``scale`` 并夹取，至少 1）。"""
     factor, _ = _clamp_scale(scale)
-    return _round_px(token(name).px * factor)
+    return round_px(token(name).px * factor)
 
 
 def scaled_line(name: str, scale: float = DEFAULT_SCALE) -> int:
     """行盒高度（px）→ 实际整数 px；``table`` 档同时是 ``rowheight``。"""
     factor, _ = _clamp_scale(scale)
-    return _round_px(token(name).line * factor)
+    return round_px(token(name).line * factor)
 
 
 def scaled_tracking(name: str, scale: float = DEFAULT_SCALE) -> float:

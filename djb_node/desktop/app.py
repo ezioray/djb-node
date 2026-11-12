@@ -353,12 +353,12 @@ class DesktopApp:
             splinesteps=12, fill=dual.chart("mint_bright"),
             outline=dual.chart("mint_bright"))
         logo.create_text(self._px(12), self._px(12), text="D", fill=dual.color("ink"),
-                         font=fonts.sans(kit.PX_CARD, bold=True))
-        tk.Label(brand, text="DJB 联脑", font=fonts.sans(kit.PX_CARD, bold=True),
+                         font=fonts.sans(kit.px("h2"), bold=True))
+        tk.Label(brand, text="DJB 联脑", font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("ink"), background=dual.color("surface")).pack(
                      side="left", padx=(8, 0))
         self._brand_sub = tk.Label(brand, text="· 节点工作台",
-                                   font=fonts.sans(kit.PX_SMALL),
+                                   font=fonts.sans(kit.px("small")),
                                    foreground=dual.color("muted_text"),
                                    background=dual.color("surface"))
         self._brand_sub.pack(side="left", padx=(6, 0))
@@ -368,18 +368,18 @@ class DesktopApp:
         right.pack(side="right", padx=(0, 12))
         self._header_right = right
         self._refresh_button = kit.Button(right, "刷新", self.refresh, kind="ghost",
-                                          ground=dual.color("surface"), px=kit.PX_SMALL,
+                                          ground=dual.color("surface"), px=kit.px("small"),
                                           height=self._px(26), pad=self._px(10))
         self._theme_button = kit.Button(right, self._theme_button_text(), self.toggle_theme,
                                         kind="ghost", ground=dual.color("surface"),
-                                        px=kit.PX_SMALL, height=self._px(26), pad=self._px(10))
+                                        px=kit.px("small"), height=self._px(26), pad=self._px(10))
         self._log_button = kit.Button(right, "打开日志", lambda: self.show_view("logs"),
                                       kind="ghost", ground=dual.color("surface"),
-                                      px=kit.PX_SMALL, height=self._px(26), pad=self._px(10))
+                                      px=kit.px("small"), height=self._px(26), pad=self._px(10))
         self._tune_button = kit.Button(right, "调整贡献", lambda: self.show_view("yield"),
                                        kind="primary", ground=dual.color("surface"),
-                                       px=kit.PX_SMALL, height=self._px(26), pad=self._px(12))
-        self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.PX_MICRO),
+                                       px=kit.px("small"), height=self._px(26), pad=self._px(12))
+        self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.px("micro")),
                                     foreground=dual.color("muted_text"),
                                     background=dual.color("surface"))
         self._pack_header_right(narrow=False)
@@ -408,9 +408,9 @@ class DesktopApp:
         ident = tk.Frame(side, background=ground)
         ident.pack(fill="x", padx=16, pady=(14, 10))
         self._ident = ident
-        tk.Label(ident, text="NODE / EDGE", font=fonts.mono(kit.PX_MICRO),
+        tk.Label(ident, text="NODE / EDGE", font=fonts.mono(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground, anchor="w").pack(fill="x")
-        self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.PX_CARD, bold=True),
+        self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.px("h2"), bold=True),
                                     foreground=dual.color("ink"), background=ground, anchor="w")
         self._ident_name.pack(fill="x", pady=(2, 2))
         line = tk.Frame(ident, background=ground)
@@ -419,11 +419,11 @@ class DesktopApp:
                                     highlightthickness=0, takefocus=0)
         self._ident_dot.pack(side="left")
         self._ident_dot.create_oval(2, 2, 8, 8, fill=dual.color("mint_text"), outline="")
-        self._ident_state = tk.Label(line, text="状态未知", font=fonts.sans(kit.PX_MICRO),
+        self._ident_state = tk.Label(line, text="状态未知", font=fonts.sans(kit.px("micro")),
                                      foreground=dual.color("muted_text"), background=ground,
                                      anchor="w")
         self._ident_state.pack(side="left", padx=(4, 0))
-        self._ident_meta = tk.Label(ident, text="—", font=fonts.sans(kit.PX_MICRO),
+        self._ident_meta = tk.Label(ident, text="—", font=fonts.sans(kit.px("micro")),
                                     foreground=dual.color("muted_text"), background=ground,
                                     anchor="w", justify="left")
         self._ident_meta.pack(fill="x", pady=(4, 0))
@@ -457,13 +457,13 @@ class DesktopApp:
         foot.pack(fill="x", padx=16, pady=(8, 10))
         from ..facts import CLIENT_VERSION
         self._version_label = tk.Label(
-            foot, text="v" + CLIENT_VERSION, font=fonts.mono(kit.PX_MICRO),
+            foot, text="v" + CLIENT_VERSION, font=fonts.mono(kit.px("micro")),
             foreground=dual.color("muted_text"), background=ground, anchor="w")
         self._version_label.pack(side="left")
         self._demo_chip = None
         if getattr(self._controller.snapshot, "source", "") == "demo":
             self._demo_chip = kit.Chip(foot, "演示数据", tone="amber", ground=ground,
-                                       px=kit.PX_MICRO, height=17)
+                                       px=kit.px("micro"), height=17)
             self._demo_chip.pack(side="right")
 
     def _font_for(self, text: str, px: int, *, bold: bool = False) -> Any:
@@ -483,7 +483,7 @@ class DesktopApp:
         return self._fonts.sans(px, bold=bold)
 
     def _render_nav_section(self, section: Any, *, first: bool = False) -> None:
-        """一个分组：10px 分组头（拉丁微标 + 中文组名）+ 该组导航项。
+        """一个分组：micro 档分组头（拉丁微标 + 中文组名）+ 该组导航项。
 
         只是给既有 :class:`ui_kit.NavItem` 加一层结构；选中态/图标/窄窗下拉都不变。
         """
@@ -491,10 +491,10 @@ class DesktopApp:
         ground = dual.color("surface3")
         head = tk.Frame(self._nav_inner, background=ground)
         head.pack(fill="x", padx=6, pady=(0 if first else 10, 2))
-        tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.PX_MICRO),
+        tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground,
                  anchor="w").pack(side="left")
-        tk.Label(head, text=section.title, font=self._fonts.sans(kit.PX_MICRO),
+        tk.Label(head, text=section.title, font=self._fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground,
                  anchor="w").pack(side="left", padx=(6, 0))
         self._nav_section_headers[section.key] = head
@@ -604,19 +604,19 @@ class DesktopApp:
         self._pagehead = head
         left = tk.Frame(head, background=dual.color("bg"))
         left.grid(row=0, column=0, sticky="w", padx=(self._px(26), 0), pady=(self._px(12), self._px(12)))
-        self._page_kicker = tk.Label(left, text="OVERVIEW", font=fonts.for_text("OVERVIEW", kit.PX_MICRO),
+        self._page_kicker = tk.Label(left, text="OVERVIEW", font=fonts.for_text("OVERVIEW", kit.px("micro")),
                                      foreground=dual.color("muted_text"),
                                      background=dual.color("bg"), anchor="w")
         self._page_kicker.pack(anchor="w")
         self._view_title = tk.Label(left, text=VIEW_TITLES[self._controller.view],
-                                    font=fonts.sans(kit.PX_H1, bold=True),
+                                    font=fonts.sans(kit.px("h1"), bold=True),
                                     foreground=dual.color("ink"), background=dual.color("bg"),
                                     anchor="w")
         self._view_title.pack(anchor="w")
         right = tk.Frame(head, background=dual.color("bg"))
         right.grid(row=0, column=1, sticky="e", padx=(0, self._px(26)))
         self._page_actions = right
-        self._snapshot_label = tk.Label(right, text="数据截至 —", font=fonts.sans(kit.PX_MICRO),
+        self._snapshot_label = tk.Label(right, text="数据截至 —", font=fonts.sans(kit.px("micro")),
                                         foreground=dual.color("muted_text"),
                                         background=dual.color("bg"))
         self._snapshot_label.pack(side="left", padx=(0, 10))
@@ -631,11 +631,11 @@ class DesktopApp:
         bar.grid_propagate(False)
         bar.pack_propagate(False)
         self._statusbar = bar
-        self._status = tk.Label(bar, text=DEFAULT_MESSAGE, font=fonts.sans(kit.PX_MICRO),
+        self._status = tk.Label(bar, text=DEFAULT_MESSAGE, font=fonts.sans(kit.px("micro")),
                                 foreground=dual.color("muted_text"),
                                 background=dual.color("surface3"), anchor="w")
         self._status.pack(side="left", padx=(self._px(14), 0), pady=self._px(4))
-        self._status_right = tk.Label(bar, text="—", font=fonts.sans(kit.PX_MICRO),
+        self._status_right = tk.Label(bar, text="—", font=fonts.sans(kit.px("micro")),
                                       foreground=dual.color("muted_text"),
                                       background=dual.color("surface3"), anchor="e")
         self._status_right.pack(side="right", padx=(0, self._px(14)), pady=self._px(4))
@@ -1143,19 +1143,19 @@ class DesktopApp:
         self._clear()
         self._view_title.configure(text=view.title)
         self._set_font(self._page_kicker,
-                       PAGE_KICKERS.get(view.key, view.key.upper()), kit.PX_MICRO)
+                       PAGE_KICKERS.get(view.key, view.key.upper()), kit.px("micro"))
         pad = (12, 6) if self._rendered_narrow else (26, 6)
         self._content_pad = pad
         body = tk.Frame(self._content, background=dual.color("bg"), bd=0, highlightthickness=0)
         body.pack(fill="both", expand=True, padx=pad[0], pady=pad[1])
         self._body = body
         if view.subtitle:
-            self._wrap(tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.PX_SMALL),
+            self._wrap(tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.px("small")),
                               foreground=dual.color("muted_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
                                   anchor="w", pady=(0, 4))
         for text in view.unavailable:
-            self._wrap(tk.Label(body, text="! " + text, font=self._fonts.sans(kit.PX_SMALL),
+            self._wrap(tk.Label(body, text="! " + text, font=self._fonts.sans(kit.px("small")),
                               foreground=dual.color("amber_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
                                   anchor="w", pady=(0, 4))
@@ -1166,7 +1166,7 @@ class DesktopApp:
         for note in view.notes:
             if not note:
                 continue
-            self._wrap(tk.Label(body, text="· " + note, font=self._fonts.sans(kit.PX_MICRO),
+            self._wrap(tk.Label(body, text="· " + note, font=self._fonts.sans(kit.px("micro")),
                               foreground=dual.color("muted_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
                                   anchor="w", pady=(2, 0))
@@ -1307,25 +1307,25 @@ class DesktopApp:
             gauge.set(hero.gauge.ratio, hero.gauge.value, hero.gauge.label)
         text = tk.Frame(top, background=surface)
         text.pack(side="left", fill="both", expand=True)
-        tk.Label(text, text=hero.kicker, font=fonts.for_text(hero.kicker, kit.PX_MICRO),
+        tk.Label(text, text=hero.kicker, font=fonts.for_text(hero.kicker, kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
         head = tk.Frame(text, background=surface)
         head.pack(fill="x", pady=(2, 0))
-        tk.Label(head, text=hero.title, font=fonts.sans(kit.PX_HERO, bold=True),
+        tk.Label(head, text=hero.title, font=fonts.sans(kit.px("hero"), bold=True),
                  foreground=dual.color("ink"), background=surface, anchor="w").pack(side="left")
         if hero.chip:
             kit.Chip(head, hero.chip, tone=hero.chip_tone, ground=surface,
-                     px=kit.PX_MICRO, height=19).pack(side="left", padx=(10, 0))
-        body_label = tk.Label(text, text=hero.body, font=fonts.sans(kit.PX_SMALL),
+                     px=kit.px("micro"), height=19).pack(side="left", padx=(10, 0))
+        body_label = tk.Label(text, text=hero.body, font=fonts.sans(kit.px("small")),
                               foreground=dual.color("ink2"), background=surface, anchor="w",
                               justify="left")
         body_label.pack(fill="x", pady=(4, 0))
         runtime = tk.Frame(text, background=surface)
         runtime.pack(fill="x", pady=(3, 0))
-        tk.Label(runtime, text=hero.runtime_label, font=fonts.sans(kit.PX_MICRO),
+        tk.Label(runtime, text=hero.runtime_label, font=fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface).pack(side="left")
         tk.Label(runtime, text=hero.runtime,
-                 font=fonts.for_text(hero.runtime, kit.PX_BODY, bold=True),
+                 font=fonts.for_text(hero.runtime, kit.px("body"), bold=True),
                  foreground=dual.color("ink"), background=surface).pack(side="left", padx=(6, 0))
         # 说明文字按卡片实际宽度换行（窗口变宽/变窄都不截断）
         def _fit(_event: Any = None) -> None:
@@ -1346,7 +1346,7 @@ class DesktopApp:
                 metrics.columnconfigure(index, weight=1, uniform="metric")
                 cell = kit.StatCell(metrics, label=metric.label, value=metric.value,
                                     unit=metric.unit, note=metric.note, ground=surface,
-                                    value_px=kit.PX_NUM_L, align="w")
+                                    value_px=kit.px("h1"), align="w")
                 cell.grid(row=0, column=index, sticky="nsew", padx=(0, 10))
         if hero.actions or hero.hint:
             foot = tk.Frame(body, background=surface)
@@ -1355,7 +1355,7 @@ class DesktopApp:
             if hero.hint:
                 # B6：提示先 pack（side=right）并限宽换行 —— 旧实现里它排在按钮后面，
                 # 剩余宽度不够时被内容画布右缘裁掉（「已授权 1 个客户端」就是这样丢字的）。
-                tk.Label(foot, text=hero.hint, font=fonts.sans(kit.PX_MICRO),
+                tk.Label(foot, text=hero.hint, font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface,
                          anchor="e", justify="right", wraplength=240).pack(
                              side="right", padx=(10, 0))
@@ -1375,16 +1375,16 @@ class DesktopApp:
         left = tk.Frame(head, background=surface)
         left.pack(side="left")
         tk.Label(left, text=chart.kicker or "CHART",
-                 font=fonts.for_text(chart.kicker or "CHART", kit.PX_MICRO),
+                 font=fonts.for_text(chart.kicker or "CHART", kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
-        tk.Label(left, text=chart.title, font=fonts.sans(kit.PX_CARD, bold=True),
+        tk.Label(left, text=chart.title, font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("ink"), background=surface, anchor="w").pack(fill="x")
         if chart.caption:
-            tk.Label(head, text=chart.caption, font=fonts.sans(kit.PX_MICRO),
+            tk.Label(head, text=chart.caption, font=fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface).pack(
                          side="right", pady=(10, 0))
         if chart.empty:
-            tk.Label(body, text=chart.empty, font=fonts.sans(kit.PX_SMALL),
+            tk.Label(body, text=chart.empty, font=fonts.sans(kit.px("small")),
                      foreground=dual.color("amber_text"), background=surface, anchor="w",
                      justify="left", wraplength=520).pack(anchor="w", pady=(12, 4))
             return
@@ -1393,9 +1393,9 @@ class DesktopApp:
         bars.set(chart.values, axis=chart.labels)
         foot = tk.Frame(body, background=surface)
         foot.pack(fill="x", pady=(2, 0))
-        tk.Label(foot, text=chart.peak, font=fonts.for_text(chart.peak, kit.PX_MICRO),
+        tk.Label(foot, text=chart.peak, font=fonts.for_text(chart.peak, kit.px("micro")),
                  foreground=dual.color("mint_text"), background=surface).pack(side="left")
-        tk.Label(foot, text=chart.foot, font=fonts.sans(kit.PX_MICRO),
+        tk.Label(foot, text=chart.foot, font=fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface).pack(side="right")
 
     def _render_rail_card(self, parent: Any, card: RailCard) -> None:
@@ -1408,19 +1408,19 @@ class DesktopApp:
         body = box.body
         head = tk.Frame(body, background=surface)
         head.pack(fill="x")
-        tk.Label(head, text=card.kicker, font=fonts.for_text(card.kicker, kit.PX_MICRO),
+        tk.Label(head, text=card.kicker, font=fonts.for_text(card.kicker, kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface, anchor="w").pack(side="left")
         if card.note:
             tk.Label(head, text=card.note,
-                     font=fonts.for_text(card.note, kit.PX_MICRO, bold=True),
+                     font=fonts.for_text(card.note, kit.px("micro"), bold=True),
                      foreground=dual.color("mint_text"), background=surface).pack(side="right")
         title = tk.Frame(body, background=surface)
         title.pack(fill="x", pady=(2, 0))
-        tk.Label(title, text=card.title, font=fonts.sans(kit.PX_CARD, bold=True),
+        tk.Label(title, text=card.title, font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("ink"), background=surface, anchor="w").pack(side="left")
         if card.badge:
             kit.Chip(title, card.badge, tone=card.badge_tone, ground=surface,
-                     px=kit.PX_MICRO, height=18).pack(side="right")
+                     px=kit.px("micro"), height=18).pack(side="right")
         if card.kind == "stats" and card.stats:
             grid = tk.Frame(body, background=surface)
             grid.pack(fill="x", pady=(6, 0))
@@ -1428,7 +1428,7 @@ class DesktopApp:
                 row, column = divmod(index, 2)
                 grid.columnconfigure(column, weight=1, uniform="today")
                 kit.StatCell(grid, label=stat.label, value=stat.value, unit=stat.unit,
-                             note=stat.note, ground=surface, value_px=kit.PX_NUM_L,
+                             note=stat.note, ground=surface, value_px=kit.px("h1"),
                              mono_value=True).grid(row=row, column=column, sticky="nsew",
                                                   padx=(0, 10), pady=(0, 2))
         if card.kind == "setup" and card.fields:
@@ -1437,11 +1437,11 @@ class DesktopApp:
             for field in card.fields:
                 line = tk.Frame(form, background=surface)
                 line.pack(fill="x", pady=(0, 5))
-                tk.Label(line, text=field.label, font=fonts.sans(kit.PX_MICRO),
+                tk.Label(line, text=field.label, font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface,
                          anchor="w", width=12).pack(side="left")
                 tk.Label(line, text=field.value,
-                         font=fonts.for_text(field.value, kit.PX_SMALL),
+                         font=fonts.for_text(field.value, kit.px("small")),
                          foreground=dual.color("ink"), background=surface,
                          anchor="w").pack(side="left", fill="x", expand=True)
         if card.kind == "throttle":
@@ -1450,17 +1450,17 @@ class DesktopApp:
             for label, value, tone in card.rows:
                 line = tk.Frame(box_rows, background=surface)
                 line.pack(fill="x", pady=(0, 2))
-                tk.Label(line, text=label, font=fonts.sans(kit.PX_MICRO),
+                tk.Label(line, text=label, font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface,
                          anchor="w").pack(side="left")
                 colour = {"mint": "mint_text", "amber": "amber_text", "red": "red_text",
                           "muted": "muted_text"}.get(tone, "ink")
-                tk.Label(line, text=value, font=fonts.for_text(value, kit.PX_SMALL),
+                tk.Label(line, text=value, font=fonts.for_text(value, kit.px("small")),
                          foreground=dual.color(colour), background=surface).pack(side="right")
             if card.toggle is not None:
                 line = tk.Frame(box_rows, background=surface)
                 line.pack(fill="x", pady=(2, 0))
-                tk.Label(line, text=card.toggle[0], font=fonts.sans(kit.PX_MICRO),
+                tk.Label(line, text=card.toggle[0], font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface).pack(side="left")
                 # 开关只读：点它等于「去让路页改」，这里不假装能改（无对应后端动作）
                 kit.Switch(line, on=bool(card.toggle[1]), ground=surface,
@@ -1471,10 +1471,10 @@ class DesktopApp:
             label, ratio, value_text = card.progress
             head_row = tk.Frame(body, background=surface)
             head_row.pack(fill="x", pady=(4, 0))
-            tk.Label(head_row, text=label, font=fonts.sans(kit.PX_MICRO),
+            tk.Label(head_row, text=label, font=fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface).pack(side="left")
             tk.Label(head_row, text=value_text,
-                     font=fonts.for_text(value_text, kit.PX_MICRO),
+                     font=fonts.for_text(value_text, kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface).pack(side="right")
             track = tk.Canvas(body, width=1, height=6, background=surface, bd=0,
                               highlightthickness=0, takefocus=0)
@@ -1498,7 +1498,7 @@ class DesktopApp:
         for action in card.actions:
             self._render_action(foot, action, ground=surface)
         if card.foot:
-            tk.Label(body, text=card.foot, font=fonts.sans(kit.PX_MICRO),
+            tk.Label(body, text=card.foot, font=fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface, anchor="w",
                      justify="left", wraplength=300).pack(anchor="w", pady=(5, 0))
 
@@ -1548,17 +1548,17 @@ class DesktopApp:
         box = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 11))
         box.grid(row=row, column=column, sticky="nsew", padx=(0, 10), pady=(0, 10))
         body = box.body
-        tk.Label(body, text=card.title, font=fonts.sans(kit.PX_CARD, bold=True),
+        tk.Label(body, text=card.title, font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
         tone = {"mint": "mint_text", "amber": "amber_text", "red": "red_text",
                 "muted": "muted_text"}.get(card.tone, "ink")
-        value = tk.Label(body, text=card.value, font=fonts.sans(kit.PX_NUM_L, bold=True),
+        value = tk.Label(body, text=card.value, font=fonts.sans(kit.px("h1"), bold=True),
                          foreground=dual.color(tone), background=surface, anchor="w",
                          justify="left")
         value.pack(fill="x", pady=(3, 0))
         meta = None
         if card.meta:
-            meta = tk.Label(body, text=card.meta, font=fonts.sans(kit.PX_MICRO),
+            meta = tk.Label(body, text=card.meta, font=fonts.sans(kit.px("micro")),
                             foreground=dual.color("muted_text"), background=surface,
                             anchor="w", justify="left")
             meta.pack(fill="x", pady=(3, 0))
@@ -1591,10 +1591,10 @@ class DesktopApp:
             (lambda key=action.key: self._on_action(key))
         button = kit.Button(parent, action.label, target,
                             kind="primary" if action.primary else "ghost", ground=base,
-                            px=kit.PX_SMALL, height=29, pad=12, enabled=action.enabled)
+                            px=kit.px("small"), height=29, pad=12, enabled=action.enabled)
         button.pack(side="left", padx=(0, 8))
         if not action.enabled and action.reason:
-            tk.Label(parent, text=action.reason, font=self._fonts.sans(kit.PX_MICRO),
+            tk.Label(parent, text=action.reason, font=self._fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=base).pack(
                          side="left", padx=(0, 10))
 
@@ -1645,7 +1645,7 @@ class DesktopApp:
         self._fit_columns(tree)
         tree.bind("<Configure>", lambda _event, view=tree: self._fit_columns(view), add="+")
         if not table.rows:
-            tk.Label(body, text=table.empty, font=self._fonts.sans(kit.PX_SMALL),
+            tk.Label(body, text=table.empty, font=self._fonts.sans(kit.px("small")),
                      foreground=dual.color("muted_text"), background=dual.color("surface"),
                      anchor="w").pack(anchor="w", pady=(10, 2))
         # 详情抽屉：选中一行就在表格下面展开字段（键盘 ↑↓ 也生效；本轮不改抽屉形态）
@@ -1656,11 +1656,11 @@ class DesktopApp:
         if table.rows:
             tree.bind("<<TreeviewSelect>>", self._on_row_select)
             tk.Label(body, text="选中一行看详情（↑↓ 或点击）",
-                     font=self._fonts.sans(kit.PX_MICRO),
+                     font=self._fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"),
                      background=dual.color("surface")).pack(anchor="w", pady=(6, 0))
         if table.note:
-            self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.PX_MICRO),
+            self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.px("micro")),
                               foreground=dual.color("muted_text"),
                               background=dual.color("surface"), anchor="w",
                               justify="left", wraplength=self._wrap_hint())).pack(anchor="w", pady=(4, 0))
@@ -1760,17 +1760,17 @@ class DesktopApp:
         for column, value in zip(self._detail_columns, values):
             line = self._tk.Frame(detail, background=surface)
             line.pack(fill="x", pady=1, padx=10)
-            self._tk.Label(line, text=column, font=fonts.sans(self._kit.PX_MICRO),
+            self._tk.Label(line, text=column, font=fonts.sans(self._kit.px("micro")),
                            foreground=dual.color("muted_text"), background=surface,
                            width=12, anchor="w").pack(side="left")
             self._tk.Label(line, text=str(value),
-                           font=fonts.for_text(str(value), self._kit.PX_SMALL),
+                           font=fonts.for_text(str(value), self._kit.px("small")),
                            foreground=dual.color("ink"), background=surface,
                            anchor="w").pack(side="left")
         note = self._row_notes.get(selection[0], "")
         if note:
             self._wrap(tk.Label(detail, text="原因：" + note,
-                                    font=fonts.sans(self._kit.PX_MICRO),
+                                    font=fonts.sans(self._kit.px("micro")),
                                     foreground=dual.color("amber_text"), background=surface,
                                     anchor="w", justify="left",
                                     wraplength=self._wrap_hint())).pack(anchor="w", padx=10, pady=(4, 6))
@@ -1787,7 +1787,7 @@ class DesktopApp:
         body = card.body
         editable = any(field.editable for field in fields)
         tk.Label(body, text="可编辑字段" if editable else "详情",
-                 font=fonts.sans(kit.PX_CARD, bold=True), foreground=dual.color("ink"),
+                 font=fonts.sans(kit.px("h2"), bold=True), foreground=dual.color("ink"),
                  background=surface, anchor="w").pack(anchor="w", pady=(0, 10))
         per_row = 1 if (self._is_narrow() or len(fields) <= 2) else 2
         grid = tk.Frame(body, background=surface)
@@ -1801,7 +1801,7 @@ class DesktopApp:
             # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
             block.columnconfigure(0, minsize=104)
             block.columnconfigure(1, weight=1)
-            tk.Label(block, text=field.label, font=fonts.sans(kit.PX_MICRO),
+            tk.Label(block, text=field.label, font=fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface,
                      anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
             if field.editable:
@@ -1816,7 +1816,7 @@ class DesktopApp:
                     hint = ("当前 " + field.value + "｜" + hint).strip("｜")
                 if hint:
                     self._wrap_to_column(tk.Label(
-                        block, text=hint, font=fonts.sans(kit.PX_MICRO),
+                        block, text=hint, font=fonts.sans(kit.px("micro")),
                         foreground=dual.color("muted_text"), background=surface,
                         anchor="w", justify="left",
                         wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
@@ -1828,14 +1828,14 @@ class DesktopApp:
                 # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
                 value_label = self._wrap_to_column(tk.Label(
                     block, text=field.value,
-                    font=fonts.for_text(field.value, kit.PX_SMALL),
+                    font=fonts.for_text(field.value, kit.px("small")),
                     foreground=dual.color("ink"), background=surface,
                     anchor="w", justify="left",
                     wraplength=self._wrap_hint()))
                 value_label.grid(row=0, column=1, sticky="we")
                 if field.hint:
                     self._wrap_to_column(tk.Label(
-                        block, text=field.hint, font=fonts.sans(kit.PX_MICRO),
+                        block, text=field.hint, font=fonts.sans(kit.px("micro")),
                         foreground=dual.color("muted_text"), background=surface,
                         anchor="w", justify="left",
                         wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
