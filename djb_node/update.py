@@ -383,18 +383,29 @@ def select_artifact(payload: dict[str, Any], *, os_name: str = facts.PLATFORM,
 
 
 def bucket_eligible(bucket: int, payload: dict[str, Any], *,
-                    now: datetime | None = None) -> tuple[bool, str]:
-    """分桶灰度：wave 1/2/3 对应 5% / 25% / 100%，每桶观测 ≥24 h。"""
+                    now: datetime | None = None,
+                    channel: str = facts.DEFAULT_UPDATE_CHANNEL) -> tuple[bool, str]:
+    """分桶灰度：wave 0 = 内部档（仅 internal 频道）；wave 1..N 对应 `facts.UPDATE_BUCKET_WAVES`。
+
+    * `wave` 缺省 = 最后一档（100%），与 0.3.4 及更早一致；
+    * `wave: 0` 必须显式写死在清单里（不能用 `or` 取缺省，否则 0 被当成缺省 → 100%）；
+    * 观测期仍是 `UPDATE_BUCKET_OBSERVE_S × (wave - 1)`：wave 0/1 无等待，wave 4 需 72 h 累计。
+    """
     moment = now or utcnow()
     rollout = payload.get("rollout")
     if not isinstance(rollout, dict):
         return True, "no_rollout"
     try:
-        wave = int(rollout.get("wave") or len(facts.UPDATE_BUCKET_WAVES))
+        raw_wave = rollout.get("wave")
+        wave = len(facts.UPDATE_BUCKET_WAVES) if raw_wave is None else int(raw_wave)
         since = parse_iso(rollout.get("since"))
     except (TypeError, ValueError):
         return False, "bad_rollout"
-    wave = max(1, min(wave, len(facts.UPDATE_BUCKET_WAVES)))
+    wave = max(0, min(wave, len(facts.UPDATE_BUCKET_WAVES)))
+    if wave == 0:
+        if channel != facts.UPDATE_BUCKET_INTERNAL_CHANNEL:
+            return False, "not_in_wave_0(internal)"
+        return True, "wave_0(internal)"
     pct = int(facts.UPDATE_BUCKET_WAVES[wave - 1])
     if int(bucket) >= pct:
         return False, "not_in_wave_" + str(wave) + "_(" + str(pct) + "%)"
@@ -583,7 +594,8 @@ class UpdateManager:
             return base
         version = str(payload["version"])
         channel = str(payload.get("channel") or facts.DEFAULT_UPDATE_CHANNEL)
-        if channel != self.channel:
+        # internal 是超集频道：内部机可收任一频道清单；wave 0 仍由 bucket_eligible 独占
+        if self.channel != facts.UPDATE_BUCKET_INTERNAL_CHANNEL and channel != self.channel:
             base.update({"state": "channel_mismatch",
                          "message": "清单频道为 " + channel + "，本机为 " + self.channel,
                          "current_version": self.store.install().version})
@@ -598,7 +610,8 @@ class UpdateManager:
             self._record("up_to_date", None, version)
             return base
         install = self.store.install()
-        eligible, reason = bucket_eligible(install.bucket, payload, now=moment)
+        eligible, reason = bucket_eligible(install.bucket, payload, now=moment,
+                                           channel=self.channel)
         base.update({"eligible": eligible, "bucket": install.bucket, "rollout_reason": reason})
         if not eligible:
             base.update({"state": "not_eligible",

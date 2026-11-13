@@ -163,7 +163,8 @@ CONCURRENT_MIN = 1
 CONCURRENT_MAX = 64
 DEFAULT_YIELD_ENABLED = True
 DEFAULT_UPDATE_CHANNEL = "stable"
-UPDATE_CHANNELS: tuple[str, ...] = ("stable", "beta")
+UPDATE_CHANNELS: tuple[str, ...] = ("stable", "beta", "internal")
+"""`internal` = 内部机频道（0.3.5 起）：可见 wave 0 制品，且接受任一频道清单（超集）。"""
 DEFAULT_LOG_LEVEL = "info"
 LOG_LEVELS: tuple[str, ...] = ("info", "debug")
 PORT_MIN = 1024
@@ -205,7 +206,16 @@ DEFAULT_MIN_PRICE_UNIT = "usd_per_1m_tokens"
 TOKEN_RELAY_KIND = "token_relay"
 
 # ─────────────────────────────────────────────────────────── 更新（03-facts §11 / §8.2）
-UPDATE_BUCKET_WAVES: tuple[int, ...] = (5, 25, 100)
+UPDATE_BUCKET_WAVES: tuple[int, ...] = (1, 10, 50, 100)
+"""分桶灰度百分比，下标 = wave 序号（wave 1 → 1%，wave 4 → 100%）。
+
+0.3.5 起按硬约束阶梯 `1/10/50/100`；0.3.4 及更早的客户端常量是 `(5, 25, 100)`，
+因此**本次 0.3.4 → 0.3.5 升级实际仍只能 5/25/100**（旧代码不认新常量），新阶梯从下一次升级生效。
+见 `reports/RM-20261113/B-PREP/10-GRAY-LADDER.md` §2C。
+"""
+UPDATE_BUCKET_INTERNAL_CHANNEL = "internal"
+"""wave 0 = 内部档：**仅**该更新频道可见（`DJB_UPDATE_CHANNEL=internal` 的内部机）；
+`stable` / `beta` 命中的结果是 `not_in_wave_0`，等于永不进入内部档。"""
 UPDATE_BUCKET_OBSERVE_S = 24 * 3600
 UPDATE_KEEP_VERSIONS = 2
 UPDATE_SIGNATURE_PREFIX = "hmac-sha256:"

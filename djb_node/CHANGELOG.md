@@ -6,6 +6,27 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.3.5 · 2026-11-13
+
+**灰度阶梯对齐硬约束 + 内部档**（RC12-B 配套）。`__version__` / `pyproject.toml` / Helm `appVersion`
+同源升到 `0.3.5`（`7779281` 已完成 bump）；**没有**协议契约变更，**没有**新增运行时依赖。
+
+### 灰度阶梯（`facts.UPDATE_BUCKET_WAVES`）
+- 常量由 `(5, 25, 100)` 改为 **`(1, 10, 50, 100)`**：wave 1/2/3/4 = 1% / 10% / 50% / 100%。
+- 新增 **wave 0 = 内部档**：只有 `update_channel=internal` 的机器可见，`stable`/`beta` 命中
+  `not_in_wave_0(internal)`；`internal` 同时是**超集频道**（可收任一频道清单），
+  `stable`/`beta` 仍严格匹配（0.3.4 行为不变）。
+- 兼容：`rollout.wave` 缺省仍 = 最后一档（100%）；`wave: 0` 必须显式写
+  （旧写法 `wave or len(...)` 会把 0 当缺省 → 100%，已修）。
+- ⚠ **口径**：0.3.4 → 0.3.5 这次升级**不受益**——旧客户端代码里常量写死 `(5,25,100)`，
+  本次实际仍只能 `0/5/25/100`；新阶梯从 0.3.5 → 0.3.6 起生效
+  （`reports/RM-20261113/B-PREP/10-GRAY-LADDER.md` §2C）。
+
+### 测试
+- `tests/test_update.py`：`test_actions_and_bucket_eligibility` 按 1/10/50/100 重写（含 48h/72h 观测窗），
+  新增 `test_wave_zero_is_internal_only`（含「`wave: 0` 不被 `or` 当缺省」回归）与
+  `test_internal_channel_accepts_any_manifest_channel`（超集频道 vs stable 严格匹配）。
+
 ## 0.3.4 · 2026-11-12
 
 **到期墙 + 五通道版**（RC10 配套）。版本号 `__version__` / `pyproject.toml` / Helm `appVersion`

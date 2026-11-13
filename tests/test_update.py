@@ -167,16 +167,62 @@ def _find_sec_fixture() -> str | None:
 
 # ─────────────────────────────────────────────────────────── 分桶 / 选择
 def test_actions_and_bucket_eligibility(clock):
-    payload = {"version": "0.2.0", "rollout": {"wave": 1, "pct": 5,
-                                               "since": clock.current.isoformat()}}
-    assert bucket_eligible(3, payload, now=clock())[0] is True
-    assert bucket_eligible(28, payload, now=clock())[0] is False
-    # wave 2 需要 ≥24h 观测
-    payload["rollout"] = {"wave": 2, "pct": 25, "since": clock.current.isoformat()}
-    assert bucket_eligible(10, payload, now=clock())[0] is False
-    later = clock.current + timedelta(seconds=facts.UPDATE_BUCKET_OBSERVE_S + 1)
-    assert bucket_eligible(10, payload, now=later)[0] is True
-    assert bucket_eligible(10, {"version": "0.2.0"}, now=clock())[0] is True
+    base = clock.current
+    payload = {"version": "0.2.0", "rollout": {"wave": 1, "since": base.isoformat()}}
+    # wave 1 = 1%：只有 bucket 0 命中（0.3.4 的 (5,25,100) 在这里会是 5%）
+    assert bucket_eligible(0, payload, now=clock())[0] is True
+    assert bucket_eligible(1, payload, now=clock())[0] is False
+    # wave 2 = 10%，且需要 ≥24h 观测
+    payload["rollout"] = {"wave": 2, "since": base.isoformat()}
+    assert bucket_eligible(9, payload, now=clock())[0] is False
+    later = base + timedelta(seconds=facts.UPDATE_BUCKET_OBSERVE_S + 1)
+    assert bucket_eligible(9, payload, now=later)[0] is True
+    assert bucket_eligible(10, payload, now=later)[0] is False
+    # wave 3 = 50%（48h）/ wave 4 = 100%（72h）
+    payload["rollout"] = {"wave": 3, "since": base.isoformat()}
+    assert bucket_eligible(49, payload, now=later)[0] is False
+    assert bucket_eligible(49, payload, now=base + timedelta(
+        seconds=2 * facts.UPDATE_BUCKET_OBSERVE_S + 1))[0] is True
+    payload["rollout"] = {"wave": 4, "since": base.isoformat()}
+    assert bucket_eligible(99, payload, now=base + timedelta(
+        seconds=3 * facts.UPDATE_BUCKET_OBSERVE_S + 1))[0] is True
+    # 缺 rollout / 缺 wave = 最后一档（100%），与 0.3.4 及更早语义一致：
+    # 有 since 时仍要走完最后一档的观测期（旧码是 observing_wave_3，新码是 observing_wave_4）
+    assert bucket_eligible(99, {"version": "0.2.0"}, now=clock())[0] is True
+    assert bucket_eligible(99, {"version": "0.2.0",
+                                "rollout": {"since": base.isoformat()}},
+                           now=clock()) == (False, "observing_wave_4")
+    assert bucket_eligible(99, {"version": "0.2.0",
+                                "rollout": {"since": base.isoformat()}},
+                           now=base + timedelta(
+                               seconds=3 * facts.UPDATE_BUCKET_OBSERVE_S + 1))[0] is True
+
+
+def test_wave_zero_is_internal_only(clock):
+    payload = {"version": "0.2.0", "rollout": {"wave": 0, "since": clock.current.isoformat()}}
+    # 默认 stable：wave 0 永不命中（等于内部档对公网不存在）
+    ok, reason = bucket_eligible(0, payload, now=clock())
+    assert ok is False and reason == "not_in_wave_0(internal)"
+    # internal 频道：命中，且 reason 自证档位
+    ok, reason = bucket_eligible(57, payload, now=clock(), channel="internal")
+    assert ok is True and reason == "wave_0(internal)"
+    # 回归：`wave: 0` 不能被 `or` 当缺省（旧写法会把 0 → 100%，把内部档漏给全体）
+    assert bucket_eligible(99, payload, now=clock(), channel="internal")[1] == "wave_0(internal)"
+    assert bucket_eligible(99, payload, now=clock())[1] == "not_in_wave_0(internal)"
+
+
+def test_internal_channel_accepts_any_manifest_channel(tmp_path, paths, store, clock, monkeypatch):
+    use_test_anchor(monkeypatch)
+    manager = UpdateManager(paths, store, source="", channel="internal",
+                            client_version="0.1.0", now=clock)
+    manager.source = build_source(tmp_path, version="0.2.0", channel="beta")
+    check = manager.check()
+    assert check["state"] == "eligible"          # internal 是超集：不再 channel_mismatch
+    # 非 internal 的机器仍按频道严格匹配（0.3.4 行为不变）
+    stable = UpdateManager(paths, store, source="", channel="stable",
+                           client_version="0.1.0", now=clock)
+    stable.source = build_source(tmp_path, version="0.2.0", channel="beta")
+    assert stable.check()["state"] == "channel_mismatch"
 
 
 def test_select_artifact():
