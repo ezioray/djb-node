@@ -45,6 +45,7 @@ import sys
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from ..errors import UsageError
+from ..platform.no_window import subprocess_window_kwargs
 from ..logging_setup import event
 from .model import TrayAction, TrayIntent, TrayMenuItem, TrayModel
 from .notifications import FETCH_LIMIT, summarize
@@ -543,7 +544,8 @@ def _run_cli_json(cli_args: Sequence[str], *, timeout: float = CLI_TIMEOUT_S) ->
         # 中文 Windows 上沿用 cp936 会 UnicodeDecodeError（见 desktop/datasource.py）
         completed = subprocess.run(command, capture_output=True,
                                    encoding="utf-8", errors="replace",
-                                   timeout=timeout, check=False, env=env)
+                                   timeout=timeout, check=False, env=env,
+                                   **subprocess_window_kwargs())
     except (OSError, subprocess.SubprocessError) as exc:
         event("tray.cli_failed", level="warning", command=label,
               error=type(exc).__name__)
@@ -603,7 +605,8 @@ def _run_cli_command(cli_args: Sequence[str], *,
         completed = subprocess.run(command, capture_output=True,
                                    encoding="utf-8", errors="replace",
                                    timeout=timeout, check=False, env=env,
-                                   stdin=subprocess.DEVNULL)
+                                   stdin=subprocess.DEVNULL,
+                                   **subprocess_window_kwargs())
     except (OSError, subprocess.SubprocessError) as exc:
         event("tray.cli_action_failed", level="warning", command=" ".join(cli_args[:2]),
               error=type(exc).__name__)

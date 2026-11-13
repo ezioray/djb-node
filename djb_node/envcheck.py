@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from . import facts, machine_profile
+from .platform.no_window import subprocess_window_kwargs
 from .config import ClientConfig, GATEWAY_PLACEHOLDER, Paths
 from .limits import ResourceMonitor
 from .store import ProfileRecord, Store
@@ -379,7 +380,8 @@ def check_acceleration(now: datetime, *, profile: dict[str, Any] | None = None) 
     try:
         completed = subprocess.run(
             [binary, "--query-gpu=name,driver_version", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=PROBE_TIMEOUT_S, check=False)
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT_S, check=False,
+            **subprocess_window_kwargs())
         first = (completed.stdout or "").strip().splitlines()[0]
         return Check("acceleration", "加速栈", "ok",
                      "检测到 GPU：" + first,

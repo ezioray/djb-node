@@ -29,6 +29,7 @@ from .access import ACCESS_FILE, RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, R
 from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
+from ..platform.no_window import subprocess_window_kwargs
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
 from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
 from . import platform_ui
@@ -269,6 +270,8 @@ class DesktopApp:
             self._scale = 1.0
         self._px = lambda n: int(round(float(n) * self._scale))
         self._controller = controller
+        #: S2：取数 worker（惰性建，见 _ensure_refresh_worker）
+        self._refresh_worker: Any = None
         if getattr(controller, "save_path", None) is None:
             controller.save_path = _make_save_path(lambda: self._root)
         if getattr(controller, "ask_code", None) is None:
@@ -824,11 +827,98 @@ class DesktopApp:
         self._page_fade()
         return view
 
-    def refresh(self) -> View:
+    def refresh(self) -> View | None:
+        """刷新（交互路径：按钮 / F5 / Ctrl-R）。**取数在 worker 线程**，不阻塞主线程。
+
+        返回 ``None`` 表示结果稍后到（:meth:`refresh_now` 是同步版，给 ``--shot`` /
+        没有事件循环的场景用）。重复点击不叠加：只会更新一次「正在刷新…」。
+        """
+        worker = self._ensure_refresh_worker()
+        if worker is None:                         # 没有 after()（假 root / 无窗口）
+            return self.refresh_now()
+        if not worker.start():
+            return None
+        return None
+
+    def refresh_now(self) -> View:
+        """同步刷新（阻塞到取数完成）：截图脚本 / 单测 / 无事件循环环境专用。"""
         view = self._controller.refresh()
         self._render(view)
         self._update_status()
         return view
+
+    def _ensure_refresh_worker(self) -> Any:
+        """惰性建 worker：``schedule`` 用 ``root.after``，``cancel`` 用 ``after_cancel``。
+
+        ``after`` 是**主线程**的东西：worker 线程只置一个 Event，主线程轮询取结果。
+        """
+        worker = getattr(self, "_refresh_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(self._controller.source.snapshot,
+                               apply=self._apply_refresh,
+                               on_start=self._refresh_started,
+                               on_busy=self._refresh_busy,
+                               on_finish=self._refresh_finished,
+                               schedule=schedule, cancel=cancel)
+        self._refresh_worker = worker
+        # 动作里（登出/绑定/暂停后）的刷新也走异步：否则那几次点击照样冻住窗口
+        self._controller.refresh_via = self._request_refresh_async
+        return worker
+
+    # ── 刷新回调（全部在主线程执行）
+    def _request_refresh_async(self, sections: Any = None) -> None:
+        worker = self._ensure_refresh_worker()
+        if worker is None:
+            self._controller.refresh(sections)     # 没有事件循环：退回同步
+            return
+        worker.start(sections)
+
+    def _refresh_started(self) -> None:
+        """(a) 立即反馈：按钮文案 + 状态栏，在取数**开始之前**就变。"""
+        button = getattr(self, "_refresh_button", None)
+        if button is not None:
+            try:
+                button.set_text("刷新中…")
+            except Exception:                      # pragma: no cover - 控件已销毁
+                pass
+        self._toast("正在刷新…（可以继续拖动/切页）", ok=True)
+
+    def _refresh_busy(self) -> None:
+        """(c) 并发闸门：重复点击只提示，不再派发第二个取数。"""
+        self._toast("正在刷新…上一次还没结束，已忽略这次点击", ok=True)
+
+    def _refresh_finished(self) -> None:
+        button = getattr(self, "_refresh_button", None)
+        if button is not None:
+            try:
+                button.set_text("刷新")
+            except Exception:                      # pragma: no cover
+                pass
+
+    def _apply_refresh(self, fresh: Any, error: BaseException | None,
+                       sections: Any = None) -> None:
+        """(d) 结果落地：合并快照 → 渲染 → 状态栏。异常已经在这里变成「刷新失败」。"""
+        view = self._controller.apply_refresh(fresh, sections=sections, error=error)
+        self._render(view)
+        self._update_status()
+        worker = getattr(self, "_refresh_worker", None)
+        duration = getattr(worker, "last_duration_s", 0.0) or 0.0
+        message = str(self._controller.message or "")
+        if duration and message.startswith("已刷新"):
+            message += "（用时 %.1f s）" % duration
+        self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
 
     # ── 双主题（day / night）
     def _theme_button_text(self, narrow: bool | None = None) -> str:
@@ -1940,8 +2030,9 @@ class DesktopApp:
             except Exception:                            # 变量随旧视图销毁：跳过，不让动作静默不执行
                 continue
         result = self._controller.action(key, confirm=self._confirm)
+        copied = True
         if result.effect == "copy":
-            self._copy(result.payload)
+            copied = self.copy_text(result.payload)
         elif result.effect == "open_dir":
             self._open_dir(result.payload)
         elif result.effect == "open_url":
@@ -1951,15 +2042,39 @@ class DesktopApp:
         elif result.effect in ("refresh", "access", "bench", "control", "reload"):
             self._render(self._controller.current())
         self._update_status()
-        if result.effect in ("save", "access", "reload", "control", "export", "verify") and result.message:
+        # "copy" 漏在名单外 = 复制成功/失败都零反馈（S4：客户说「点了没反应」）
+        if result.effect == "copy" and not copied:
+            self._toast("复制失败：剪贴板写入被拒绝（可能有别的程序占着剪贴板），请再点一次",
+                        ok=False)
+        elif result.effect in ("save", "access", "reload", "control", "export", "verify",
+                              "copy") and result.message:
             self._toast(result.message, ok=result.ok)
 
-    def _copy(self, text: str) -> None:
+    def copy_text(self, text: str) -> bool:
+        """把文本放进系统剪贴板；**必须** ``update()`` 一次才算真的写进去。
+
+        真机事故（S4）：Tk 的 ``clipboard_append`` 只是把内容登记给本进程，X11/Win32 的
+        剪贴板所有权要等事件循环处理一次才转移；不 ``update()`` 就退出/切窗口，粘贴出来
+        是**旧内容或空**。旧实现还 ``except Exception: pass``，失败连日志都没有。
+        返回是否成功；失败原因交给调用方 toast（不再静默）。
+        """
         try:
             self._root.clipboard_clear()
-            self._root.clipboard_append(text)
-        except Exception:
-            pass
+            self._root.clipboard_append(str(text))
+            updater = getattr(self._root, "update", None)
+            if callable(updater):
+                updater()
+            return True
+        except Exception as exc:                      # noqa: BLE001 - 剪贴板可能被别的程序占着
+            try:
+                from ..logging_setup import event
+                event("desktop.copy_failed", error=type(exc).__name__)
+            except Exception:
+                pass
+            return False
+
+    def _copy(self, text: str) -> None:
+        self.copy_text(text)
 
     def _open_dir(self, path: str) -> None:
         """只做「显示路径」：不自动调用系统文件管理器（避免在无桌面环境弹错）。"""
@@ -2033,6 +2148,12 @@ class DesktopApp:
         self._root.mainloop()
 
     def stop(self) -> None:
+        worker = getattr(self, "_refresh_worker", None)
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:                      # pragma: no cover
+                pass
         if self._unsubscribe is not None:
             try:
                 self._unsubscribe()
@@ -2258,7 +2379,16 @@ def unique_iid(key: str, used: set[str]) -> str:
 
 
 def _make_cli_runner(home):
-    """本机命令通道：显式带上 ``DJB_HOME``，避免子进程读到别的 home。"""
+    """本机命令通道：显式带上 ``DJB_HOME``，避免子进程读到别的 home。
+
+    ``home is None`` 必须在这里解析成**真实目录**：旧实现写 ``str(home)`` → 子进程拿到
+    ``DJB_HOME=None``（字符串），CLI 会把 ``<cwd>/None`` 当数据目录 → 一律「本机未初始化」。
+    """
+    if home is None:
+        from ..config import resolve_home
+        home = resolve_home()
+    home = os.fspath(home)
+
     def run(argv):
         import subprocess
         import sys
@@ -2274,7 +2404,8 @@ def _make_cli_runner(home):
             # 否则中文 Windows 上按 cp936 解会 UnicodeDecodeError → 动作区报错。
             completed = subprocess.run(command, capture_output=True,
                                        encoding="utf-8", errors="replace", timeout=20,
-                                       env=env, stdin=subprocess.DEVNULL, check=False)
+                                       env=env, stdin=subprocess.DEVNULL, check=False,
+                                       **subprocess_window_kwargs())
         except subprocess.TimeoutExpired:
             raise ProviderError("本地命令超时（20s）") from None
         except OSError as exc:
@@ -2304,7 +2435,10 @@ def _make_reloader(home: str | os.PathLike | None):
             from ..errors import NotRunningError, UsageError
         except ImportError:                       # pragma: no cover - 防御
             return RELOAD_UNSUPPORTED, ""
-        paths = Paths(str(home) if home else os.path.expanduser("~/.djb"))
+        # 与数据层同一个解析口径（Windows 是 %APPDATA%\DJB，不是 ~/.djb）：
+        # 写死 ~/.djb 时「保存并回读」会连到不存在的 socket → 永远「daemon 未运行」。
+        from ..config import resolve_home
+        paths = Paths(os.fspath(home) if home else resolve_home())
         try:
             response = ControlClient(paths).call({"cmd": "reload"}, timeout=15.0)
         except NotRunningError:
@@ -2329,10 +2463,21 @@ def demo_source() -> FakeDataSource:
 
 
 def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False,
-                    cloud: Any | None = None, bus: Any | None = None) -> DesktopController:
-    """装配：数据源 + 接入配置服务 + 控制通道 + 状态总线。"""
+                    cloud: Any | None = None, bus: Any | None = None,
+                    boot: Mapping[str, Any] | None = None) -> DesktopController:
+    """装配：数据源 + 接入配置服务 + 控制通道 + 状态总线。
+
+    ``home`` **只解析一次**（S3 根因，见 REPORT）：``None`` 时各下游曾各自找默认目录——
+    数据层用 ``resolve_home()``（Windows = ``%APPDATA%\\DJB``），action CLI 用了
+    ``str(None)`` = 字符串 ``"None"``（= 当前工作目录下的 ``None`` 目录），控制通道 / 热重载
+    又写死 ``~/.djb``。结果：同一个窗口里「取数去 A、保存去 B、控制去 C」，
+    在真机上表现成「节点绑定不可用 / 保存了不生效」。
+    """
     from ..gui.state import ControlBus
     bus = bus if bus is not None else ControlBus()
+    if home is None and not demo:
+        home = _default_home()             # 与 LocalDataSource / bootstrap 同一个解析口径
+    home = None if home is None else os.fspath(home)
     if demo:
         source: Any = demo_source()
     else:
@@ -2340,7 +2485,7 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
             # 没显式注入就按 ~/.djb 自己装：没登录节点时是 None（视图照常显示「暂不可用」）
             from .nodecloud import NodeCloudClient
             cloud = NodeCloudClient.from_home(home)
-        source = LocalDataSource(home=home, cloud=cloud)
+        source = LocalDataSource(home=home, cloud=cloud, boot=boot)
     store = FileAccessStore(None if home is None else
                             os.path.join(str(home), ACCESS_FILE))
     access = AccessService(store, reloader=_make_reloader(home))
@@ -2365,13 +2510,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="关闭首启自举（测试/离线环境：不建目录、不起节点）")
     args = parser.parse_args(list(argv) if argv is not None else None)
     boot_line = ""
+    daemon: Mapping[str, Any] | None = None
     if not args.demo and not args.no_auto:
         # 首启自举（2026-11-06 外部客户实测：装完只看到「云端未接通/本机未初始化」）
         from ..bootstrap import ensure_ready, start_daemon, summary_text
         boot = ensure_ready(home=args.home)
         daemon = start_daemon(home=args.home)
         boot_line = summary_text(boot, daemon)
-    controller = make_controller(home=args.home, demo=args.demo)
+    # 自举结论（尤其 start_daemon 的 no-cli / timeout）要带进数据层：
+    # 「接入配置」页的「节点进程」字段靠它说出真因，而不是只说「daemon 未运行」
+    controller = make_controller(home=args.home, demo=args.demo, boot=daemon)
     try:
         # prefs_home 必须显式给：demo 数据源没有 home，不给就会把主题偏好写到真实 ~/.djb
         app = DesktopApp(controller, on_quit=lambda: None,
@@ -2425,7 +2573,8 @@ def _shoot(app: DesktopApp, directory: str) -> list[str]:
                     continue
             try:
                 window_id = str(app._root.winfo_id())
-                subprocess.run(["import", "-window", window_id, target], check=False, timeout=30)
+                subprocess.run(["import", "-window", window_id, target], check=False,
+                               timeout=30, **subprocess_window_kwargs())
             except (OSError, subprocess.SubprocessError):
                 continue
             if os.path.exists(target):

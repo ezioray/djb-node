@@ -61,6 +61,8 @@ from __future__ import annotations
 import sys
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from ..platform.no_window import subprocess_window_kwargs
+
 __all__ = [
     "DEFAULT_MARGIN",
     "IS_LINUX",
@@ -575,6 +577,7 @@ def _xrdb_dpi() -> float | None:
     try:
         import subprocess
         result = subprocess.run(["xrdb", "-query"], capture_output=True, text=True,
+                                **subprocess_window_kwargs(),
                                 timeout=2, check=False)
     except Exception:
         return None

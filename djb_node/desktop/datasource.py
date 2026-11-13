@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 from ..errors import StoreNotInitializedError
+from ..platform import inproc_cli
+from ..platform.no_window import subprocess_window_kwargs
 from .access import ACCESS_FILE, AccessConfig, FileAccessStore, mask_secret
 
 __all__ = [
@@ -302,7 +304,8 @@ def gpu_devices(*, run: Callable[[Sequence[str]], str] | None = None,
 
 def _run_text(argv: Sequence[str], *, timeout: float = 4.0) -> str:
     completed = subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout,
-                               check=False, stdin=subprocess.DEVNULL)
+                               check=False, stdin=subprocess.DEVNULL,
+                               **subprocess_window_kwargs())
     if completed.returncode != 0:
         raise ProviderError("命令返回非零")
     return completed.stdout
@@ -382,7 +385,8 @@ class LocalDataSource:
                  store_factory: Callable[[Path], Any] | None = None,
                  clock: Callable[[], float] = time.time,
                  cli_timeout: float = 8.0,
-                 log_limit: int = 2000) -> None:
+                 log_limit: int = 2000,
+                 boot: Mapping[str, Any] | None = None) -> None:
         from ..config import resolve_home
         self._home = Path(home or resolve_home(None))
         self._runner = runner or self._cli_runner
@@ -398,10 +402,22 @@ class LocalDataSource:
         self._cloud_probed = False
         self._offline_reason = ""          # 本轮刷新已确认的「连不上」原因（跨域复用）
         self._which = which
+        # 本轮快照内的 status 记忆化（见 status()）；快照外恒为 None
+        self._status_cache: Mapping[str, Any] | None = None
+        self._status_error: ProviderError | None = None
+        self._in_snapshot = False
+        # 机器画像 TTL 缓存：硬件型号不会在 60 s 内变，而 Windows 上每次采集是
+        # 3 次 powershell.exe（真机 200-500 ms/次，且从 windowed 进程起会弹黑框）
+        self._profile_cache: tuple[Any, float] = (None, 0.0)
+        self._gpu_cache: Any = None
         self._facts = facts
         self._bench = bench
         self._store_factory = store_factory
         self._clock = clock
+        # 首启自举结果（bootstrap.start_daemon）：``reason`` / ``log`` 用来解释「节点为什么
+        # 没起来」。只有 status 的话页面只能说「daemon 未运行」，真因（缺 djb-node.exe /
+        # 启动超时）被吞掉——S3 客户现场就是这个现象。
+        self._boot: dict[str, Any] = dict(boot or {})
         self._cli_timeout = float(cli_timeout)
         self._access = FileAccessStore(self._home / ACCESS_FILE)
         self._logs = RingLog(self._home / "logs" / "djb.log", limit=log_limit)
@@ -435,30 +451,41 @@ class LocalDataSource:
         expected = str(self._home or "")
         if env.get("DJB_HOME", "") != expected:
             raise ProviderError("本机命令的 home 不一致（拒绝执行）")
-        try:
-            # 编码必须显式钉成 UTF-8：子进程是**我们自己**的 CLI，`cli.main()` 会
-            # `_enable_utf8_stdio()` 强制以 UTF-8 写 stdout（0.2.3 修的 Windows 控制台
-            # 乱码）。父进程若沿用本地代码页（中文 Windows = cp936）解码，UTF-8 中文
-            # 三字节被判非法 → ``UnicodeDecodeError`` → payload 拿不到 → ``status()``
-            # 报「状态回显不完整」→ 依赖 status 的 token_plan / access / account 一起
-            # 变成「暂不可用」。``errors="replace"`` 是兜底：宁可屏幕上出现一个 U+FFFD，
-            # 也不许因为一个坏字节把整个视图打成不可用。
-            completed = subprocess.run(command, capture_output=True,
-                                       encoding="utf-8", errors="replace",
-                                       timeout=self._cli_timeout, check=False,
-                                       env=env, stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            raise ProviderError("本地命令超时") from None
-        except OSError as exc:
-            raise ProviderError("本地命令无法执行（" + type(exc).__name__ + "）") from None
-        if completed.returncode != 0:
+        # 加速路径（默认关闭，见 platform.inproc_cli 的三字段开关）：同一份 CLI 代码在
+        # 本进程里跑，省掉 onefile 冷启动（真机 1.5-1.6 s/次）。任何不合适都返回 None →
+        # 下面原路起子进程，行为与 0.3.4 逐字一致。
+        inproc = inproc_cli.call(argv, home=self._home)
+        returncode, stdout, stderr = -1, "", ""
+        if inproc is not None:
+            returncode, stdout, stderr = inproc
+        else:
+            try:
+                # 编码必须显式钉成 UTF-8：子进程是**我们自己**的 CLI，`cli.main()` 会
+                # `_enable_utf8_stdio()` 强制以 UTF-8 写 stdout（0.2.3 修的 Windows 控制台
+                # 乱码）。父进程若沿用本地代码页（中文 Windows = cp936）解码，UTF-8 中文
+                # 三字节被判非法 → ``UnicodeDecodeError`` → payload 拿不到 → ``status()``
+                # 报「状态回显不完整」→ 依赖 status 的 token_plan / access / account 一起
+                # 变成「暂不可用」。``errors="replace"`` 是兜底：宁可屏幕上出现一个 U+FFFD，
+                # 也不许因为一个坏字节把整个视图打成不可用。
+                completed = subprocess.run(command, capture_output=True,
+                                           encoding="utf-8", errors="replace",
+                                           timeout=self._cli_timeout, check=False,
+                                           env=env, stdin=subprocess.DEVNULL,
+                                           **subprocess_window_kwargs())
+            except subprocess.TimeoutExpired:
+                raise ProviderError("本地命令超时") from None
+            except OSError as exc:
+                raise ProviderError("本地命令无法执行（" + type(exc).__name__ + "）") from None
+            returncode, stdout, stderr = (completed.returncode, completed.stdout,
+                                          completed.stderr)
+        if returncode != 0:
             # 把 CLI 的原话带上来（「本机未初始化：先执行 djb init」比「退出码 3」有用得多）
-            lines = [line.strip() for line in (completed.stderr or completed.stdout or "").splitlines()
+            lines = [line.strip() for line in (stderr or stdout or "").splitlines()
                      if line.strip() and not line.strip().startswith("details=")]
             detail = lines[0].removeprefix("djb: ") if lines else ""
-            raise ProviderError(detail[:160] or "本地命令退出码 " + str(completed.returncode))
+            raise ProviderError(detail[:160] or "本地命令退出码 " + str(returncode))
         try:
-            payload = json.loads(completed.stdout or "{}")
+            payload = json.loads(stdout or "{}")
         except ValueError:
             raise ProviderError("本地命令输出不是 JSON") from None
         if not isinstance(payload, Mapping):
@@ -498,17 +525,47 @@ class LocalDataSource:
         collected: dict[str, Any] = {}
         self._offline_reason = ""
         self._cloud_probed = False         # 每轮刷新给「重新装配云端客户端」一次机会
-        for name in wanted:
-            collected[name] = self._safe(name, loader[name])
+        # status 缓存只在**这一轮快照内**有效：5 个数据域（status/tasks/earnings/
+        # token_plan/yield）都要同一份 ``djb status --json``，旧实现各跑一次子进程
+        # （冻结包 onefile 冷启动真机 1.6 s/次 → 一轮刷新 8 秒）。此处一轮只取一次。
+        self._status_cache = None
+        self._status_error = None
+        self._gpu_cache = None
+        self._in_snapshot = True
+        try:
+            for name in wanted:
+                collected[name] = self._safe(name, loader[name])
+        finally:
+            self._in_snapshot = False
         return Snapshot(sections=collected,
                         fetched_at=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(self._clock())),
                         source="local", notes=tuple(self.notes))
 
     # ── 各数据域
     def status(self) -> Mapping[str, Any]:
-        payload = self._runner(["status"])
-        if not isinstance(payload, Mapping) or "state" not in payload:
-            raise ProviderError("状态回显不完整")
+        """``djb status --json``：**一轮快照内只跑一次**（结果给 5 个域共用）。
+
+        为什么记忆化：``status`` 是 13 个域里 5 个（status / tasks / earnings /
+        token_plan / yield）的共同依赖，旧实现对每个域各起一次 CLI 子进程；冻结包
+        onefile 冷启动真机 1.6 s/次，光这一项就吃掉 8 s（S2「点了没反应」）。
+        缓存**只在一次 ``snapshot()`` 内有效**：快照外直接调 ``status()`` 永远取新值。
+        失败也缓存（同一轮里不重复等同一个失败的超时）。
+        """
+        if self._in_snapshot:
+            if self._status_cache is not None:
+                return self._status_cache
+            if self._status_error is not None:
+                raise self._status_error
+        try:
+            payload = self._runner(["status"])
+            if not isinstance(payload, Mapping) or "state" not in payload:
+                raise ProviderError("状态回显不完整")
+        except ProviderError as exc:
+            if self._in_snapshot:
+                self._status_error = exc
+            raise
+        if self._in_snapshot:
+            self._status_cache = payload
         return payload
 
     def _status(self) -> Mapping[str, Any]:
@@ -524,7 +581,10 @@ class LocalDataSource:
             now = utcnow()
             paths = Paths(str(self._home))
             # 三个探针签名都是 (now, ...)：少传参会在界面上变成「检测失败（TypeError）」
-            for probe in (lambda: check_system(now), lambda: check_hardware(now),
+            # check_hardware 现场采集会跑 3 次 powershell（Windows）；画像按 TTL 复用
+            profile = self._machine_profile()
+            for probe in (lambda: check_system(now),
+                          lambda: check_hardware(now, profile=profile),
                           lambda: check_runtime(now, paths)):
                 try:
                     check = probe()
@@ -551,7 +611,52 @@ class LocalDataSource:
                 "gpu": self._safe("gpu", self._gpu)}
 
     def _gpu(self) -> Mapping[str, Any]:
+        """GPU 探测（nvidia-smi / rocm-smi）。**一轮快照内只跑一次**。
+
+        ``bench`` 域为了渲染「硬件检测」卡片会内嵌一份 gpu，``gpu`` 域自己也要一份；
+        旧实现一次刷新跑两遍 ``nvidia-smi``（Windows 上 = 两个黑框 + 2×59 ms）。
+        """
+        if self._in_snapshot:
+            cached = self._gpu_cache
+            if isinstance(cached, BaseException):   # 本轮已失败过：不再探第二遍
+                raise cached
+            if cached is not None:
+                return cached
+            try:
+                value = gpu_devices(which=self._which)
+            except BaseException as exc:
+                self._gpu_cache = exc
+                raise
+            self._gpu_cache = value
+            return value
         return gpu_devices(which=self._which)
+
+    #: 机器画像缓存时长（秒）：硬件型号 / 核数 / 显存不会在窗口开着的时候变
+    PROFILE_TTL_S = 60.0
+
+    def _machine_profile(self) -> dict[str, Any] | None:
+        """本机机器画像（CPU/内存/磁盘/GPU 型号），TTL 内只采集一次。
+
+        Windows 上 :func:`machine_profile.collect` 会跑 3 次 ``powershell.exe``
+        （Win32_Processor / Win32_OperatingSystem / Win32_VideoController）。旧实现每次
+        刷新都采一遍 → 一次刷新 3 个黑框 + 0.6-1.5 s。缓存的是**静态画像**，实时数字
+        （负载 / 显存占用 / 利用率）仍由 ``check_hardware`` 现场读，不受影响。
+        """
+        cached, stamp = self._profile_cache
+        now = time.monotonic()
+        if stamp and (now - stamp) < self.PROFILE_TTL_S:
+            return cached if isinstance(cached, dict) else None
+        data: dict[str, Any] = {}
+        try:
+            from .. import machine_profile as profile_mod
+            data = dict(profile_mod.collect(home=str(self._home)).to_dict())
+        except Exception:
+            # 采集失败给**空 dict**（不是 None）：``check_hardware(profile=None)`` 会现场
+            # 再采一遍 → 失败场景反而比修复前多跑一次 powershell。空 dict 走「没有画像」
+            # 的同一条分支（与旧实现 collect 失败时 check_hardware 拿到的 None 等价）。
+            data = {}
+        self._profile_cache = (data, now)
+        return data
 
     def _ensure_cloud(self) -> Any | None:
         """按本机凭据惰性装配云端客户端；同一轮刷新只尝试一次。
@@ -957,21 +1062,112 @@ class LocalDataSource:
         config = self._access.load()
         binding: Mapping[str, Any] | None = None
         note = ""
-        try:
-            node_id = config.node_id
-            if node_id:
-                binding = self._cloud_call("binding", node_id)
-        except ProviderError as exc:
-            note = "云端绑定状态暂不可用：" + exc.reason
+        # 先解析节点 ID，再用**解析结果**查云端绑定状态：旧实现只拿 ``config.node_id``
+        # （用户手填字段），而注册成功根本不写 access.json → 真机上一注册过就永远查不到，
+        # 绑定卡恒为「暂不可用」。这是 S3 的第二个真 bug。
+        resolved, source = self._resolve_node_id(config)
+        if resolved:
+            try:
+                binding = self._cloud_call("binding", resolved)
+            except ProviderError as exc:
+                note = "云端绑定状态暂不可用：" + exc.reason
         # 文件不存在 ≠ 通过校验：没保存过就说没保存过，避免「通过校验」误导
         saved = bool(getattr(self._access, "path", None)
                      and Path(self._access.path).exists())
-        resolved, source = self._resolve_node_id(config)
+        status = self._safe("status", self._status)
+        info: Mapping[str, Any] = status if isinstance(status, Mapping) else {}
         return {"config": config.display(), "valid": _valid(config) if saved else None,
                 "saved": saved, "binding": binding,
                 # 只增字段：``config`` 投影保持原样（秘密仍掩码），供旧调用方无痛
                 "node_id": resolved, "node_id_source": source,
+                # 三级回退每一级的可观测结论 + 节点进程状态：空 ID 时客户能自己看出卡在哪
+                "node_id_diag": self._node_id_diag(config, info, resolved),
+                "daemon": self._daemon_diag(info),
                 "note": note, "path": str(self._access.path)}
+
+    def _daemon_diag(self, info: Mapping[str, Any]) -> dict[str, Any]:
+        """节点进程的可展示状态：没跑就说没跑 + **真因** + 下一步（不吞成空白）。
+
+        真因优先取自举结果（``start_daemon`` 的 ``no-cli`` / ``timeout``）：``status``
+        只知道「daemon 未运行」，不知道「同目录没有 djb-node.exe」。
+        """
+        running = bool(info.get("daemon_running"))
+        reason = str(info.get("reason_label") or info.get("reason") or "")
+        next_step = str(info.get("next_step") or "")
+        if not running:
+            from ..bootstrap import daemon_reason_text
+            boot_reason = str(self._boot.get("reason") or "")
+            boot_log = str(self._boot.get("log") or "")
+            if boot_reason and boot_reason != "already-running":
+                text = daemon_reason_text(boot_reason, boot_log)
+                if text:
+                    reason = text
+                    next_step = next_step or "按上面这句处理后点「刷新」"
+            if not reason:
+                reason = "节点进程没在跑，且没拿到原因（看 logs/djb.log）"
+        return {"running": running,
+                "state": str(info.get("state") or "unknown"),
+                "reason": reason, "next_step": next_step}
+
+    def _node_id_diag(self, config: AccessConfig, info: Mapping[str, Any],
+                      resolved: str) -> list[dict[str, Any]]:
+        """节点 ID 三级回退的**逐级结论**（ok / 原因 / 下一步）——排障时不用猜。
+
+        顺序与 :meth:`_resolve_node_id` 一致：access.json（手填）→ 本机凭据（注册下发）
+        → 状态库 ``kv("node")``。每一级都写明「读到了什么」或「为什么读不到」，
+        并给出客户能自己执行的下一步（而不是只留一句「先启动一次」）。
+        """
+        levels: list[dict[str, Any]] = []
+        manual = str(getattr(config, "node_id", "") or "")
+        levels.append({"level": "access.json（手填）", "ok": bool(manual),
+                       "reason": "" if manual else "接入配置里没有手填节点 ID（正常：注册不会写这里）",
+                       "next_step": "" if manual else "不用管这一级，看下面两级"})
+        credentials = info.get("credentials") if isinstance(info.get("credentials"), Mapping) else {}
+        cred_node = str(credentials.get("node_id") or "") if credentials else ""
+        if not credentials:
+            # status 取不到（daemon 没跑 / CLI 失败）：自己读一次凭据文件
+            try:
+                from ..config import Paths
+                from ..secure import CredentialStore
+                cred_node = str(CredentialStore(Paths(str(self._home))).node_id() or "")
+                cred_reason = "" if cred_node else "本机凭据里没有 node_id"
+            except Exception as exc:
+                cred_node = ""
+                cred_reason = "本机凭据读不到（" + type(exc).__name__ + "）"
+        elif cred_node:
+            cred_reason = ""
+        elif credentials.get("file_mode") == "0o0" or not credentials.get("client_key_set"):
+            cred_reason = "从未成功注册（没有 client_key / node_id）"
+        else:
+            cred_reason = "凭据里没有 node_id 字段"
+        levels.append({"level": "本机凭据（注册下发）", "ok": bool(cred_node),
+                       "reason": cred_reason,
+                       "next_step": "" if cred_node else
+                       ("先让节点进程跑起来并完成注册：点「启动节点」或用 djb start；"
+                        "仍失败看日志 logs/djb.log 里的注册报错")})
+        store_node = ""
+        store_reason = ""
+        try:
+            node = self._store().get_kv("node")
+            if isinstance(node, Mapping):
+                store_node = str(node.get("node_id") or "")
+                store_reason = "" if store_node else "状态库有 node 记录但没有 node_id"
+            else:
+                store_reason = "状态库里没有 node 记录（注册未成功）"
+        except Exception as exc:
+            if type(exc).__name__ == "StoreNotInitializedError":
+                store_reason = "本机状态库还没建（首次启动时会自动初始化）"
+            else:
+                store_reason = "状态库读不到（" + type(exc).__name__ + "）"
+        levels.append({"level": "状态库 kv(node)", "ok": bool(store_node),
+                       "reason": store_reason,
+                       "next_step": "" if store_node else "与上一级同因：先完成注册"})
+        if resolved:
+            # 已经拿到值：只保留「哪一级给的」，理由不再重要（页面不显示噪音）
+            for row in levels:
+                if row["ok"]:
+                    row["reason"] = "命中"
+        return levels
 
     def _yield(self) -> Mapping[str, Any]:
         status = self._safe("status", self._status)

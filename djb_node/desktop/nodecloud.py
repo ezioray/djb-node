@@ -37,6 +37,7 @@ PATHS = {
     "profile": "/api/v1/node/profile",
     "receipt": "/api/v1/node/receipts/",       # 单条：+ receipt_id
     "node_balance": "/api/v1/node/balance",    # 节点绑定账户的可用余额（节点钥可读）
+    "binding": "/api/v1/node/binding",         # 节点绑定状态（只读 GET，?node_id=）
 }
 
 #: 一页最多取多少条（服务端可下调，客户端不硬要）
@@ -183,7 +184,10 @@ class NodeCloudClient:
         from ..config import Paths, load_config
         from ..secure import CredentialStore
 
-        paths = Paths(str(home) if home else os.path.expanduser("~/.djb"))
+        # home=None 时用平台解析（Windows = %APPDATA%\DJB）：写死 ~/.djb 会读到空配置
+        # → 整块云端数据「未登录节点」，而本机明明已经注册过（S3 同一类 root cause）。
+        from ..config import resolve_home
+        paths = Paths(os.fspath(home) if home else resolve_home())
         try:
             config = load_config(paths)
             key = CredentialStore(paths).client_key()
@@ -365,6 +369,20 @@ class NodeCloudClient:
         return {"balance_minor": int(minor), "balance": micro_text(minor),
                 "as_of": payload.get("as_of"),
                 "note": reason_text(payload.get("note")) if payload.get("note") else ""}
+
+    def binding(self, node_id: str) -> dict[str, Any]:
+        """节点绑定状态（只读）：``GET /api/v1/node/binding?node_id=…``。
+
+        与 :meth:`djb_node.api.NodeApi.binding` 同一个端点、同一套返回字段。桌面端历史上
+        **没有**这个方法，而 ``_access_section`` 一直在调 ``_cloud_call("binding", …)`` →
+        ``getattr(cloud, "binding", None)`` 永远 None → 绑定卡恒为
+        「暂不可用（云端接口未接线（binding））」。属于接口缺口的补齐，不改任何既有语义。
+        """
+        if not str(node_id or "").strip():
+            raise ProviderError("还没有节点 ID：先完成注册", hint="节点进程起来后自动注册")
+        path = PATHS["binding"] + "?node_id=" + quote(str(node_id), safe="")
+        payload = self._request_json("binding", path)
+        return dict(payload) if isinstance(payload, Mapping) else {}
 
     def profile(self) -> dict[str, Any]:
         """节点身份（服务端 404 = 节点不存在/无权查看，不编占位值）。"""

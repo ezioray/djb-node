@@ -1037,15 +1037,22 @@ def test_access_shows_node_id_from_credentials_readonly_and_copyable():
     assert "nd_from_credentials" in view.plain_text()
 
 
-def test_access_without_node_id_asks_to_start_once():
-    """两者都没有 → 显示「先启动一次」（不是「—」），复制动作置灰并说明原因。"""
+def test_access_without_node_id_explains_the_real_reason():
+    """三级回退全空 → **不说**「先启动一次」（客户已经启动了，照着做也没用）。
+
+    改成：值说「尚未生成 + 卡在哪一环」，提示给真因/下一步，复制动作置灰并指向原因。
+    """
     view = vw.build_view("access", _access_snapshot())
     field = next(item for item in view.fields if item.key == "node_id")
-    assert field.value == "先启动一次"
+    assert field.value != "先启动一次"
+    assert "尚未生成" in field.value
     assert field.editable is False
+    assert field.hint                       # 有下一步，不是空白
     action = next(item for item in view.actions if item.key == "access.copy_node_id")
-    assert action.enabled is False and "先启动一次" in action.reason
-    assert "先启动一次" in view.plain_text()
+    assert action.enabled is False
+    assert "先启动" not in action.reason     # 旧误导文案必须消失
+    assert "注册状态" in action.reason or "节点进程" in action.reason
+    assert "先启动一次" not in view.plain_text()
 
 
 def test_access_secrets_stay_masked_after_node_id_change():
@@ -1076,4 +1083,6 @@ def test_access_copy_node_id_action_returns_clipboard_payload(tmp_path):
 
     empty = make_controller(tmp_path, sections=dict(_access_snapshot().sections))
     missing = empty.action("access.copy_node_id")
-    assert missing.ok is False and "先启动一次" in missing.message
+    assert missing.ok is False
+    assert "接入配置" in missing.message            # 指向能看原因的地方
+    assert "先启动一次" not in missing.message

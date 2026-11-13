@@ -77,10 +77,12 @@ class LocalControlChannel:
 
     def control(self, action: str, confirm: Callable[[str], bool]) -> ControlOutcome:
         from ..daemon import ControlClient
-        from ..config import Paths, load_config
+        from ..config import Paths, load_config, resolve_home
         from ..tray.actions import apply_control, control_enabled
         from ..tray.model import TrayAction
-        paths = Paths(str(self._home)) if self._home else Paths(os.path.expanduser("~/.djb"))
+        # home=None 时必须用 resolve_home()（Windows = %APPDATA%\DJB）：写死 ~/.djb 会连到
+        # 不存在的控制口 → 暂停 / 继续永远「控制通道未接通」。
+        paths = Paths(os.fspath(self._home)) if self._home else Paths(resolve_home())
         config = self._config if self._config is not None else load_config(paths)
         client = ControlClient(paths)
         tray_action = TrayAction.PAUSE if action == "pause" else TrayAction.RESUME
@@ -110,6 +112,8 @@ class DesktopController:
     message: str = DEFAULT_MESSAGE
     view: str = "overview"
     drafts: dict[str, str] = field(default_factory=dict)
+    #: 异步刷新通道（GUI 侧注入 worker）；None = 同步刷新（单测 / 无 Tk 环境）
+    refresh_via: Callable[[Sequence[str] | None], Any] | None = None
     benchmark: Mapping[str, Any] | None = None
     _snapshot: Snapshot | None = None
 
@@ -157,21 +161,53 @@ class DesktopController:
         return self.show(VIEW_KEYS[index])
 
     def refresh(self, sections: Sequence[str] | None = None) -> View:
-        """重新取数；单个数据域失败会在视图里显示「暂不可用」，不影响其他页。
+        """**同步**刷新（单测 / ``--shot`` / 没有事件循环时用）。
 
-        只刷部分域（``sections=("gpu",)``）时**必须合并**进旧快照：数据源只返回
-        被点名的域，直接替换会把其它 12 页一起变成「暂不可用」（点一次「刷新 GPU」
-        后日志/收据全空，直到整页刷新）。
+        交互路径见 :meth:`request_refresh`：GUI 里取数在 worker 线程跑，
+        主线程只调 :meth:`apply_refresh`（Tk 不是线程安全的）。
         """
         names = tuple(sections) if sections else SECTIONS
         try:
             fresh = self.source.snapshot(sections=sections)
         except Exception as exc:                       # 数据层理论上不抛；兜底不让窗口空白
+            return self.apply_refresh(None, sections=names, error=exc)
+        return self.apply_refresh(fresh, sections=sections)
+
+    def request_refresh(self, sections: Sequence[str] | None = None) -> bool:
+        """动作内部请求刷新：接了异步通道就交给它（不阻塞 Tk 主线程），否则同步刷。
+
+        返回 ``True`` = 已交给异步通道（结果稍后到）；``False`` = 已经同步刷完。
+        """
+        hook = self.refresh_via
+        if hook is not None:
+            try:
+                hook(sections)
+            except Exception:                          # 异步通道坏了也不许把动作打崩
+                self.refresh(sections)
+                return False
+            return True
+        self.refresh(sections)
+        return False
+
+    def apply_refresh(self, fresh: Any = None, *, sections: Sequence[str] | None = None,
+                      error: BaseException | None = None) -> View:
+        """把一次取数结果落到快照上（**必须在主线程调用**）。
+
+        * ``error``：取数整体失败 → 只把这次点名的域标成「刷新失败（类型）」，
+          其它域保留上一次结果（老口径一字不改：界面不空白、不静默）；
+        * ``sections``：只刷部分域时**必须合并**进旧快照——数据源只返回被点名的域，
+          直接替换会把其它 12 页一起变成「暂不可用」；
+        * ``fresh is None`` 且无 error：按「没取到数据」处理，同样保留旧结果。
+        """
+        names = tuple(sections) if sections else SECTIONS
+        if error is not None:
             merged = dict(self._snapshot.sections) if self._snapshot is not None else {}
-            merged.update({name: Unavailable("刷新失败（" + type(exc).__name__ + "）")
+            merged.update({name: Unavailable("刷新失败（" + type(error).__name__ + "）")
                            for name in names})
             self._snapshot = Snapshot(sections=merged, source="error")
             self.message = "刷新失败：界面保留上一次结果，详情见日志。"
+        elif fresh is None:
+            self.message = "刷新失败：没有取到数据；界面保留上一次结果，详情见日志。"
         else:
             if sections and self._snapshot is not None:
                 merged = dict(self._snapshot.sections)
@@ -276,7 +312,8 @@ class DesktopController:
 
     # 真做的动作
     def _act_refresh(self, *, confirm=None) -> ActionResult:
-        self.refresh()
+        if self.request_refresh(None):
+            return ActionResult("正在刷新…", effect="refresh")
         return ActionResult(self.message, effect="refresh")
 
     def _act_bench_run(self, *, confirm=None) -> ActionResult:
@@ -332,8 +369,12 @@ class DesktopController:
         access = self.snapshot.get("access")
         node_id = str(access.get("node_id") or "") if isinstance(access, Mapping) else ""
         if not node_id:
-            return ActionResult("暂不可用（还没有节点 ID：先启动一次客户端，注册后自动生成）",
-                                ok=False)
+            # 旧文案「先启动一次客户端」在 3 级回退全空时是**误导**：客户已经启动了，
+            # 真因是「节点进程没起来 / 注册没成功」。这里说清「去哪儿看原因」。
+            daemon = access.get("daemon") if isinstance(access, Mapping) else None
+            reason = str((daemon or {}).get("reason") or "") if isinstance(daemon, Mapping) else ""
+            detail = ("；节点进程原因：" + reason) if reason else "；原因见「接入配置」页的注册状态"
+            return ActionResult("暂不可用（还没有节点 ID" + detail + "）", ok=False)
         return ActionResult("已复制节点 ID：" + node_id, effect="copy", payload=node_id)
 
     def _act_agent_save(self, *, confirm=None) -> ActionResult:
@@ -388,7 +429,7 @@ class DesktopController:
         if isinstance(payload, Mapping) and payload.get("ok") is False:
             return ActionResult("登出未成功：" + str(payload.get("error") or "服务端拒绝")
                                 + "；本机凭据未改动。", ok=False)
-        self.refresh()
+        self.request_refresh(None)
         return ActionResult("已登出：节点已解绑、本机密钥已清除；重新配对后才能接单。",
                             effect="refresh")
 
@@ -417,7 +458,7 @@ class DesktopController:
         if isinstance(payload, Mapping) and payload.get("ok") is False:
             return ActionResult("绑定未成功：" + str(payload.get("error") or "服务端拒绝")
                                 + "；本机凭据未改动。", ok=False)
-        self.refresh()
+        self.request_refresh(None)
         return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。", effect="refresh")
 
     def _act_account_open_web(self, *, confirm=None) -> ActionResult:
