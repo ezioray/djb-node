@@ -29,6 +29,7 @@ from .config import (ClientConfig, Paths, feature_flag, load_config, resolve_hom
 from .daemon import ControlClient, Daemon, control_socket_file
 from .diagnose import DiagnoseBuilder, DiagnoseError
 from .envcheck import EnvChecker
+from .platform.no_window import subprocess_window_kwargs
 from .errors import (AuthError, DjbError, NotInstalledError, NotRunningError,
                      UsageError, exit_code_of)
 from .httpclient import HttpClient
@@ -569,7 +570,7 @@ def _spawn_daemon(paths: Paths, config: ClientConfig, token: str) -> None:
     try:
         subprocess.Popen(command, stdout=stdout, stderr=stdout, stdin=subprocess.DEVNULL,
                          start_new_session=True, env=env, close_fds=True,
-                         cwd=package_parent)
+                         cwd=package_parent, **subprocess_window_kwargs())
     finally:
         stdout.close()
 

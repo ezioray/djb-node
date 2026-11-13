@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
+from . import payout as payout_mod
+from .access import mask_address
 from .datasource import Snapshot, UNAVAILABLE, Unavailable
 from .nodecloud import STATE_TEXT
 from .. import facts
@@ -183,7 +185,16 @@ class Table:
 
 @dataclass(frozen=True)
 class Field:
-    """一行「标签 / 值」；``secret`` 表示只显示掩码，``editable`` 表示可编辑输入。"""
+    """一行「标签 / 值」；``secret`` 表示只显示掩码，``editable`` 表示可编辑输入。
+
+    两个只影响**渲染**的开关（默认值 = 老行为，老调用方无需改）：
+
+    * ``advanced``：折叠进「高级（排障用）」区。用于「必须保留但客户平时不该动」的字段
+      （节点凭证 = 节点密钥，排障要用，可它绝不该占首屏）。
+    * ``prefill``：可编辑框是否预填 ``value``。``False`` 时输入框留空、``value`` 进 hint——
+      掩码值（如收款地址 ``TQn9Xa…7f3d``）若预填进输入框，客户直接点「保存并回读」就会把
+      掩码当地址写回配置（真机上会被 ``validate_address`` 拒，等于保存永远失败）。
+    """
 
     label: str
     value: str
@@ -192,6 +203,8 @@ class Field:
     secret: bool = False
     hint: str = ""
     tone: str = "default"
+    advanced: bool = False
+    prefill: bool = True
 
 
 @dataclass(frozen=True)
@@ -1336,55 +1349,143 @@ def _access(snapshot: Snapshot) -> View:
         from_config = str(config.get("node_id") or "")
         if from_config and from_config != "—":
             node_id, node_source = from_config, "config"
+    diag = [row for row in (access.get("node_id_diag") or []) if isinstance(row, Mapping)]
+    daemon = access.get("daemon") if isinstance(access.get("daemon"), Mapping) else {}
     if node_id:
         node_hint = ("网页端绑定要填这个 ID（本机只读）" if node_source != "config"
                      else "网页端绑定要填这个 ID")
         node_field = Field("节点标识", node_id, key="node_id",
                            editable=node_source == "config", hint=node_hint)
     else:
-        node_field = Field("节点标识", "先启动一次", key="node_id",
-                           hint="首次启动会自动注册节点并下发节点 ID；网页端绑定要填它")
+        # 旧文案「先启动一次」把三种完全不同的故障说成一句话，客户照做也没用。
+        # 现在按**已知原因**说下一步；原因不明时给可执行的排查入口。
+        daemon_reason = str(daemon.get("reason") or "").strip()
+        if not daemon.get("running") and daemon_reason:
+            node_value = "尚未生成（节点进程没起来）"
+            node_hint = daemon_reason
+        elif not daemon.get("running"):
+            node_value = "尚未生成（节点进程没起来）"
+            node_hint = "先看「节点进程」这一行的原因；启动失败时日志在 logs/djb.log"
+        else:
+            node_value = "尚未生成（节点进程在跑，注册没成功）"
+            node_hint = "看下面「注册状态」的原因；修好后点右上角「刷新」即可，不用重装"
+        node_field = Field("节点标识", node_value, key="node_id", hint=node_hint)
     # 「节点绑定」卡的副标题也带节点 ID（云端口径优先；``display()`` 的占位「—」不算值）
     card_node = str(binding.get("node_id") or "").strip()
     for candidate in (config.get("node_id"), node_id):
         text = str(candidate or "").strip()
         if not card_node and text and text != "—":
             card_node = text
+    # ── USDT 收款地址的云端状态（owner 2026-11-13 方案 B：客户端直接提交云端）
+    # ok=True + 空 dict = 云端确实没登记过（尚未提交）；ok=False = 这一轮没读到。
+    # 两种都不能显示成「已生效」——收款地址写错就是钱打到别人账上。
+    payout = _mapping(access.get("payout"))
+    payout_ok = payout.get("ok") is True
+    payout_row = dict(_mapping(payout.get("data"))) if payout_ok else None
+    payout_disabled = payout.get("disabled") is True
+    cloud_state = ("服务未开放" if payout_disabled
+                   else payout_mod.short_state(payout_row))
+    cloud_reason = str(payout.get("reason") or "").strip()
+    if payout_disabled:
+        cloud_hint = "服务未开放（等平台开启后再提交）"
+        cloud_meta = cloud_reason or "等平台开启"
+    elif payout_ok:
+        cloud_hint = cloud_state
+        cloud_meta = mask_address(str(payout_row.get("address") or "")) or "—"
+        # 冷却中把「可再改时间」放在卡片副标题里（字段提示保持一行，别挤成两行）
+        if payout_mod.cooldown_active(payout_row):
+            cloud_meta += "．可再改时间 " + str(payout_row.get("cooldown_until"))
+    else:
+        # 读不到 ≠ 已生效：字段提示说清「读不到」，原因放卡片副标题
+        cloud_hint = payout_mod.UNREADABLE
+        cloud_meta = cloud_reason or "完成节点绑定后重试"
+    cloud_tone = {"已生效": "mint", "待审核": "amber", "冷却中": "amber",
+                  "已拒绝": "red", "已撤销": "red"}.get(cloud_state, "muted")
+    can_submit = payout.get("can_submit") is True
+    address_seen = str(config.get("usdt_address") or "—")
     return View(
         key="access", title="接入配置",
-        subtitle="保存 → daemon reload → 回读一致",
+        subtitle="贡献节点口径：绑定节点 → 填 USDT 收款地址 → 选价格模式（不填上游地址）",
         cards=(Card("配置有效性",
                     "尚未保存" if access.get("saved") is False
                     else _flag(valid, "通过校验", "有字段需修正"), "",
                     "amber" if access.get("saved") is False or not valid else "mint"),
                Card("节点绑定", _flag(bound if bound is not None else None, "已绑定", "未绑定"),
-                    card_node or "—", "default")),
+                    card_node or "—", "default"),
+               Card("USDT 收款地址（云端）", cloud_state, cloud_meta, cloud_tone)),
         fields=(
             node_field,
-            Field("节点凭证", str(config.get("node_secret") or "—"), key="node_secret",
-                  editable=True, secret=True, hint="掩码显示；粘贴新值才会覆盖"),
-            Field("API Key", str(config.get("api_key") or "—"), key="api_key",
-                  editable=True, secret=True, hint="djb_sk_… 形式，只显示尾 4 位"),
+            # 只读排障字段：节点进程 / 注册状态（有则显示事实，无则写原因 + 下一步）
+            Field("节点进程",
+                  ("运行中" if daemon.get("running") else "未运行")
+                  + ("（" + str(daemon.get("state")) + "）" if daemon.get("state") else ""),
+                  key="daemon_state", hint=str(daemon.get("reason") or "—")),
+            Field("注册状态",
+                  ("已注册" if node_id else "未注册"),
+                  key="register_state",
+                  hint=(("节点 ID 来源：" + str(access.get("node_id_source") or "—"))
+                        if node_id else _diag_hint(diag))),
+            # 可编辑收款地址：**输入框不预填掩码**（prefill=False），否则一点保存就把掩码
+            # 当地址写回配置；当前值进 hint，云端状态也进 hint。
+            Field("USDT 收款地址", address_seen, key="usdt_address", editable=True,
+                  prefill=False,
+                  hint=(payout_mod.CHAIN_HINT + "｜本机已存：" + address_seen
+                        + "｜云端：" + cloud_hint)),
             Field("价格模式", str(config.get("price_mode") or "—"), key="price_mode",
                   editable=True,
                   hint="auto / manual；当前：" + str(config.get("price_mode_label") or "—")),
-            Field("USDT 收款地址", str(config.get("usdt_address") or "—"), key="usdt_address",
-                  editable=True, hint="TRC20（T 开头 34 位）或 EVM（0x + 40 位）"),
-            Field("OpenAI 请求地址", str(config.get("openai_base_url") or "未设置"),
-                  key="openai_base_url", editable=True),
-            Field("Anthropic 请求地址", str(config.get("anthropic_base_url") or "未设置"),
-                  key="anthropic_base_url", editable=True),
+            # 节点凭证 = 节点密钥（排障要用，绝不能占首屏）→ 折叠进「高级（排障用）」
+            Field("节点凭证", str(config.get("node_secret") or "—"), key="node_secret",
+                  editable=True, secret=True, advanced=True,
+                  hint="掩码显示；粘贴新值才会覆盖"),
         ),
         actions=(Action("access.save", "保存并回读", primary=True),
+                 Action("access.submit_payout", "提交到云端", enabled=can_submit,
+                        reason="" if can_submit else
+                        ("云端收款地址功能还没开放（等平台开启后再提交）" if payout_disabled
+                         else "节点还没绑定账户，先在网页端完成绑定"
+                              "（本页「复制节点 ID」→ 网页端）")),
                  Action("access.copy_node_id", "复制节点 ID", enabled=bool(node_id),
-                        reason="还没有节点 ID：先启动一次客户端"),
+                        reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
+                                + _diag_hint(diag) + "）") if not node_id else ""),
+                 Action("account.bind", "粘贴绑定码绑定",
+                        enabled=bool(binding is not None or node_id),
+                        reason="本机还没有节点 ID，先启动节点进程（点「刷新」）"),
                  Action("access.reload", "请求 daemon 重载")),
         unavailable=_missing(snapshot, ("access",)),
         notes=(str(access.get("note") or ""),
+               *(() if node_id else tuple(
+                   "节点 ID 三级回退：" + row.get("level", "?") + " → "
+                   + ("读到" if row.get("ok") else str(row.get("reason") or "读不到"))
+                   for row in diag)),
+               ("节点进程下一步：" + str(daemon.get("next_step"))) if daemon.get("next_step") else "",
                "配置文件：" + str(access.get("path") or "—") + "（0600，只在本机）",
-               "该文件只存本机接入配置（上游地址 / 收款地址 / 价格模式），"
+               "收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
+               "（云端出款链只有 Polygon）。",
+               # 明细（掩码地址 / 冷却截止 / 已拒绝的下一步）放脚注，字段行保持一行
+               payout_mod.summarize(payout_row) if payout_ok else "",
+               "该文件只存本机接入配置（节点密钥 / 收款地址 / 价格模式），"
                "不含账号登录态；账户资料要等节点绑定后从云端读取。"),
     )
+
+
+def _diag_hint(diag: Sequence[Mapping[str, Any]]) -> str:
+    """三级回退里**第一条真故障**的原因（跳过「手填为空」这种常态，也跳过最末级的连带现象）。
+
+    「access.json 里没有手填值」是注册成功时的正常形态，不能当原因；
+    「状态库读不到」往往是前一级失败后的连带现象（库都没建）。所以取第一条**有意义的**
+    失败原因——它就是客户要动手的那一环。
+    """
+    for row in diag:
+        if not isinstance(row, Mapping) or row.get("ok"):
+            continue
+        if str(row.get("level") or "").startswith("access.json"):
+            continue
+        reason = str(row.get("reason") or "")
+        if reason:
+            step = str(row.get("next_step") or "")
+            return reason + ("（" + step + "）" if step else "")
+    return "原因未知：看 logs/djb.log"
 
 
 def _today_note(today: Any) -> str:

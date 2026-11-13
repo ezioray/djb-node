@@ -22,6 +22,8 @@ import os
 import re
 import subprocess
 
+from .no_window import subprocess_window_kwargs
+
 WINDOWS = os.name == "nt"
 
 #: pid 文件五元组里用来判「这确实是个 djb daemon」的标记
@@ -99,7 +101,8 @@ def start_token(pid: int) -> str | None:
         return "linux:" + _boot_id() + ":" + str(ticks)
     try:                                                       # pragma: no cover - macOS/BSD
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                             capture_output=True, timeout=10).stdout.decode("utf-8", "replace")
+                             capture_output=True, timeout=10,
+                             **subprocess_window_kwargs()).stdout.decode("utf-8", "replace")
     except (OSError, subprocess.SubprocessError):              # pragma: no cover
         return None
     text = out.strip()
@@ -184,7 +187,8 @@ def cmdline(pid: int) -> str | None:
         return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
     try:                                                       # pragma: no cover - macOS/BSD
         out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                             capture_output=True, timeout=10).stdout.decode("utf-8", "replace")
+                             capture_output=True, timeout=10,
+                             **subprocess_window_kwargs()).stdout.decode("utf-8", "replace")
     except (OSError, subprocess.SubprocessError):              # pragma: no cover
         return None
     return out.strip() or None

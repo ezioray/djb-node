@@ -29,6 +29,7 @@ from .access import ACCESS_FILE, RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, R
 from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
+from ..platform.no_window import subprocess_window_kwargs
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
 from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
 from . import platform_ui
@@ -269,6 +270,12 @@ class DesktopApp:
             self._scale = 1.0
         self._px = lambda n: int(round(float(n) * self._scale))
         self._controller = controller
+        #: S2：取数 worker（惰性建，见 _ensure_refresh_worker）
+        self._refresh_worker: Any = None
+        #: USDT 收款地址提交 worker（惰性建，见 _ensure_payout_worker）；目标地址与提示文案
+        self._payout_worker: Any = None
+        self._payout_target = ""
+        self._payout_note = ""
         if getattr(controller, "save_path", None) is None:
             controller.save_path = _make_save_path(lambda: self._root)
         if getattr(controller, "ask_code", None) is None:
@@ -824,11 +831,158 @@ class DesktopApp:
         self._page_fade()
         return view
 
-    def refresh(self) -> View:
+    def refresh(self) -> View | None:
+        """刷新（交互路径：按钮 / F5 / Ctrl-R）。**取数在 worker 线程**，不阻塞主线程。
+
+        返回 ``None`` 表示结果稍后到（:meth:`refresh_now` 是同步版，给 ``--shot`` /
+        没有事件循环的场景用）。重复点击不叠加：只会更新一次「正在刷新…」。
+        """
+        worker = self._ensure_refresh_worker()
+        if worker is None:                         # 没有 after()（假 root / 无窗口）
+            return self.refresh_now()
+        if not worker.start():
+            return None
+        return None
+
+    def refresh_now(self) -> View:
+        """同步刷新（阻塞到取数完成）：截图脚本 / 单测 / 无事件循环环境专用。"""
         view = self._controller.refresh()
         self._render(view)
         self._update_status()
         return view
+
+    def _ensure_refresh_worker(self) -> Any:
+        """惰性建 worker：``schedule`` 用 ``root.after``，``cancel`` 用 ``after_cancel``。
+
+        ``after`` 是**主线程**的东西：worker 线程只置一个 Event，主线程轮询取结果。
+        """
+        worker = getattr(self, "_refresh_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(self._controller.source.snapshot,
+                               apply=self._apply_refresh,
+                               on_start=self._refresh_started,
+                               on_busy=self._refresh_busy,
+                               on_finish=self._refresh_finished,
+                               schedule=schedule, cancel=cancel)
+        self._refresh_worker = worker
+        # 动作里（登出/绑定/暂停后）的刷新也走异步：否则那几次点击照样冻住窗口
+        self._controller.refresh_via = self._request_refresh_async
+        return worker
+
+    # ── 刷新回调（全部在主线程执行）
+    def _request_refresh_async(self, sections: Any = None) -> None:
+        worker = self._ensure_refresh_worker()
+        if worker is None:
+            self._controller.refresh(sections)     # 没有事件循环：退回同步
+            return
+        worker.start(sections)
+
+    def _refresh_started(self) -> None:
+        """(a) 立即反馈：按钮文案 + 状态栏，在取数**开始之前**就变。"""
+        button = getattr(self, "_refresh_button", None)
+        if button is not None:
+            try:
+                button.set_text("刷新中…")
+            except Exception:                      # pragma: no cover - 控件已销毁
+                pass
+        self._toast("正在刷新…（可以继续拖动/切页）", ok=True)
+
+    def _refresh_busy(self) -> None:
+        """(c) 并发闸门：重复点击只提示，不再派发第二个取数。"""
+        self._toast("正在刷新…上一次还没结束，已忽略这次点击", ok=True)
+
+    def _refresh_finished(self) -> None:
+        button = getattr(self, "_refresh_button", None)
+        if button is not None:
+            try:
+                button.set_text("刷新")
+            except Exception:                      # pragma: no cover
+                pass
+
+    def _apply_refresh(self, fresh: Any, error: BaseException | None,
+                       sections: Any = None) -> None:
+        """(d) 结果落地：合并快照 → 渲染 → 状态栏。异常已经在这里变成「刷新失败」。"""
+        view = self._controller.apply_refresh(fresh, sections=sections, error=error)
+        self._render(view)
+        self._update_status()
+        worker = getattr(self, "_refresh_worker", None)
+        duration = getattr(worker, "last_duration_s", 0.0) or 0.0
+        message = str(self._controller.message or "")
+        if duration and message.startswith("已刷新"):
+            message += "（用时 %.1f s）" % duration
+        self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
+
+    # ── USDT 收款地址提交（owner 2026-11-13 方案 B：客户端直接提交云端）
+    def _ensure_payout_worker(self) -> Any:
+        """惰性建「提交收款地址」worker：复用 W1 的 :class:`RefreshWorker` 模式。
+
+        同一个模式解决同一个问题（主线程不碰网络）：worker 线程只跑
+        ``controller.submit_payout``（纯数据层调用，不碰控件），主线程用 ``after`` 轮询取结果。
+        """
+        worker = getattr(self, "_payout_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(
+            lambda sections=None: self._controller.submit_payout(self._payout_target),
+            apply=self._apply_payout, on_start=self._payout_started,
+            on_busy=self._payout_busy, schedule=schedule, cancel=cancel)
+        self._payout_worker = worker
+        return worker
+
+    def _start_payout_submit(self, address: str, message: str = "") -> None:
+        """派发一次提交；没有事件循环（截图脚本/单测）才退回同步，行为和按钮一致。"""
+        self._payout_target = str(address)
+        self._payout_note = str(message or "")
+        worker = self._ensure_payout_worker()
+        if worker is None:
+            result = self._controller.submit_payout(self._payout_target)
+            self._toast(str(result.message), ok=bool(result.ok))
+            self._request_refresh_async(("access",))
+            return
+        worker.start()                     # 忙时走 on_busy（不叠加第二个 POST）
+
+    def _payout_started(self) -> None:
+        self._toast(self._payout_note or "正在提交收款地址到云端…", ok=True)
+
+    def _payout_busy(self) -> None:
+        self._toast("正在提交…上一次还没结束，已忽略这次点击", ok=True)
+
+    def _apply_payout(self, result: Any, error: BaseException | None,
+                      sections: Any = None) -> None:
+        """结果落地（主线程）：先 toast 说清成败，再异步重拉云端状态（GET 也不在主线程）。"""
+        if error is not None:
+            self._toast("提交失败（" + type(error).__name__ + "）；地址未变更", ok=False)
+        elif result is None:
+            self._toast("提交失败：没有拿到结果；地址未变更", ok=False)
+        else:
+            self._toast(str(getattr(result, "message", "") or "提交完成"),
+                        ok=bool(getattr(result, "ok", False)))
+        refresh = getattr(self, "_refresh_worker", None)
+        if refresh is None or not getattr(refresh, "busy", False):
+            self._request_refresh_async(("access",))
 
     # ── 双主题（day / night）
     def _theme_button_text(self, narrow: bool | None = None) -> str:
@@ -1290,8 +1444,16 @@ class DesktopApp:
         label.bind("<Configure>", lambda event, target=label: self._fit_wrap(target), add="+")
         return label
 
+    #: 换行宽「变大」的最小步长（px）。同一帧里列宽会因滚动条出现/消失抖 1px，
+    #: 若逐像素追着改：wraplength → 行数 → 高度 → 滚动条 → 列宽 形成回环，
+    #: ``update_idletasks`` **永不返回**（0.3.6 接入页长提示实测复现）。两个钉子：
+    #: tests/test_desktop_payout.py::test_fit_wrap_follows_shrink_but_steps_growth
+    #: 与 ::test_real_tk_access_page_folds_advanced_and_never_prefills_mask（修前会挂死）。
+    #: 策略：**变窄立刻跟**（保证不裁字），变宽按 24px 步进（抖动吃掉，最多多折一行）。
+    WRAP_GROW_STEP = 24
+
     def _fit_wrap(self, label: Any, width: int | None = None) -> None:
-        """把单条 label 的换行宽钳到它实际分到的宽度（只减不增，防抖）。"""
+        """把单条 label 的换行宽钳到它实际分到的宽度（变窄立刻跟、变宽按步进）。"""
         try:
             span = int(label.winfo_width() if width is None else width)
         except Exception:                            # pragma: no cover - 控件已销毁
@@ -1303,11 +1465,12 @@ class DesktopApp:
             current = int(float(label.cget("wraplength")))
         except Exception:                            # pragma: no cover - 防御
             current = -1
-        if current != span:
+        if current <= 0 or span < current or span - current >= self.WRAP_GROW_STEP:
             try:
                 label.configure(wraplength=span)
             except Exception:                        # pragma: no cover - 控件已销毁
                 pass
+
 
     def _rewrap(self) -> None:
         """宽度变了但没跨断点：只更新换行宽度，不重建控件。"""
@@ -1868,7 +2031,13 @@ class DesktopApp:
 
     def _render_fields(self, fields: Sequence[Field], view_key: str,
                        parent: Any = None) -> None:
-        """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。"""
+        """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。
+
+        ``Field.advanced`` 的字段**默认折叠**在「高级（排障用）」按钮后面（接入页的
+        节点凭证就是这种：排障要用，但绝不该占首屏——owner 2026-11-13「页面太复杂」）。
+        ``Field.prefill=False`` 的可编辑框留空（掩码值只进 hint），避免一点保存就把掩码
+        当真实值写回配置。
+        """
         kit, tk, ttk = self._kit, self._tk, self._ttk
         fonts = self._fonts
         surface = dual.color("surface")
@@ -1876,61 +2045,99 @@ class DesktopApp:
         card = kit.RoundedCard(target, ground=dual.color("bg"), pad=(16, 14))
         card.pack(fill="x", pady=(0, 10))
         body = card.body
-        editable = any(field.editable for field in fields)
+        normal = [field for field in fields if not getattr(field, "advanced", False)]
+        advanced = [field for field in fields if getattr(field, "advanced", False)]
+        editable = any(field.editable for field in normal)
         tk.Label(body, text="可编辑字段" if editable else "详情",
                  font=fonts.sans(kit.px("h2"), bold=True), foreground=dual.color("ink"),
                  background=surface, anchor="w").pack(anchor="w", pady=(0, 10))
-        per_row = 1 if (self._is_narrow() or len(fields) <= 2) else 2
+        per_row = 1 if (self._is_narrow() or len(normal) <= 2) else 2
+
+        def build(container: Any, rows: Sequence[Field]) -> None:
+            for column in range(per_row):
+                container.columnconfigure(column, weight=1, uniform="field")
+            for index, field in enumerate(rows):
+                row, column = divmod(index, per_row)
+                self._render_field(container, row, column, field, per_row)
+
         grid = tk.Frame(body, background=surface)
         grid.pack(fill="x")
-        for column in range(per_row):
-            grid.columnconfigure(column, weight=1, uniform="field")
-        for index, field in enumerate(fields):
-            row, column = divmod(index, per_row)
-            block = tk.Frame(grid, background=surface)
-            block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
-            # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
-            block.columnconfigure(0, minsize=104)
-            block.columnconfigure(1, weight=1)
-            tk.Label(block, text=field.label, font=fonts.sans(kit.px("micro")),
-                     foreground=dual.color("muted_text"), background=surface,
-                     anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
-            if field.editable:
-                variable = tk.StringVar(value="" if field.secret else field.value)
-                entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
-                                  width=28 if per_row > 1 else 44)
-                if field.secret:
-                    entry.configure(show="•")
-                entry.grid(row=0, column=1, sticky="ew")
-                hint = field.hint or ""
-                if field.secret:
-                    hint = ("当前 " + field.value + "｜" + hint).strip("｜")
-                if hint:
-                    self._wrap_to_column(tk.Label(
-                        block, text=hint, font=fonts.sans(kit.px("micro")),
-                        foreground=dual.color("muted_text"), background=surface,
-                        anchor="w", justify="left",
-                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
-                                                            pady=(3, 0))
-                self._fields[field.key] = field
-                self._vars[field.key] = variable
+        build(grid, normal)
+        if not advanced:
+            return
+        # 折叠区：默认不 pack（= 不占高度）；按钮文案在「高级」与「收起高级」之间切
+        hidden = tk.Frame(body, background=surface)
+        toggle = kit.Button(body, "高级（排障用）", lambda: _toggle(),
+                            kind="ghost", ground=surface, px=kit.px("small"),
+                            height=26, pad=10)
+        toggle.pack(anchor="w", pady=(2, 0))
+        # 留给真窗口取证（tests/test_desktop_payout.py）：折叠区/按钮不在首屏，也得能被点开
+        self._advanced_panel = hidden
+        self._advanced_toggle = toggle
+        state = {"open": False}
+
+        def _toggle() -> None:
+            state["open"] = not state["open"]
+            if state["open"]:
+                build(hidden, advanced)
+                hidden.pack(fill="x", pady=(6, 0), before=toggle)
+                toggle.set_text("收起高级")
             else:
-                # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
-                # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
-                value_label = self._wrap_to_column(tk.Label(
-                    block, text=field.value,
-                    font=fonts.for_text(field.value, kit.px("small")),
-                    foreground=dual.color("ink"), background=surface,
+                hidden.pack_forget()
+                toggle.set_text("高级（排障用）")
+
+    def _render_field(self, container: Any, row: int, column: int, field: Field,
+                      per_row: int) -> None:
+        """画一个字段格（从 :meth:`_render_fields` 拆出来：折叠区复用同一套画法）。"""
+        kit, tk, ttk = self._kit, self._tk, self._ttk
+        fonts = self._fonts
+        surface = dual.color("surface")
+        block = tk.Frame(container, background=surface)
+        block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
+        # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
+        block.columnconfigure(0, minsize=104)
+        block.columnconfigure(1, weight=1)
+        tk.Label(block, text=field.label, font=fonts.sans(kit.px("micro")),
+                 foreground=dual.color("muted_text"), background=surface,
+                 anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        if field.editable:
+            # 秘密与「只给掩码」的字段都不预填：输入框里的空串 = 不改（_config_for_save 口径）
+            empty = field.secret or not getattr(field, "prefill", True)
+            variable = tk.StringVar(value="" if empty else field.value)
+            entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
+                              width=28 if per_row > 1 else 44)
+            if field.secret:
+                entry.configure(show="•")
+            entry.grid(row=0, column=1, sticky="ew")
+            hint = field.hint or ""
+            if field.secret:
+                hint = ("当前 " + field.value + "｜" + hint).strip("｜")
+            if hint:
+                self._wrap_to_column(tk.Label(
+                    block, text=hint, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("muted_text"), background=surface,
                     anchor="w", justify="left",
-                    wraplength=self._wrap_hint()))
-                value_label.grid(row=0, column=1, sticky="we")
-                if field.hint:
-                    self._wrap_to_column(tk.Label(
-                        block, text=field.hint, font=fonts.sans(kit.px("micro")),
-                        foreground=dual.color("muted_text"), background=surface,
-                        anchor="w", justify="left",
-                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
-                                                            pady=(3, 0))
+                    wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
+                                                        pady=(3, 0))
+            self._fields[field.key] = field
+            self._vars[field.key] = variable
+        else:
+            # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
+            # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
+            value_label = self._wrap_to_column(tk.Label(
+                block, text=field.value,
+                font=fonts.for_text(field.value, kit.px("small")),
+                foreground=dual.color("ink"), background=surface,
+                anchor="w", justify="left",
+                wraplength=self._wrap_hint()))
+            value_label.grid(row=0, column=1, sticky="we")
+            if field.hint:
+                self._wrap_to_column(tk.Label(
+                    block, text=field.hint, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("muted_text"), background=surface,
+                    anchor="w", justify="left",
+                    wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
+                                                        pady=(3, 0))
 
     # ── 动作
     def _on_action(self, key: str) -> None:
@@ -1940,26 +2147,54 @@ class DesktopApp:
             except Exception:                            # 变量随旧视图销毁：跳过，不让动作静默不执行
                 continue
         result = self._controller.action(key, confirm=self._confirm)
+        copied = True
         if result.effect == "copy":
-            self._copy(result.payload)
+            copied = self.copy_text(result.payload)
         elif result.effect == "open_dir":
             self._open_dir(result.payload)
         elif result.effect == "open_url":
             self._open_url(result.payload)
         elif result.effect == "goto" and result.payload:
             self.show_view(str(result.payload))       # 例如「共享 Token Plan」→「接入配置」
+        elif result.effect == "payout_submit":
+            # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
+            self._start_payout_submit(str(result.payload), result.message)
         elif result.effect in ("refresh", "access", "bench", "control", "reload"):
             self._render(self._controller.current())
         self._update_status()
-        if result.effect in ("save", "access", "reload", "control", "export", "verify") and result.message:
+        # "copy" 漏在名单外 = 复制成功/失败都零反馈（S4：客户说「点了没反应」）
+        if result.effect == "copy" and not copied:
+            self._toast("复制失败：剪贴板写入被拒绝（可能有别的程序占着剪贴板），请再点一次",
+                        ok=False)
+        elif result.effect in ("save", "access", "reload", "control", "export", "verify",
+                              "copy") and result.message:
             self._toast(result.message, ok=result.ok)
 
-    def _copy(self, text: str) -> None:
+    def copy_text(self, text: str) -> bool:
+        """把文本放进系统剪贴板；**必须** ``update()`` 一次才算真的写进去。
+
+        真机事故（S4）：Tk 的 ``clipboard_append`` 只是把内容登记给本进程，X11/Win32 的
+        剪贴板所有权要等事件循环处理一次才转移；不 ``update()`` 就退出/切窗口，粘贴出来
+        是**旧内容或空**。旧实现还 ``except Exception: pass``，失败连日志都没有。
+        返回是否成功；失败原因交给调用方 toast（不再静默）。
+        """
         try:
             self._root.clipboard_clear()
-            self._root.clipboard_append(text)
-        except Exception:
-            pass
+            self._root.clipboard_append(str(text))
+            updater = getattr(self._root, "update", None)
+            if callable(updater):
+                updater()
+            return True
+        except Exception as exc:                      # noqa: BLE001 - 剪贴板可能被别的程序占着
+            try:
+                from ..logging_setup import event
+                event("desktop.copy_failed", error=type(exc).__name__)
+            except Exception:
+                pass
+            return False
+
+    def _copy(self, text: str) -> None:
+        self.copy_text(text)
 
     def _open_dir(self, path: str) -> None:
         """只做「显示路径」：不自动调用系统文件管理器（避免在无桌面环境弹错）。"""
@@ -2033,6 +2268,12 @@ class DesktopApp:
         self._root.mainloop()
 
     def stop(self) -> None:
+        worker = getattr(self, "_refresh_worker", None)
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:                      # pragma: no cover
+                pass
         if self._unsubscribe is not None:
             try:
                 self._unsubscribe()
@@ -2182,12 +2423,18 @@ _DEMO_SECTIONS = {
                    "config": {"node_id": "node-7c31", "node_secret": "djb_ns_…4e11",
                               "api_key": "djb_sk_…abcd", "price_mode": "auto",
                               "price_mode_label": "跟随平台建议价",
-                              "price_note": "—", "usdt_address": "TQn9Xa…7f3d",
+                              "price_note": "—", "usdt_address": "0x3f7c…9a2c",
                               "openai_base_url": "http://127.0.0.1:1717/v1",
                               "anthropic_base_url": "http://127.0.0.1:1717",
                               "agent_downlink_url": "http://127.0.0.1:1717/agent",
                               "scoped_token": "djb_sc_…9f2c"},
                    "valid": True, "binding": {"state": "bound", "node_id": "node-7c31"},
+                   # 收款地址云端状态（方案 B）：演示数据给「已生效」，截图才看得到正向态
+                   "payout": {"ok": True, "can_submit": True, "reason": "", "hint": "",
+                              "data": {"address": "0x3f7c9a1b2d3e4f5a6b7c8d9e0f1a2b3c4d5e9a2c",
+                                       "status": "whitelisted", "cooldown_until": None,
+                                       "updated_at": "2026-11-01T04:30:00Z",
+                                       "label": "默认收款"}},
                    "note": "", "path": "~/.djb/desktop/access-config.json"},
         # 共享 Token Plan（第 9 项）：演示数据必须给「有上游」的形状，
         # 否则截图里只有空态，客户看不到「我的 Token Plan」长什么样。
@@ -2258,7 +2505,16 @@ def unique_iid(key: str, used: set[str]) -> str:
 
 
 def _make_cli_runner(home):
-    """本机命令通道：显式带上 ``DJB_HOME``，避免子进程读到别的 home。"""
+    """本机命令通道：显式带上 ``DJB_HOME``，避免子进程读到别的 home。
+
+    ``home is None`` 必须在这里解析成**真实目录**：旧实现写 ``str(home)`` → 子进程拿到
+    ``DJB_HOME=None``（字符串），CLI 会把 ``<cwd>/None`` 当数据目录 → 一律「本机未初始化」。
+    """
+    if home is None:
+        from ..config import resolve_home
+        home = resolve_home()
+    home = os.fspath(home)
+
     def run(argv):
         import subprocess
         import sys
@@ -2274,7 +2530,8 @@ def _make_cli_runner(home):
             # 否则中文 Windows 上按 cp936 解会 UnicodeDecodeError → 动作区报错。
             completed = subprocess.run(command, capture_output=True,
                                        encoding="utf-8", errors="replace", timeout=20,
-                                       env=env, stdin=subprocess.DEVNULL, check=False)
+                                       env=env, stdin=subprocess.DEVNULL, check=False,
+                                       **subprocess_window_kwargs())
         except subprocess.TimeoutExpired:
             raise ProviderError("本地命令超时（20s）") from None
         except OSError as exc:
@@ -2304,7 +2561,10 @@ def _make_reloader(home: str | os.PathLike | None):
             from ..errors import NotRunningError, UsageError
         except ImportError:                       # pragma: no cover - 防御
             return RELOAD_UNSUPPORTED, ""
-        paths = Paths(str(home) if home else os.path.expanduser("~/.djb"))
+        # 与数据层同一个解析口径（Windows 是 %APPDATA%\DJB，不是 ~/.djb）：
+        # 写死 ~/.djb 时「保存并回读」会连到不存在的 socket → 永远「daemon 未运行」。
+        from ..config import resolve_home
+        paths = Paths(os.fspath(home) if home else resolve_home())
         try:
             response = ControlClient(paths).call({"cmd": "reload"}, timeout=15.0)
         except NotRunningError:
@@ -2329,10 +2589,21 @@ def demo_source() -> FakeDataSource:
 
 
 def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False,
-                    cloud: Any | None = None, bus: Any | None = None) -> DesktopController:
-    """装配：数据源 + 接入配置服务 + 控制通道 + 状态总线。"""
+                    cloud: Any | None = None, bus: Any | None = None,
+                    boot: Mapping[str, Any] | None = None) -> DesktopController:
+    """装配：数据源 + 接入配置服务 + 控制通道 + 状态总线。
+
+    ``home`` **只解析一次**（S3 根因，见 REPORT）：``None`` 时各下游曾各自找默认目录——
+    数据层用 ``resolve_home()``（Windows = ``%APPDATA%\\DJB``），action CLI 用了
+    ``str(None)`` = 字符串 ``"None"``（= 当前工作目录下的 ``None`` 目录），控制通道 / 热重载
+    又写死 ``~/.djb``。结果：同一个窗口里「取数去 A、保存去 B、控制去 C」，
+    在真机上表现成「节点绑定不可用 / 保存了不生效」。
+    """
     from ..gui.state import ControlBus
     bus = bus if bus is not None else ControlBus()
+    if home is None and not demo:
+        home = _default_home()             # 与 LocalDataSource / bootstrap 同一个解析口径
+    home = None if home is None else os.fspath(home)
     if demo:
         source: Any = demo_source()
     else:
@@ -2340,7 +2611,7 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
             # 没显式注入就按 ~/.djb 自己装：没登录节点时是 None（视图照常显示「暂不可用」）
             from .nodecloud import NodeCloudClient
             cloud = NodeCloudClient.from_home(home)
-        source = LocalDataSource(home=home, cloud=cloud)
+        source = LocalDataSource(home=home, cloud=cloud, boot=boot)
     store = FileAccessStore(None if home is None else
                             os.path.join(str(home), ACCESS_FILE))
     access = AccessService(store, reloader=_make_reloader(home))
@@ -2365,13 +2636,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="关闭首启自举（测试/离线环境：不建目录、不起节点）")
     args = parser.parse_args(list(argv) if argv is not None else None)
     boot_line = ""
+    daemon: Mapping[str, Any] | None = None
     if not args.demo and not args.no_auto:
         # 首启自举（2026-11-06 外部客户实测：装完只看到「云端未接通/本机未初始化」）
         from ..bootstrap import ensure_ready, start_daemon, summary_text
         boot = ensure_ready(home=args.home)
         daemon = start_daemon(home=args.home)
         boot_line = summary_text(boot, daemon)
-    controller = make_controller(home=args.home, demo=args.demo)
+    # 自举结论（尤其 start_daemon 的 no-cli / timeout）要带进数据层：
+    # 「接入配置」页的「节点进程」字段靠它说出真因，而不是只说「daemon 未运行」
+    controller = make_controller(home=args.home, demo=args.demo, boot=daemon)
     try:
         # prefs_home 必须显式给：demo 数据源没有 home，不给就会把主题偏好写到真实 ~/.djb
         app = DesktopApp(controller, on_quit=lambda: None,
@@ -2425,7 +2699,8 @@ def _shoot(app: DesktopApp, directory: str) -> list[str]:
                     continue
             try:
                 window_id = str(app._root.winfo_id())
-                subprocess.run(["import", "-window", window_id, target], check=False, timeout=30)
+                subprocess.run(["import", "-window", window_id, target], check=False,
+                               timeout=30, **subprocess_window_kwargs())
             except (OSError, subprocess.SubprocessError):
                 continue
             if os.path.exists(target):

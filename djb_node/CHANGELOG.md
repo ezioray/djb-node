@@ -6,6 +6,62 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.3.6 · 2026-11-13
+
+**接入页精简 + 收款地址提交云端**（owner 2026-11-13 三条客户端指令）。`__version__` /
+`pyproject.toml` / Helm `appVersion` 同源升到 `0.3.6`（0.3.5 已发 macOS，Windows 用 0.3.6，
+不覆盖已发布制品）；**没有**协议契约变更（`openapi.yaml` 未动），**没有**新增运行时依赖。
+
+> ⚠ **合并说明**：本段（0.3.6）原在 `feat/ux-036-20261113` 上开发，基线 `5eea2fd`；
+> 0.3.5 的内容（`7779281` 版本 bump、`8ad418a` 灰度阶梯 `(1,10,50,100)` + wave 0 内部档）
+> 已于 `release/0.3.6` 通过 `--no-ff` 合并并入本版次，**不再缺失**
+> （原提示见 `reports/UX-20261113/W5-CLIENT-036/REPORT.md` §6）。
+
+### 接入配置页精简（owner：「接入的是贡献节点，不是要接入使用」）
+- 页面口径改为**贡献节点**：绑定节点 → 填 USDT 收款地址 → 选价格模式；
+  副标题不再提「上游地址」，说明文案改成「不再填 API Key / 上游地址」。
+- **UI 移除三个字段**：`API Key`、`OpenAI 请求地址`、`Anthropic 请求地址`
+  （`AccessConfig` 的 `api_key` / `openai_base_url` / `anthropic_base_url` 字段与
+  `validate()` 规则**全部保留**，老配置文件照常读——**UI 移除、模型保留**）。
+- 节点凭证（= 节点密钥，排障要用）保留但**折叠**进「高级（排障用）」区，默认不展开
+  （`Field.advanced` / 渲染层 `_render_fields` 的折叠区）。
+- 收款地址输入框不再预填掩码（`Field.prefill=False`）：旧行为下客户不动地址直接点「保存并回读」
+  会把 `TQn9Xa…7f3d` 这种掩码当地址写回配置（必然校验失败）。
+- 节点绑定区保留「复制节点 ID」并新增「粘贴绑定码绑定」（复用既有 `account.bind` 动作，不新造流程）。
+
+### USDT 收款地址提交云端（owner 方案 B：客户端直接提交云端）
+- 新增 `POST/GET /api/v1/node/payout-address`（头 `X-Client-Key`，与 cloud 侧契约逐字对齐）：
+  `djb_node/desktop/nodecloud.py` 加 `payout_address()` / `submit_payout_address()`；
+  `datasource.submit_payout_address()` 是**本层唯一写操作**，只在 worker 线程调用。
+- 状态显示（字段 hint + 卡片）：未提交 / 待审核 / 已生效 / 已拒绝 / 已撤销 / 冷却中；
+  **读不到就说「暂时读不到云端状态」**，绝不把未知渲染成「已生效」（`desktop/payout.py`）。
+- 提交不阻塞 Tk 主线程：复用 W1 的 `RefreshWorker`（线程取数 + `after` 轮询回投），
+  成功/失败都有 toast，**没有** `except: pass`。
+- 401/403 给可执行文案（「节点还没绑定账户，先在网页端完成绑定」）；409 冷却 / 422 风控 /
+  400 格式各自一句话，均带「地址未变更」。
+- **只支持 Polygon（ERC20）地址**：提交前本地拦 `T` 开头（TRC20）并提示
+  「TRC20 暂不支持，请填 Polygon（ERC20）地址」，不发请求；`validate_address()` 的 TRC20
+  分支保留（老配置兼容）。理由见 cloud 侧三道闸（`CHAIN_ID=polygon` / 表约束
+  `payout_addresses_chain_ck` / 入库 `address.lower()` 抹平 base58 大小写）。
+
+### 包含 W1（`fix/ux-20261113`，基线 `5eea2fd`）的 4 条修复
+- **S1 黑窗**：`platform/no_window.py` 唯一封装，`djb_node/` 16/16 子进程调用点全部无窗。
+- **S2 主线程卡死**：`desktop/refresh_worker.py`，取数搬到 worker 线程 + `after` 轮询。
+- **S3 节点 ID 空**：`DJB_HOME="None"`、绑定只查手填值、`NodeCloudClient` 缺 `binding()` 三个真 bug。
+- **S4 复制无反馈**：`copy_text` + `clipboard.update()` + toast。
+
+### 版本同源（三处 + Helm）
+- `djb_node/__init__.py`（`__version__`，`facts.CLIENT_VERSION` 由它派生）＝
+  `pyproject.toml [project].version` ＝ `deploy/machine-room/helm/djb-node/Chart.yaml appVersion`。
+- `tests/rc8/t3_offline_verify.py` 的 `TARGET_VERSION` 抬到 `0.3.7`（必须比已装版本大，
+  否则 update 判 `up_to_date`，三个正例会假红灯）。
+
+### 未做 / 跨仓
+- **未构建、未发布**：`win-build.py` / `ci/pkgbuild.py` 由 release-manager 在构建机跑。
+- **TRC20 支持需独立立项**：要迁移出款链（Polygon → 多链）、加 `chain_id` 存储维度、
+  接 TRON 出款轨；本版次只做「拦 + 说清楚」。
+- 云端 `payout-address` 接口未部署（cloud 侧 `feat/ux-payout-20261113`），联调需等其发布。
+
 ## 0.3.5 · 2026-11-13
 
 **灰度阶梯对齐硬约束 + 内部档**（RC12-B 配套）。`__version__` / `pyproject.toml` / Helm `appVersion`
