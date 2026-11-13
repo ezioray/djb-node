@@ -196,15 +196,44 @@ def test_yield_actions_follow_state():
     assert "已暂停" in paused.plain_text()
 
 
-def test_access_fields_include_every_required_config():
+def test_access_fields_are_contribution_node_only():
+    """owner 2026-11-13：接入的是**贡献节点**，页面只留绑定 / 收款 / 价格。
+
+    UI 只保留 6 个字段（node_id + 两个排障只读 + 收款地址 + 价格 + 节点凭证），
+    API Key / 两个上游地址**从 UI 移除**——但模型字段必须还在（见下一个用例）。
+    """
     view = vw.build_view("access", demo_snapshot())
     keys = {field.key for field in view.fields}
-    for needed in ("node_id", "node_secret", "api_key", "price_mode", "usdt_address",
-                   "openai_base_url", "anthropic_base_url"):
+    for needed in ("node_id", "node_secret", "price_mode", "usdt_address",
+                   "daemon_state", "register_state"):
         assert needed in keys, needed
+    for removed in ("api_key", "openai_base_url", "anthropic_base_url"):
+        assert removed not in keys, removed
+    assert "API Key" not in view.plain_text()
+    assert "OpenAI 请求地址" not in view.plain_text()
+    assert "Anthropic 请求地址" not in view.plain_text()
     secrets = [f for f in view.fields if f.secret]
-    assert {f.key for f in secrets} >= {"node_secret", "api_key"}
+    assert {f.key for f in secrets} == {"node_secret"}
     assert all("…" in f.value or f.value in ("—", "未设置") for f in secrets)
+
+
+def test_access_removed_fields_stay_in_model_and_validate():
+    """「UI 移除、模型保留」：字段与校验规则一个都没删，老配置文件照常读。
+
+    这条是给 release-manager 的护栏：页面精简**不许**顺手删 ``AccessConfig`` 字段或放宽
+    ``validate()``（否则老配置 / 老 profile 会被判不合法）。
+    """
+    fields = set(ac.AccessConfig.__dataclass_fields__)
+    assert {"api_key", "openai_base_url", "anthropic_base_url"} <= fields
+    config = ac.AccessConfig(api_key="k", openai_base_url="http://127.0.0.1:1717/v1",
+                             anthropic_base_url="http://127.0.0.1:1717")
+    config.validate()                        # 三个字段仍然参与校验，且合法值不被拒
+    broken = ac.AccessConfig(openai_base_url="ftp://上游改坏了")
+    with pytest.raises(ValueError):
+        broken.validate()
+    # 收款地址校验只加不改：TRC20 仍被接受（老配置兼容），仅「提交云端」这条路只放行 EVM
+    trc20 = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"     # 合法 base58，验「老配置仍能读」
+    assert ac.validate_address(trc20) == trc20
 
 
 def test_unwired_views_say_unavailable_not_fake_success():
@@ -1063,7 +1092,9 @@ def test_access_secrets_stay_masked_after_node_id_change():
     assert SECRET not in text
     assert "djb_ck_live_secret_value" not in text
     secrets = {field.key: field for field in view.fields if field.secret}
-    assert "…" in secrets["api_key"].value and "…" in secrets["node_secret"].value
+    # 节点凭证 = 节点密钥（唯一还在页面上的秘密）；api_key 已从 UI 移除，自然也不上屏
+    assert "…" in secrets["node_secret"].value
+    assert "api_key" not in secrets
 
 
 def test_access_node_id_keeps_legacy_config_value_for_demo_snapshots():

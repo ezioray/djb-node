@@ -3,7 +3,8 @@
 
 设计原则（与桌面端其余部分一致）：
 
-1. **只读**：只发 GET，不带副作用；写操作不在本模块。
+1. **以只读为主**：除 `submit_payout_address`（USDT 收款地址提交，owner 2026-11-13 方案 B）
+   之外全是 GET；写操作**只有这一处**，且只由 worker 线程调用（见 `desktop/app.py`）。
 2. **凭据不进 URL / 日志 / 屏幕**：与 daemon 出站同一套头（``X-Client-Key``，见 ``protocol``）。
 3. **取不到就说取不到**：任何失败都抛 :class:`ProviderError`（带**短中文原因**），
    由视图渲染成「暂不可用（原因）」；**绝不返回 0、绝不造行**。
@@ -23,6 +24,7 @@ from urllib.parse import quote
 
 from ..httpclient import HttpClient, join_url
 from ..protocol import build_headers
+from ..util import new_request_id
 from .datasource import ProviderError
 
 __all__ = ["NodeCloudClient", "micro_text", "LOGIN_HINT"]
@@ -38,6 +40,9 @@ PATHS = {
     "receipt": "/api/v1/node/receipts/",       # 单条：+ receipt_id
     "node_balance": "/api/v1/node/balance",    # 节点绑定账户的可用余额（节点钥可读）
     "binding": "/api/v1/node/binding",         # 节点绑定状态（只读 GET，?node_id=）
+    # USDT 收款地址（owner 2026-11-13 方案 B：客户端直接提交云端）。
+    # 路径/字段按 cloud 侧契约逐字对齐；**云端只收 Polygon（EVM）**，见 payout.CHAIN_HINT。
+    "payout_address": "/api/v1/node/payout-address",
 }
 
 #: 一页最多取多少条（服务端可下调，客户端不硬要）
@@ -161,6 +166,90 @@ def _next_cursor(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _payout_error(response: Any, status: int) -> ProviderError:
+    """收款地址接口的错误信封 → **可执行**中文（401/403/409/422 各自给下一步）。
+
+    判定口径（cloud-payout 2026-11-13 契约）：先看 ``error.code``（40913 链不支持 /
+    40919 冷却 / 42210 准入 / 42211 风险 / 40001 格式），``error.reason`` 兜底；
+    两条都没给就退回状态码级别的话术——**不猜具体原因**。
+    """
+    code: int | None = None
+    reason = ""
+    field_name = ""
+    try:
+        raw = response.error_code()
+        code = raw if isinstance(raw, int) else None
+    except Exception:                      # pragma: no cover - 伪 response
+        code = None
+    try:
+        payload = response.json()
+    except Exception:                      # pragma: no cover - 伪 response
+        payload = None
+    if isinstance(payload, Mapping):
+        error = payload.get("error")
+        if isinstance(error, Mapping):
+            raw_reason = error.get("reason")
+            if isinstance(raw_reason, str):
+                reason = raw_reason.strip()
+            if isinstance(error.get("field"), str):
+                field_name = error["field"].strip()
+            if code is None and isinstance(error.get("code"), int):
+                code = int(error["code"])
+    by_code = {
+        40101: ("节点凭据无效或缺失（401）",
+                "先在网页端完成节点绑定（配对会刷新节点密钥），再回来提交"),
+        40305: ("节点还没绑定账户（403）", "先在网页端完成节点绑定，再回来提交收款地址"),
+        40401: ("服务未开放（404）",
+                "云端收款地址功能还没开启，等平台开放后再试；地址未变更（不用反复重试）"),
+        40913: ("云端只支持 Polygon（ERC20）链上 USDT 收款地址，TRC20 暂不支持（409）",
+                "把地址改成 0x 开头 42 位后重试"),
+        40919: ("收款地址 24 小时内只能改一次，冷却未过（409）",
+                "等冷却结束再改（「云端状态」里会显示可再改时间）"),
+        42210: ("该地址未通过准入校验（422）", "确认这是你本人在 Polygon 上的收款地址后重试"),
+        42211: ("云端风控判定该地址风险过高（422）", "换一个地址；有疑问联系平台客服"),
+        40001: ("云端判定收款地址格式不对（400）", "按 0x 开头 42 位填写；TRC20 暂不支持"),
+    }
+    # ``reason`` 优先：40919 同时用于「24h 冷却」与「幂等冲突」，只看 code 会把后者
+    # 说成「等冷却」——那会让客户白等 24 小时（cloud-payout 2026-11-13 明确提醒）。
+    by_reason = {
+        "chain_unsupported": by_code[40913],
+        "address_cooldown": by_code[40919],
+        "node_not_bound": by_code[40305],
+        "feature_disabled": by_code[40401],
+        "idempotency_conflict": (
+            "提交被云端判为重复请求（409/40919 幂等冲突）",
+            "再点一次「提交到云端」（客户端每次都会换新的幂等键）；地址未变更"),
+    }
+    if reason in by_reason:
+        reason_text, hint = by_reason[reason]
+        return ProviderError(reason_text, hint=hint)
+    if code in by_code:
+        reason_text, hint = by_code[code]
+        if code == 40001 and field_name == "body":
+            return ProviderError("云端拒收了请求内容（400）",
+                                 hint="客户端只发 address / label；请把这个情况报给平台（是 bug）")
+        return ProviderError(reason_text, hint=hint)
+    if status == 401:
+        return ProviderError("节点凭据无效或缺失（401）", hint=by_code[40101][1])
+    if status == 403:
+        return ProviderError("节点还没绑定账户（403）", hint=by_code[40305][1])
+    if status == 404:
+        return ProviderError("服务未开放（404）",
+                             hint="云端还没开放收款地址接口，等平台开启后再试；地址未变更")
+    if status == 409:
+        return ProviderError("收款地址暂时不能改（409）",
+                             hint="先看「云端状态」里的冷却时间，再重试")
+    if status == 422:
+        return ProviderError("云端拒绝了这个地址（422）", hint="确认地址归属后重试")
+    if status == 429:
+        return ProviderError("提交太频繁（429）", hint="稍后重试")
+    if status >= 500:
+        return ProviderError("云端暂时不可用（" + str(status) + "）",
+                             hint="稍后重试；地址未变更")
+    return ProviderError("提交被拒绝（" + str(status) + "）",
+                         hint="看云端返回的 message；地址未变更")
+
+
 class NodeCloudClient:
     """节点控制台只读客户端。``transport`` 可注入（单测不需要真网络）。"""
 
@@ -215,14 +304,32 @@ class NodeCloudClient:
         """一次 GET → JSON；失败一律映射成可读 ``ProviderError``（不含 URL / 令牌）。"""
         if self._transport is not None:
             return self._transport(kind, {})
-        request_headers = dict(headers) if headers else build_headers(client_key=self._client_key)
+        return self._request("GET", path, kind=kind, headers=headers)
+
+    def _request(self, method: str, path: str, *, kind: str,
+                 json_body: Any | None = None,
+                 headers: Mapping[str, str] | None = None,
+                 idempotency_key: str | None = None) -> Mapping[str, Any]:
+        """一次请求 → JSON。GET / POST 共用同一套状态码口径（只加不改）。
+
+        ``kind`` 只用于**错误文案分域**：``payout_address`` 的 401/403/409/422 有专门的
+        可执行文案（节点没绑定账户 / 冷却中 / 链不支持 / 风控拒），其余域维持老口径。
+        """
+        request_headers = dict(headers) if headers else build_headers(
+            client_key=self._client_key, idempotency_key=idempotency_key)
         url = join_url(self.base_url, path)
         try:
-            response = self._http.request("GET", url, headers=request_headers,
-                                          timeout=self._timeout)
+            if json_body is None:
+                response = self._http.request(method, url, headers=request_headers,
+                                              timeout=self._timeout)
+            else:
+                response = self._http.request(method, url, headers=request_headers,
+                                              json_body=json_body, timeout=self._timeout)
         except Exception as exc:              # 网络层：只说类型，不把 URL 抛给界面
             raise ProviderError("云端连不上（" + type(exc).__name__ + "）") from None
         status = int(getattr(response, "status", 0) or 0)
+        if kind == "payout_address" and status >= 400:
+            raise _payout_error(response, status)
         if status == 401:
             raise ProviderError("登录已过期（401）", hint=LOGIN_HINT)
         if status == 403:
@@ -245,6 +352,40 @@ class NodeCloudClient:
         if not isinstance(payload, Mapping):
             raise ProviderError("云端返回结构异常")
         return payload
+
+    # ─────────────────────────────────────────────────────── USDT 收款地址（方案 B）
+    def payout_address(self) -> dict[str, Any]:
+        """读云端已登记的收款地址（``GET``，只读）。
+
+        契约：没有登记过 → ``data: null``。这里统一归一成**空 dict**，让上层
+        「空 = 尚未提交」与「读不到 = 抛 ProviderError」两件事分开（不混成同一句文案）。
+        """
+        if self._transport is not None:
+            payload = self._transport("payout_address", {})
+        else:
+            payload = self._request("GET", PATHS["payout_address"], kind="payout_address")
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        return dict(data) if isinstance(data, Mapping) else {}
+
+    def submit_payout_address(self, address: str, label: str = "") -> dict[str, Any]:
+        """提交收款地址（``POST``，**唯一的写操作**；只在 worker 线程调用）。
+
+        * 带 ``X-DJB-Idempotency-Key``（cloud 侧两个幂等头都收，本仓既有头名优先）——
+          网络超时后客户再点一次不会变成两条变更记录；
+        * **不自动重试**：写操作重试会撞 24h 冷却（409/40919），失败由用户点按钮重试；
+        * 只发 ``0x`` 地址（TRC20 由 ``payout.submit_blocker`` 在本地拦掉，不到云端）。
+        """
+        body: dict[str, Any] = {"address": str(address).strip()}
+        text_label = str(label or "").strip()
+        if text_label:
+            body["label"] = text_label
+        if self._transport is not None:
+            payload = self._transport("payout_submit", dict(body))
+        else:
+            payload = self._request("POST", PATHS["payout_address"], kind="payout_address",
+                                    json_body=body, idempotency_key=new_request_id())
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        return dict(data) if isinstance(data, Mapping) else {}
 
     def fetch(self, kind: str) -> dict[str, Any]:
         """按 ``page.next_cursor`` 翻页聚合；返回 ``{items, next_cursor, pages, truncated}``。"""

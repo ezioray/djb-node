@@ -272,6 +272,10 @@ class DesktopApp:
         self._controller = controller
         #: S2：取数 worker（惰性建，见 _ensure_refresh_worker）
         self._refresh_worker: Any = None
+        #: USDT 收款地址提交 worker（惰性建，见 _ensure_payout_worker）；目标地址与提示文案
+        self._payout_worker: Any = None
+        self._payout_target = ""
+        self._payout_note = ""
         if getattr(controller, "save_path", None) is None:
             controller.save_path = _make_save_path(lambda: self._root)
         if getattr(controller, "ask_code", None) is None:
@@ -920,6 +924,66 @@ class DesktopApp:
             message += "（用时 %.1f s）" % duration
         self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
 
+    # ── USDT 收款地址提交（owner 2026-11-13 方案 B：客户端直接提交云端）
+    def _ensure_payout_worker(self) -> Any:
+        """惰性建「提交收款地址」worker：复用 W1 的 :class:`RefreshWorker` 模式。
+
+        同一个模式解决同一个问题（主线程不碰网络）：worker 线程只跑
+        ``controller.submit_payout``（纯数据层调用，不碰控件），主线程用 ``after`` 轮询取结果。
+        """
+        worker = getattr(self, "_payout_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(
+            lambda sections=None: self._controller.submit_payout(self._payout_target),
+            apply=self._apply_payout, on_start=self._payout_started,
+            on_busy=self._payout_busy, schedule=schedule, cancel=cancel)
+        self._payout_worker = worker
+        return worker
+
+    def _start_payout_submit(self, address: str, message: str = "") -> None:
+        """派发一次提交；没有事件循环（截图脚本/单测）才退回同步，行为和按钮一致。"""
+        self._payout_target = str(address)
+        self._payout_note = str(message or "")
+        worker = self._ensure_payout_worker()
+        if worker is None:
+            result = self._controller.submit_payout(self._payout_target)
+            self._toast(str(result.message), ok=bool(result.ok))
+            self._request_refresh_async(("access",))
+            return
+        worker.start()                     # 忙时走 on_busy（不叠加第二个 POST）
+
+    def _payout_started(self) -> None:
+        self._toast(self._payout_note or "正在提交收款地址到云端…", ok=True)
+
+    def _payout_busy(self) -> None:
+        self._toast("正在提交…上一次还没结束，已忽略这次点击", ok=True)
+
+    def _apply_payout(self, result: Any, error: BaseException | None,
+                      sections: Any = None) -> None:
+        """结果落地（主线程）：先 toast 说清成败，再异步重拉云端状态（GET 也不在主线程）。"""
+        if error is not None:
+            self._toast("提交失败（" + type(error).__name__ + "）；地址未变更", ok=False)
+        elif result is None:
+            self._toast("提交失败：没有拿到结果；地址未变更", ok=False)
+        else:
+            self._toast(str(getattr(result, "message", "") or "提交完成"),
+                        ok=bool(getattr(result, "ok", False)))
+        refresh = getattr(self, "_refresh_worker", None)
+        if refresh is None or not getattr(refresh, "busy", False):
+            self._request_refresh_async(("access",))
+
     # ── 双主题（day / night）
     def _theme_button_text(self, narrow: bool | None = None) -> str:
         """窄窗只留图标（390 宽时顶栏放不下四个带字的控件）。"""
@@ -1380,8 +1444,16 @@ class DesktopApp:
         label.bind("<Configure>", lambda event, target=label: self._fit_wrap(target), add="+")
         return label
 
+    #: 换行宽「变大」的最小步长（px）。同一帧里列宽会因滚动条出现/消失抖 1px，
+    #: 若逐像素追着改：wraplength → 行数 → 高度 → 滚动条 → 列宽 形成回环，
+    #: ``update_idletasks`` **永不返回**（0.3.6 接入页长提示实测复现）。两个钉子：
+    #: tests/test_desktop_payout.py::test_fit_wrap_follows_shrink_but_steps_growth
+    #: 与 ::test_real_tk_access_page_folds_advanced_and_never_prefills_mask（修前会挂死）。
+    #: 策略：**变窄立刻跟**（保证不裁字），变宽按 24px 步进（抖动吃掉，最多多折一行）。
+    WRAP_GROW_STEP = 24
+
     def _fit_wrap(self, label: Any, width: int | None = None) -> None:
-        """把单条 label 的换行宽钳到它实际分到的宽度（只减不增，防抖）。"""
+        """把单条 label 的换行宽钳到它实际分到的宽度（变窄立刻跟、变宽按步进）。"""
         try:
             span = int(label.winfo_width() if width is None else width)
         except Exception:                            # pragma: no cover - 控件已销毁
@@ -1393,11 +1465,12 @@ class DesktopApp:
             current = int(float(label.cget("wraplength")))
         except Exception:                            # pragma: no cover - 防御
             current = -1
-        if current != span:
+        if current <= 0 or span < current or span - current >= self.WRAP_GROW_STEP:
             try:
                 label.configure(wraplength=span)
             except Exception:                        # pragma: no cover - 控件已销毁
                 pass
+
 
     def _rewrap(self) -> None:
         """宽度变了但没跨断点：只更新换行宽度，不重建控件。"""
@@ -1958,7 +2031,13 @@ class DesktopApp:
 
     def _render_fields(self, fields: Sequence[Field], view_key: str,
                        parent: Any = None) -> None:
-        """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。"""
+        """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。
+
+        ``Field.advanced`` 的字段**默认折叠**在「高级（排障用）」按钮后面（接入页的
+        节点凭证就是这种：排障要用，但绝不该占首屏——owner 2026-11-13「页面太复杂」）。
+        ``Field.prefill=False`` 的可编辑框留空（掩码值只进 hint），避免一点保存就把掩码
+        当真实值写回配置。
+        """
         kit, tk, ttk = self._kit, self._tk, self._ttk
         fonts = self._fonts
         surface = dual.color("surface")
@@ -1966,61 +2045,99 @@ class DesktopApp:
         card = kit.RoundedCard(target, ground=dual.color("bg"), pad=(16, 14))
         card.pack(fill="x", pady=(0, 10))
         body = card.body
-        editable = any(field.editable for field in fields)
+        normal = [field for field in fields if not getattr(field, "advanced", False)]
+        advanced = [field for field in fields if getattr(field, "advanced", False)]
+        editable = any(field.editable for field in normal)
         tk.Label(body, text="可编辑字段" if editable else "详情",
                  font=fonts.sans(kit.px("h2"), bold=True), foreground=dual.color("ink"),
                  background=surface, anchor="w").pack(anchor="w", pady=(0, 10))
-        per_row = 1 if (self._is_narrow() or len(fields) <= 2) else 2
+        per_row = 1 if (self._is_narrow() or len(normal) <= 2) else 2
+
+        def build(container: Any, rows: Sequence[Field]) -> None:
+            for column in range(per_row):
+                container.columnconfigure(column, weight=1, uniform="field")
+            for index, field in enumerate(rows):
+                row, column = divmod(index, per_row)
+                self._render_field(container, row, column, field, per_row)
+
         grid = tk.Frame(body, background=surface)
         grid.pack(fill="x")
-        for column in range(per_row):
-            grid.columnconfigure(column, weight=1, uniform="field")
-        for index, field in enumerate(fields):
-            row, column = divmod(index, per_row)
-            block = tk.Frame(grid, background=surface)
-            block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
-            # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
-            block.columnconfigure(0, minsize=104)
-            block.columnconfigure(1, weight=1)
-            tk.Label(block, text=field.label, font=fonts.sans(kit.px("micro")),
-                     foreground=dual.color("muted_text"), background=surface,
-                     anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
-            if field.editable:
-                variable = tk.StringVar(value="" if field.secret else field.value)
-                entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
-                                  width=28 if per_row > 1 else 44)
-                if field.secret:
-                    entry.configure(show="•")
-                entry.grid(row=0, column=1, sticky="ew")
-                hint = field.hint or ""
-                if field.secret:
-                    hint = ("当前 " + field.value + "｜" + hint).strip("｜")
-                if hint:
-                    self._wrap_to_column(tk.Label(
-                        block, text=hint, font=fonts.sans(kit.px("micro")),
-                        foreground=dual.color("muted_text"), background=surface,
-                        anchor="w", justify="left",
-                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
-                                                            pady=(3, 0))
-                self._fields[field.key] = field
-                self._vars[field.key] = variable
+        build(grid, normal)
+        if not advanced:
+            return
+        # 折叠区：默认不 pack（= 不占高度）；按钮文案在「高级」与「收起高级」之间切
+        hidden = tk.Frame(body, background=surface)
+        toggle = kit.Button(body, "高级（排障用）", lambda: _toggle(),
+                            kind="ghost", ground=surface, px=kit.px("small"),
+                            height=26, pad=10)
+        toggle.pack(anchor="w", pady=(2, 0))
+        # 留给真窗口取证（tests/test_desktop_payout.py）：折叠区/按钮不在首屏，也得能被点开
+        self._advanced_panel = hidden
+        self._advanced_toggle = toggle
+        state = {"open": False}
+
+        def _toggle() -> None:
+            state["open"] = not state["open"]
+            if state["open"]:
+                build(hidden, advanced)
+                hidden.pack(fill="x", pady=(6, 0), before=toggle)
+                toggle.set_text("收起高级")
             else:
-                # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
-                # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
-                value_label = self._wrap_to_column(tk.Label(
-                    block, text=field.value,
-                    font=fonts.for_text(field.value, kit.px("small")),
-                    foreground=dual.color("ink"), background=surface,
+                hidden.pack_forget()
+                toggle.set_text("高级（排障用）")
+
+    def _render_field(self, container: Any, row: int, column: int, field: Field,
+                      per_row: int) -> None:
+        """画一个字段格（从 :meth:`_render_fields` 拆出来：折叠区复用同一套画法）。"""
+        kit, tk, ttk = self._kit, self._tk, self._ttk
+        fonts = self._fonts
+        surface = dual.color("surface")
+        block = tk.Frame(container, background=surface)
+        block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
+        # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
+        block.columnconfigure(0, minsize=104)
+        block.columnconfigure(1, weight=1)
+        tk.Label(block, text=field.label, font=fonts.sans(kit.px("micro")),
+                 foreground=dual.color("muted_text"), background=surface,
+                 anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        if field.editable:
+            # 秘密与「只给掩码」的字段都不预填：输入框里的空串 = 不改（_config_for_save 口径）
+            empty = field.secret or not getattr(field, "prefill", True)
+            variable = tk.StringVar(value="" if empty else field.value)
+            entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
+                              width=28 if per_row > 1 else 44)
+            if field.secret:
+                entry.configure(show="•")
+            entry.grid(row=0, column=1, sticky="ew")
+            hint = field.hint or ""
+            if field.secret:
+                hint = ("当前 " + field.value + "｜" + hint).strip("｜")
+            if hint:
+                self._wrap_to_column(tk.Label(
+                    block, text=hint, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("muted_text"), background=surface,
                     anchor="w", justify="left",
-                    wraplength=self._wrap_hint()))
-                value_label.grid(row=0, column=1, sticky="we")
-                if field.hint:
-                    self._wrap_to_column(tk.Label(
-                        block, text=field.hint, font=fonts.sans(kit.px("micro")),
-                        foreground=dual.color("muted_text"), background=surface,
-                        anchor="w", justify="left",
-                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
-                                                            pady=(3, 0))
+                    wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
+                                                        pady=(3, 0))
+            self._fields[field.key] = field
+            self._vars[field.key] = variable
+        else:
+            # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
+            # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
+            value_label = self._wrap_to_column(tk.Label(
+                block, text=field.value,
+                font=fonts.for_text(field.value, kit.px("small")),
+                foreground=dual.color("ink"), background=surface,
+                anchor="w", justify="left",
+                wraplength=self._wrap_hint()))
+            value_label.grid(row=0, column=1, sticky="we")
+            if field.hint:
+                self._wrap_to_column(tk.Label(
+                    block, text=field.hint, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("muted_text"), background=surface,
+                    anchor="w", justify="left",
+                    wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
+                                                        pady=(3, 0))
 
     # ── 动作
     def _on_action(self, key: str) -> None:
@@ -2039,6 +2156,9 @@ class DesktopApp:
             self._open_url(result.payload)
         elif result.effect == "goto" and result.payload:
             self.show_view(str(result.payload))       # 例如「共享 Token Plan」→「接入配置」
+        elif result.effect == "payout_submit":
+            # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
+            self._start_payout_submit(str(result.payload), result.message)
         elif result.effect in ("refresh", "access", "bench", "control", "reload"):
             self._render(self._controller.current())
         self._update_status()
@@ -2303,12 +2423,18 @@ _DEMO_SECTIONS = {
                    "config": {"node_id": "node-7c31", "node_secret": "djb_ns_…4e11",
                               "api_key": "djb_sk_…abcd", "price_mode": "auto",
                               "price_mode_label": "跟随平台建议价",
-                              "price_note": "—", "usdt_address": "TQn9Xa…7f3d",
+                              "price_note": "—", "usdt_address": "0x3f7c…9a2c",
                               "openai_base_url": "http://127.0.0.1:1717/v1",
                               "anthropic_base_url": "http://127.0.0.1:1717",
                               "agent_downlink_url": "http://127.0.0.1:1717/agent",
                               "scoped_token": "djb_sc_…9f2c"},
                    "valid": True, "binding": {"state": "bound", "node_id": "node-7c31"},
+                   # 收款地址云端状态（方案 B）：演示数据给「已生效」，截图才看得到正向态
+                   "payout": {"ok": True, "can_submit": True, "reason": "", "hint": "",
+                              "data": {"address": "0x3f7c9a1b2d3e4f5a6b7c8d9e0f1a2b3c4d5e9a2c",
+                                       "status": "whitelisted", "cooldown_until": None,
+                                       "updated_at": "2026-11-01T04:30:00Z",
+                                       "label": "默认收款"}},
                    "note": "", "path": "~/.djb/desktop/access-config.json"},
         # 共享 Token Plan（第 9 项）：演示数据必须给「有上游」的形状，
         # 否则截图里只有空态，客户看不到「我的 Token Plan」长什么样。

@@ -11,7 +11,7 @@
 | 运行身份 | 系统用户 `djb-supply`（非 root，`nologin`） |
 | 入站端口 | **无**（只绑 `127.0.0.1:1717`，调度不走入站） |
 | 默认开启 | `client.relay.enabled`、`client.probe.periodic.enabled`、`client.quotes.publish.enabled` |
-| 客户端版本 | **0.3.4**（与 Windows / macOS / Linux 三端同一份源码、同一个 `djb_node.__version__`） |
+| 客户端版本 | **0.3.6**（与 Windows / macOS / Linux 三端同一份源码、同一个 `djb_node.__version__`） |
 | 报价参数 | 周期 60 s · TTL 120 s（**TTL 恒等于 2 × 周期**） |
 
 > ⚠ **这三项靠 `facts.FEATURE_FLAGS[*].expire_at` 续期，不是靠本 profile 的 `true` 保命。**
@@ -69,7 +69,7 @@ getent passwd djb-supply || echo "还没有 djb-supply 用户（install.sh 会�
 sudo ./install.sh --gateway https://tkbank.ai
 
 # 生产装 · 离线（把 wheel 一起带过去）
-sudo ./install.sh --gateway https://tkbank.ai --wheel ./djb_node-0.3.4-py3-none-any.whl
+sudo ./install.sh --gateway https://tkbank.ai --wheel ./djb_node-0.3.6-py3-none-any.whl
 
 # 装测试 / 预发：--gateway 覆盖成交付 config 以外的地址（不改就还是生产）
 ./install.sh --gateway https://test.example.com --dry-run

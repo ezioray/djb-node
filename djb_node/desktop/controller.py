@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED,
-                     AccessConfig, AccessService, FileAccessStore, SaveResult, mask_secret)
+                     AccessConfig, AccessService, FileAccessStore, SaveResult, mask_secret,
+                     validate_address)
 from .datasource import (SECTIONS, DataSource, LocalDataSource, ProviderError, Snapshot,
                          Unavailable, benchmark)
 from .views import VIEW_KEYS, VIEW_TITLES, View, build_view
@@ -242,16 +243,22 @@ class DesktopController:
     def set_draft(self, key: str, value: str) -> None:
         self.drafts[str(key)] = str(value)
 
+    #: 「留空 = 不改」的字段：秘密字段（空 = 保留原值）与**掩码回填**字段。
+    #: ``usdt_address`` 属于后者：接入页的输入框不预填掩码（``Field.prefill=False``），
+    #: 用户没动它就是空串——若照常合并会把已保存的收款地址**清空**（比原来的「掩码写回」
+    #: 更糟）。要改地址就填新值，点「提交到云端」；本版次不提供 UI 清空（没有这个需求）。
+    KEEP_WHEN_EMPTY = ("node_secret", "api_key", "scoped_token", "usdt_address")
+
     def _config_for_save(self) -> tuple[AccessConfig, list[str]]:
-        """把草稿合并进当前配置；秘密字段空值表示「保持不变」。"""
+        """把草稿合并进当前配置；``KEEP_WHEN_EMPTY`` 里的字段空值表示「保持不变」。"""
         service = self._service()
         current = service.load()
         warnings: list[str] = []
         changes: dict[str, str] = {}
         for key, value in self.drafts.items():
             text = str(value or "")
-            if key in ("node_secret", "api_key", "scoped_token") and not text.strip():
-                continue                               # 空 = 不覆盖已有秘密
+            if key in self.KEEP_WHEN_EMPTY and not text.strip():
+                continue                               # 空 = 不覆盖已有值
             changes[key] = text.strip() if key != "price_note" else text
         known = {name for name in AccessConfig().__dict__ if name != "extra"}
         unknown = [key for key in changes if key not in known]
@@ -359,6 +366,64 @@ class DesktopController:
 
     def _act_access_save(self, *, confirm=None) -> ActionResult:
         return self.save_access()
+
+    def _act_access_submit_payout(self, *, confirm=None) -> ActionResult:
+        """「提交到云端」：本地先校验（格式 + **链**），**不发请求**。
+
+        真正的 ``POST`` 在 worker 线程里由 :meth:`submit_payout` 执行（Tk 主线程不碰网络，
+        S2 口径）；这里只把「能提交什么」判清楚，返回 ``effect="payout_submit"`` 让渲染层
+        去派发。TRC20 在本地就拦下并说清楚，不把请求打到云端等 409——客户会误以为重试就行。
+        """
+        from . import payout as payout_mod
+
+        address = self.payout_address()
+        if not address:
+            return ActionResult("暂不可用（先填 USDT 收款地址，再点「提交到云端」）", ok=False)
+        try:
+            address = validate_address(address)        # 格式（TRC20 / EVM 都认，老配置兼容）
+        except ValueError as exc:
+            return ActionResult("提交失败：" + str(exc) + "（未发送到云端）", ok=False)
+        blocked = payout_mod.submit_blocker(address)   # 链闸：只放行 0x（Polygon）
+        if blocked:
+            return ActionResult(blocked + "（未发送到云端）", ok=False)
+        if not callable(getattr(self.source, "submit_payout_address", None)):
+            return ActionResult("暂不可用（当前数据源不支持提交收款地址）；地址未变更。", ok=False)
+        return ActionResult("正在提交收款地址到云端…（可以继续操作）",
+                            effect="payout_submit", payload=address)
+
+    def payout_address(self) -> str:
+        """要提交的收款地址：草稿优先（用户刚填的），否则用已保存的配置值。"""
+        draft = str(self.drafts.get("usdt_address") or "").strip()
+        if draft:
+            return draft
+        try:
+            return str(self._service().load().usdt_address or "").strip()
+        except Exception:                          # 配置坏了：当没填（动作会说下一步）
+            return ""
+
+    def submit_payout(self, address: str) -> ActionResult:
+        """**在 worker 线程里**提交收款地址（由 ``app._ensure_payout_worker`` 调用）。
+
+        本地闸重判一次（防御：调用方可能绕过动作直接调），再调数据层；任何失败都带
+        「地址未变更」——客户最怕的是「不知道到底改没改」。
+        """
+        from . import payout as payout_mod
+
+        blocked = payout_mod.submit_blocker(address)
+        if blocked:
+            return ActionResult("提交失败：" + blocked + "（未发送到云端）", ok=False)
+        handler = getattr(self.source, "submit_payout_address", None)
+        if not callable(handler):
+            return ActionResult("暂不可用（当前数据源不支持提交收款地址）；地址未变更。",
+                                ok=False)
+        try:
+            data = handler(address)
+        except ProviderError as exc:
+            hint = ("；" + exc.hint) if exc.hint else ""
+            return ActionResult("提交失败：" + exc.reason + hint + "（地址未变更）", ok=False)
+        except Exception as exc:                   # 数据层理论上有归一，兜底不冒栈
+            return ActionResult("提交失败（" + type(exc).__name__ + "）；地址未变更。", ok=False)
+        return ActionResult(payout_mod.submit_message(data), ok=True)
 
     def _act_access_copy_node_id(self, *, confirm=None) -> ActionResult:
         """复制节点 ID（网页端绑定要填的那个）：只读快照，不写真机、不发请求。

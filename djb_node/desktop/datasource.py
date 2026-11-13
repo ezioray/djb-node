@@ -726,6 +726,15 @@ class LocalDataSource:
         """拉云端单条收据（校验用）；失败抛 ``ProviderError``（视图显示暂不可用）。"""
         return self._cloud_call("receipt", receipt_id)
 
+    def submit_payout_address(self, address: str, label: str = "") -> Mapping[str, Any]:
+        """把 USDT 收款地址提交到云端（**本层唯一的写操作**，owner 方案 B）。
+
+        与读路径彻底分开：不在 :meth:`snapshot` 里、不被 ``_safe`` 吞异常、
+        **只在 worker 线程调用**（`desktop/app.py` 的 ``_ensure_payout_worker``），
+        失败抛 :class:`ProviderError`（带可执行 hint）由控制器转成 toast。
+        """
+        return self._cloud_call("submit_payout_address", address, label)
+
     def _cloud_pages(self, kind: str, method: str) -> dict[str, Any]:
         """按 ``page.next_cursor`` 取全量（客户端负责翻页上限）；无 ``fetch`` 的桩只取单页。"""
         cloud = self._ensure_cloud()
@@ -1071,6 +1080,25 @@ class LocalDataSource:
                 binding = self._cloud_call("binding", resolved)
             except ProviderError as exc:
                 note = "云端绑定状态暂不可用：" + exc.reason
+        # USDT 收款地址的**云端**状态（owner 2026-11-13 方案 B：客户端直接提交云端）。
+        # 取数走既有 `_cloud_call`（同一套 401/网络降级口径），读不到就 ok=False，
+        # 由视图说「暂时读不到云端状态」——绝不把读不到渲染成「已生效」。
+        payout: dict[str, Any] = {"ok": False, "reason": "", "hint": "", "data": {},
+                                  "can_submit": False, "disabled": False}
+        try:
+            cloud_row = self._cloud_call("payout_address")
+        except ProviderError as exc:
+            # 404/40401 是「平台还没开放」，不是故障：单独标出来，页面说清「未开放」而不是
+            # 「读不到」——两者对客户的含义完全不同（后者会让人反复点重试）。
+            payout.update({"ok": False, "reason": exc.reason, "hint": exc.hint,
+                           "disabled": "未开放" in exc.reason})
+        else:
+            payout.update({"ok": True,
+                           "data": dict(cloud_row) if isinstance(cloud_row, Mapping) else {}})
+        # 「能不能提交」只看本机有没有节点凭据（纯本地读，不发请求）：没有就置灰说下一步；
+        # 云端未开放时也置灰——省掉一次注定失败的往返，文案直接说等平台开启。
+        payout["can_submit"] = (self._ensure_cloud() is not None
+                                and not payout["disabled"])
         # 文件不存在 ≠ 通过校验：没保存过就说没保存过，避免「通过校验」误导
         saved = bool(getattr(self._access, "path", None)
                      and Path(self._access.path).exists())
@@ -1083,6 +1111,7 @@ class LocalDataSource:
                 # 三级回退每一级的可观测结论 + 节点进程状态：空 ID 时客户能自己看出卡在哪
                 "node_id_diag": self._node_id_diag(config, info, resolved),
                 "daemon": self._daemon_diag(info),
+                "payout": payout,
                 "note": note, "path": str(self._access.path)}
 
     def _daemon_diag(self, info: Mapping[str, Any]) -> dict[str, Any]:
