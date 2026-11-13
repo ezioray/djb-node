@@ -2,7 +2,7 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: DJB Protocol API
-  version: 1.12.0
+  version: 1.13.0
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面 + S4 TokenRouter 加性字段（覆盖 M01–M14、M16–M18）
   description: "DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、\n契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。\n\n- 命名空间：`/v1/*` 为 OpenAI\
     \ 兼容网关面；`/api/v1/*` 为控制面（节点/用方/协议/后台）。\n- 可用性：`x-djb-availability` 标记「不是所有部署都提供」的面；`m03` = 仅 M03 网关装配\n  （`DJB_GATEWAY_M03=1`）时挂载，默认部署返回\
@@ -15256,6 +15256,54 @@ components:
               - unverified
               - stale
               - null
+        fee_mode:
+          type: string
+          enum:
+          - none
+          - add
+          description: '1.13.0 加性：该模型参考报价行的平台费模式（CHG-2026-11-13-BILLING-FIX §3）。
+
+            `none` = 客户应付 = 供方 ask、平台费 0（不倒扣供方）；`add` = 客户应付 = ask × (1 + fee_bps/10000)。
+
+            多供方时取 `price` 所指的那一行（最低 ask，并列按 node_id 定序），与 `effective_price` 同一行。
+
+            目录未给该字段 = 未知，不得推断为 `add`（缺省按 `none` 兼容读取）。
+
+            '
+        fee_bps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: '1.13.0 加性：`fee_mode=add` 时的加价基点（1500 = 15%）；`none` 恒为 0。
+
+            由服务端在报价时快照（服务端事实源，客户端不能自报费率）。
+
+            '
+        effective_price:
+          type: object
+          additionalProperties: true
+          description: '1.13.0 加性：**客户实付价** —— 按当前计费口径客户真正要付的单价（展示即实收）。
+
+            加价需**同时**满足三个条件：`gateway.platform_fee` 打开、`gateway.billing_micro` 打开
+            （平台费的加价只存在于 micro 计费分支；micro 关时网关走旧分口径 `charge_minor_for_tokens`，
+            该路径没有费率参数）、该行 `fee_mode=add`。
+
+            三者同时成立 ⇒ `price` 所指报价行的 ask × (1 + fee_bps/10000)；
+            **任一开关关闭或 `fee_mode=none` ⇒ 等于 `price`**（客户就是按 ask 付，展示不得虚高）。
+
+            按 micro-USD 整数换算、6 位小数字符串输出：ask=0.84、fee=1500、两开关都开 ⇒ `0.966000`；
+            任一开关关闭 ⇒ `0.840000`。
+
+            `price` 语义不变（仍是供方 ask / 参考价）；`fee_mode` / `fee_bps` 是报价快照（供方意图），
+            不随开关改写；客户端展示「客户应付」请读本字段。
+
+            '
+          properties:
+            amount:
+              type: string
+              description: 十进制字符串，6 位小数（不用浮点）。
+            unit:
+              type: string
     ModelList:
       type: object
       additionalProperties: true
@@ -15426,6 +15474,33 @@ components:
         canceled_at:
           type: string
           format: date-time
+    MicroAmount:
+      type: object
+      additionalProperties: true
+      required:
+      - micro
+      - amount
+      - unit
+      - scale
+      description: '整数 micro 口径的金额（加性：批次 B 读面）。`micro` 是唯一精度源
+        （`amount` = `micro` / 10^6，固定 6 位小数定点字符串）；两者不可能不同步，
+        出现不一致时以 `micro` 为准。**不要**用浮点解析 `amount`。'
+      properties:
+        micro:
+          type: integer
+          description: 金额的整数 micro 表示（1 = 0.000001）。
+        amount:
+          type: string
+          pattern: ^-?[0-9]+\.[0-9]{6}$
+          description: 十进制定点字符串，固定 6 位小数（补零、不省略尾零）。
+        unit:
+          type: string
+          description: 计价单位（当前为 USD）。
+        scale:
+          type: string
+          enum:
+          - micro
+          description: 口径标记；未知值按 tolerant reader 忽略该对象。
     UsageSummary:
       type: object
       additionalProperties: true
@@ -15462,6 +15537,26 @@ components:
               minimum: 0
             billable:
               $ref: '#/components/schemas/Amount'
+            billed:
+              $ref: '#/components/schemas/MicroAmount'
+              description: 已入账（结算 cut-off 之前）的金额；cut-off 未配置时为 0。
+            unbilled:
+              $ref: '#/components/schemas/MicroAmount'
+              description: 尚未入账（结算 cut-off 之后）的金额；cut-off 未配置时为 0。
+            legacy:
+              $ref: '#/components/schemas/MicroAmount'
+              description: cut-off 之前的用量金额；**仅** `include_legacy=true` 时计入，否则为 0。
+        include_legacy:
+          type: boolean
+          default: false
+          description: 是否把结算 cut-off 之前的用量计入 `legacy`；默认 false（不影响 `billable` 口径）。
+        cutoff_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: 结算 cut-off 时刻；未配置时 `null`（此时 `billed`/`unbilled` 为 0，
+            金额只在 `include_legacy=true` 时出现在 `legacy` 里）。
         groups:
           type: array
           items:
@@ -15481,6 +15576,15 @@ components:
                 minimum: 0
               billable:
                 $ref: '#/components/schemas/Amount'
+              billed:
+                $ref: '#/components/schemas/MicroAmount'
+                description: 同 `totals.billed`，按本组统计。
+              unbilled:
+                $ref: '#/components/schemas/MicroAmount'
+                description: 同 `totals.unbilled`，按本组统计。
+              legacy:
+                $ref: '#/components/schemas/MicroAmount'
+                description: 同 `totals.legacy`，按本组统计。
     NodeRegisterRequest:
       type: object
       additionalProperties: true
@@ -19716,6 +19820,17 @@ components:
           minimum: 0
         price:
           $ref: '#/components/schemas/Amount'
+        fee_bps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: '1.13.0 加性：本次成交报价的平台费基点快照（`add` 报价 = 1500，其余为 0）。
+
+            只在成交报价带 fee 时出现；`price` 仍是供方 ask，客户应付由网关按
+
+            `gateway.platform_fee` 开关决定是否加价（关闸 ⇒ 按 ask 计费，价格不变）。
+
+            '
         price_saved_pct:
           type: number
           minimum: 0
@@ -19832,6 +19947,20 @@ components:
           type: integer
           minimum: 1
           description: 报价有效期（秒）；到期转 `expired`，不复活。
+        fee_mode:
+          type: string
+          enum:
+          - none
+          - add
+          description: '1.13.0 加性：平台费模式（CHG-2026-11-13-BILLING-FIX §3）。缺省 `none`（旧客户端行为不变）。
+
+            `add` = 客户应付 = ask × 1.15；`none` = 客户应付 = ask、平台费 0（不倒扣供方）。
+
+            服务端只采信模式：`fee_bps` 由服务端按事实源快照，**忽略请求里的 fee_bps**。
+
+            云端「报价设置」命中时以云端申报的模式为准（供方在门户的选择优先于节点自报）。
+
+            '
     QuoteAck:
       type: object
       additionalProperties: true
@@ -19854,6 +19983,21 @@ components:
         expires_at:
           type: string
           format: date-time
+        fee_mode:
+          type: string
+          enum:
+          - none
+          - add
+          description: '1.13.0 加性：本版报价**快照后**的平台费模式（可能被云端申报覆盖）。
+
+            旧响应字段一个不动，客户端忽略即可。
+
+            '
+        fee_bps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: 1.13.0 加性：快照后的加价基点（`add` ⇒ 1500；`none` ⇒ 0）。
     BidRequest:
       type: object
       additionalProperties: true
@@ -24981,6 +25125,27 @@ components:
           type: string
           maxLength: 64
           description: 采用标记（如 recommend:settled_7d）；必须与 ask_min/ask_max 同请求给出
+        fee_mode:
+          type: string
+          enum:
+          - none
+          - add
+          description: '1.13.0 加性：平台费模式（CHG-2026-11-13-BILLING-FIX §3 / 裁决 Q2）。
+
+            `none` = 客户应付 = ask、平台费 0（不倒扣供方）；`add` = 客户应付 = ask × 1.15。
+
+            缺省 = 保持原值（现有行 = `none`，价格不变）。**不选不能提交**：门户表单必须二选一。
+
+            '
+        fee_bps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: '1.13.0 加性：兼容字段，**服务端一律忽略**（费率不能由调用方自报）。
+
+            只给 `fee_bps` 不给 `fee_mode` ⇒ 40001（避免「以为设了费率其实没设」）。
+
+            '
       minProperties: 1
     MarketQuote:
       type: object
@@ -25183,6 +25348,21 @@ components:
           - string
           - 'null'
           description: 采用标记，人工改价后自动清空
+        fee_mode:
+          type: string
+          enum:
+          - none
+          - add
+          description: '1.13.0 加性：本行申报的平台费模式（未设置过 = `none`）。
+
+            生效点是报价快照（quotes.fee_mode）：改这里只影响**后续新报价**，已生成报价保留。
+
+            '
+        fee_bps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: 1.13.0 加性：服务端快照的基点（`add` ⇒ 1500；`none` ⇒ 0）。
         resolved_from:
           type: string
           enum:
