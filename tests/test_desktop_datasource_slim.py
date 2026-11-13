@@ -182,6 +182,31 @@ def test_inproc_flag_on_needs_no_cli_subprocess(tmp_path, monkeypatch, home_stor
     assert status.get("state") == "stopped"
 
 
+def test_inproc_cli_pins_home_instead_of_falling_back(tmp_path, monkeypatch):
+    """进程内 CLI 必须读**钉住的** home。
+
+    回归（0.3.6 合并前）：``inproc_cli.call`` 把 ``--home`` 放在子命令**前**，各子解析器
+    也定义了 ``--home`` 且无 ``default=SUPPRESS``，argparse 用它的默认值把主解析器的值覆盖成
+    ``None`` → ``resolve_home(None)`` 回落到 ``$DJB_HOME`` / ``~/.djb``：未初始化时报
+    「本机未初始化」，已初始化时**读到别的库**（窗口显示别人家的节点状态）。
+    """
+    from djb_node.config import Paths
+    from djb_node.platform import inproc_cli
+    from djb_node.store import Store
+
+    monkeypatch.setenv("DJB_INPROC_CLI", "1")
+    monkeypatch.setenv("DJB_HOME", str(tmp_path / "decoy"))   # 诱饵：一个未初始化的 home
+    real = Paths(str(tmp_path / "real"))
+    real.prepare()
+    Store.create(real.db_file, version="0.1.0").close()
+
+    result = inproc_cli.call(["status"], home=real.home)
+    assert result is not None, "进程内路径没跑（开关/白名单被改？）"
+    code, stdout, stderr = result
+    assert code == 0, (code, stderr)
+    assert "本机未初始化" not in (stderr or "")
+
+
 class _Done:
     def __init__(self, returncode: int, stdout: str, stderr: str = "") -> None:
         self.returncode = returncode

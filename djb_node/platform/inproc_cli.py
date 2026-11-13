@@ -105,7 +105,11 @@ def call(argv: Sequence[str], *, home: str | os.PathLike | None = None,
         return None                       # home 只由本函数显式钉住，调用方不许自带
     from .. import cli                    # 延迟 import：CLI 很重，桌面端只在需要时才拉
 
-    args = ["--home", os.fspath(home), *words]
+    # ``--home`` 必须放在**子命令之后**：每个子解析器也定义了 ``--home``，argparse 会用它的
+    # 默认值（``None``）覆盖主解析器已解析出的值。放前面时 ``resolve_home(None)`` 会回落到
+    # ``$DJB_HOME`` / ``~/.djb`` —— 未初始化时报「本机未初始化」，已初始化时**读到别的库**
+    # （与本函数「home 只由本函数显式钉住」的承诺正好相反）。
+    args = [*words, "--home", os.fspath(home)]
     if "--json" not in args:
         args.append("--json")
     out, err = io.StringIO(), io.StringIO()
