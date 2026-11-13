@@ -389,7 +389,12 @@ class UpstreamManager:
         # 协议必须从**记录**传下去（CR-20261106 客户端 P2）：daemon 的周期探针、
         # 启动探针、CLI `djb upstream probe` 全走这一个入口，所以在这一处接线
         # 就覆盖了所有调用方；`record.protocol` 缺省即 `openai-chat`，旧上游行为不变。
-        result = probe_upstream(record.base_url, record.model_ids(),
+        # W6-FIX：只探测 enabled 模型。disabled 模型可能已不在上游 /models 清单，
+        # 若仍参与探针，云端 `_probe_verdict` 会「任一失败即 rejected」，
+        # 导致「停用」无法把上游恢复为 verified（RC13 W6 实测 6/7）。
+        probe_models = [str(item.get("id")) for item in record.models
+                        if item.get("id") and item.get("enabled", True)]
+        result = probe_upstream(record.base_url, probe_models,
                                 credential=secret, http=self.http, timeout=seconds,
                                 protocol=record.protocol)
         checks: list[dict[str, Any]] = [dict(item) for item in result.model_checks]

@@ -68,6 +68,20 @@ def test_stale_probe_stops_being_announced(manager, store, stub, clock):
     assert len(manager.announceable_models(edge)) == 1
 
 
+def test_disabled_model_is_not_probed(manager, store, stub, clock):
+    """W6-FIX：disabled 模型不参与探针，避免「上游未列该模型」把整条上游判 rejected。"""
+    stub.models = ["probe-model"]                    # disabled-model 不在 /models
+    record = _add(manager, stub, models="probe-model,disabled-model")
+    manager.set_model_enabled(record.id, "disabled-model", False)
+    payload = manager.probe(record.id, now=clock())
+    assert [item["model"] for item in payload["model_checks"]] == ["probe-model"]
+    assert all(item["ok"] for item in payload["model_checks"])
+    assert store.upstream(record.id).state == "verified"
+    # disabled 模型仍留在本地记录里，只是不探
+    assert [item["id"] for item in store.upstream(record.id).models] == [
+        "probe-model", "disabled-model"]
+
+
 def test_rejected_upstream_vetoes_capacity(manager, store, stub, clock):
     stub.chat_status = 500                           # L1 可达，但推理失败
     record = _add(manager, stub)
