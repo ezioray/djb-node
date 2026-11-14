@@ -11,6 +11,7 @@ import json
 import socket
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -94,6 +95,48 @@ class InputStream:
         self.close()
 
 
+#: 重定向时**只允许同源**携带的凭据头（跨源必须剥掉，2026-11-15 审计 P1）。
+CREDENTIAL_HEADERS: frozenset[str] = frozenset({
+    "authorization", "x-client-key", "x-api-key", "cookie", "set-cookie",
+    "proxy-authorization",
+})
+
+
+class _RedirectGuard(urllib.request.HTTPRedirectHandler):
+    """重定向护栏：限跳数 + 跨源剥凭据 + 拒绝 https→http 降级。
+
+    为什么需要：``urllib`` 默认 ``HTTPRedirectHandler`` 会把**所有请求头**带到新 URL
+    （只去掉 Content-Length / Content-Type）。而客户端的 ``X-Client-Key``（节点密钥）与
+    ``Authorization``（上游密钥）都在请求头里 —— 只要网关或上游回一次 302，
+    密钥就会被送到重定向目标（可能是另一台主机，也可能是明文 http）。
+
+    处置口径：
+    * 同源（scheme/host/port 全同）重定向：原样保留头（兼容 CDN 尾斜杠等正常场景）；
+    * 跨源：保留请求方法与 body，剥掉 :data:`CREDENTIAL_HEADERS`；
+    * ``https`` → 非 ``https``：返回 ``None``（urllib 不跳，调用方拿到 3xx 自行判失败）；
+    * 最多 3 跳（默认 10 跳对凭据暴露面太大）。
+    """
+
+    max_redirections = 3
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> Any:
+        new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_request is None:
+            return None
+        origin = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(newurl)
+        if origin.scheme == "https" and target.scheme != "https":
+            return None                                    # 拒绝降级；3xx 原样交回调用方
+        same_origin = ((origin.scheme, origin.hostname, origin.port)
+                       == (target.scheme, target.hostname, target.port))
+        if not same_origin:
+            for name in list(new_request.headers):
+                if name.lower() in CREDENTIAL_HEADERS:
+                    del new_request.headers[name]
+        return new_request
+
+
 class HttpClient:
     def __init__(self, *, timeout: float = 10.0,
                  user_agent: str = facts.USER_AGENT,
@@ -101,6 +144,16 @@ class HttpClient:
         self.timeout = float(timeout)
         self.user_agent = user_agent
         self.ssl_context = ssl_context
+        self._opener: urllib.request.OpenerDirector | None = None
+
+    def _open(self) -> urllib.request.OpenerDirector:
+        """带重定向护栏的 opener（惰性构建，线程内复用；ssl_context 只影响 HTTPS）。"""
+        if self._opener is None:
+            handlers: list[Any] = [_RedirectGuard()]
+            if self.ssl_context is not None:
+                handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
+            self._opener = urllib.request.build_opener(*handlers)
+        return self._opener
 
     # ── 基础请求
     def request(self, method: str, url: str, *, headers: dict[str, str] | None = None,
@@ -120,14 +173,14 @@ class HttpClient:
                                          headers=request_headers)
         started = _monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=timeout or self.timeout,
-                                        context=self.ssl_context) as response:
+            with self._open().open(request, timeout=timeout or self.timeout) as response:
                 payload = response.read()
                 elapsed = int((_monotonic() - started) * 1000)
+                final_url = getattr(response, "geturl", lambda: url)() or url
                 return HttpResponse(status=int(response.status or 200),
                                     headers={key.lower(): value
                                              for key, value in response.headers.items()},
-                                    body=payload, url=url, elapsed_ms=elapsed)
+                                    body=payload, url=final_url, elapsed_ms=elapsed)
         except urllib.error.HTTPError as exc:
             try:
                 payload = exc.read()
@@ -168,8 +221,7 @@ class HttpClient:
         request = urllib.request.Request(url, data=data, method=method.upper(),
                                          headers=request_headers)
         try:
-            response = urllib.request.urlopen(request, timeout=timeout or self.timeout,
-                                              context=self.ssl_context)
+            response = self._open().open(request, timeout=timeout or self.timeout)
         except urllib.error.HTTPError as exc:
             # 上游错误也要能读 body（SSE 之外的错误封装成 InputStream 由调用方处理）
             return InputStream(exc, url)
