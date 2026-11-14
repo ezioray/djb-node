@@ -59,6 +59,12 @@ NAV_ICONS = {
 #: 窗口实际用的是实例级 ``self._ia_kickers``（跟着 ``DJB_UI_IA`` 走，回滚时与本表逐项相等）。
 PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 
+#: 这些 effect 由**自己的渲染函数**播报结果（打开浏览器 / 打开目录 / 派发收款提交）。
+#:
+#: 它们在 :meth:`DesktopApp._on_action` 的通用播报里要跳过，否则「已在浏览器打开」会被
+#: 动作自带的一句「网页端：https://…」覆盖掉——那正好抹掉了「打不开」这个关键差别。
+SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit")
+
 TOP_NAV_KEYS = VIEW_KEYS
 
 # ── IA 接线（第三轮）：侧栏 / 快捷键 / 窄窗下拉 / 页头眉标全部由 ``ia.py`` 驱动
@@ -2166,8 +2172,21 @@ class DesktopApp:
         if result.effect == "copy" and not copied:
             self._toast("复制失败：剪贴板写入被拒绝（可能有别的程序占着剪贴板），请再点一次",
                         ok=False)
-        elif result.effect in ("save", "access", "reload", "control", "export", "verify",
-                              "copy") and result.message:
+        elif result.effect == "copy":
+            if result.message:
+                self._toast(result.message, ok=result.ok)
+        elif result.effect in SELF_REPORTING_EFFECTS:
+            # 这几条在自己的渲染函数里已经播报（``_open_url`` / ``_open_dir`` / 收款 worker），
+            # 再播一次会让后一条把「已打开 / 未打开」这类关键差别盖掉。
+            pass
+        # G1-0（RC14 P0）：白名单 → **黑名单**。旧实现只播报
+        # ("save","access","reload","control","export","verify","copy") 六种 effect，
+        # 于是 effect="" 的 8 处（models.save / bench 失败 / 空节点 ID / 收据未选中 /
+        # 控制通道未接通 / 登出无节点 / 日志无行 / 日志路径未知）全部**点了没反应**。
+        # 现在：**失败必报**，成功只要有话就说；只有「用户自己取消」和「刷新中…」
+        # （``_refresh_started`` 已经播过，重复会盖掉忙态提示）两种例外。
+        elif (result.effect != "cancelled" and result.message
+              and not (result.effect == "refresh" and result.ok)):
             self._toast(result.message, ok=result.ok)
 
     def copy_text(self, text: str) -> bool:
