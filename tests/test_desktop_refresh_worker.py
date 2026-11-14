@@ -233,3 +233,52 @@ def test_controller_request_refresh_falls_back_to_sync(tmp_path):
     assert controller.request_refresh(None) is False
     assert controller.message.startswith("已刷新")
     assert source.calls == 1
+
+
+# ─────────────────────────────── G2（RC14 P0）：三个「刷新」不再走同步取数
+def test_gpu_and_tasks_refresh_use_the_async_channel(tmp_path):
+    """G2-1 / G2-2：``gpu.refresh`` / ``tasks.refresh`` 必须交给 worker。
+
+    修前这两条直连同步 :meth:`DesktopController.refresh`：``gpu`` 域要跑
+    ``nvidia-smi``/``rocm-smi``（各 timeout=4.0，两次 ≤8 s）、``tasks`` 域要起 CLI 子进程
+    （≤8 s），全在 Tk 主线程里跑 ⇒ 真机上「点了像卡住」。
+    """
+    calls = []
+    source = FakeDataSource({"status": {"state": "online"}})
+    controller = DesktopController(source, cli=None)
+    controller.refresh_via = lambda sections: calls.append(tuple(sections))
+
+    result = controller.action("gpu.refresh")
+    assert calls == [("gpu",)], "gpu.refresh 没有走异步通道"
+    assert result.effect == "refresh" and "正在刷新" in result.message
+
+    result = controller.action("tasks.refresh")
+    assert calls[-1] == ("tasks",), "tasks.refresh 没有走异步通道"
+    assert result.effect == "refresh" and "正在刷新" in result.message
+    # 关键：动作**没有**同步取数（source.calls 只在 worker 线程里才会 +1）
+    assert source.calls == 0
+
+
+def test_token_plan_refresh_uses_the_async_channel_with_three_sections(tmp_path):
+    """G2-3：一次刷 3 个域，仍走 worker；分区语义由 ``apply_refresh`` 管（不整表替换）。"""
+    calls = []
+    source = FakeDataSource({"status": {"state": "online"}})
+    controller = DesktopController(source, cli=None)
+    controller.refresh_via = lambda sections: calls.append(tuple(sections))
+
+    result = controller.action("token_plan.refresh")
+    assert calls == [("status", "token_plan", "receipts")]
+    assert result.effect == "refresh" and "正在刷新" in result.message
+    assert source.calls == 0
+
+
+def test_refresh_actions_fall_back_to_sync_without_an_event_loop(tmp_path):
+    """没有事件循环（截图脚本/单测）时仍退回同步：动作不许因为「没 worker」变成空操作。"""
+    source = FakeDataSource({"status": {"state": "online"}})
+    controller = DesktopController(source, cli=None)      # 不接 refresh_via
+
+    for key in ("gpu.refresh", "tasks.refresh", "token_plan.refresh"):
+        before = source.calls
+        result = controller.action(key)
+        assert source.calls > before, key + " 在无事件循环时什么都没刷"
+        assert result.effect == "refresh"

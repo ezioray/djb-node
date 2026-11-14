@@ -39,6 +39,19 @@ __all__ = [
     "SectionHead", "StatCell", "Switch", "apply_kit_styles", "fonts_for", "px",
 ]
 
+
+def surface_alt(ratio: float = 0.08) -> str:
+    """「二级面」：ghost 按钮的 hover / **按下**底色（A 类可交互态的唯一来源）。
+
+    为什么不用新色板键：``theme.PALETTES`` 被 ``test_desktop_dual_theme`` 逐键钉死
+    （裁决「色板不改」）。这里用 :func:`theme.blend` 把 ``surface`` 往 ``ink`` 混一点，
+    两套主题自洽：日间变略深的灰紫、夜间变略亮的紫，**都**能和白底/深底拉开可见色差。
+
+    为什么 ghost 必须有色差（G2-4）：ghost 的常态底就是 ``surface``，若按下/悬停也只换描边，
+    30px 高的按钮在真机上几乎看不出变化——「按下态」等于没做（客户仍然觉得「点了像卡住」）。
+    """
+    return theme.blend(theme.color("surface"), theme.color("ink"), ratio)
+
 # ── 字阶：**唯一来源**是 :mod:`djb_node.desktop.typography`
 #
 # 0.3.4 曾在这里定义 8 个真值常量（30/19/18/13/13/12/10 + 表格 11）和 7 个旧名别名
@@ -611,10 +624,16 @@ class Button(tk.Canvas):
         self._radius = int(radius)
         self._enabled = bool(enabled)
         self._hover = False
+        # G2-4（RC14 P0）：按下态 + 幂等闸。
+        # ``_pressed`` 让「按下去」在**命令执行前**就重绘一次（≤200 ms 的视觉反馈）；
+        # ``_busy`` 让同一次点击只跑一遍命令（双击 / 事件重入不再叠两个动作）。
+        self._pressed = False
+        self._busy = False
         width = fonts.measure(self.text, self._font) + self._pad * 2 + 2
         super().__init__(master, width=width, height=int(height), background=self.ground,
                          bd=0, highlightthickness=0, takefocus=1 if enabled else 0, **kwargs)
-        self.bind("<Button-1>", self._on_click)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<Return>", self._on_click)
@@ -639,9 +658,33 @@ class Button(tk.Canvas):
         self._redraw()
 
     # ── 事件
+    def _on_press(self, _event: Any = None) -> None:
+        """按下即重绘（反馈先于命令）：真机上这一步就把「按到了」画出来。"""
+        if not self._enabled:
+            return
+        self._pressed = True
+        self._redraw()
+        try:
+            self.update_idletasks()      # 强制把这一帧推给 X11/Win32，不等事件循环
+        except Exception:                # pragma: no cover - 控件已销毁
+            pass
+
+    def _on_release(self, _event: Any = None) -> None:
+        was_pressed = self._pressed
+        self._pressed = False
+        self._redraw()
+        if was_pressed and self._hover:   # 松手时鼠标已移出 = 取消，不触发命令
+            self._on_click()
+
     def _on_click(self, _event: Any = None) -> None:
-        if self._enabled and callable(self.command):
+        """幂等闸：``_busy`` 期间的重入直接丢弃（双击不再派发两个动作）。"""
+        if not self._enabled or self._busy or not callable(self.command):
+            return
+        self._busy = True
+        try:
             self.command()
+        finally:
+            self._busy = False
 
     def _on_enter(self, _event: Any = None) -> None:
         self._hover = True
@@ -649,6 +692,7 @@ class Button(tk.Canvas):
 
     def _on_leave(self, _event: Any = None) -> None:
         self._hover = False
+        self._pressed = False             # 拖出按钮范围即视为取消按下
         self._redraw()
 
     # ── 绘制
@@ -666,6 +710,18 @@ class Button(tk.Canvas):
             text_color = theme.color(text_token)
             if self.kind == "ghost":
                 stroke = theme.color("border")        # 可点控件边界 ≥3:1（01 §1.3）
+                # ghost 常态底 = surface，所以 hover/按下必须**换底**才看得见（G2-4）：
+                # 只换描边在 30px 高的按钮上等于没有反馈。色差来自 surface_alt()。
+                if self._pressed:
+                    fill = surface_alt(0.16)
+                elif self._hover:
+                    fill = surface_alt(0.08)
+            elif self._pressed:
+                # 实心按钮：按下要比 hover **再变一档**（否则 hover 与 pressed 同色，
+                # 客户点下去看不到任何变化）。方向由 ``ink`` 决定：日间更深、夜间更亮。
+                base = theme.color(hover_token) if hover_token else fill
+                fill = theme.blend(base, theme.color("ink"), 0.18)
+                stroke = fill
             elif hover_token and self._hover:
                 fill = theme.color(hover_token)
                 stroke = fill

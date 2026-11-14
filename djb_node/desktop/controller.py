@@ -341,11 +341,19 @@ class DesktopController:
         return ActionResult("已复制跑分结果。", effect="copy", payload=text)
 
     def _act_gpu_refresh(self, *, confirm=None) -> ActionResult:
-        self.refresh(sections=("gpu",))
+        """G2-1（RC14 P0）：照 :meth:`_act_refresh` 走异步通道，**不在 Tk 主线程取数**。
+
+        ``gpu`` 域要跑 ``nvidia-smi``/``rocm-smi``（各 ``timeout=4.0``，两次尝试 ≤8 s），
+        同步刷会把窗口冻住，客户看到的是「点了像卡住」。
+        """
+        if self.request_refresh(("gpu",)):
+            return ActionResult("正在刷新 GPU 信息…（可以继续拖动/切页）", effect="refresh")
         return ActionResult("已刷新 GPU 信息。", effect="refresh")
 
     def _act_tasks_refresh(self, *, confirm=None) -> ActionResult:
-        self.refresh(sections=("tasks",))
+        """G2-2（RC14 P0）：同 :meth:`_act_gpu_refresh`（任务域含 CLI 子进程，≤8 s）。"""
+        if self.request_refresh(("tasks",)):
+            return ActionResult("正在刷新任务队列…（可以继续拖动/切页）", effect="refresh")
         return ActionResult("已刷新任务队列。", effect="refresh")
 
     def _act_logs_copy(self, *, confirm=None) -> ActionResult:
@@ -455,7 +463,11 @@ class DesktopController:
                             effect="goto", payload="access")
 
     def _act_token_plan_refresh(self, *, confirm=None) -> ActionResult:
-        self.refresh(sections=("status", "token_plan", "receipts"))
+        """G2-3（RC14 P0）：三个域一起刷，走 worker；``apply_refresh`` 按 section 合并，
+        **不整表替换**（否则正在看的那一列会被半截数据顶掉）。"""
+        if self.request_refresh(("status", "token_plan", "receipts")):
+            return ActionResult("正在刷新 Token Plan…（可以继续拖动/切页）",
+                                effect="refresh")
         return ActionResult(self.message, effect="refresh")
 
     def _act_yield_pause(self, *, confirm=None) -> ActionResult:

@@ -127,3 +127,117 @@ def test_configure_handler_ignores_an_identical_size(factory):
         assert calls, "尺寸变了却没重画（去抖去过头）"
     finally:
         root.destroy()
+
+
+# ───────────────────────────── G2-4（RC14 P0）：按钮「按下态」必须真的看得见
+@needs_tk
+def test_ghost_button_changes_fill_when_pressed():
+    """ghost 常态底 = surface ⇒ 按下必须**换底**（只换描边在 30px 按钮上等于没做）。"""
+    from djb_node.desktop import theme
+
+    root = new_root()
+    try:
+        button = ui_kit.Button(root, "刷新", kind="ghost")
+        button.pack()
+        root.update_idletasks()
+        root.update()
+        def fill() -> str:
+            # _redraw() 会 delete("all") 再重画 ⇒ 每次都要重新取 id（旧 id 会读到空串）
+            return str(button.itemcget(button.find_all()[0], "fill"))
+
+        resting = fill()
+        assert resting == theme.color("surface"), "ghost 常态底不该被改：%r" % resting
+        button._on_press()                                   # noqa: SLF001 - 断言用
+        pressed = fill()
+        assert pressed != resting, "按下后底色没变（客户仍然看不出按到了）"
+        assert pressed == ui_kit.surface_alt(0.16)
+        button._on_release()                                 # noqa: SLF001
+        assert fill() == resting, "松手后没有恢复常态底色"
+    finally:
+        root.destroy()
+
+
+@needs_tk
+def test_pressed_command_runs_exactly_once_and_only_on_release():
+    """幂等闸 + 松手触发：按下不执行，松手执行一次；连点两次也只有两次（不叠）。"""
+    root = new_root()
+    try:
+        calls = []
+        button = ui_kit.Button(root, "保存", command=lambda: calls.append(1))
+        button.pack()
+        root.update_idletasks()
+        button._on_enter()                                   # noqa: SLF001 - 指针在按钮上
+        button._on_press()                                   # noqa: SLF001
+        assert calls == [], "按下就执行了命令（看不出「按到了」，也没机会取消）"
+        button._on_release()                                 # noqa: SLF001
+        assert calls == [1]
+        # 点两次 = 两次（不叠）：_busy 只在命令执行期间生效
+        button._on_press()                                   # noqa: SLF001
+        button._on_release()                                 # noqa: SLF001
+        assert calls == [1, 1]
+    finally:
+        root.destroy()
+
+
+@needs_tk
+def test_press_then_drag_outside_cancels_the_click():
+    """按下后拖出按钮范围再松手 = 取消（标准按钮语义，避免误触保存/登出）。"""
+    root = new_root()
+    try:
+        calls = []
+        button = ui_kit.Button(root, "登出", command=lambda: calls.append(1))
+        button.pack()
+        root.update_idletasks()
+        button._on_enter()                                   # noqa: SLF001
+        button._on_press()                                   # noqa: SLF001
+        button._on_leave()                                   # noqa: SLF001 - 拖出
+        button._on_release()                                 # noqa: SLF001
+        assert calls == []
+        # 再进入并正常点击仍然可用（_pressed 没有卡死）
+        button._on_enter()                                   # noqa: SLF001
+        button._on_press()                                   # noqa: SLF001
+        button._on_release()                                 # noqa: SLF001
+        assert calls == [1]
+    finally:
+        root.destroy()
+
+
+@needs_tk
+def test_primary_button_also_has_a_pressed_color():
+    """实心按钮同样要有按下色（否则主 CTA 只有 hover 一档，点下去毫无变化）。"""
+    from djb_node.desktop import theme
+
+    root = new_root()
+    try:
+        button = ui_kit.Button(root, "保存并回读", kind="primary")
+        button.pack()
+        root.update_idletasks()
+        root.update()
+        def fill() -> str:
+            return str(button.itemcget(button.find_all()[0], "fill"))
+
+        resting = fill()
+        button._on_press()                                   # noqa: SLF001
+        pressed = fill()
+        assert pressed != resting, "主按钮按下后与常态同色"
+        # 与 hover 也要不同档：否则「按下去」和「指针移上去」看起来一模一样
+        assert pressed != theme.color("mint_strong")
+    finally:
+        root.destroy()
+
+
+def test_surface_alt_is_visible_in_both_themes():
+    """``surface_alt`` 不碰 ``PALETTES``（裁决「色板不改」），两套主题都要真的有色差。"""
+    from djb_node.desktop import theme
+
+    saved = theme.current()
+    try:
+        for name in ("day", "night"):
+            theme.set_active(name)
+            surface = theme.color("surface")
+            for ratio in (0.08, 0.16):
+                value = ui_kit.surface_alt(ratio)
+                assert value != surface, name + " 主题下按下态与常态同色（等于没做）"
+                assert value.startswith("#") and len(value) == 7
+    finally:
+        theme.set_active(saved)
