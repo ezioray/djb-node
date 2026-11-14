@@ -428,21 +428,20 @@ class UpstreamManager:
         stamp = iso(moment)
         self.store.update_upstream(upstream_id, models=self._probe_models_payload(
             record, outcomes, stamp), state=state, last_probe_at=stamp)
-        # RC14 复盘 P0-2（0.3.8）：``not_probed`` 是「本轮预算没轮到」，**不是失败**。
-        # 上报的 ``model_checks`` 只带本轮真出结论的模型；没探到的单独走 ``not_probed[]``
-        # 加性字段。否则云端 ``_probe_verdict`` 的「任一失败即 rejected」会把
-        # 「预算不够」误判成「上游坏了」——正是本轮要修的那条链。
-        budget_missed = {str(item.get("model")) for item in checks
-                         if item.get("error_class") == facts.PROBE_NOT_PROBED}
-        report_checks = [dict(item) for item in checks
-                         if str(item.get("model")) not in budget_missed]
+        # RC14 复盘 P0-2（0.3.8）：**不要**把 ``not_probed`` 从 ``model_checks`` 里剔掉。
+        # 云端 main（745eddc）的 ``_probe_verdict_scoped`` 已按 ``models[]``（enabled 集合）
+        # + ``not_probed[]`` 判定：not_probed 记 ``ok=None``、不算失败，全都没探到时判 verified；
+        # 节点侧再剔除会让 ``models[]`` 从「enabled 集合」退化成「探过的集合」，
+        # 把云端的 ``not_reported`` 分支和排障信息一起抹掉（2026-11-15 cloud-auditor 校正）。
+        # 节点只负责**如实上报**：``models[]`` = 本轮 L1 进过清单的 enabled 模型，
+        # ``not_probed[]`` = 没探到的及原因；「算不算失败」由云端 scoped 判定负责。
         payload = {"upstream_id": upstream_id, "reachable": result.reachable,
                    "latency_ms": result.latency_ms,
                    "error_class": result.error_class,
-                   "model_checks": report_checks, "checked_at": stamp,
+                   "model_checks": checks, "checked_at": stamp,
                    # RC14 §2.3 加性字段（只加不改）：明确「这一轮探了哪些 / 哪些没探」。
                    # 云端据此判「至少一个 enabled 模型通过即 ok」；旧服务端忽略未知字段。
-                   "models": [str(item.get("model")) for item in report_checks],
+                   "models": [str(item.get("model")) for item in checks],
                    "not_probed": self._not_probed(record, checks, outcomes)}
         return payload
 

@@ -31,8 +31,10 @@ def mock():
 
 
 def _payload(*, ok_models, budget_missed=(), real_failures=()):
-    """模拟 ``UpstreamManager.probe()`` 的返回：not_probed 已从 model_checks 剔除。"""
+    """模拟 ``UpstreamManager.probe()`` 的返回：not_probed 仍在 model_checks 里（ok=False）。"""
     checks = [{"model": name, "ok": True, "error_class": None} for name in ok_models]
+    checks += [{"model": name, "ok": False, "error_class": "not_probed"}
+               for name in budget_missed]
     checks += [{"model": name, "ok": False, "error_class": "timeout"}
                for name in real_failures]
     return {
@@ -58,9 +60,13 @@ def _daemon_with_payload(paths, store, credentials, mock, clock, payload):
     return daemon, reports
 
 
-def test_partial_pass_with_backlog_still_verifies_and_reports_only_probed(
+def test_partial_pass_with_backlog_still_verifies_and_reports_honestly(
         paths, store, credentials, mock, clock):
-    """5 模型：3 个 ok + 2 个 not_probed ⇒ verified，且上报里**没有** not_probed。"""
+    """5 模型：3 个 ok + 2 个 not_probed ⇒ verified；上报**如实**带 5 条 model_checks。
+
+    云端（main/745eddc）按 ``models[]``+``not_probed[]`` 判定，not_probed 记 ok=None 不算失败；
+    节点侧剔除反而会让 ``models[]`` 从 enabled 集合退化成「探过的集合」。
+    """
     payload = _payload(ok_models=["m1", "m2", "m3"], budget_missed=["m4", "m5"])
     daemon, reports = _daemon_with_payload(paths, store, credentials, mock, clock, payload)
     result = daemon._probe_upstreams(clock(), reason="periodic")
@@ -69,12 +75,15 @@ def test_partial_pass_with_backlog_still_verifies_and_reports_only_probed(
     assert result["failed"] == 0
     assert result["backlog"] == 2
     detail = result["per_upstream"][0]
-    assert detail["ok"] is True and detail["passed"] == 3 and detail["total"] == 3
+    assert detail["ok"] is True and detail["passed"] == 3 and detail["total"] == 5
     assert detail["not_probed"] == 2 and detail["real_failures"] == []
 
     assert len(reports) == 1, "有 ok 模型就必须上报，否则云端 verified_at 不刷新"
-    reported = [item["model"] for item in reports[0]["model_checks"]]
-    assert reported == ["m1", "m2", "m3"], "not_probed 不能进 model_checks（云端按任一失败判 rejected）"
+    reported = [(item["model"], item["ok"]) for item in reports[0]["model_checks"]]
+    assert reported == [("m1", True), ("m2", True), ("m3", True),
+                        ("m4", False), ("m5", False)], "如实上报，不剔除 not_probed"
+    assert {item["model"]: item["reason"]
+            for item in reports[0]["not_probed"]} == {"m4": "budget", "m5": "budget"}
 
     # backlog 未清空 ⇒ 5s 后续跑，而不是等 half-fresh（450s）
     assert daemon._next_probe_at <= clock() + timedelta(
@@ -115,8 +124,8 @@ def test_periodic_probe_uses_l2_and_budget_is_capped():
     assert facts.probe_pass_budget_s() <= facts.PROBE_PASS_BUDGET_MAX_S
 
 
-def test_probe_excludes_budget_missed_models_from_report(store, credentials, monkeypatch):
-    """源头（UpstreamManager.probe）：预算没轮到的模型不进 ``model_checks``。"""
+def test_probe_reports_budget_missed_models_honestly(store, credentials, monkeypatch):
+    """源头（UpstreamManager.probe）：not_probed 仍进 ``model_checks``，另进 ``not_probed[]``。"""
     store.add_upstream(upstream_id="u1", access_type="A2",
                        base_url="https://upstream.invalid/v1",
                        models=[{"id": name, "enabled": True, "min_price": "0.5"}
@@ -144,7 +153,7 @@ def test_probe_excludes_budget_missed_models_from_report(store, credentials, mon
 
     payload = UpstreamManager(store, credentials).probe("u1")
 
-    assert [item["model"] for item in payload["model_checks"]] == ["m1", "m2", "m3"]
-    assert payload["models"] == ["m1", "m2", "m3"]
+    assert [item["model"] for item in payload["model_checks"]] == ["m1", "m2", "m3", "m4", "m5"]
+    assert payload["models"] == ["m1", "m2", "m3", "m4", "m5"], "models[] = enabled 集合"
     reasons = {item["model"]: item["reason"] for item in payload["not_probed"]}
     assert reasons["m4"] == "budget" and reasons["m5"] == "budget"
