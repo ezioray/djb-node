@@ -73,3 +73,32 @@ def test_hmac_and_constant_time_equals():
     assert util.constant_time_equals(digest, digest)
     assert not util.constant_time_equals(digest, "0" * 64)
     assert util.first_line("a\nb", 10) == "a"
+
+
+def test_redact_obj_masks_nested_secret_containers():
+    """2026-11-15 审计 P0：容器型密钥（upstream_keys）在父键层整值替换。
+
+    回归现场：`redact_obj({"upstream_keys": {"<任意上游 id>": "<任意格式密钥>"}})`
+    只走正则脱敏；第三方聚合站的密钥不是 ``sk-`` / ``Bearer`` 形态、子键又不是
+    ``client_key``，于是原样输出 —— 一次工具输出泄露就是这么发生的。
+    """
+    payload = {
+        "storage": "file-0600",
+        "upstream_keys": {"u-9f3c": "agg-key-not-matching-any-pattern-0123456789"},
+        "nested": {"upstream_secrets": {"x": "another-opaque-value"}},
+    }
+    masked = util.redact_obj(payload)
+    assert masked["upstream_keys"] == "[REDACTED]"
+    assert masked["nested"]["upstream_secrets"] == "[REDACTED]"
+    assert masked["storage"] == "file-0600"            # 非密钥字段不受影响
+    assert "agg-key-not-matching" not in str(masked)
+
+
+def test_redact_value_secret_name_suffixes_do_not_hit_usage_counters():
+    assert util.redact_value("provider_key", "opaque-value") == "[REDACTED]"
+    assert util.redact_value("upstream_secret", "opaque-value") == "[REDACTED]"
+    assert util.redact_value("scoped-token", "opaque-value") == "[REDACTED]"
+    # 计数不是凭据：误伤会让用量观测失真（FEATURE_FLAGS/token 统计都靠它们）
+    assert util.redact_value("prompt_tokens", 12) == 12
+    assert util.redact_value("total_tokens", 12) == 12
+    assert util.redact_value("key_id", "update-primary") == "update-primary"

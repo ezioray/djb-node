@@ -126,6 +126,33 @@ SECRET_KEYS: frozenset[str] = frozenset({
     "signature", "messages", "prompt", "response", "content", "body",
 })
 
+#: 「容器型」密钥字段名：值是 ``{任意 id: 密钥}``，**子键名不可预测**（上游 id / 账号名），
+#: 所以必须在父键这一层整值替换。只按固定键名 + 正则脱敏漏过这一层（2026-11-15 审计）：
+#: 第三方聚合站的密钥是任意格式（不一定是 ``sk-`` / ``Bearer`` / ``key=`` 形态），
+#: 子键又不是 ``client_key`` 之类，正则匹配不到 ⇒ 原样外泄。
+SECRET_CONTAINERS: frozenset[str] = frozenset({
+    "upstream_keys", "upstream_credentials", "upstream_secrets",
+    "client_keys", "api_keys", "secret_keys",
+})
+
+#: 字段名后缀规则（只加不删）：``provider_key`` / ``node_secret`` / ``scoped_token`` 这类
+#: 组合名不必一个个登记，但要避开 ``prompt_tokens`` / ``total_tokens`` 这类**计数**字段
+#: （它们不是凭据，误伤会让用量观测失真）——所以只用单数 ``_token``。
+_SECRET_NAME_SUFFIXES: tuple[str, ...] = (
+    "_key", "_keys", "_secret", "_token", "_password", "_passwd",
+    "_credential", "_credentials",
+)
+
+
+def is_secret_field(key: Any) -> bool:
+    """字段名是否应当整值脱敏（唯一口径：`redact_value` / 诊断包都走这里）。"""
+    name = str(key or "").strip().lower().replace("-", "_")
+    if not name:
+        return False
+    if name in SECRET_KEYS or name in SECRET_CONTAINERS:
+        return True
+    return name.endswith(_SECRET_NAME_SUFFIXES)
+
 
 def redact_text(text: str) -> str:
     """把疑似凭据 / 签名替换成 [REDACTED]（日志、诊断包共用）。"""
@@ -142,8 +169,12 @@ def redact_text(text: str) -> str:
 
 
 def redact_value(key: str, value: Any) -> Any:
-    """按字段名脱敏（结构化日志 / 诊断包用）。"""
-    if key.lower() in SECRET_KEYS:
+    """按字段名脱敏（结构化日志 / 诊断包用）。
+
+    容器型字段（``upstream_keys`` 等）**整值替换**，不递归子键 —— 子键是不可预测的上游
+    id，密钥本身也可能是任意格式，递归下去只能靠正则碰运气。
+    """
+    if is_secret_field(key):
         if value in (None, "", {}, []):
             return value
         if isinstance(value, (dict, list)):
