@@ -424,7 +424,25 @@ class UpstreamManager:
                 item.pop("error_class", None)
         verified = [model_id for model_id, outcome in outcomes.items()
                     if outcome.inference_ok]
-        state = "verified" if (result.reachable and verified) else "rejected"
+        # RC14 复盘 P0-2（0.3.8）：**没有证据的轮次不改状态**。
+        # 旧写法 `verified if reachable and verified else rejected` 会在「预算截断、
+        # 一个模型都没探到」时把本地 state 抹成 rejected；而 `quotes.py` 的
+        # `gated = ... or record.state == "rejected"` 会因此把这条上游的全部报价门掉
+        # ⇒ 容量随**采样预算**抖动（与云端 `verified_at = moment if verified else None`
+        # 是同一个 bug 的两端，cloud-auditor 2026-11-15 已确认）。
+        # 语义对齐云端 b420f59：没有新证据 ⇒ 什么都不改，旧结论按新鲜度自然过期。
+        explicit_failures = [item for item in checks
+                             if item.get("error_class")
+                             and item.get("error_class") != facts.PROBE_NOT_PROBED]
+        if not result.reachable or explicit_failures or not checks:
+            # 不可达 / 有明确失败 / **一个 enabled 模型都没有** ⇒ rejected（安全侧：
+            # 没启用模型的上游不该被当成可用容量）；只有「有 enabled 模型但全没探到」
+            # 才保留上一轮结论。
+            state = "rejected"
+        elif verified:
+            state = "verified"
+        else:
+            state = record.state          # 全是 not_probed：保留上一轮结论
         stamp = iso(moment)
         self.store.update_upstream(upstream_id, models=self._probe_models_payload(
             record, outcomes, stamp), state=state, last_probe_at=stamp)

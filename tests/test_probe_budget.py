@@ -157,3 +157,55 @@ def test_probe_reports_budget_missed_models_honestly(store, credentials, monkeyp
     assert payload["models"] == ["m1", "m2", "m3", "m4", "m5"], "models[] = enabled 集合"
     reasons = {item["model"]: item["reason"] for item in payload["not_probed"]}
     assert reasons["m4"] == "budget" and reasons["m5"] == "budget"
+
+
+def _patch_probe(monkeypatch, *, listed, outcomes):
+    class _Result:
+        reachable = True
+        latency_ms = 5.0
+        error_class = None
+        model_checks = [{"model": name, "ok": True, "error_class": None} for name in listed]
+
+    class _Outcome:
+        def __init__(self, ok=True, error_class=None):
+            self.inference_ok = ok
+            self.stream_ok = ok
+            self.usage_present = ok
+            self.error_class = error_class
+
+    monkeypatch.setattr("djb_node.upstream.probe_upstream", lambda *a, **k: _Result())
+    monkeypatch.setattr("djb_node.upstream.probe_mod.probe_models",
+                        lambda *a, **k: dict(outcomes))
+
+
+def _seed_upstream(store, credentials, *, state="verified"):
+    store.add_upstream(upstream_id="u1", access_type="A2",
+                       base_url="https://upstream.invalid/v1",
+                       models=[{"id": name, "enabled": True, "min_price": "0.5"}
+                               for name in ("m1", "m2", "m3", "m4", "m5")],
+                       credential_ref="upstream:u1")
+    store.update_upstream("u1", state=state)
+    credentials.set_upstream_secret("u1", "sk-test-not-a-real-key")
+
+
+def test_all_not_probed_keeps_previous_state(store, credentials, monkeypatch):
+    """全 not_probed（预算截断）= 没证据 ⇒ 本地 state 不动（否则 quotes 会被门掉）。"""
+    _seed_upstream(store, credentials, state="verified")
+    _patch_probe(monkeypatch, listed=("m1", "m2", "m3", "m4", "m5"), outcomes={})
+    UpstreamManager(store, credentials).probe("u1")
+    assert store.upstream("u1").state == "verified"
+
+
+def test_real_failure_sets_rejected(store, credentials, monkeypatch):
+    """有明确失败结论 ⇒ 仍然 rejected（无证据≠失败，别把两者混为一谈）。"""
+    _seed_upstream(store, credentials, state="verified")
+
+    class _Outcome:
+        inference_ok = False
+        stream_ok = False
+        usage_present = False
+        error_class = "timeout"
+
+    _patch_probe(monkeypatch, listed=("m1", "m2"), outcomes={"m1": _Outcome()})
+    UpstreamManager(store, credentials).probe("u1")
+    assert store.upstream("u1").state == "rejected"
