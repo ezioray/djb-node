@@ -970,17 +970,20 @@ def _models(snapshot: Snapshot) -> View:
     local = models.get("local") if isinstance(models.get("local"), list) else []
     return View(
         key="models", title="可提供模型",
-        subtitle="逐模型开关 · 不兼容标灰并给原因",
+        subtitle="云端目录 · 不兼容标灰并给原因",
         cards=(Card("云端目录", _count(snapshot, "models", str(len(catalog)) + " 个"),
                     "来自 /models 目录", "default"),
                Card("本地已应用", _count(snapshot, "models", str(len(local)) + " 个"),
                     "model-sync 状态", "default")),
         table=Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(rows),
                     note=str(models.get("note") or ""), empty="云端目录暂不可用"),
-        actions=(Action("models.save", "保存并上报意向", enabled=bool(rows),
-                        reason="没有可编辑的模型目录"),),
+        # G1-1（RC14 P0）：**摘掉**「保存并上报意向」这颗按钮（键名见 commit / NODE.md）。
+        # 表里根本没有开关控件，副标题却写「逐模型开关」，按钮点了又永远无声
+        # （云端意向上报接口未接线）——虚假承诺比缺按钮更伤。
+        # 等「一 Key 多模型 + 逐模型底价」把上报端点接上再加回（见「提供 Token Plan」页）。
+        actions=(),
         unavailable=_missing(snapshot, ("models",)),
-        notes=("开关变更只上报意向；服务端确认后才会真正分配任务。",),
+        notes=("模型开关与底价在「提供 Token Plan」页设置（本页只读：云端目录与本机已应用）。",),
     )
 
 
@@ -1620,9 +1623,15 @@ def _account(snapshot: Snapshot) -> View:
     actions: list[Action] = []
     if can_bind:
         actions.append(Action("account.bind", "绑定网页端", primary=True))
-    actions.append(Action("account.enable_2fa", "启用双因素验证",
-                          enabled=twofa is not True,
-                          reason="已开启" if twofa is True else "登录后可用",
+    # G1-2（RC14 P0）：2FA 不在本机做绑定 ⇒ ①禁用态 + 说清原因；②旁边给**真能点**的入口。
+    # 旧实现是一颗可点的按钮，点下去只回一句「暂不可用」——客户会以为客户端坏了。
+    actions.append(Action("account.enable_2fa", "启用双因素验证", enabled=False,
+                          reason=("已开启（服务端）：如需关闭或换设备，去网页控制台安全页"
+                                  if twofa is True else
+                                  "在网页控制台开启（TOTP）；本机不代理 2FA 绑定")))
+    # 已开启也要给入口：客户要关闭 / 换设备 / 重装 TOTP 时同样得去这一页
+    actions.append(Action("account.open_2fa_page",
+                          "去控制台管理 2FA" if twofa is True else "去控制台开启 2FA",
                           primary=not can_bind and twofa is not True))
     actions.append(Action("account.logout", "登出", enabled=bool(security.get("node_id")),
                           reason=("尚未登录" if not node_id

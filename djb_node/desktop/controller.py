@@ -626,11 +626,24 @@ class DesktopController:
                             payload=str(target))
 
     # 未接线动作：如实说，不假装成功
-    def _act_models_save(self, *, confirm=None) -> ActionResult:
-        return ActionResult("暂不可用（云端意向上报接口未接线）；改动未上报，未生效。", ok=False)
-
     def _act_account_enable_2fa(self, *, confirm=None) -> ActionResult:
-        return ActionResult("暂不可用（2FA 入口在服务端控制台）；本机未做任何改动。", ok=False)
+        """兜底：界面上这颗按钮已经是**禁用态**（并写明为什么），正常路径点不到。
+
+        G1-2 口径：本机不代理 2FA 绑定（TOTP 的 enroll/confirm 只在网页控制台），
+        所以正确做法是「禁用 + 灰字原因 + 旁边给一个真能打开控制台的按钮」，
+        而不是让客户点了才看到「暂不可用」。
+        """
+        return ActionResult("暂不可用（2FA 只能在网页控制台开启）；本机未做任何改动。", ok=False)
+
+    def _act_account_open_2fa_page(self, *, confirm=None) -> ActionResult:
+        """G1-2：2FA 的**真入口**——用系统浏览器打开控制台的安全页（TOTP enroll/confirm）。
+
+        地址来自 ``facts.WEB_CONSOLE_URL``（``DJB_WEB_CONSOLE`` 可覆盖）；渲染层
+        ``_open_url`` 会再校验协议头，配错域名时**报错而不是静默**。
+        """
+        url = str(facts.WEB_CONSOLE_URL or "").rstrip("/") + facts.WEB_CONSOLE_SECURITY_PATH
+        return ActionResult("在浏览器打开控制台安全页：" + url, effect="open_url",
+                            payload=url)
 
     # ── 筛选
     def set_log_level(self, level: str) -> View:

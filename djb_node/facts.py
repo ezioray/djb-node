@@ -62,6 +62,11 @@ USER_AGENT = "djb-node/" + CLIENT_VERSION + " (" + PLATFORM + ")"
 #: 客户在生产包里点「打开网页端」会落到预发站。
 WEB_CONSOLE_URL = (os.environ.get("DJB_WEB_CONSOLE") or "").strip() or "https://tkbank.ai"
 
+#: 网页控制台的「账户安全」页路径（2FA / TOTP enroll 与 confirm 都在这一页）。
+#: 客户端不代理 2FA 绑定，只能把客户**送到这一页**（repos/djb-web/app/routes/consumer.py 的
+#: security 路由）；路径只在这里出现一次，改版时不用满仓找字符串。
+WEB_CONSOLE_SECURITY_PATH = "/console/security"
+
 # ─────────────────────────────────────────────────────────── 状态机（M15 §3 / §5.9）
 DAEMON_STATES: tuple[str, ...] = ("stopped", "starting", "online", "paused", "error", "updating")
 """daemon 运行态（M15 §3 状态机的运行侧投影）。"""

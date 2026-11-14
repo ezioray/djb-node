@@ -237,10 +237,24 @@ def test_access_removed_fields_stay_in_model_and_validate():
 
 
 def test_unwired_views_say_unavailable_not_fake_success():
-    for key, action in (("models", "models.save"), ("receipts", "receipts.verify"),
+    for key, action in (("receipts", "receipts.verify"),
                         ("earnings", "earnings.export"), ("account", "account.logout")):
         view = vw.build_view(key, demo_snapshot())
         assert action in {a.key for a in view.actions}, key
+
+
+def test_models_page_no_longer_promises_a_save_that_does_nothing():
+    """G1-1（RC14 P0）：模型页摘掉「保存并上报意向」，且不再写「逐模型开关」。
+
+    三处一起改才算修好：按钮（点了永远无声）、表头note（暗示可编辑）、副标题
+    （「逐模型开关」是**不存在**的能力）。只删按钮而留文案 = 同一个谎话换个地方说。
+    """
+    view = vw.build_view("models", demo_snapshot())
+    assert all("models." not in action.key for action in view.actions)
+    assert "逐模型开关" not in (view.subtitle or "")
+    assert "逐模型开关" not in " ".join(view.notes)
+    # 但必须留下**去哪里设置**的指路（否则客户不知道该点哪）
+    assert any("Token Plan" in note for note in view.notes)
 
 
 # ─────────────────────────────── 共享 Token Plan（第 13 个导航页，任务 A）
@@ -456,10 +470,21 @@ def test_controller_save_without_reload_says_restart(tmp_path):
 
 def test_controller_unwired_action_is_honest(tmp_path):
     controller = make_controller(tmp_path)
-    for key in ("models.save", "account.enable_2fa", "nope.unknown"):
+    for key in ("account.enable_2fa", "nope.unknown"):
         result = controller.action(key)
         assert result.ok is False, key
         assert "暂不可用" in result.message, key
+
+
+def test_controller_2fa_opens_the_console_security_page(tmp_path, monkeypatch):
+    """G1-2：2FA 的**真入口**——把客户送到控制台安全页，而不是回一句「暂不可用」。"""
+    from djb_node import facts
+
+    monkeypatch.setattr(facts, "WEB_CONSOLE_URL", "https://console.example.test")
+    result = make_controller(tmp_path).action("account.open_2fa_page")
+    assert result.effect == "open_url"
+    assert result.payload == "https://console.example.test" + facts.WEB_CONSOLE_SECURITY_PATH
+    assert result.payload.endswith("/console/security")
 
 
 def test_receipts_verify_and_earnings_export_are_no_longer_stubs(tmp_path):

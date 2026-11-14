@@ -2181,7 +2181,7 @@ class DesktopApp:
             pass
         # G1-0（RC14 P0）：白名单 → **黑名单**。旧实现只播报
         # ("save","access","reload","control","export","verify","copy") 六种 effect，
-        # 于是 effect="" 的 8 处（models.save / bench 失败 / 空节点 ID / 收据未选中 /
+        # 于是 effect="" 的 8 处（模型意向上报 / 跑分失败 / 空节点 ID / 收据未选中 /
         # 控制通道未接通 / 登出无节点 / 日志无行 / 日志路径未知）全部**点了没反应**。
         # 现在：**失败必报**，成功只要有话就说；只有「用户自己取消」和「刷新中…」
         # （``_refresh_started`` 已经播过，重复会盖掉忙态提示）两种例外。
@@ -2230,15 +2230,26 @@ class DesktopApp:
         return str(value).strip() if value else None
 
     def _open_url(self, url: str) -> None:
-        """用系统浏览器打开网页端；打不开就把地址留在状态栏（不静默失败）。"""
+        """用系统浏览器打开网页端；打不开就把地址留在状态栏（不静默失败）。
+
+        G1-2 的附加要求：**先校验协议头**。``DJB_WEB_CONSOLE`` 配错（或动作给错）时，
+        ``webbrowser`` 可能把 ``ftp:`` / 空 scheme 交给系统处理器，甚至什么都不发生——
+        客户看到「点了没反应」。这里直接报错，并把地址原样留在状态栏供手工复制。
+        """
         if not url:
+            self._toast("打开失败：链接为空（配置可能缺失）", ok=False)
+            return
+        lowered = str(url).strip().lower()
+        if not (lowered.startswith("http://") or lowered.startswith("https://")):
+            self._toast("打开失败：不是 http(s) 链接，已拒绝调用浏览器（" + str(url) + "）",
+                        ok=False)
             return
         try:
             import webbrowser
-            opened = bool(webbrowser.open(url))
+            opened = bool(webbrowser.open(str(url)))
         except Exception:
             opened = False
-        self._toast(("已在浏览器打开：" if opened else "浏览器未能自动打开，请手动访问：") + url,
+        self._toast(("已在浏览器打开：" if opened else "浏览器未能自动打开，请手动访问：") + str(url),
                     ok=opened)
 
     def _toast(self, message: str, *, ok: bool = True) -> None:

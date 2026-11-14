@@ -3,7 +3,7 @@
 
 客户报的「点按钮整体没反馈」**不是 8 个分散 bug**，而是一处白名单式分派：
 ``app.py`` 只在 ``result.effect`` ∈ 六个已知值时才播报，于是 ``effect=""`` 的失败
-（``models.save`` / 跑分失败 / 空节点 ID / 收据未选中 / 控制通道未接通 / 登出无节点 /
+（模型意向上报 / 跑分失败 / 空节点 ID / 收据未选中 / 控制通道未接通 / 登出无节点 /
 日志无行 / 日志路径未知）全部零反馈。
 
 本文件锁住三条口径（都不需要显示器，直接测真方法）：
@@ -120,3 +120,35 @@ def test_self_reporting_effects_do_not_double_toast():
         app._start_payout_submit = lambda *_a, **_k: None   # noqa: SLF001
         app._on_action("account.open_web" if effect == "open_url" else "logs.open_dir")
         assert status.text == "", effect + " 被播报了两次（会盖掉「打不开」的差别）"
+
+
+# ───────────────────────────── G1-2（RC14 P0）：2FA 真入口 + 链接协议校验
+def test_2fa_action_is_disabled_with_a_reason_and_has_a_real_entry():
+    """禁用态 + 灰字原因 + 旁边一颗**真能点**的按钮（旧实现：可点 → 只回「暂不可用」）。"""
+    from djb_node.desktop.views import build_view
+
+    view = build_view("account", desktop_app.demo_snapshot())
+    actions = {action.key: action for action in view.actions}
+    assert actions["account.enable_2fa"].enabled is False
+    assert "网页控制台" in actions["account.enable_2fa"].reason
+    entry = actions["account.open_2fa_page"]
+    assert entry.enabled is True and "2FA" in entry.label
+
+
+def test_open_url_refuses_non_http_schemes(monkeypatch):
+    """``DJB_WEB_CONSOLE`` 配错时不许静默（``webbrowser`` 对 ``ftp:`` / 空 scheme 可能毫无反应）。"""
+    opened = []
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url) or True)
+
+    app, status = _app_for(ActionResult("x", effect=""))
+    app._open_url("ftp://misconfigured.example/console/security")   # noqa: SLF001
+    assert status.text.startswith("!") and "已拒绝" in status.text
+    assert opened == [], "非 http(s) 链接被交给浏览器了"
+
+    app._open_url("")                                             # noqa: SLF001
+    assert status.text.startswith("!")
+
+    app._open_url("https://tkbank.ai/console/security")            # noqa: SLF001
+    assert status.text.startswith("✓") and "已在浏览器打开" in status.text
+    assert opened == ["https://tkbank.ai/console/security"]
