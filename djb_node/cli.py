@@ -1314,6 +1314,21 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         record = store.upstream(args.id)
         result = manager.probe(record.id, level=getattr(args, "level", None))
         details = manager.probe_details(record.id)
+        if not result.get("models"):
+            # P2-9（与 cloud P1-7 对齐）：全模型被停用 ⇒ 没有 enabled 模型 = **没有证据**。
+            # 此时上报 `models=[]` 会被云端旧口径（无 check ⇒ verified）判通过，
+            # 并按申报清单展开容量；所以节点这边直接不上报，原因码与云端
+            # `rejected_reason_code` 同名（`no_enabled_models`），审计链可对齐。
+            # 仅新增一种 `reported=false` 的情形，不改既有输出字段语义。
+            result["reported"] = False
+            result["report_error"] = "no_enabled_models"
+            payload = {**result, "local_details": details}
+            _emit(payload, as_json=_json_flag(args),
+                  text=lambda value: ("探测 " + str(value["upstream_id"]) + "："
+                                      + ("可达" if value["reachable"] else "不可达")
+                                      + " · 0 个 enabled 模型，未上报"
+                                      + "（no_enabled_models）"))
+            return 0
         try:
             api = NodeApi(config.gateway_url, client_key=credentials.client_key(),
                           http=HttpClient(timeout=15.0))

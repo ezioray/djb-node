@@ -209,3 +209,29 @@ def test_real_failure_sets_rejected(store, credentials, monkeypatch):
     _patch_probe(monkeypatch, listed=("m1", "m2"), outcomes={"m1": _Outcome()})
     UpstreamManager(store, credentials).probe("u1")
     assert store.upstream("u1").state == "rejected"
+
+
+def test_cli_probe_with_no_enabled_models_does_not_report(home, mock_server, capsys):
+    """P2-9：全模型停用 ⇒ CLI 不上报（原因码与云端 `no_enabled_models` 对齐）。"""
+    import json
+
+    from djb_node.cli import main
+    from djb_node.config import Paths
+    from djb_node.secure import CredentialStore
+    from tests.mock_m02 import CLIENT_KEY
+
+    assert main(["init", "--no-env", "--gateway", mock_server.base_url]) == 0
+    capsys.readouterr()
+    CredentialStore(Paths(str(home))).set_node("node-mock-1", CLIENT_KEY)
+    assert main(["upstream", "add", "--access", "A1", "--base-url",
+                 mock_server.upstream_base_url, "--models", "mock-model",
+                 "--secret", "secret-value", "--json"]) == 0
+    upstream_id = json.loads(capsys.readouterr().out.strip())["upstream"]["id"]
+    assert main(["upstream", "disable", "--id", upstream_id,
+                 "--model", "mock-model", "--json"]) == 0
+    capsys.readouterr()
+    assert main(["upstream", "probe", "--id", upstream_id, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["reported"] is False
+    assert payload["report_error"] == "no_enabled_models"
+    assert payload["model_checks"] == []
