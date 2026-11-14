@@ -108,9 +108,15 @@ else
         tmp=$(mktemp "$HOME_DIR/.config.json.XXXXXX")
         # 两个字段都要落到正式环境：gateway_url 由 --gateway 决定；
         # update_source 决定客户端能不能自动升级（沿用旧版占位/旧域会永远升不了）。
-        sed -e "s#\"gateway_url\": \"[^\"]*\"#\"gateway_url\": \"$GATEWAY\"#" \
-            -e "s#\"update_source\": \"[^\"]*\"#\"update_source\": \"$UPDATE_SOURCE\"#" \
-            "$HERE/config.json" > "$tmp"
+        #
+        # 用 render_config.py 而不是 sed：URL 里的 & / # / " / \ 会破坏 sed 替换，
+        # 写出的 config 要么 daemon 起不来，要么悄悄改错字段（2026-11-15 审计 P2）。
+        if ! "$PYTHON" "$HERE/render_config.py" "$HERE/config.json" "$tmp" \
+                "$GATEWAY" "$UPDATE_SOURCE"; then
+            rm -f "$tmp"
+            say "install.sh: 配置渲染失败，已中止（没有动现有 config.json）" >&2
+            exit 3
+        fi
         chmod 600 "$tmp"
         chown "$RUN_USER:$RUN_USER" "$tmp"
         mv -f "$tmp" "$HOME_DIR/config.json"
