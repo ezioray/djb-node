@@ -20,7 +20,7 @@ SECRET = "djb_sk_live_9f2c41aa77be"
 SPEC_ORDER = ["overview", "bench", "gpu", "models", "tasks", "receipts", "earnings",
               "token_plan", "agent", "access", "yield", "account", "logs"]
 SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "模型与探针", "任务队列", "收据", "收益",
-               "共享 Token Plan", "Agent 接入", "接入配置", "让路/节能", "账户与安全",
+               "提供 Token Plan", "Agent 接入", "本机设置", "让路/节能", "账户与安全",
                "日志"]
 #: 分组口径（00-PLAN §1.1 已裁决）：组 key / 中文名 / 拉丁微标 / 成员顺序
 SPEC_SECTIONS = [
@@ -248,18 +248,18 @@ def test_yield_actions_follow_state():
 
 
 def test_access_fields_are_contribution_node_only():
-    """owner 2026-11-13：接入的是**贡献节点**，页面只留绑定 / 收款 / 价格。
+    """本机设置页只放**本机**配置；绑定与收款已搬去「账户与安全」（RC14 E）。
 
-    UI 只保留 6 个字段（node_id + 两个排障只读 + 收款地址 + 价格 + 节点凭证），
-    API Key / 两个上游地址**从 UI 移除**——但模型字段必须还在（见下一个用例）。
+    字段收敛到 node_id / 两个排障只读 / 价格模式 / 节点凭证；``usdt_address`` 与
+    API Key / 两个上游地址都不在本页（前者的唯一位在账户页，见下一个用例）。
     """
     view = vw.build_view("access", demo_snapshot())
     keys = {field.key for field in view.fields}
-    for needed in ("node_id", "node_secret", "price_mode", "usdt_address",
-                   "daemon_state", "register_state"):
+    for needed in ("node_id", "node_secret", "price_mode", "daemon_state", "register_state"):
         assert needed in keys, needed
-    for removed in ("api_key", "openai_base_url", "anthropic_base_url"):
+    for removed in ("api_key", "openai_base_url", "anthropic_base_url", "usdt_address"):
         assert removed not in keys, removed
+    assert view.title == "本机设置"
     assert "API Key" not in view.plain_text()
     assert "OpenAI 请求地址" not in view.plain_text()
     assert "Anthropic 请求地址" not in view.plain_text()
@@ -332,7 +332,7 @@ def test_token_plan_nav_item_sits_before_access_in_earn_section():
     R2 分组后它从平铺第 9 项变为第 8 项（组内顺序变了，产品意图没变）：
     先看到「共享了什么、还能共享多少」，再进「接入」组动手。
     """
-    assert ("token_plan", "共享 Token Plan") in vw.VIEWS
+    assert ("token_plan", "提供 Token Plan") in vw.VIEWS
     order = list(vw.VIEW_KEYS)
     assert order.index("token_plan") == 7                     # 第 8 项
     assert order.index("token_plan") < order.index("access")
@@ -347,9 +347,9 @@ def test_token_plan_key_is_showable_and_renders_plain_text(tmp_path):
     """tools/live_views.py 与无显示环境验收都走 controller.show(key).plain_text()。"""
     controller = make_controller(tmp_path)
     view = controller.show("token_plan")
-    assert view.key == "token_plan" and view.title == "共享 Token Plan"
+    assert view.key == "token_plan" and view.title == "提供 Token Plan"
     text = view.plain_text()
-    assert text.startswith("# 共享 Token Plan")
+    assert text.startswith("# 提供 Token Plan")
     assert controller.view == "token_plan"
 
 

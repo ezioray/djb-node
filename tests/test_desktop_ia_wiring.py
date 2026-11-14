@@ -120,7 +120,7 @@ def test_shortcuts_follow_the_active_order():
 
 def test_combo_values_match_the_sidebar_order():
     values = desktop_app.nav_combo_values(SHARE)
-    assert values[0] == "1 · 共享 Token Plan"
+    assert values[0] == "1 · 提供 Token Plan"
     assert values == tuple(str(i) + " · " + ia.page(key).title
                            for i, key in enumerate(desktop_app.nav_order(SHARE), start=1))
     assert desktop_app.nav_combo_values(LEGACY)[0] == "1 · " + VIEW_TITLES[VIEW_KEYS[0]]

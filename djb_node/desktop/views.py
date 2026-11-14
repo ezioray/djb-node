@@ -79,9 +79,9 @@ VIEW_TITLES: dict[str, str] = {
     "tasks": "任务队列",
     "receipts": "收据",
     "earnings": "收益",
-    "token_plan": "共享 Token Plan",
+    "token_plan": "提供 Token Plan",
     "agent": "Agent 接入",
-    "access": "接入配置",
+    "access": "本机设置",
     "yield": "让路 / 节能",
     "account": "账户与安全",
     "logs": "日志",
@@ -742,18 +742,26 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
     steps = (bool(config.get("node_secret") or config.get("node_id")), bool(config.get("price_mode")),
              bool(config.get("usdt_address")))
     done = sum(1 for step in steps if step)
+    # E（RC14 IA 拆分）：总览右栏只做**只读摘要**，且把「去哪改」指到唯一入口——
+    # 价格/凭证 → 本机设置；绑定/收款 → 账户与安全（这里不再出现可编辑的 usdt_address 键，
+    # 否则又变成第二个「填了以为生效」的地方）。
     setup_fields = (
-        Field("节点凭证", str(config.get("node_secret") or "未设置"), key="node_secret", secret=True),
+        Field("节点凭证", str(config.get("node_secret") or "未设置"), key="node_secret",
+              secret=True),
         Field("价格", str(config.get("price_mode_label") or config.get("price_mode") or "未设置"),
               key="price_mode"),
-        Field("USDT 收款地址", str(config.get("usdt_address") or "未设置"), key="usdt_address"),
+        Field("USDT 收款地址", "已设置" if config.get("usdt_address") else "未设置",
+              key="usdt_state"),
     )
-    setup = RailCard(kicker="SETUP / 接入配置", title="三步，把节点接上。", kind="setup",
+    setup = RailCard(kicker="SETUP / 三步接上", title="三步，把节点接上。", kind="setup",
                      badge=("接入完成" if done == 3 else "待完成"), badge_tone=("mint" if done == 3
                                                                           else "amber"),
                      note=str(done) + " / 3", fields=setup_fields,
-                     actions=(Action("", "去接入配置", nav="access", primary=done < 3),),
-                     foot="编辑请到「接入配置」页。")
+                     actions=(Action("", "绑定与收款（账户与安全）", nav="account",
+                                     primary=done < 2),
+                              Action("", "价格与凭证（本机设置）", nav="access")),
+                     foot="绑定、解绑、USDT 收款地址只在「账户与安全」；价格模式与节点凭证在"
+                          "「本机设置」。")
     daily = None
     for item in plan.get("usage") or ():
         mapping = _mapping(item)
@@ -1459,16 +1467,29 @@ def _token_plan(snapshot: Snapshot) -> View:
         notes.append("接入配置 / 账户数据暂不可用：绑定状态暂时无法确认，点「刷新」重试。")
     if plan.get("note"):
         notes.append(str(plan.get("note")))
+    # E（RC14 IA 拆分）：原来只有一颗「去接入配置（添加上游 / 绑定节点）」——两件事挤在
+    # 一句话里，跳到的是**本机设置**页，那里既不能添加上游也没有绑定按钮（死路）。
+    # 现在拆成两颗，各自跳到真正能做这件事的地方：
+    #   * 添加上游 → 本页「添加接入」（第 1 步就在下方，item 11 落地表单）
+    #   * 绑定节点 → 账户与安全（绑定的唯一位）
+    plan_actions = [Action("token_plan.add_upstream", "添加上游（填请求链接与密钥）",
+                           primary=True)]
+    if bound is True:
+        plan_actions.append(Action("token_plan.bind_node", "已绑定这台电脑", enabled=False,
+                                   reason="已绑定 · 解绑/换绑在「账户与安全」"))
+    else:
+        plan_actions.append(Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）"))
+    plan_actions.append(Action("token_plan.refresh", "刷新"))
     return View(
-        key="token_plan", title="共享 Token Plan",
-        subtitle="节点与绑定 · 我的上游 · 共享预算 · 今日用量",
+        key="token_plan", title="提供 Token Plan",
+        subtitle="接入 / 模型清单 / 逐模型底价 / 探针（本页可操作）",
         cards=(
             Card("共享状态", state_text, bound_text + " · 节点 " + node_id,
                  "amber" if bound is False else state_tone),
             Card("我的 Token Plan（上游）",
                  _count(snapshot, "token_plan", str(len(rows)) + " 条上游"),
                  (("已验证 " + str(verified_upstreams) + " 条 · 详见下表") if rows
-                  else "点下面「去接入配置」添加上游") if snapshot.ok("token_plan") else "",
+                  else "点下面「添加上游」填请求链接") if snapshot.ok("token_plan") else "",
                  "mint" if rows else "amber"),
             Card("共享预算", budget, budget_meta + "（本机限额设置）", "default"),
             Card("今日已共享", shared_value, shared_meta, "mint" if used else "muted"),
@@ -1477,11 +1498,40 @@ def _token_plan(snapshot: Snapshot) -> View:
                     narrow_hide=("最近验证",),
                     note="验证通过且新鲜的模型才会进入共享容量",
                     empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE)),
-        actions=(Action("token_plan.open_access", "去接入配置（添加上游 / 绑定节点）", primary=True),
-                 Action("token_plan.refresh", "刷新")),
+        actions=tuple(plan_actions),
         unavailable=_missing(snapshot, ("token_plan",)),
         notes=tuple(notes),
     )
+
+
+def _payout_state(access: Mapping[str, Any]) -> dict[str, Any]:
+    """USDT 收款地址的云端状态（**唯一**计算处：「账户与安全」页用）。
+
+    ok=True + 空 dict = 云端确实没登记过（尚未提交）；ok=False = 这一轮没读到。
+    两种都不能显示成「已生效」——收款地址写错就是钱打到别人账上。
+    """
+    payout = _mapping(access.get("payout"))
+    ok = payout.get("ok") is True
+    row = dict(_mapping(payout.get("data"))) if ok else None
+    disabled = payout.get("disabled") is True
+    state = "服务未开放" if disabled else payout_mod.short_state(row)
+    reason = str(payout.get("reason") or "").strip()
+    if disabled:
+        hint, meta = "服务未开放（等平台开启后再提交）", reason or "等平台开启"
+    elif ok:
+        hint = state
+        meta = mask_address(str(row.get("address") or "")) or "—"
+        if payout_mod.cooldown_active(row):
+            meta += "．可再改时间 " + str(row.get("cooldown_until"))
+    else:
+        hint = payout_mod.UNREADABLE
+        meta = reason or "完成节点绑定后重试"
+    tone = {"已生效": "mint", "待审核": "amber", "冷却中": "amber",
+            "已拒绝": "red", "已撤销": "red"}.get(state, "muted")
+    return {"ok": ok, "row": row, "disabled": disabled, "state": state, "hint": hint,
+            "meta": meta, "tone": tone,
+            "can_submit": payout.get("can_submit") is True,
+            "local": str(_mapping(access.get("config")).get("usdt_address") or "—")}
 
 
 def _access(snapshot: Snapshot) -> View:
@@ -1528,43 +1578,22 @@ def _access(snapshot: Snapshot) -> View:
         text = str(candidate or "").strip()
         if not card_node and text and text != "—":
             card_node = text
-    # ── USDT 收款地址的云端状态（owner 2026-11-13 方案 B：客户端直接提交云端）
-    # ok=True + 空 dict = 云端确实没登记过（尚未提交）；ok=False = 这一轮没读到。
-    # 两种都不能显示成「已生效」——收款地址写错就是钱打到别人账上。
-    payout = _mapping(access.get("payout"))
-    payout_ok = payout.get("ok") is True
-    payout_row = dict(_mapping(payout.get("data"))) if payout_ok else None
-    payout_disabled = payout.get("disabled") is True
-    cloud_state = ("服务未开放" if payout_disabled
-                   else payout_mod.short_state(payout_row))
-    cloud_reason = str(payout.get("reason") or "").strip()
-    if payout_disabled:
-        cloud_hint = "服务未开放（等平台开启后再提交）"
-        cloud_meta = cloud_reason or "等平台开启"
-    elif payout_ok:
-        cloud_hint = cloud_state
-        cloud_meta = mask_address(str(payout_row.get("address") or "")) or "—"
-        # 冷却中把「可再改时间」放在卡片副标题里（字段提示保持一行，别挤成两行）
-        if payout_mod.cooldown_active(payout_row):
-            cloud_meta += "．可再改时间 " + str(payout_row.get("cooldown_until"))
-    else:
-        # 读不到 ≠ 已生效：字段提示说清「读不到」，原因放卡片副标题
-        cloud_hint = payout_mod.UNREADABLE
-        cloud_meta = cloud_reason or "完成节点绑定后重试"
-    cloud_tone = {"已生效": "mint", "待审核": "amber", "冷却中": "amber",
-                  "已拒绝": "red", "已撤销": "red"}.get(cloud_state, "muted")
-    can_submit = payout.get("can_submit") is True
-    address_seen = str(config.get("usdt_address") or "—")
+    # E（RC14 IA 拆分）：收款地址的**状态卡不再放本页**（唯一位在「账户与安全」，
+    # 计算收敛到 :func:`_payout_state`，避免两页各算一遍、说法不一致）。：本页退为「本机设置」——只放**本机**配置（价格模式 / 节点凭证 /
+    # 配置文件 / 只读诊断）。绑定与收款地址搬去「账户与安全」：同一件事只允许一个入口，
+    # 否则客户在两边填、两边都以为生效（报告 §E 的原始投诉）。
     return View(
-        key="access", title="接入配置",
-        subtitle="贡献节点口径：绑定节点 → 填 USDT 收款地址 → 选价格模式（不填上游地址）",
+        key="access", title="本机设置",
+        subtitle="价格模式 · 节点凭证 · 配置文件（绑定与收款在「账户与安全」）",
         cards=(Card("配置有效性",
                     "尚未保存" if access.get("saved") is False
                     else _flag(valid, "通过校验", "有字段需修正"), "",
                     "amber" if access.get("saved") is False or not valid else "mint"),
                Card("节点绑定", _flag(bound if bound is not None else None, "已绑定", "未绑定"),
                     card_node or "—", "default"),
-               Card("USDT 收款地址（云端）", cloud_state, cloud_meta, cloud_tone)),
+               # 第三张卡给「本页能做什么」：客户在本页找不到绑定时，得知道去哪
+               Card("绑定与收款", "在「账户与安全」",
+                    "本页只存本机配置（0600）", "muted")),
         fields=(
             node_field,
             # 只读排障字段：节点进程 / 注册状态（有则显示事实，无则写原因 + 下一步）
@@ -1577,12 +1606,6 @@ def _access(snapshot: Snapshot) -> View:
                   key="register_state",
                   hint=(("节点 ID 来源：" + str(access.get("node_id_source") or "—"))
                         if node_id else _diag_hint(diag))),
-            # 可编辑收款地址：**输入框不预填掩码**（prefill=False），否则一点保存就把掩码
-            # 当地址写回配置；当前值进 hint，云端状态也进 hint。
-            Field("USDT 收款地址", address_seen, key="usdt_address", editable=True,
-                  prefill=False,
-                  hint=(payout_mod.CHAIN_HINT + "｜本机已存：" + address_seen
-                        + "｜云端：" + cloud_hint)),
             Field("价格模式", str(config.get("price_mode") or "—"), key="price_mode",
                   editable=True,
                   hint="auto / manual；当前：" + str(config.get("price_mode_label") or "—")),
@@ -1592,18 +1615,12 @@ def _access(snapshot: Snapshot) -> View:
                   hint="掩码显示；粘贴新值才会覆盖"),
         ),
         actions=(Action("access.save", "保存并回读", primary=True),
-                 Action("access.submit_payout", "提交到云端", enabled=can_submit,
-                        reason="" if can_submit else
-                        ("云端收款地址功能还没开放（等平台开启后再提交）" if payout_disabled
-                         else "节点还没绑定账户，先在网页端完成绑定"
-                              "（本页「复制节点 ID」→ 网页端）")),
                  Action("access.copy_node_id", "复制节点 ID", enabled=bool(node_id),
                         reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
                                 + _diag_hint(diag) + "）") if not node_id else ""),
-                 Action("account.bind", "粘贴绑定码绑定",
-                        enabled=bool(binding is not None or node_id),
-                        reason="本机还没有节点 ID，先启动节点进程（点「刷新」）"),
-                 Action("access.reload", "请求 daemon 重载")),
+                 Action("access.reload", "请求 daemon 重载"),
+                 # 搬走的两个入口在这里只留**指路**（不是按钮）：本页不能做，就别假装能做
+                 Action("access.goto_account", "绑定与收款在「账户与安全」")),
         unavailable=_missing(snapshot, ("access",)),
         notes=(str(access.get("note") or ""),
                *(() if node_id else tuple(
@@ -1612,10 +1629,8 @@ def _access(snapshot: Snapshot) -> View:
                    for row in diag)),
                ("节点进程下一步：" + str(daemon.get("next_step"))) if daemon.get("next_step") else "",
                "配置文件：" + str(access.get("path") or "—") + "（0600，只在本机）",
-               "收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
-               "（云端出款链只有 Polygon）。",
-               # 明细（掩码地址 / 冷却截止 / 已拒绝的下一步）放脚注，字段行保持一行
-               payout_mod.summarize(payout_row) if payout_ok else "",
+               ("收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
+                "（云端出款链只有 Polygon）—— 填地址与提交都在「账户与安全」。"),
                "该文件只存本机接入配置（节点密钥 / 收款地址 / 价格模式），"
                "不含账号登录态；账户资料要等节点绑定后从云端读取。"),
     )
@@ -1768,6 +1783,13 @@ def _account(snapshot: Snapshot) -> View:
     if can_bind:
         fields.append(Field("网页端", facts.WEB_CONSOLE_URL, key="web_console",
                             hint="在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里"))
+    # E（RC14 IA 拆分）：USDT 收款地址**只在这里**（原来在「接入配置」，两处都能填、
+    # 两处都以为生效）。输入框不预填掩码（prefill=False），否则一点保存就把掩码写回配置。
+    payout = _payout_state(access)
+    fields.append(Field("USDT 收款地址", payout["local"], key="usdt_address", editable=True,
+                        prefill=False,
+                        hint=(payout_mod.CHAIN_HINT + "｜本机已存：" + payout["local"]
+                              + "｜云端：" + payout["hint"])))
     fields.append(Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录"))
     actions: list[Action] = []
     if can_bind:
@@ -1810,12 +1832,26 @@ def _account(snapshot: Snapshot) -> View:
         # 只写「暂无安装包」客户会以为「没有更新」→ 必须给一条能点的路（G4-4）
         update_actions.append(Action("update.download", "去下载页手动下载", primary=True))
     actions.extend(update_actions)
-    actions.append(Action("account.logout", "登出", enabled=bool(security.get("node_id")),
+    actions.append(Action("account.submit_payout", "提交收款地址到云端",
+                          enabled=payout["can_submit"],
+                          reason="" if payout["can_submit"] else
+                          ("云端收款地址功能还没开放（等平台开启后再提交）"
+                           if payout["disabled"] else
+                           ("先填好 Polygon 收款地址再点这里提交"
+                            if bound is True else
+                            "节点还没绑定账户：先完成上面的绑定"))))
+    # 解绑 = 原来「接入配置」页那颗「粘贴绑定码绑定」的对偶：绑定与解绑都只在本页。
+    # 键名保留 ``account.logout``（接口只加不改）：它就是「解绑 + 清本机密钥」那一个动作。
+    actions.append(Action("account.logout", "解绑这台电脑（登出并清本机密钥）",
+                          enabled=bool(security.get("node_id")),
                           reason=("尚未登录" if not node_id
-                                  else "本机无凭据（登出要清本机密钥）")))
+                                  else "本机无凭据（解绑要清本机密钥）")))
     if can_bind:
         actions.append(Action("account.open_web", "打开网页端"))
-    notes = [str(account.get("note") or "未登录时只显示本机信息。")]
+    notes = [str(account.get("note") or "未登录时只显示本机信息。"),
+             ("收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
+              "（云端出款链只有 Polygon）。"),
+             payout_mod.summarize(payout["row"]) if payout["ok"] else ""]
     if verify_state == "failed_verify":
         notes.insert(0, "上次更新校验失败，已拒装（安全拦截）；版本未变，请联系客服核查更新源。")
     elif verify_state == "no_artifact":
@@ -1834,7 +1870,8 @@ def _account(snapshot: Snapshot) -> View:
         subtitle="节点身份 · 绑定 · 双因素 · 登出",
         cards=(Card("账户", identity, identity_meta, "default"), second,
                Card("本机凭据", str(security.get("storage") or "—"),
-                    str(security.get("node_id") or "本机未保存"), "muted")),
+                    str(security.get("node_id") or "本机未保存"), "muted"),
+               Card("USDT 收款地址（云端）", payout["state"], payout["meta"], payout["tone"])),
         fields=tuple(fields),
         actions=tuple(actions),
         unavailable=unavailable,

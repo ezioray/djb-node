@@ -531,6 +531,27 @@ class DesktopController:
         return ActionResult("已切到「接入配置」：在那里添加上游凭据、或完成节点绑定。",
                             effect="goto", payload="access")
 
+    def _act_token_plan_add_upstream(self, *, confirm=None) -> ActionResult:
+        """E（RC14 IA 拆分）：「添加上游」不再跳到「本机设置」（那里根本不能加）。
+
+        第 1 步就在本页下方「添加接入」（协议 / 请求链接 / 密钥 → 读取模型清单）。
+        """
+        return ActionResult("在下方「添加接入」填：协议 → 请求链接 → 密钥，再点「读取模型清单」。",
+                            effect="goto", payload="token_plan")
+
+    def _act_token_plan_bind_node(self, *, confirm=None) -> ActionResult:
+        """绑定只有**一个**入口（「账户与安全」）；这里只负责把客户送过去。"""
+        return ActionResult("已切到「账户与安全」：绑定 / 解绑 / 收款地址都在那一页。",
+                            effect="goto", payload="account")
+
+    def _act_access_goto_account(self, *, confirm=None) -> ActionResult:
+        return ActionResult("绑定、解绑与 USDT 收款地址都在「账户与安全」页。",
+                            effect="goto", payload="account")
+
+    def _act_account_submit_payout(self, *, confirm=None) -> ActionResult:
+        """账户页的「提交收款地址」（唯一位）；实现与旧的 ``access.submit_payout`` 同一段。"""
+        return self._act_access_submit_payout(confirm=confirm)
+
     def _act_token_plan_refresh(self, *, confirm=None) -> ActionResult:
         """G2-3（RC14 P0）：三个域一起刷，走 worker；``apply_refresh`` 按 section 合并，
         **不整表替换**（否则正在看的那一列会被半截数据顶掉）。"""

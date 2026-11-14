@@ -627,11 +627,17 @@ def test_real_tk_access_page_folds_advanced_and_never_prefills_mask():
         assert "node_secret" not in app._vars
         assert app._advanced_toggle.text == "高级（排障用）"
         assert app._advanced_panel.winfo_ismapped() == 0
-        # 收款地址：输入框留空（不预填掩码），当前值与云端状态都在提示里
+        # 收款地址已搬去「账户与安全」（RC14 E：USDT 只能有一个入口）——
+        # 那里同样不预填掩码，否则一点保存就把掩码当地址写回配置。
+        assert "usdt_address" not in app._vars
+        app.show_view("account")
+        root.update()
         assert app._vars["usdt_address"].get() == ""
         assert app._fields["usdt_address"].prefill is False
         hint = app._fields["usdt_address"].hint
         assert "本机已存：0x3f7c…9a2c" in hint and "Polygon" in hint
+        app.show_view("access")
+        root.update()
 
         app._advanced_toggle.command()            # 展开
         root.update()
