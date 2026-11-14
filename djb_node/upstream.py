@@ -428,13 +428,21 @@ class UpstreamManager:
         stamp = iso(moment)
         self.store.update_upstream(upstream_id, models=self._probe_models_payload(
             record, outcomes, stamp), state=state, last_probe_at=stamp)
+        # RC14 复盘 P0-2（0.3.8）：``not_probed`` 是「本轮预算没轮到」，**不是失败**。
+        # 上报的 ``model_checks`` 只带本轮真出结论的模型；没探到的单独走 ``not_probed[]``
+        # 加性字段。否则云端 ``_probe_verdict`` 的「任一失败即 rejected」会把
+        # 「预算不够」误判成「上游坏了」——正是本轮要修的那条链。
+        budget_missed = {str(item.get("model")) for item in checks
+                         if item.get("error_class") == facts.PROBE_NOT_PROBED}
+        report_checks = [dict(item) for item in checks
+                         if str(item.get("model")) not in budget_missed]
         payload = {"upstream_id": upstream_id, "reachable": result.reachable,
                    "latency_ms": result.latency_ms,
                    "error_class": result.error_class,
-                   "model_checks": checks, "checked_at": stamp,
+                   "model_checks": report_checks, "checked_at": stamp,
                    # RC14 §2.3 加性字段（只加不改）：明确「这一轮探了哪些 / 哪些没探」。
                    # 云端据此判「至少一个 enabled 模型通过即 ok」；旧服务端忽略未知字段。
-                   "models": [str(item.get("model")) for item in checks],
+                   "models": [str(item.get("model")) for item in report_checks],
                    "not_probed": self._not_probed(record, checks, outcomes)}
         return payload
 
@@ -453,16 +461,21 @@ class UpstreamManager:
           ``model_not_listed``），不在这里。
         """
         rows: list[dict[str, Any]] = []
-        probed = {str(item.get("model")) for item in checks}
+        checked = {str(item.get("model")): item for item in checks}
         for raw in record.models:
             entry = ModelEntry.from_dict(raw)
             if not entry.id:
                 continue
             if not entry.enabled:
                 rows.append({"model": entry.id, "reason": "disabled"})
-            elif entry.id not in probed:
+            elif entry.id not in checked:
                 rows.append({"model": entry.id, "reason": "not_listed"})
             elif outcomes.get(entry.id) is None:
+                # 已有明确结论（如 model_not_listed / L2 失败）的模型属于**失败**，
+                # 不能重复记成 backlog；只有「L1 通过但预算没轮到」才算 budget。
+                reason = checked[entry.id].get("error_class")
+                if reason and reason != facts.PROBE_NOT_PROBED:
+                    continue
                 rows.append({"model": entry.id, "reason": "budget"})
         return rows
 

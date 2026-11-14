@@ -553,10 +553,60 @@ PROBE_MODELS_PER_STEP = 8
 """模型数退避：每多 8 个模型，周期复探间隔再加一档。"""
 PROBE_MAX_BACKOFF_SHIFT = 5
 """失败指数退避上限：2**5 = 32 倍（再乘上限截断）。"""
-PROBE_PASS_BUDGET_S = 10
-"""单轮探针预算（秒）：启动校验与周期复探共用，超出即把剩余模型留到下一轮。"""
+PROBE_PASS_BUDGET_S = _float_env("DJB_NODE_PROBE_PASS_BUDGET_S", 20.0, minimum=5.0)
+"""单轮探针预算（秒）：启动校验与周期复探共用，超出即把剩余模型留到下一轮。
+
+0.3.8（RC14 复盘 P0-2）：原值 10s 是死值。真机 L3 一轮 5 个模型实测 2 分 37 秒 ~ 6 分 06 秒
+（2026-11-15 生产 journal），预算内**永远**探不完，尾部模型被打成 ``not_probed``，0.3.4 的
+``all()`` 因此每轮 false、``verified_at`` 永不刷新。现在可配（env）且默认 20s，
+配合 :data:`PROBE_PERIODIC_LEVEL`（周期只跑 L2）一轮可在预算内跑完。
+"""
+
+PROBE_PASS_BUDGET_MAX_S = float(HEARTBEAT_DEFAULT_S)
+"""单轮预算硬上限（秒）＝一个心跳周期。
+
+探针在 daemon 主循环里**内联**执行，预算超过一个心跳周期会让节点 presence 掉档
+（云端 ``STALE_AFTER_S=45``、``OFFLINE_AFTER_CYCLES=3`` ⇒ 90s 判 offline）。
+要跑「一次 600s 全量 L3」必须先把探针移出主循环（独立线程/子进程），不要直接调大预算。
+"""
+
+
+def probe_pass_budget_s(pass_budget: float | None = None) -> float:
+    """实际生效的单轮探针预算（秒）：**不得超过一个心跳周期**。
+
+    探针内联在 daemon 主循环里，预算超过一个心跳周期会让节点 presence 掉档
+    （云端 ``STALE_AFTER_S=45``、``OFFLINE_AFTER_CYCLES=3`` ⇒ 90s 判 offline）。
+    要跑「一次 600s 全量 L3」必须先把探针移出主循环（独立线程/子进程），不要直接调大预算。
+    """
+    value = float(PROBE_PASS_BUDGET_S if pass_budget is None else pass_budget)
+    return max(1.0, min(value, PROBE_PASS_BUDGET_MAX_S))
+
+
+PROBE_PERIODIC_LEVEL = "L2"
+"""周期复探/启动校验的探针档位：只做推理级（L2），不重复流式与用量校验（L3）。
+
+为什么：L3 每个模型要 3 次 HTTP（L2 推理 + 流式 + usage），5 个模型真机实测 2.5–6 min，
+而云端门控只认 ``model_checks[].ok``（推理是否通过）。把 L3 留给 ``djb upstream probe``
+（人工/CLI）与 ``PROBE_DEFAULT_LEVEL``，周期健康检查就能在一轮预算内覆盖全部模型。
+"""
+
 PROBE_NOT_PROBED = "not_probed"
 """预算内没来得及探的模型：不算失败，但不进容量公告。"""
+
+PROBE_TOLERATED_ERROR_CLASSES: tuple[str, ...] = (PROBE_NOT_PROBED, "model_not_listed")
+"""daemon 判定「真实失败」时要排除的错误类（0.3.8 / RC14 复盘 P0-2）。
+
+* ``not_probed``：本轮预算没轮到（不是上游坏了）；
+* ``model_not_listed``：该模型已从上游清单下架（W6 owner 裁决：停用/下架不该拖死整条上游）。
+
+其余错误类（timeout / http_5xx / auth / model_error …）仍算真实失败 ⇒ rejected。
+"""
+
+PROBE_BACKLOG_RETRY_S = 5.0
+"""还有模型因预算没探到（backlog）时，下一轮的间隔（秒）。
+
+不按常规周期（half-fresh）等，而是很快续跑，几轮内把 backlog 清空；
+清空后自动回到 ``periodic_interval_s``。"""
 
 # ─────────────────────────────────────────────────────────── 报价发布（CR-20261106-OFFICIAL-SUPPLY-01）
 # 口径：`design/17-官方供给与价格配置-设计方案-v1.md` §15 + CR 第 3 节 P1/P2/P4/P6。
