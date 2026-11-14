@@ -120,6 +120,10 @@ class DesktopController:
     update_via: Callable[[str], Any] | None = None
     #: 探针异步通道（RC14 D）：返回 True = 已派给 worker（网络在 worker 线程里跑）
     probe_via: Callable[[], Any] | None = None
+    #: RC14 C：设备码绑定 —— 设备流程状态（``djb_node.device_flow.DeviceFlow``）
+    device_flow: Any | None = None
+    #: 设备流程异步通道：``(flow) -> bool``；返回 True = 已派给 worker（轮询不在主线程）
+    device_via: Callable[[Any], Any] | None = None
     #: RC14 B：首次引导状态（``djb_node.onboarding.OnboardingStore``；None = 未接本机目录）
     onboarding: Any | None = None
     #: 当前引导步骤（1..3；4 = 完成页；None = 不显示面板）
@@ -163,6 +167,16 @@ class DesktopController:
         merged_access = dict(access) if isinstance(access, Mapping) else {}
         merged_access["onboarding"] = onboarding_meta
         sections["access"] = merged_access
+        # RC14 C：设备码状态由本层注入账户页（视图层不持有流程状态）
+        flow = self.device_flow
+        account = sections.get("account")
+        merged_account = dict(account) if isinstance(account, Mapping) else {}
+        merged_account["device_flow"] = {
+            "enabled": self.device_flow_enabled(),
+            **((flow.as_dict() if hasattr(flow, "as_dict") else dict(flow))
+               if isinstance(flow, Mapping) or hasattr(flow, "as_dict") else {}),
+        }
+        sections["account"] = merged_account
         # RC14 I：Token Plan 页的「选中行 + 该行已存底价」由本层注入（视图层不持有选中态）
         plan = sections.get("token_plan")
         if isinstance(plan, Mapping):
@@ -583,6 +597,99 @@ class DesktopController:
             except Exception:
                 return bids_mod.BidBook(None)
         return bids_mod.BidBook(None)
+
+    # ── RC14 C 设备码自动绑定
+    def _device_client(self):
+        return getattr(self.source, "cloud", None)
+
+    def device_flow_enabled(self) -> bool:
+        from .. import facts as facts_mod
+        from ..config import Paths, feature_flag, load_config
+
+        home = getattr(self.source, "_home", None)
+        if not home:
+            return False
+        try:
+            return bool(feature_flag(load_config(Paths(str(home))),
+                                     facts_mod.DEVICE_FLOW_FLAG))
+        except Exception:
+            return False
+
+    def run_device_flow(self, *, stop: Any = None) -> ActionResult:
+        """同步跑设备码流程（worker 与无事件循环环境共用；网络在调用方线程）。"""
+        from .. import device_flow as flow_mod
+
+        client = self._device_client()
+        if client is None or not callable(getattr(client, "device_start", None)):
+            flow = flow_mod.unavailable("当前数据源没有云端客户端")
+            self.device_flow = flow
+            return ActionResult(flow.hint, ok=False, payload=flow.as_dict())
+
+        def post(path: str, body: Mapping[str, Any]) -> Mapping[str, Any]:
+            if path.endswith("/poll"):
+                return client.device_poll(str(body.get("device_code") or ""))
+            return client.device_start()
+
+        runner = flow_mod.DeviceFlowRunner(post, sleep=time.sleep, clock=time.monotonic,
+                                          on_update=self._device_update, stop=stop)
+        flow = runner.run()
+        self.device_flow = flow
+        return self._device_result(flow)
+
+    def _device_update(self, flow: Any) -> None:
+        self.device_flow = flow
+
+    def _device_result(self, flow: Any) -> ActionResult:
+        from .. import device_flow as flow_mod
+
+        if flow.state == "approved":
+            # 绑定成功后重新取数：绑定状态/收款面板都要立刻反映
+            return ActionResult("绑定成功：这台电脑已经绑到你的账户（" + flow.user_code + "）",
+                                effect="refresh", payload=flow.as_dict())
+        if flow.state == "unavailable":
+            return ActionResult(flow_mod.NOT_OPEN_TEXT + "（" + (flow.reason or "云端没有响应")
+                                + "）", ok=False, payload=flow.as_dict())
+        text = {"denied": "这次绑定被拒绝（网页端点的是拒绝）",
+                "expired": flow.reason or "设备码已过期"}.get(
+                    flow.state, "还没在网页确认（" + flow.user_code + "）")
+        hint = ("；" + flow.hint) if flow.hint else ""
+        return ActionResult(text + hint + "（本次未绑定）", ok=False, payload=flow.as_dict())
+
+    def _act_account_bind_device(self, *, confirm=None) -> ActionResult:
+        """「在浏览器确认绑定」：开关默认关；关着就只指向老的手输码路径。"""
+        from .. import device_flow as flow_mod
+
+        if not self.device_flow_enabled():
+            return ActionResult("设备码绑定开关关闭（client.binding.device_flow.enabled）："
+                                "改用高级→手输绑定码（djb auth --bind）", ok=False)
+        hook = self.device_via
+        if hook is not None:
+            try:
+                if hook(None):
+                    return ActionResult("正在向云端申请设备码…（可以继续操作）", effect="refresh")
+            except Exception:
+                pass                                   # 通道坏了：退回同步，别把动作打崩
+        return self.run_device_flow()
+
+    def _act_account_bind_device_cancel(self, *, confirm=None) -> ActionResult:
+        """「停止等待」：只结束本地轮询，不发任何请求。"""
+        flow = self.device_flow
+        if flow is None or getattr(flow, "state", "") != "pending":
+            return ActionResult("现在没有正在等待的绑定", ok=False)
+        flow.state = "expired"
+        flow.reason = "已停止等待（没在网页确认）"
+        flow.hint = "要重试就再点「在浏览器确认绑定」"
+        flow.events.append("cancelled")
+        return ActionResult("已停止等待绑定；随时可以重新点「在浏览器确认绑定」",
+                            effect="refresh")
+
+    def _act_account_copy_verify_url(self, *, confirm=None) -> ActionResult:
+        flow = self.device_flow
+        url = str(getattr(flow, "verify_url", "") or "")
+        if not url:
+            return ActionResult("还没有确认链接：先点「在浏览器确认绑定」", ok=False)
+        return ActionResult("已复制确认链接（在浏览器打开后输入 " + str(flow.user_code) + "）",
+                            effect="copy", payload=url)
 
     # ── RC14 B 首次引导（应用内面板，不是模态；每步都能跳）
     def _onboarding_store(self):

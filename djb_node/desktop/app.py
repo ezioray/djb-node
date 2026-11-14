@@ -241,6 +241,14 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def _device_error(exc: BaseException) -> Any:
+    """后台线程兜底：把异常变成一条**不假成功**的结果（线程里不能抛给 Tk）。"""
+    from .controller import ActionResult
+
+    return ActionResult("绑定流程出错（" + type(exc).__name__ + "）：未绑定；"
+                        "可以用高级→手输绑定码", ok=False)
+
+
 class DesktopApp:
     """主窗口：一个 sidebar + 一个内容区（视图切换只重画内容区，不重建侧栏）。"""
 
@@ -333,6 +341,7 @@ class DesktopApp:
         self._ensure_update_worker()
         self._ensure_probe_worker()
         self._ensure_discover_worker()
+        self._controller.device_via = self._start_device_flow
         bind = getattr(self._root, "bind", None)
         if callable(bind):
             try:
@@ -1139,6 +1148,52 @@ class DesktopApp:
         refresh = getattr(self, "_refresh_worker", None)
         if refresh is None or not getattr(refresh, "busy", False):
             self._request_refresh_async(("models", "token_plan"))
+
+    # ── RC14 C 设备码绑定（轮询在后台线程；主线程只播报 + 重画）
+    def _ensure_device_runner(self) -> bool:
+        """首点建线程；轮询节奏由 ``device_flow`` 决定（5/15/30 秒，10 分钟停）。"""
+        if getattr(self, "_device_thread", None) is not None and self._device_thread.is_alive():
+            return True
+        if not callable(getattr(self._root, "after", None)):
+            return False
+        import threading
+
+        stop = threading.Event()
+        self._device_stop = stop
+
+        def work() -> None:
+            try:
+                result = self._controller.run_device_flow(stop=stop.is_set)
+            except Exception as exc:                     # 后台线程绝不把异常抛给 Tk
+                result = _device_error(exc)
+            self._ui_call(lambda: self._apply_device(result))
+
+        thread = threading.Thread(target=work, name="djb-device-flow", daemon=True)
+        self._device_thread = thread
+        thread.start()
+        return True
+
+    def _ui_call(self, fn: Any) -> None:
+        """把回调排队回主线程（Tk 只能在自己的线程里改界面）。"""
+        after = getattr(self._root, "after", None)
+        if callable(after):
+            try:
+                after(0, fn)
+                return
+            except Exception:                            # pragma: no cover - 窗口已销毁
+                pass
+        fn()
+
+    def _start_device_flow(self, _flow: Any = None) -> bool:
+        if not self._controller.device_flow_enabled():
+            return False
+        return self._ensure_device_runner()
+
+    def _apply_device(self, result: Any) -> None:
+        message = str(getattr(result, "message", "") or "绑定流程结束")
+        self._toast(message, ok=bool(getattr(result, "ok", False)))
+        if bool(getattr(result, "ok", False)):
+            self._request_refresh_async(("account", "overview", "access"))
 
     # ── RC14 I：读取模型清单（网络在 worker 线程，主线程只播报）
     def _ensure_discover_worker(self) -> Any:

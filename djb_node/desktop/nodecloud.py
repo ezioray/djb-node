@@ -43,6 +43,9 @@ PATHS = {
     # USDT 收款地址（owner 2026-11-13 方案 B：客户端直接提交云端）。
     # 路径/字段按 cloud 侧契约逐字对齐；**云端只收 Polygon（EVM）**，见 payout.CHAIN_HINT。
     "payout_address": "/api/v1/node/payout-address",
+    # RC14 C 设备码绑定（云端未上线 → 404，客户端给「绑定服务未开通，请用高级→手输绑定码」）
+    "device_start": "/api/v1/node/binding/device",
+    "device_poll": "/api/v1/node/binding/device/poll",
 }
 
 #: 一页最多取多少条（服务端可下调，客户端不硬要）
@@ -386,6 +389,18 @@ class NodeCloudClient:
                                     json_body=body, idempotency_key=new_request_id())
         data = payload.get("data") if isinstance(payload, Mapping) else None
         return dict(data) if isinstance(data, Mapping) else {}
+
+    # ── RC14 C 设备码绑定（只发两个 POST；不自动重试，节奏由 device_flow 决定）
+    def device_start(self) -> dict[str, Any]:
+        """``POST /node/binding/device`` → ``{user_code, verify_url, expires_in, device_code}``。"""
+        return dict(self._request("POST", PATHS["device_start"], kind="device_start",
+                                  json_body={}, idempotency_key=new_request_id()))
+
+    def device_poll(self, device_code: str) -> dict[str, Any]:
+        """``POST /node/binding/device/poll`` → ``{state: pending|approved|denied|expired}``。"""
+        return dict(self._request("POST", PATHS["device_poll"], kind="device_poll",
+                                  json_body={"device_code": str(device_code)},
+                                  idempotency_key=new_request_id()))
 
     def fetch(self, kind: str) -> dict[str, Any]:
         """按 ``page.next_cursor`` 翻页聚合；返回 ``{items, next_cursor, pages, truncated}``。"""

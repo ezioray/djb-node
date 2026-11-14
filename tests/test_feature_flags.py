@@ -36,7 +36,8 @@ EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30",
                     facts.PROBE_FLAG_PERIODIC: "2027-06-30T00:00:00+08:00",
                     # RC14 B/I：设计 §5.4 给这两条定的是 2027-03-31（引导与竞价 UI 一起收敛）
                     facts.ONBOARDING_FLAG: "2027-03-31",
-                    facts.UPSTREAM_BID_FLAG: "2027-03-31"}
+                    facts.UPSTREAM_BID_FLAG: "2027-03-31",
+                    facts.DEVICE_FLOW_FLAG: "2027-03-31"}
 
 
 def test_every_flag_has_three_fields_and_default_off():

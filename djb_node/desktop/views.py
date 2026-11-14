@@ -1906,10 +1906,37 @@ def _account(snapshot: Snapshot) -> View:
                         prefill=False,
                         hint=(payout_mod.CHAIN_HINT + "｜本机已存：" + payout["local"]
                               + "｜云端：" + payout["hint"])))
+    # RC14 C 设备码状态（开关关 → 整段不渲染，连状态都不显示）
+    device = account.get("device_flow") if isinstance(account.get("device_flow"), Mapping) else {}
+    device_on = bool(device.get("enabled"))
+    device_state = str(device.get("state") or "idle")
+    if device_on and can_bind:
+        from .. import device_flow as flow_mod
+
+        state_text = flow_mod.STATE_TEXT.get(device_state, device_state)
+        detail = "｜".join(item for item in (
+            str(device.get("user_code") or ""),
+            "等待第 " + str(device.get("attempts") or 0) + " 次确认" if device_state == "pending" else "",
+            str(device.get("reason") or "")) if item)
+        fields.append(Field("设备码", detail or "未申请", key="device_state",
+                            hint=(("打开 " + str(device.get("verify_url") or "确认链接")
+                                   + " 并在网页里点「确认」；本机每 5/15/30 秒自动问一次，10 分钟停")
+                                  if device_state == "pending" else
+                                  "状态：" + state_text + "（"
+                                  + (str(device.get("hint") or "") or "点左边按钮开始") + "）")))
     fields.append(Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录"))
     actions: list[Action] = []
+    # RC14 C 设备码：主按钮 = 「在浏览器确认绑定」（开关关着 → 只保留老的手输码入口）
+    if device_on and can_bind:
+        actions.append(Action("account.bind_device", "在浏览器确认绑定", primary=True,
+                              enabled=device_state not in ("pending",)))
+        if device_state == "pending":
+            actions.append(Action("account.bind_device_cancel", "停止等待"))
+            if device.get("verify_url"):
+                actions.append(Action("account.copy_verify_url", "复制确认链接"))
     if can_bind:
-        actions.append(Action("account.bind", "绑定网页端", primary=True))
+        actions.append(Action("account.bind", "绑定网页端" if not device_on else "手输绑定码",
+                             primary=not device_on))
     # G1-2（RC14 P0）：2FA 不在本机做绑定 ⇒ ①禁用态 + 说清原因；②旁边给**真能点**的入口。
     # 旧实现是一颗可点的按钮，点下去只回一句「暂不可用」——客户会以为客户端坏了。
     actions.append(Action("account.enable_2fa", "启用双因素验证", enabled=False,

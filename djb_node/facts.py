@@ -648,6 +648,19 @@ FEATURE_FLAGS["supply.attestation.enabled"] = {
     "default": False,
     "description": "模型身份证明（M17 §5 / C12 客户端侧线索采集），默认关闭",
 }
+# ── RC14 C 设备码自动绑定（默认关闭：关 → 只显示「高级 → 手输绑定码」老入口，
+# 云端 N1–N4 端点保留但客户端不调用，可随时下线，无状态依赖）
+FEATURE_FLAGS["client.binding.device_flow.enabled"] = {
+    "default": False,
+    "owner": "lead",
+    "expire_at": "2027-03-31",
+    "rollback_rule": "置 false → 只显示「粘贴绑定码」老入口；N1–N4 端点保留但客户端不调用，"
+                     "云端可随时下线（无状态依赖）",
+    "description": "设备码自动绑定（POST /node/binding/device + poll，网页 /activate 确认；RC14 C）",
+}
+DEVICE_FLOW_FLAG = "client.binding.device_flow.enabled"
+DEVICE_FLOW_PATHS = ("/api/v1/node/binding/device", "/api/v1/node/binding/device/poll")
+
 # ── RC14 B 首启引导（默认关闭：关 → 不渲染引导视图，onboarding.json 保留但不读，
 # 零数据迁移；QA 截图基线不受影响）
 FEATURE_FLAGS["client.onboarding.enabled"] = {
