@@ -359,14 +359,18 @@ def test_periodic_probe_reports_each_round(paths, store, credentials, mock, cloc
         daemon.stop()
 
 
-# ───────────────────────────────────────── D-PROBE-03：节点/云端判决口径对齐
-def test_partially_working_upstream_counts_as_failed(paths, store, credentials, mock,
-                                                     clock):
-    """一个模型通、一个模型不通 ⇒ 必须计 failed（与云端 `任一失败即拒` 一致）。
+# ───────────────────────────── RC14 §3-B.1：逐模型判定（取代 D-PROBE-03 的 all()）
+def test_partially_working_upstream_counts_as_verified(paths, store, credentials, mock,
+                                                       clock):
+    """一个模型通、一个模型不通 ⇒ 仍计 verified（**这是 owner 2026-11-14 的裁决**）。
 
-    修前用 `any(ok)`：节点自称 verified=1、云端回 rejected（reason=第一条失败原因），
-    两边日志口径不一致。本用例锁住对齐后的语义。
+    历史：D-PROBE-03（2026-11-04）曾把这里对齐成「任一失败即 failed」，理由是节点与
+    云端日志口径要一致。W6 现场（6/7 模型可用、整条上游 rejected、容量归零）证明那条
+    对齐会**放大故障**：一个模型下架就能拖死整条上游。RC14 起判定改为
+    「至少一个 enabled 模型通过即 ok」，逐模型结论进 ``per_upstream[].per_model``，
+    云端侧同步改成按 enabled 集合判定（契约 1.14.0 的 ``verdict_scope=enabled_only``）。
     """
+    mock.models = ["probe-model"]                 # 上游只列 probe-model（另一个是下架模型）
     store.add_upstream(upstream_id="u1", access_type="A2",
                        base_url=mock.upstream_base_url,
                        models=[{"id": "probe-model", "enabled": True, "min_price": "0.5"},
@@ -378,8 +382,33 @@ def test_partially_working_upstream_counts_as_failed(paths, store, credentials, 
     try:
         result = daemon.probe_now(reason="manual")
         assert result["models"] == 2
-        assert result["verified"] == 0
-        assert result["failed"] == 1
+        assert result["verified"] == 1
+        assert result["failed"] == 0
+        # 逐模型结论必须留在 last_pass 里（桌面「为什么没通过」的唯一来源之一）
+        detail = result["per_upstream"][0]
+        assert detail["ok"] is True and detail["passed"] == 1 and detail["total"] == 2
+        per_model = {item["model"]: item for item in detail["per_model"]}
+        assert per_model["probe-model"]["ok"] is True
+        assert per_model["not-served-model"]["ok"] is False
+        assert per_model["not-served-model"]["error_class"] == "model_not_listed"
+    finally:
+        daemon.stop()
+
+
+def test_no_working_model_still_counts_failed(paths, store, credentials, mock, clock):
+    """一个都不通 ⇒ failed（新口径的边界：至少一个通过才算 ok，不许无条件放行）。"""
+    store.add_upstream(upstream_id="u1", access_type="A2",
+                       base_url=mock.upstream_base_url,
+                       models=[{"id": "not-served-a", "enabled": True, "min_price": "0.5"},
+                               {"id": "not-served-b", "enabled": True,
+                                "min_price": "0.5"}],
+                       credential_ref="upstream:u1")
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        result = daemon.probe_now(reason="manual")
+        assert result["verified"] == 0 and result["failed"] == 1
+        assert result["per_upstream"][0]["passed"] == 0
     finally:
         daemon.stop()
 

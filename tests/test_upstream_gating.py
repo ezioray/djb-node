@@ -12,7 +12,10 @@ from djb_node.upstream import ModelEntry, UpstreamManager
 from tests.mock_probe import UpstreamStub
 
 SPEC_PROBE_REPORT_FIELDS = {"upstream_id", "reachable", "latency_ms", "error_class",
-                            "model_checks", "checked_at"}
+                            "model_checks", "checked_at",
+                            # RC14 §2.3 加性字段（只加不改）：这一轮探了哪些 / 哪些没探。
+                            # 契约在 lead 合入前统一 +1 版；旧服务端忽略未知字段。
+                            "models", "not_probed"}
 MODEL_CHECK_FIELDS = {"model", "ok", "error_class"}
 
 
@@ -66,6 +69,60 @@ def test_stale_probe_stops_being_announced(manager, store, stub, clock):
     # 边界：正好等于窗口仍然算新鲜
     edge = clock() + timedelta(seconds=facts.PROBE_FRESH_S)
     assert len(manager.announceable_models(edge)) == 1
+
+
+def test_disabled_model_is_not_probed(manager, store, stub, clock):
+    """W6-FIX：disabled 模型不参与探针，避免「上游未列该模型」把整条上游判 rejected。"""
+    stub.models = ["probe-model"]                    # disabled-model 不在 /models
+    record = _add(manager, stub, models="probe-model,disabled-model")
+    manager.set_model_enabled(record.id, "disabled-model", False)
+    payload = manager.probe(record.id, now=clock())
+    assert [item["model"] for item in payload["model_checks"]] == ["probe-model"]
+    assert all(item["ok"] for item in payload["model_checks"])
+    assert store.upstream(record.id).state == "verified"
+    # disabled 模型仍留在本地记录里，只是不探
+    assert [item["id"] for item in store.upstream(record.id).models] == [
+        "probe-model", "disabled-model"]
+
+
+def test_probe_declares_probed_and_not_probed(manager, store, stub, clock):
+    """RC14 §2.3：上行 payload 要能回答「探了哪些 / 哪些没探，为什么」。
+
+    这是「一个失败即全空」的**数据面**修复：云端不必再靠 ``all(model_checks)`` 猜，
+    因为 ``models[]`` 只含 enabled，``not_probed[]`` 把停用的模型显式摘出来。
+    """
+    stub.models = ["probe-model"]
+    record = _add(manager, stub, models="probe-model,disabled-model")
+    manager.set_model_enabled(record.id, "disabled-model", False)
+    payload = manager.probe(record.id, now=clock())
+    assert payload["models"] == ["probe-model"]
+    assert payload["not_probed"] == [{"model": "disabled-model", "reason": "disabled"}]
+    # 没探的模型不许出现在 model_checks 里（否则旧云端 still all() 一刀切）
+    assert [item["model"] for item in payload["model_checks"]] == ["probe-model"]
+
+
+def test_probe_with_every_model_disabled_sends_no_model_and_stays_safe(manager, store,
+                                                                      stub, clock):
+    """边界（W6 的 D7 未测）：全部停用 ⇒ 不探任何模型，也不许炸。
+
+    口径：一条**没有任何 enabled 模型**的上游不可公告，`state` 落到 ``rejected``
+    （本次实现不额外发明状态词；重新启用任一模型后下一轮探针自然回到 verified）。
+    """
+    stub.models = ["probe-model", "other-model"]
+    record = _add(manager, stub, models="probe-model,other-model")
+    manager.set_model_enabled(record.id, "probe-model", False)
+    manager.set_model_enabled(record.id, "other-model", False)
+    payload = manager.probe(record.id, now=clock())
+    assert payload["model_checks"] == []
+    assert payload["models"] == []
+    assert sorted(item["model"] for item in payload["not_probed"]) == [
+        "other-model", "probe-model"]
+    assert store.upstream(record.id).state == "rejected"
+    assert manager.announceable_models(clock()) == []
+    # 恢复一个模型 → 下一轮回到 verified（不是永久卡死）
+    manager.set_model_enabled(record.id, "probe-model", True)
+    manager.probe(record.id, now=clock())
+    assert store.upstream(record.id).state == "verified"
 
 
 def test_rejected_upstream_vetoes_capacity(manager, store, stub, clock):

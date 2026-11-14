@@ -1414,6 +1414,7 @@ class Daemon:
         verified = 0
         failed = 0
         models = 0
+        per_upstream: list[dict[str, Any]] = []
         for record in self.upstreams.list():
             if not record.enabled:
                 continue
@@ -1435,11 +1436,21 @@ class Daemon:
                 continue
             checks = payload.get("model_checks") or []
             models += len(checks)
-            # 与服务端口径对齐（2026-11-04，D-PROBE-03）：云端 `_probe_verdict` 是
-            # **任一检查失败即 rejected**（零检查 ⇒ rejected/no_model_check）。
-            # 旧版这里用 `any(...)`：部分模型可用时节点自以为 verified、云端判 rejected，
-            # 两边日志对不上，排障时容易误判。改为 all + 非空，逐字对齐。
-            if checks and all(item.get("ok") for item in checks):
+            # RC14 §3-B.1（owner 裁决「修复探针一个失败即全空」）：判定改成
+            # **至少一个 enabled 模型通过即 ok**，逐模型结论进 `per_model[]`。
+            #
+            # 旧口径是 `checks and all(item.ok)`，与云端「任一检查失败即 rejected」对齐
+            # （D-PROBE-03/2026-11-04）。W6 现场 6/7 证明这条对齐是**放大故障**：
+            # 只要一个 enabled 模型临时失败（上游清单缺项 / L2 抖动 / 该模型下架），
+            # 整条上游就 rejected、全部容量归零，其余能用的模型被一起拖死。
+            # 现在 `payload["models"]` 只含 enabled（upstream.py 的 W6-FIX），
+            # 所以「任何一个能用的模型通过」就是这条上游可用的证据。
+            per_model = [{"model": str(item.get("model") or ""),
+                          "ok": bool(item.get("ok")),
+                          "error_class": item.get("error_class")}
+                         for item in checks if isinstance(item, dict)]
+            passed = sum(1 for item in per_model if item["ok"])
+            if passed:
                 verified += 1
                 # D-PROBE-03：**周期探针的结论必须上报**，否则云端 verified_at 不动。
                 # 旧行为：daemon 只写本地 last_probe_at ⇒ 本地算出正 QPS，但云端
@@ -1449,6 +1460,9 @@ class Daemon:
                 self._report_probe(record, payload, reason=reason)
             else:
                 failed += 1
+            per_upstream.append({"upstream_id": record.id, "ok": bool(passed),
+                                 "passed": passed, "total": len(per_model),
+                                 "per_model": per_model})
         self._probe_failures = min(self._probe_failures + 1, facts.PROBE_MAX_BACKOFF_SHIFT) \
             if failed else 0
         self._probe_interval_s = periodic_interval_s(self._upstream_model_count(),
@@ -1457,7 +1471,9 @@ class Daemon:
         self._last_probe = {"at": iso(now), "reason": reason, "verified": verified,
                             "failed": failed, "models": models,
                             "failures": self._probe_failures,
-                            "interval_s": self._probe_interval_s}
+                            "interval_s": self._probe_interval_s,
+                            # 逐模型结论（本地排障用；上行仍走 model_checks，不重复发）
+                            "per_upstream": per_upstream}
         event("upstream.probe_pass", reason=reason, verified=verified, failed=failed,
               models=models, failures=self._probe_failures,
               interval_s=self._probe_interval_s)
