@@ -75,7 +75,7 @@ VIEW_TITLES: dict[str, str] = {
     "overview": "总览",
     "bench": "性能基准",
     "gpu": "GPU 监控",
-    "models": "可提供模型",
+    "models": "模型与探针",
     "tasks": "任务队列",
     "receipts": "收据",
     "earnings": "收益",
@@ -327,6 +327,9 @@ class View:
     subtitle: str = ""
     cards: tuple[Card, ...] = ()
     table: Table | None = None
+    #: 附加表（RC14 D：模型与探针页要同时显示「探针事实」和「云端目录」两张表）。
+    #: 只加不改：``table`` 仍是主表，渲染顺序 = 主表 → 附加表；空元组时行为与 0.3.6 完全一致。
+    tables: tuple[Table, ...] = ()
     fields: tuple[Field, ...] = ()
     actions: tuple[Action, ...] = ()
     notes: tuple[str, ...] = ()
@@ -356,19 +359,19 @@ class View:
             lines.extend(_chart_text(self.chart))
         if self.rail:
             lines.extend(_rail_text(self.rail))
-        if self.table is not None:
+        for table in ((self.table,) + self.tables if self.table is not None else self.tables):
             lines.append("")
-            lines.append(" | ".join(self.table.columns))
-            if not self.table.rows:
-                lines.append("（" + self.table.empty + "）")
-            for row in self.table.rows:
+            lines.append(" | ".join(table.columns))
+            if not table.rows:
+                lines.append("（" + table.empty + "）")
+            for row in table.rows:
                 prefix = "x " if row.disabled else "- "
                 line = prefix + " | ".join(row.cells)
                 if row.note:
                     line += "   " + row.note
                 lines.append(line)
-            if self.table.note:
-                lines.append("… " + self.table.note)
+            if table.note:
+                lines.append("… " + table.note)
         if self.fields:
             lines.append("")
             for item in self.fields:
@@ -971,36 +974,153 @@ def _bench(snapshot: Snapshot) -> View:
     )
 
 
+#: 探针失败分类 → 客户能看懂的原因（``upstream.ProbeOutcome.error_class`` 的取值）。
+#:
+#: 设计 40-UX §3.3「原因」一行：映射表 + 「其余原样 + （未登记的原因）」。
+#: **不许**只显示英文错误码——客户看不懂 ``stream_failed`` 是什么意思。
+PROBE_REASON_TEXT = {
+    "timeout": "超时（上游没在时限内回话）",
+    "unauthorized": "密钥被拒（401；检查 Key 是否过期/权限）",
+    "http_5xx": "上游 5xx（对方服务异常，稍后重试）",
+    "stream_failed": "流式不可用（stream_failed）；仍按非流式公告",
+    "model_not_listed": "上游 /models 里没有这个模型（清单或模型名不对）",
+    "not_listed": "上游 /models 里没有这个模型（清单或模型名不对）",
+    "usage_missing": "上游没回 usage（用量对不上，报价会保守）",
+    "budget": "本轮探测预算用完（下一轮继续）",
+    "disabled": "模型已停用（不参与探测与公告）",
+    "network": "网络不通（DNS/连接被拒）",
+    "invalid_response": "上游返回的不是兼容格式（不是 OpenAI/Anthropic 形状）",
+}
+
+#: 探针「上次结论」的年龄 → 人话（设计 40-UX §3.3：相对时间 + 「从未」）
+def _short_url(text: str) -> str:
+    """``https://api.example.com/v1`` → ``api.example.com/v1``（列宽有限，去掉协议头）。"""
+    value = str(text or "").strip()
+    for prefix in ("https://", "http://"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+            break
+    return value.rstrip("/") or "—"
+
+
+def _ago(seconds: Any) -> str:
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        return "从未"
+    if value < 0:
+        return "刚刚（时钟回拨）"
+    if value < 60:
+        return str(value) + " 秒前"
+    if value < 3600:
+        return str(value // 60) + " 分钟前"
+    return str(value // 3600) + " 小时前"
+
+
+def _probe_state(row: Mapping[str, Any], *, fresh_window: int, quote_window: int) -> tuple[str, str]:
+    """探针行 →（状态标签, tone）。三态不许混：``None``（没探过）≠ ``False``（探过但失败）。"""
+    if not row.get("enabled", True):
+        return "已停用", "muted"
+    marked = [row.get("inference_ok"), row.get("stream_ok"), row.get("usage_ok")]
+    if all(item is None for item in marked):
+        return "未探测", "muted"
+    if row.get("announceable") is True:
+        return "可公告", "mint"
+    if row.get("inference_ok") is True:
+        if row.get("fresh") is False:
+            age = row.get("probe_age_s")
+            return ("结论过期（报价已停，公告还剩 " + str(max(0, int(fresh_window)
+                                                          - int(age or 0)) // 60)
+                    + " 分钟）" if isinstance(age, int) else "结论过期"), "amber"
+        if row.get("stream_ok") is False:
+            return "降级：流式不可用", "amber"
+        return "降级", "amber"
+    return "失败", "red"
+
+
 def _models(snapshot: Snapshot) -> View:
     models = _section(snapshot, "models")
+    probe = models.get("probe") if isinstance(models.get("probe"), Mapping) else {}
+    probe_rows = probe.get("rows") if isinstance(probe.get("rows"), list) else []
+    fresh_window = int(probe.get("fresh_window_s") or 900)
+    quote_window = int(probe.get("quote_window_s") or 600)
+
+    # ── 探针表（D 的主战场：纯投影 probe_details()，不重算门控）
+    rows: list[Row] = []
+    counts = {"announceable": 0, "failed": 0, "never": 0}
+    for item in probe_rows:
+        if not isinstance(item, Mapping):
+            continue
+        state_text, tone = _probe_state(item, fresh_window=fresh_window,
+                                        quote_window=quote_window)
+        # 三态渲染：True ✓ / False ✗ / None —（None **不是** False，设计 40-UX §3.3 硬要求）
+        def tri(value: Any) -> str:
+            return MARK_DONE if value is True else (MARK_FAIL if value is False else "—")
+        error_class = str(item.get("probe_error_class") or "")
+        reason = PROBE_REASON_TEXT.get(error_class)
+        if reason is not None:
+            # 人话在前、原值在后：客服照人话解释，排障还能按英文码搜日志
+            reason = reason + " [" + error_class + "]"
+        elif error_class:
+            reason = str(error_class) + "（未登记的原因）"
+        if state_text == "可公告":
+            counts["announceable"] += 1
+        elif state_text == "未探测":
+            counts["never"] += 1
+        elif state_text in ("失败", "已停用"):
+            counts["failed"] += 1
+        model_id = str(item.get("model") or "—")
+        upstream = str(item.get("base_url") or item.get("upstream_id") or "—")
+        rows.append(Row((model_id, _short_url(upstream), _ago(item.get("probe_age_s")),
+                         tri(item.get("inference_ok")), tri(item.get("stream_ok")),
+                         tri(item.get("usage_ok")), state_text, reason or "—"),
+                        key=str(item.get("upstream_id") or "") + "/" + model_id,
+                        tone=tone, note=("失败原因：" + reason) if reason else ""))
+    probe_table = Table(("模型", "上游", "最近探测", "L2", "L3", "用量", "状态", "原因"),
+                        tuple(rows),
+                        note=str(probe.get("unavailable") or ""),
+                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论")
+
+    # ── 云端目录（原 4 列，保留为附加表：它是「云端认为该有哪些模型」，与探针事实互补）
     catalog = models.get("catalog") if isinstance(models.get("catalog"), list) else []
-    rows = []
+    catalog_rows: list[Row] = []
     for row in catalog:
         if not isinstance(row, Mapping):
             continue
         offerable = bool(row.get("offered", True))
         reason = str(row.get("reason") or "")
         mark = MARK_DONE + " 可提供" if offerable else MARK_FAIL + " 不兼容"
-        rows.append(Row((str(row.get("id") or "—"), _num(row.get("context")), mark,
-                         reason or ("按当前资源可提供" if offerable else "原因未下发")),
-                        key=str(row.get("id") or ""), disabled=not offerable))
+        catalog_rows.append(Row((str(row.get("id") or "—"), _num(row.get("context")), mark,
+                                 reason or ("按当前资源可提供" if offerable else "原因未下发")),
+                                key=str(row.get("id") or ""), disabled=not offerable))
     local = models.get("local") if isinstance(models.get("local"), list) else []
+    probe_actions = [Action("probe.run", "立即探测（全部上游）", primary=True,
+                            enabled=bool(probe_rows),
+                            reason="还没有接入上游" if not probe_rows else "")]
     return View(
-        key="models", title="可提供模型",
-        subtitle="云端目录 · 不兼容标灰并给原因",
-        cards=(Card("云端目录", _count(snapshot, "models", str(len(catalog)) + " 个"),
-                    "来自 /models 目录", "default"),
+        key="models", title="模型与探针",
+        subtitle="探针事实（L2/L3/用量/新鲜度/失败原因）· 云端目录",
+        cards=(Card("可公告", str(counts["announceable"]) + " 个",
+                    "探针通过且结论新鲜才会进容量", "mint" if counts["announceable"] else "muted"),
+               Card("探针失败 / 停用", str(counts["failed"]) + " 个",
+                    "看右列原因逐条修", "red" if counts["failed"] else "muted"),
+               Card("从未探测", str(counts["never"]) + " 个",
+                    "点「立即探测」补一次", "amber" if counts["never"] else "muted"),
                Card("本地已应用", _count(snapshot, "models", str(len(local)) + " 个"),
                     "model-sync 状态", "default")),
-        table=Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(rows),
-                    note=str(models.get("note") or ""), empty="云端目录暂不可用"),
+        table=probe_table,
+        tables=(Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(catalog_rows),
+                      note=str(models.get("note") or ""), empty="云端目录暂不可用"),),
         # G1-1（RC14 P0）：**摘掉**「保存并上报意向」这颗按钮（键名见 commit / NODE.md）。
         # 表里根本没有开关控件，副标题却写「逐模型开关」，按钮点了又永远无声
         # （云端意向上报接口未接线）——虚假承诺比缺按钮更伤。
         # 等「一 Key 多模型 + 逐模型底价」把上报端点接上再加回（见「提供 Token Plan」页）。
-        actions=(),
+        actions=tuple(probe_actions),
         unavailable=_missing(snapshot, ("models",)),
-        notes=("模型开关与底价在「提供 Token Plan」页设置（本页只读：云端目录与本机已应用）。",),
+        notes=("容量公告只看 " + str(fresh_window // 60) + " 分钟内的探针结论；报价更严，只看 "
+               + str(quote_window // 60) + " 分钟内的（提前停报防半窗口）。",
+               "没有探针结论 / 结论过期的模型不会进容量、也不会报价——不是「设置没生效」。",
+               "模型开关与底价在「提供 Token Plan」页设置；本页只读探针事实。"),
     )
 
 

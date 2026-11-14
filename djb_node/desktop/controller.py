@@ -118,6 +118,8 @@ class DesktopController:
     benchmark: Mapping[str, Any] | None = None
     #: G4（RC14 P0）：更新检查/安装走独立 worker（网络 + 签名校验，绝不在主线程）
     update_via: Callable[[str], Any] | None = None
+    #: 探针异步通道（RC14 D）：返回 True = 已派给 worker（网络在 worker 线程里跑）
+    probe_via: Callable[[], Any] | None = None
     #: 造 UpdateManager 的工厂（默认按本机 home 装；单测注入假管理器）
     update_factory: Callable[[], Any] | None = None
     #: 最近一次检查结果（``check()`` 原样 payload；界面/日志都用它）
@@ -328,6 +330,67 @@ class DesktopController:
         if self.request_refresh(None):
             return ActionResult("正在刷新…", effect="refresh")
         return ActionResult(self.message, effect="refresh")
+
+    # ── 探针（RC14 D）：手动补一次体检，明细回「模型与探针」页
+    def _act_probe_run(self, *, confirm=None) -> ActionResult:
+        """「立即探测」：逐上游跑 ``djb upstream probe``（**网络 + 服务端回报，必须走 worker**）。
+
+        与「检查更新」同一套通道（``probe_via``）：主线程只负责派发与播报。
+        """
+        hook = self.probe_via
+        if hook is not None:
+            try:
+                started = hook()
+            except Exception:                      # 异步通道坏了 → 回落同步
+                started = False
+            if started:
+                return ActionResult("正在探测上游（L1 列表 + L2 推理 / L3 流式，通常 10 秒内）…",
+                                    effect="probe", payload={"state": "probing"})
+        return self.run_probe()
+
+    def run_probe(self) -> ActionResult:
+        """worker 侧：逐个上游探测，并把结论翻成一条人话（不碰控件）。"""
+        if self.cli is None:
+            return ActionResult("暂不可用（本机命令通道未接通）；没有发起探测。", ok=False)
+        try:
+            listing = self.cli(["upstream", "list"])
+        except ProviderError as exc:
+            return ActionResult("探测未开始：" + exc.reason, ok=False)
+        except Exception as exc:
+            return ActionResult("探测未开始（" + type(exc).__name__ + "）", ok=False)
+        rows = listing.get("upstreams") if isinstance(listing, Mapping) else None
+        ids = [str(item.get("id")) for item in (rows or [])
+               if isinstance(item, Mapping) and item.get("id")]
+        if not ids:
+            return ActionResult("还没有接入任何上游：先去「提供 Token Plan」填请求链接与密钥。",
+                                ok=False)
+        verified = failed = 0
+        reasons: list[str] = []
+        for identifier in ids:
+            try:
+                payload = self.cli(["upstream", "probe", "--id", identifier])
+            except Exception as exc:
+                failed += 1
+                reasons.append(identifier + "：" + type(exc).__name__)
+                continue
+            checks = payload.get("model_checks") if isinstance(payload, Mapping) else None
+            passed = sum(1 for item in (checks or [])
+                         if isinstance(item, Mapping) and item.get("ok"))
+            if passed:
+                verified += 1
+            else:
+                failed += 1
+                error = str(payload.get("error_class") or "") if isinstance(payload, Mapping) else ""
+                reasons.append(identifier + ("：" + error if error else "：没有模型通过"))
+        parts = ["探测完成：" + str(verified) + " 个上游有模型通过"]
+        if failed:
+            parts.append(str(failed) + " 个没通过（" + "；".join(reasons[:3])
+                         + ("…" if len(reasons) > 3 else "") + "）"
+                         + "：先看「原因」列逐条修（改 Key / 改链接 / 等上游）")
+        parts.append("明细见下表")
+        return ActionResult("；".join(parts) + "。", ok=bool(verified) or not failed,
+                            effect="probe",
+                            payload={"state": "done", "verified": verified, "failed": failed})
 
     def _act_bench_run(self, *, confirm=None) -> ActionResult:
         try:

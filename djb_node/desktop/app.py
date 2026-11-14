@@ -63,7 +63,7 @@ PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 #:
 #: 它们在 :meth:`DesktopApp._on_action` 的通用播报里要跳过，否则「已在浏览器打开」会被
 #: 动作自带的一句「网页端：https://…」覆盖掉——那正好抹掉了「打不开」这个关键差别。
-SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "update")
+SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "update", "probe")
 
 TOP_NAV_KEYS = VIEW_KEYS
 
@@ -327,6 +327,7 @@ class DesktopApp:
         # G4：更新 worker 在窗口起来时就接上——否则第一次点「检查更新」会因为
         # ``update_via`` 还是 None 而在**主线程**跑网络检查（正是本条要修的卡顿）。
         self._ensure_update_worker()
+        self._ensure_probe_worker()
         self.show_view(controller.view)
 
     # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
@@ -1077,6 +1078,57 @@ class DesktopApp:
         if refresh is None or not getattr(refresh, "busy", False):
             self._request_refresh_async(("access",))
 
+    # ── 探针（RC14 D）：「立即探测」也要在 worker 里跑（网络 10 s 级）
+    def _ensure_probe_worker(self) -> Any:
+        """惰性建探针 worker：与刷新/更新同一个 :class:`RefreshWorker` 模板。"""
+        worker = getattr(self, "_probe_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(lambda sections=None: self._controller.run_probe(),
+                               apply=self._apply_probe, on_start=self._probe_started,
+                               on_busy=self._probe_busy,
+                               schedule=schedule, cancel=cancel)
+        self._probe_worker = worker
+        self._controller.probe_via = self._start_probe
+        return worker
+
+    def _start_probe(self) -> bool:
+        worker = self._ensure_probe_worker()
+        if worker is None:
+            return False                   # 无事件循环 → controller 回落同步
+        return bool(worker.start())
+
+    def _probe_started(self) -> None:
+        self._toast("正在探测上游（L1 列表 + L2 推理 / L3 流式，通常 10 秒内）…", ok=True)
+
+    def _probe_busy(self) -> None:
+        self._toast("上一次探测还没结束，已忽略这次点击", ok=True)
+
+    def _apply_probe(self, result: Any, error: BaseException | None,
+                     sections: Any = None) -> None:
+        if error is not None:
+            self._toast("探测失败（" + type(error).__name__ + "）：" + str(error)[:120], ok=False)
+        elif result is None:
+            self._toast("探测失败：没有拿到结果", ok=False)
+        else:
+            self._toast(str(getattr(result, "message", "") or "探测完成"),
+                        ok=bool(getattr(result, "ok", False)))
+        # 结论落库后再取一次数（探针表/容量卡片要立刻反映新结论）；GET 也不在主线程
+        refresh = getattr(self, "_refresh_worker", None)
+        if refresh is None or not getattr(refresh, "busy", False):
+            self._request_refresh_async(("models", "token_plan"))
+
     # ── 双主题（day / night）
     def _theme_button_text(self, narrow: bool | None = None) -> str:
         """窄窗只留图标（390 宽时顶栏放不下四个带字的控件）。"""
@@ -1294,6 +1346,7 @@ class DesktopApp:
         # 已销毁的 Treeview（换肤时 TclError: invalid command name ...!treeview）
         self._tree = None
         self._table = None
+        self._tables = []                    # [(Table, Treeview)]：主表 + 附加表（见 _render_table）
         self._detail = None
         self._row_cells = {}
         self._row_notes = {}
@@ -1309,21 +1362,24 @@ class DesktopApp:
 
     def _apply_narrow_cells(self, narrow: bool) -> None:
         """窄窗用行级紧凑文案，回宽恢复完整文案（数据两份都在视图里，不丢字段）。"""
-        table = getattr(self, "_table", None)
-        tree = getattr(self, "_tree", None)
-        if table is None or tree is None:
-            return
-        for row in getattr(table, "rows", ()) or ():
-            iid = row.key or ""
-            if not iid:
-                continue
-            compact = getattr(row, "narrow", ())
-            values = (compact if narrow and compact and len(compact) == len(row.cells)
-                      else row.cells)
-            try:
-                tree.item(iid, values=values)
-            except Exception:                        # pragma: no cover - 行已被重建
-                pass
+        pairs = list(getattr(self, "_tables", ()) or ())
+        if not pairs:
+            table = getattr(self, "_table", None)
+            tree = getattr(self, "_tree", None)
+            if table is not None and tree is not None:
+                pairs = [(table, tree)]
+        for table, tree in pairs:
+            for row in getattr(table, "rows", ()) or ():
+                iid = row.key or ""
+                if not iid:
+                    continue
+                compact = getattr(row, "narrow", ())
+                values = (compact if narrow and compact and len(compact) == len(row.cells)
+                          else row.cells)
+                try:
+                    tree.item(iid, values=values)
+                except Exception:                    # pragma: no cover - 行已被重建
+                    pass
 
     def _on_nav_combo(self, _event=None) -> None:
         value = str(self._nav_combo.get() or "")
@@ -1467,6 +1523,7 @@ class DesktopApp:
         self._tree = None
         self._detail = None
         self._table = None
+        self._tables = []                    # [(Table, Treeview)]：主表 + 附加表（见 _render_table）
         self._wrap_targets = []
 
     # ── 渲染入口
@@ -1630,6 +1687,8 @@ class DesktopApp:
         if view.table is not None:
             # 总览只放「最近几张」：整页要一屏装下（G-16），完整列表在「收据」页
             self._render_table(view.table, parent=left, max_rows=4)
+        for extra in view.tables:
+            self._render_table(extra, parent=left, max_rows=4, primary=False)
         for card in view.rail:
             self._render_rail_card(right, card)
         if view.actions:
@@ -1870,6 +1929,8 @@ class DesktopApp:
                 self._render_action(bar, action)
         if view.table is not None:
             self._render_table(view.table)
+        for extra in view.tables:                     # RC14 D：模型与探针页的第二张表
+            self._render_table(extra, primary=False)
 
     def _cards_per_row(self, count: int = 0) -> int:
         """宽窗 4 张、中宽 2 张、窄窗 1 张（设计是四宫格；不许再把第三张挤出窗口）。
@@ -1946,9 +2007,15 @@ class DesktopApp:
                          side="left", padx=(0, 10))
 
     def _render_table(self, table: Table, parent: Any = None,
-                      max_rows: int = 12) -> None:
-        """表格：保留 ttk.Treeview（``_tree`` / ``_row_cells`` 是既有契约），只换外观。"""
-        self._table = table
+                      max_rows: int = 12, primary: bool = True) -> None:
+        """表格：保留 ttk.Treeview（``_tree`` / ``_row_cells`` 是既有契约），只换外观。
+
+        ``primary=False`` 是**附加表**（RC14 D：模型与探针页的云端目录）：照常渲染并登记到
+        ``self._tables``，但**不覆盖** ``_table`` / ``_tree`` / ``_row_cells`` / ``_detail``——
+        详情抽屉、窄窗紧凑文案都只服务主表，附加表抢走它们会让探针表点开没反应。
+        """
+        if primary:
+            self._table = table
         narrow = self._is_narrow()
         tk, ttk = self._tk, self._ttk
         kit = self._kit
@@ -1995,11 +2062,23 @@ class DesktopApp:
             tk.Label(body, text=table.empty, font=self._fonts.sans(kit.px("small")),
                      foreground=dual.color("muted_text"), background=dual.color("surface"),
                      anchor="w").pack(anchor="w", pady=(10, 2))
+        if not primary:
+            # 附加表：只登记（列宽/窄窗适配要能一起遍历），不抢主表的契约字段
+            self._tables = list(getattr(self, "_tables", ()) or ()) + [(table, tree)]
+            if table.note:
+                self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.px("micro")),
+                                    foreground=dual.color("muted_text"),
+                                    background=dual.color("surface"), anchor="w",
+                                    justify="left",
+                                    wraplength=self._wrap_hint())).pack(anchor="w", pady=(4, 0))
+            return
         # 详情抽屉：选中一行就在表格下面展开字段（键盘 ↑↓ 也生效；本轮不改抽屉形态）
         self._detail = tk.Frame(body, background=dual.color("surface3"), bd=0,
                                 highlightthickness=0)
         self._detail_columns = tuple(table.columns)
         self._tree = tree
+        # 主表也登记（窄窗紧凑文案要能连附加表一起遍历；见 _apply_narrow_cells）
+        self._tables = list(getattr(self, "_tables", ()) or ()) + [(table, tree)]
         if table.rows:
             tree.bind("<<TreeviewSelect>>", self._on_row_select)
             tk.Label(body, text="选中一行看详情（↑↓ 或点击）",
@@ -2247,6 +2326,11 @@ class DesktopApp:
             self._open_dir(result.payload)
         elif result.effect == "open_url":
             self._open_url(result.payload)
+        elif result.effect == "probe":
+            # 「已派发」由 _probe_started 播报；只有同步回落时这里才拿到最终结论，
+            # 否则 worker 侧结束时 _apply_probe 播报（两条路都只播一次）
+            if str((result.payload or {}).get("state") or "") == "done":
+                self._apply_probe(result, None)
         elif result.effect == "update":
             # G4-3：九状态逐个翻译成「发生了什么 + 下一步」，下载类动作顺手打开下载页
             self._apply_update(result.payload, ok=result.ok, message=result.message)
@@ -2388,11 +2472,13 @@ class DesktopApp:
         self._root.mainloop()
 
     def stop(self) -> None:
-        worker = getattr(self, "_refresh_worker", None)
-        if worker is not None:
+        for name in ("_refresh_worker", "_payout_worker", "_update_worker", "_probe_worker"):
+            worker = getattr(self, name, None)
+            if worker is None:
+                continue
             try:
                 worker.close()
-            except Exception:                      # pragma: no cover
+            except Exception:                      # pragma: no cover - 已关闭/线程已退
                 pass
         if self._unsubscribe is not None:
             try:
@@ -2473,6 +2559,34 @@ _DEMO_SECTIONS = {
             {"id": "mixtral-8x7b", "context": 32768, "offered": False,
              "reason": "需要 ≥24GB 显存，本机不满足"}],
             "local": [{"id": "qwen2.5-7b-instruct", "state": "applied"}],
+            # 探针事实（截图基线）：四种状态各来一行，页面才看得出「三态不混」
+            "probe": {"rows": [
+                {"upstream_id": "u1", "base_url": "https://api.example-relay.com/v1",
+                 "model": "qwen2.5-7b-instruct", "enabled": True,
+                 "inference_ok": True, "stream_ok": True, "usage_ok": True,
+                 "probe_version": 3, "last_probe_at": "2026-11-14T11:58:00+0800",
+                 "probe_error_class": None, "probe_age_s": 132, "fresh": True,
+                 "announceable": True},
+                {"upstream_id": "u1", "base_url": "https://api.example-relay.com/v1",
+                 "model": "llama-3.1-8b-instruct", "enabled": True,
+                 "inference_ok": True, "stream_ok": False, "usage_ok": True,
+                 "probe_version": 3, "last_probe_at": "2026-11-14T11:57:00+0800",
+                 "probe_error_class": "stream_failed", "probe_age_s": 192,
+                 "fresh": True, "announceable": False},
+                {"upstream_id": "u2", "base_url": "https://api.another-relay.net",
+                 "model": "claude-3-7-sonnet", "enabled": True,
+                 "inference_ok": False, "stream_ok": None, "usage_ok": None,
+                 "probe_version": 3, "last_probe_at": "2026-11-14T11:50:00+0800",
+                 "probe_error_class": "unauthorized", "probe_age_s": 612,
+                 "fresh": False, "announceable": False},
+                {"upstream_id": "u2", "base_url": "https://api.another-relay.net",
+                 "model": "gpt-4o-mini", "enabled": True,
+                 "inference_ok": None, "stream_ok": None, "usage_ok": None,
+                 "probe_version": None, "last_probe_at": None,
+                 "probe_error_class": None, "probe_age_s": None, "fresh": False,
+                 "announceable": False}],
+                "periodic_s": 450, "fresh_window_s": 900, "quote_window_s": 600,
+                "note": ""},
             "online": True, "note": ""},
         "tasks": {"rows": [
             {"id": "t-8821", "state": "running", "elapsed_s": 12, "tokens": 1536},

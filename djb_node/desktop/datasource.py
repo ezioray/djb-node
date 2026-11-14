@@ -796,12 +796,60 @@ class LocalDataSource:
                 })
         local = [{"id": str(row.get("model") or row.get("id") or ""),
                   "state": str(row.get("state") or row.get("status") or "")} for row in self._local_models()]
-        if not catalog_rows and not local:
+        try:
+            probe = self._probe_section()
+        except Exception as exc:                    # 库没初始化：探针块如实不可用
+            probe = {"rows": [], "unavailable": "探针结论读不到（" + type(exc).__name__
+                     + "：" + str(exc)[:60] + "）", "note": ""}
+        if not catalog_rows and not local and not probe["rows"]:
             raise ProviderError(error.reason if error else "模型目录为空",
                                 hint=error.hint if error else DATA_SOURCE_HINT)
         return {"catalog": catalog_rows, "local": local,
                 "online": error is None,
+                "probe": probe,
                 "note": "" if error is None else error.text}
+
+    @staticmethod
+    def _probe_rows(manager: Any, moment: Any) -> list[dict[str, Any]]:
+        """``probe_details()`` × 上游清单 → 页面行（补 ``upstream_id`` / ``base_url``）。
+
+        单独拆出来是为了能脱离 sqlite 测「投影不做二次判定」：这里**只搬运**，
+        ``announceable`` / ``fresh`` / ``inference_ok`` 等一律原样透传。
+        """
+        rows: list[dict[str, Any]] = []
+        for record in manager.list():
+            for detail in manager.probe_details(record.id, now=moment):
+                rows.append(dict(detail, upstream_id=record.id, base_url=record.base_url,
+                                 protocol=record.protocol,
+                                 upstream_state=record.state,
+                                 upstream_enabled=bool(record.enabled)))
+        return rows
+
+    def _probe_section(self) -> Mapping[str, Any]:
+        """「模型与探针」的数据域：**纯投影** ``UpstreamManager.probe_details()``。
+
+        E8 的结论是「探针明细已经在本机，只是没有 UI」——这里一行代码都不重算门控，
+        直接把 ``inference_ok / stream_ok / usage_ok / probe_error_class / probe_age_s /
+        fresh / announceable`` 摊平，并补上 ``upstream_id`` 与 ``base_url``（``probe_details``
+        只有模型维度，页面要按上游分组，也才能说清「哪个 Key 的哪个模型不行」）。
+
+        两个新鲜窗口都带上（E16）：``PROBE_FRESH_S``=900 s 管容量公告，
+        ``PROBE_FRESH_AFTER_S``=600 s 管报价——页脚那句解释的数字只能来自 facts。
+        """
+        from .. import facts as facts_mod
+        from ..config import Paths
+        from ..secure import CredentialStore
+        from ..upstream import UpstreamManager
+        from ..util import utcnow
+
+        store = self._store()
+        manager = UpstreamManager(store, CredentialStore(Paths(str(self._home))))
+        rows = self._probe_rows(manager, utcnow())
+        return {"rows": rows,
+                "periodic_s": facts_mod.PROBE_PERIODIC_DEFAULT_S,
+                "fresh_window_s": facts_mod.PROBE_FRESH_S,
+                "quote_window_s": facts_mod.PROBE_FRESH_AFTER_S,
+                "note": ""}
 
     def _tasks(self) -> Mapping[str, Any]:
         status = self._safe("status", self._status)

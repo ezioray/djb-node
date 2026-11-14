@@ -99,7 +99,7 @@ IA_SECTIONS_LEGACY: tuple[SectionSpec, ...] = (
 #: 页面注册表：13 项一个不少、一个不并（§1 约束）
 PAGES: dict[str, PageSpec] = {
     "token_plan": PageSpec("token_plan", "共享 Token Plan", "TOKEN PLAN", "share"),
-    "models": PageSpec("models", "可提供模型", "MODELS", "share"),
+    "models": PageSpec("models", "模型与探针", "MODELS", "share"),
     "access": PageSpec("access", "接入配置", "ACCESS", "share"),
     "overview": PageSpec("overview", "总览", "OVERVIEW", "run"),
     "bench": PageSpec("bench", "性能基准", "BENCH", "run"),

@@ -10,6 +10,7 @@ import pytest
 
 from djb_node.desktop import access as ac
 from djb_node.desktop import datasource as ds
+from djb_node.desktop.datasource import Snapshot
 from djb_node.desktop import views as vw
 from djb_node.desktop.app import demo_snapshot
 from djb_node.desktop.controller import ControlOutcome, DesktopController
@@ -18,7 +19,7 @@ SECRET = "djb_sk_live_9f2c41aa77be"
 #: 侧栏顺序 = IA 顺序（4 组：运行 → 收益 → 接入 → 系统；见 views.NAV_SECTIONS）
 SPEC_ORDER = ["overview", "bench", "gpu", "models", "tasks", "receipts", "earnings",
               "token_plan", "agent", "access", "yield", "account", "logs"]
-SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "可提供模型", "任务队列", "收据", "收益",
+SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "模型与探针", "任务队列", "收据", "收益",
                "共享 Token Plan", "Agent 接入", "接入配置", "让路/节能", "账户与安全",
                "日志"]
 #: 分组口径（00-PLAN §1.1 已裁决）：组 key / 中文名 / 拉丁微标 / 成员顺序
@@ -174,10 +175,60 @@ def test_gpu_absent_keeps_the_overview_gauge_honest():
 
 
 def test_models_incompatible_rows_greyed_with_reason():
+    """云端目录（附加表）里不兼容的模型仍要标灰 + 给原因（0.3.6 的验收不回退）。"""
     view = vw.build_view("models", demo_snapshot())
-    greyed = [row for row in view.table.rows if row.disabled]
+    catalog = view.tables[0]                      # 主表已换成探针事实（RC14 D）
+    greyed = [row for row in catalog.rows if row.disabled]
     assert greyed, "演示数据里应有不兼容模型"
     assert all(row.cells[-1] for row in greyed), "标灰必须给原因"
+
+
+def test_models_page_projects_probe_details_with_three_state_columns():
+    """D（RC14）：探针表纯投影 probe_details()，三态不混（None ≠ False）。"""
+    view = vw.build_view("models", demo_snapshot())
+    assert view.title == "模型与探针"
+    assert view.table.columns[:3] == ("模型", "上游", "最近探测")
+    assert set(view.table.columns[3:6]) == {"L2", "L3", "用量"}
+    rows = {row.cells[0]: row for row in view.table.rows}
+    assert len(rows) == 4, "演示数据的四行探针结论都该出现"
+    # 通过：三列全 ✓、状态可公告
+    ok = rows["qwen2.5-7b-instruct"]
+    assert ok.cells[3:6] == ("✓", "✓", "✓") and ok.cells[6] == "可公告"
+    # L3 失败：L2 ✓ / L3 ✗，状态「降级：流式不可用」，原因翻译成人话
+    degraded = rows["llama-3.1-8b-instruct"]
+    assert degraded.cells[3:6] == ("✓", "✕", "✓")
+    assert degraded.cells[6].startswith("降级")
+    assert "流式不可用" in degraded.cells[7]
+    # 失败：L2 ✗，原因「密钥被拒」
+    failed = rows["claude-3-7-sonnet"]
+    assert failed.cells[3] == "✕" and failed.cells[6] == "失败"
+    assert "密钥被拒" in failed.cells[7]
+    # 从未探测：三列全是「—」（不是 ✗），最近探测「从未」
+    never = rows["gpt-4o-mini"]
+    assert never.cells[3:6] == ("—", "—", "—")
+    assert never.cells[2] == "从未" and never.cells[6] == "未探测"
+
+
+def test_models_page_counts_and_probe_action():
+    view = vw.build_view("models", demo_snapshot())
+    cards = {card.title: card.value for card in view.cards}
+    assert cards["可公告"] == "1 个" and cards["从未探测"] == "1 个"
+    actions = {action.key: action for action in view.actions}
+    assert actions["probe.run"].enabled is True
+    # 两个新鲜窗口的数字只能来自 facts（900 / 600）
+    assert any("15 分钟内" in note for note in view.notes)
+    assert any("10 分钟内" in note for note in view.notes)
+
+
+def test_models_page_without_upstreams_says_where_to_start():
+    """没有上游时：探针表空态指路「提供 Token Plan」，且「立即探测」置灰带原因。"""
+    sections = dict(demo_snapshot().sections)
+    sections["models"] = {"catalog": [], "local": [], "online": True, "note": ""}
+    view = vw.build_view("models", Snapshot(sections=sections))
+    assert "提供 Token Plan" in view.table.empty
+    actions = {action.key: action for action in view.actions}
+    assert actions["probe.run"].enabled is False
+    assert "还没有接入上游" in actions["probe.run"].reason
 
 
 def test_yield_actions_follow_state():
@@ -559,7 +610,7 @@ def test_controller_action_exception_does_not_escape(tmp_path):
 
 def test_access_view_says_unsaved_when_no_config_file(tmp_path):
     """没保存过就说「尚未保存」：不许把「默认值通过校验」说成配置有效。"""
-    from djb_node.desktop.datasource import FakeDataSource
+    from djb_node.desktop.datasource import Snapshot, FakeDataSource
 
     config = {"node_id": "—", "node_secret": "未设置", "api_key": "未设置",
               "price_mode": "auto", "price_mode_label": "跟随平台建议价",
