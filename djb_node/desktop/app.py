@@ -63,7 +63,7 @@ PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 #:
 #: 它们在 :meth:`DesktopApp._on_action` 的通用播报里要跳过，否则「已在浏览器打开」会被
 #: 动作自带的一句「网页端：https://…」覆盖掉——那正好抹掉了「打不开」这个关键差别。
-SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit")
+SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "update")
 
 TOP_NAV_KEYS = VIEW_KEYS
 
@@ -324,6 +324,9 @@ class DesktopApp:
                         lambda event: self._apply_layout(getattr(event, "width", None)), add="+")
         if self._bus is not None:
             self._unsubscribe = self._bus.subscribe(self._on_bus)
+        # G4：更新 worker 在窗口起来时就接上——否则第一次点「检查更新」会因为
+        # ``update_via`` 还是 None 而在**主线程**跑网络检查（正是本条要修的卡顿）。
+        self._ensure_update_worker()
         self.show_view(controller.view)
 
     # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
@@ -929,6 +932,90 @@ class DesktopApp:
         if duration and message.startswith("已刷新"):
             message += "（用时 %.1f s）" % duration
         self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
+
+    # ── 检查更新 / 安装更新（G4 / RC14 P0）：网络 + 签名校验，绝不在主线程
+    def _ensure_update_worker(self) -> Any:
+        """惰性建更新 worker（同一个 :class:`RefreshWorker` 模板，``kind`` 区分 check/apply）。"""
+        worker = getattr(self, "_update_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        def fetch(sections: Any = None) -> Any:
+            kind = str(getattr(self, "_update_kind", "check"))
+            if kind == "apply":
+                return self._controller.run_update_apply()
+            return self._controller.run_update_check()
+
+        worker = RefreshWorker(fetch, apply=self._apply_update_worker,
+                               on_start=self._update_started,
+                               on_busy=self._update_busy,
+                               schedule=schedule, cancel=cancel)
+        self._update_worker = worker
+        # 动作入口：controller 侧只认「有没有异步通道」，具体 check/apply 由本层记 kind
+        self._controller.update_via = self._start_update
+        return worker
+
+    def _start_update(self, kind: str = "check") -> bool:
+        """controller 的动作回调进来：派给 worker（返回 True = 已派出）。"""
+        self._update_kind = "apply" if str(kind) == "apply" else "check"
+        worker = self._ensure_update_worker()
+        if worker is None:
+            return False                  # 无事件循环 → controller 回落同步
+        return bool(worker.start())
+
+    def _update_started(self) -> None:
+        self._toast("正在检查更新…" if getattr(self, "_update_kind", "check") == "check"
+                    else "正在下载并安装更新…", ok=True)
+
+    def _update_busy(self) -> None:
+        self._toast("上一次更新操作还没结束，已忽略这次点击", ok=True)
+
+    def _apply_update_worker(self, result: Any, error: BaseException | None,
+                             sections: Any = None) -> None:
+        if error is not None:
+            self._toast("更新操作失败（" + type(error).__name__ + "）：" + str(error)[:120],
+                        ok=False)
+            return
+        if result is None:
+            self._toast("更新操作失败：没有拿到结果", ok=False)
+            return
+        self._apply_update(getattr(result, "payload", None) or {},
+                           ok=bool(getattr(result, "ok", False)),
+                           message=str(getattr(result, "message", "") or ""))
+
+    def _apply_update(self, payload: Any, *, ok: bool | None = None,
+                      message: str = "") -> None:
+        """把一次更新结果讲给客户听（G4-3/G4-4）：发生了什么 + 下一步 + 能点就点。
+
+        ``payload`` 是 ``check()``/``apply()`` 的原始结果（含 ``state``）；``message``
+        是 controller 已经翻好的人话（优先用它，避免两层文案打架）。
+        """
+        from ..update import guidance
+        state = str((payload or {}).get("state") or "") if hasattr(payload, "get") else ""
+        if state in ("checking", "applying"):
+            # 派发那一瞬间已经在 ``_update_started`` 里播报过（同一句话），这里不再重复
+            return
+        info = guidance(payload if hasattr(payload, "get") else None)
+        text = message or (info["title"] + ("（" + info["detail"] + "）" if info["detail"] else "")
+                          + " — 下一步：" + info["next"])
+        self._toast(text, ok=bool(ok if ok is not None else info["ok"]))
+        # 下载类动作直接把客户送到下载页（no_artifact 的「下一步」不能只是一句话）
+        url = str(info.get("url") or "")
+        if info.get("action") == "download" and url:
+            self._open_url(url)
+        # 结果落地后重画账户页（「上次结果」那三行要立刻反映新状态）
+        self._render(self._controller.current())
+        self._update_status()
 
     # ── USDT 收款地址提交（owner 2026-11-13 方案 B：客户端直接提交云端）
     def _ensure_payout_worker(self) -> Any:
@@ -2160,6 +2247,9 @@ class DesktopApp:
             self._open_dir(result.payload)
         elif result.effect == "open_url":
             self._open_url(result.payload)
+        elif result.effect == "update":
+            # G4-3：九状态逐个翻译成「发生了什么 + 下一步」，下载类动作顺手打开下载页
+            self._apply_update(result.payload, ok=result.ok, message=result.message)
         elif result.effect == "goto" and result.payload:
             self.show_view(str(result.payload))       # 例如「共享 Token Plan」→「接入配置」
         elif result.effect == "payout_submit":
@@ -2645,8 +2735,16 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
     store = FileAccessStore(None if home is None else
                             os.path.join(str(home), ACCESS_FILE))
     access = AccessService(store, reloader=_make_reloader(home))
+    factory = None
+    if not demo:
+        def factory() -> Any:              # noqa: ANN401 - 惰性构造（worker 线程里调用）
+            from ..update import open_manager
+            return open_manager(home)
     return DesktopController(source, access=access, control=LocalControlChannel(home), bus=bus,
-                             cli=_make_cli_runner(home) if not demo else None)
+                             cli=_make_cli_runner(home) if not demo else None,
+                             # G4：更新检查要 UpdateManager（本机 paths/store/config），
+                             # 由装配层注入，controller 不自己找 home（S3 教训）
+                             update_factory=factory)
 
 
 def _default_home() -> str:

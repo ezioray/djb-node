@@ -37,6 +37,23 @@ MARK_FAIL = "✕"
 MARK_UNKNOWN = "?"
 MARK_IDLE = "·"
 
+#: 上次更新检查的结果（``Store.update_state().verify_state``）→ 客户能看懂的一句话。
+#:
+#: 九状态全覆盖（``update.STATE_GUIDANCE`` 是权威表，这里只是**短标签**用于表格单元格；
+#: 详细「下一步」由 toast 用的 ``update.guidance()`` 给）。缺失的状态退回显示状态码，
+#: 绝不显示成「已是最新」。
+UPDATE_STATE_TEXT = {
+    "offline": "网络不通，没拿到清单",
+    "invalid": "更新源异常，不要安装",
+    "no_source": "本渠道暂无更新源",
+    "failed_verify": "校验失败，已拒装",
+    "channel_mismatch": "清单渠道与本机不一致",
+    "up_to_date": "已是最新",
+    "not_eligible": "灰度未命中，本轮不更新",
+    "no_artifact": "本平台暂无安装包",
+    "eligible": "有可用更新",
+}
+
 
 class Mark:
     """状态前缀常量（类只是命名空间，避免到处写散字符串）。"""
@@ -1633,12 +1650,47 @@ def _account(snapshot: Snapshot) -> View:
     actions.append(Action("account.open_2fa_page",
                           "去控制台管理 2FA" if twofa is True else "去控制台开启 2FA",
                           primary=not can_bind and twofa is not True))
+    # ── G4（RC14 P0）：更新检查入口 + 九状态下的可操作项
+    # 放在「账户与安全」而不是总览：低频操作，且本页已有「网页端」等外链字段。
+    update = account.get("update") if isinstance(account.get("update"), Mapping) else {}
+    update_unavailable = str(update.get("unavailable") or "")
+    checked_at = str(update.get("checked_at") or "")
+    verify_state = str(update.get("verify_state") or "")
+    state_text = UPDATE_STATE_TEXT.get(verify_state) or (
+        "尚未检查过" if not verify_state else verify_state)
+    fields.extend([
+        Field("当前版本", str(update.get("current_version") or "暂不可用"),
+              key="update_version",
+              hint=str(update.get("channel") or "") + " 渠道 · "
+                   + (str(update.get("edition") or "") or "本机"),
+              tone="muted"),
+        Field("上次检查", checked_at or "还没检查过", key="update_checked_at"),
+        Field("上次结果", (update_unavailable or state_text), key="update_state",
+              hint=str(update.get("hint") or ""),
+              tone="amber" if update_unavailable else "muted"),
+    ])
+    update_actions: list[Action] = [Action("update.check", "检查更新",
+                                           enabled=not update_unavailable,
+                                           reason=update_unavailable or "")]
+    if verify_state == "eligible":
+        update_actions.append(Action("update.apply", "安装更新（重启生效）", primary=True))
+    elif verify_state == "no_artifact":
+        # 只写「暂无安装包」客户会以为「没有更新」→ 必须给一条能点的路（G4-4）
+        update_actions.append(Action("update.download", "去下载页手动下载", primary=True))
+    actions.extend(update_actions)
     actions.append(Action("account.logout", "登出", enabled=bool(security.get("node_id")),
                           reason=("尚未登录" if not node_id
                                   else "本机无凭据（登出要清本机密钥）")))
     if can_bind:
         actions.append(Action("account.open_web", "打开网页端"))
     notes = [str(account.get("note") or "未登录时只显示本机信息。")]
+    if verify_state == "failed_verify":
+        notes.insert(0, "上次更新校验失败，已拒装（安全拦截）；版本未变，请联系客服核查更新源。")
+    elif verify_state == "no_artifact":
+        notes.insert(0, "本平台暂无安装包——这不是「没有更新」，请点「去下载页手动下载」。")
+    elif verify_state == "not_eligible":
+        notes.insert(0, "上次未命中灰度桶（当前 " + str(update.get("bucket") or "?")
+                     + "%），本轮不更新；下一波会自动再检查。")
     if can_bind:
         notes = [
             "绑定：在网页端 → 账户/节点 → 生成绑定码，然后点「绑定网页端」粘贴到这里"

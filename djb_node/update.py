@@ -33,7 +33,7 @@ from urllib.parse import urlparse
 
 from . import ed25519, facts, update_source
 from .config import Paths, feature_flag, load_config
-from .errors import NetworkError, UpdateError
+from .errors import NetworkError, NotInstalledError, UpdateError
 from .httpclient import HttpClient
 from .logging_setup import event
 from .store import Store, UpdateRecord
@@ -759,6 +759,101 @@ class UpdateManager:
             shutil.rmtree(os.path.join(self.paths.versions_dir, oldest), ignore_errors=True)
             removed.append(oldest)
         return removed
+
+
+#: 九状态 → **客户能做的下一步**（RC14 P0 G4-4）。
+#:
+#: 为什么单独一张表：``check()`` 返回的是工程口径（``state`` + ``message``），直接丢给客户
+#: 就变成「只有状态码的 toast」——客户既不知道下一步，也不知道能不能信。这张表把每个状态
+#: 翻成三件事：**发生了什么 / 怎么办 / 有没有一键动作**，并且 ``no_artifact`` 必须带下载页
+#: （只写「暂无安装包」客户会以为「没有更新」，实际是「我们没给这个平台发包」）。
+#:
+#: ``action`` 取值（渲染层按它决定放哪颗按钮）：
+#: ``retry``（重试）/ ``apply``（安装）/ ``download``（去下载页）/ ``contact``（联系客服）/
+#: ``wait``（等下一波）/ ``none``（无需操作）。
+STATE_GUIDANCE: dict[str, dict[str, str]] = {
+    "offline": {"title": "网络不通，没拿到更新清单",
+                "next": "检查网络/代理后重试；离线不影响本机现有功能", "action": "retry"},
+    "invalid": {"title": "更新源异常，**不要安装**",
+                "next": "清单格式/签名不合法；把这条提示发给客服，别自己动手", "action": "contact"},
+    "no_source": {"title": "本渠道暂无更新源",
+                  "next": "本渠道没有配置更新源；需要离线包请找客服", "action": "contact"},
+    "failed_verify": {"title": "校验失败，已拒装（安全拦截）",
+                      "next": "版本未变；把这条提示发给客服核查更新源", "action": "contact"},
+    "channel_mismatch": {"title": "清单渠道与本机不一致",
+                         "next": "不提供一键切渠道；请装回本渠道的安装包（找客服）",
+                         "action": "contact"},
+    "up_to_date": {"title": "已是最新版本", "next": "无需操作", "action": "none"},
+    "not_eligible": {"title": "灰度未命中，本轮不更新",
+                     "next": "观察期结束后会自动再检查；也可稍后再点一次「检查更新」",
+                     "action": "wait"},
+    "no_artifact": {"title": "本平台暂无安装包",
+                    "next": "去下载页手动下载安装包（不是「没有更新」）", "action": "download"},
+    "eligible": {"title": "有可用更新", "next": "点「安装更新」（重启后生效）或执行 djb update --apply",
+                 "action": "apply"},
+}
+
+#: 这些状态算「检查本身成功」（toast 打勾）；其余按失败/受限处理（黄/红提示）。
+GUIDANCE_OK_STATES = ("up_to_date", "eligible", "not_eligible", "no_artifact")
+
+
+def guidance(result: dict[str, Any] | None, *,
+             web_console: str | None = None) -> dict[str, Any]:
+    """把 ``check()`` 的结果翻成客户可执行的一段话（九状态全覆盖，纯函数、可无网单测）。
+
+    返回 ``{"state","title","detail","next","action","url","ok"}``：
+    ``detail`` 带上工程细节（当前/可用版本、桶、渠道），``url`` 只有下载类动作才有。
+    任何未知 state 也**不返回空**——退回「未知状态 + 找客服」，绝不出现「只有状态码」。
+    """
+    result = dict(result or {})
+    state = str(result.get("state") or "unknown")
+    row = STATE_GUIDANCE.get(state) or {
+        "title": "更新检查返回了未知状态（" + state + "）",
+        "next": "把这条提示发给客服", "action": "contact"}
+    title = row["title"]
+    action = row["action"]
+    detail_bits: list[str] = []
+    current = str(result.get("current_version") or "").strip()
+    if current:
+        detail_bits.append("当前 " + current)
+    if result.get("manifest_version"):
+        detail_bits.append("可用 " + str(result["manifest_version"]))
+    if state == "channel_mismatch":
+        detail_bits.append("清单 " + str(result.get("message") or "").replace("清单频道为 ", "")
+                           .replace("，本机为 ", " / 本机 "))
+    elif result.get("message") and state not in ("up_to_date", "eligible"):
+        detail_bits.append(first_line(str(result["message"])))
+    if state == "not_eligible" and result.get("rollout_reason"):
+        detail_bits.append("桶 " + str(result.get("bucket")) + "%（"
+                           + str(result["rollout_reason"]) + "）")
+    if state == "eligible" and result.get("artifact", {}).get("size"):
+        size = result["artifact"]["size"]
+        detail_bits.append(str(round(float(size) / 1048576.0, 1)) + " MB")
+    url = ""
+    if action == "download":
+        base = str(web_console or facts.WEB_CONSOLE_URL or "").rstrip("/")
+        url = base + facts.UPDATE_DOWNLOAD_PATH if base else ""
+    return {"state": state, "title": title, "detail": " · ".join(detail_bits),
+            "next": row["next"], "action": action, "url": url,
+            "ok": state in GUIDANCE_OK_STATES}
+
+
+def open_manager(home: str | os.PathLike[str] | None = None, *,
+                 timeout: float = 20.0) -> "UpdateManager":
+    """按 ``home`` 装一个 :class:`UpdateManager`（与 ``djb update`` 同一套参数）。
+
+    桌面端用它做「检查更新」：**只在 worker 线程里调**（网络 + 签名校验）。
+    本机未初始化（没有库）时抛 :class:`NotInstalledError`——不要在 GUI 里凭空建库。
+    """
+    from .config import resolve_home
+    paths = Paths(resolve_home(home))
+    if not os.path.exists(paths.db_file):
+        raise NotInstalledError("本机未初始化：先执行 djb init")
+    store = Store(paths.db_file)
+    config = load_config(paths)
+    return UpdateManager(paths, store, source=config.update_source,
+                         channel=config.update_channel, edition=config.edition,
+                         http=HttpClient(timeout=timeout), config=config)
 
 
 def apply_exit_code(result: dict[str, Any]) -> int:

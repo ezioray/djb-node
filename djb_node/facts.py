@@ -67,6 +67,9 @@ WEB_CONSOLE_URL = (os.environ.get("DJB_WEB_CONSOLE") or "").strip() or "https://
 #: security 路由）；路径只在这里出现一次，改版时不用满仓找字符串。
 WEB_CONSOLE_SECURITY_PATH = "/console/security"
 
+#: 下载页路径（``no_artifact`` 必须给客户一条**能点**的路，而不是只说「暂无安装包」）。
+UPDATE_DOWNLOAD_PATH = "/download"
+
 # ─────────────────────────────────────────────────────────── 状态机（M15 §3 / §5.9）
 DAEMON_STATES: tuple[str, ...] = ("stopped", "starting", "online", "paused", "error", "updating")
 """daemon 运行态（M15 §3 状态机的运行侧投影）。"""

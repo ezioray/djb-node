@@ -112,12 +112,13 @@ def test_refresh_failure_is_reported():
 
 
 def test_self_reporting_effects_do_not_double_toast():
-    """``open_url`` / ``open_dir`` / ``payout_submit`` 自己播报，总闸不重复播。"""
+    """``open_url`` / ``open_dir`` / ``payout_submit`` / ``update`` 自己播报，总闸不重复播。"""
     for effect in desktop_app.SELF_REPORTING_EFFECTS:
         app, status = _app_for(ActionResult("网页端：https://tkbank.ai", effect=effect))
         app._open_url = lambda _url: None        # noqa: SLF001 - 不真的开浏览器
         app._open_dir = lambda _path: None       # noqa: SLF001
         app._start_payout_submit = lambda *_a, **_k: None   # noqa: SLF001
+        app._apply_update = lambda *_a, **_k: None          # noqa: SLF001
         app._on_action("account.open_web" if effect == "open_url" else "logs.open_dir")
         assert status.text == "", effect + " 被播报了两次（会盖掉「打不开」的差别）"
 

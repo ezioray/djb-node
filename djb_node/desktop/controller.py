@@ -116,6 +116,12 @@ class DesktopController:
     #: 异步刷新通道（GUI 侧注入 worker）；None = 同步刷新（单测 / 无 Tk 环境）
     refresh_via: Callable[[Sequence[str] | None], Any] | None = None
     benchmark: Mapping[str, Any] | None = None
+    #: G4（RC14 P0）：更新检查/安装走独立 worker（网络 + 签名校验，绝不在主线程）
+    update_via: Callable[[str], Any] | None = None
+    #: 造 UpdateManager 的工厂（默认按本机 home 装；单测注入假管理器）
+    update_factory: Callable[[], Any] | None = None
+    #: 最近一次检查结果（``check()`` 原样 payload；界面/日志都用它）
+    last_update: Mapping[str, Any] | None = None
     _snapshot: Snapshot | None = None
 
     # ── 快照 / 视图
@@ -624,6 +630,108 @@ class DesktopController:
         return ActionResult("已导出 " + str(counted) + " 行到 " + str(target)
                             + "（回读 " + str(counted) + " 行一致）。", effect="export",
                             payload=str(target))
+
+    # ── 更新（G4 / RC14 P0）
+    def _update_manager(self) -> Any:
+        """造一个 UpdateManager：注入了工厂用工厂，否则按 home 现装（与 CLI 同参数）。"""
+        factory = self.update_factory
+        if factory is not None:
+            return factory()
+        # 没有工厂时按数据源的 home 现装；数据源没 home（假源/演示源）就**报错而不是**
+        # 退回 ``resolve_home(None)``——那会去读客户真机的 ~/.djb（S3 的老坑）。
+        home = getattr(self.source, "home", None)
+        if home is None:
+            raise RuntimeError("找不到本机配置目录（数据源没有 home）")
+        from ..update import open_manager
+        return open_manager(home)
+
+    def _act_update_check(self, *, confirm=None) -> ActionResult:
+        """「检查更新」：**必须走 worker**（网络 15 s + 签名校验）。
+
+        接了异步通道（``update_via``）就派出去、立刻返回「正在检查…」；没有事件循环
+        （截图脚本 / 单测）时原地同步跑一次——动作不许因为「没 worker」变成空操作。
+        """
+        cached = self._snapshot
+        if cached is not None and getattr(cached, "source", "") == "demo":
+            # 演示数据不联网（截图基线要确定性）；也绝不落到客户真机的 ~/.djb 上
+            return ActionResult("演示数据：不联网检查更新（真实客户端会核对清单并校验签名）。",
+                                ok=False, effect="update", payload={"state": "no_source"})
+        hook = self.update_via
+        if hook is not None:
+            try:
+                started = hook("check")
+            except Exception:                      # 异步通道坏了 → 回落同步
+                started = False
+            if started:
+                return ActionResult("正在检查更新…（联网核对清单 + 校验签名，通常几秒）",
+                                    effect="update", payload={"state": "checking"})
+        return self.run_update_check()
+
+    def run_update_check(self) -> ActionResult:
+        """同步执行检查（**只能在 worker 线程或测试里调**），结果落 ``last_update``。"""
+        try:
+            manager = self._update_manager()
+            result = dict(manager.check() or {})
+        except Exception as exc:                   # 未初始化 / 库坏 / 配置坏
+            result = {"state": "offline", "current_version": None,
+                      "message": "本机更新检查不可用（" + type(exc).__name__ + "："
+                                 + str(exc)[:80] + "）"}
+        self.last_update = result
+        return self.update_result_to_action(result)
+
+    @staticmethod
+    def update_result_to_action(result: Mapping[str, Any]) -> ActionResult:
+        """``check()`` 结果 → 一句可执行的话（九状态全覆盖，见 ``update.STATE_GUIDANCE``）。"""
+        from ..update import guidance
+        info = guidance(dict(result or {}))
+        text = info["title"]
+        if info["detail"]:
+            text += "（" + info["detail"] + "）"
+        text += " — 下一步：" + info["next"]
+        return ActionResult(text, ok=bool(info["ok"]), effect="update",
+                            payload=dict(result or {}))
+
+    def _act_update_apply(self, *, confirm=None) -> ActionResult:
+        """「安装更新」：二次确认后走 worker（下载 + 校验 + 装到版本目录，重启生效）。
+
+        与 CLI ``djb update --apply`` 同一条代码路径；桌面端**永不自动装**。
+        """
+        if confirm is not None and not confirm(
+                "现在下载并安装更新？装完需要重启客户端才生效。\n"
+                "（校验失败会自动拒绝安装，版本不变）"):
+            return ActionResult("已取消安装（版本未变）。", ok=False, effect="cancelled")
+        hook = self.update_via
+        if hook is not None:
+            try:
+                started = hook("apply")
+            except Exception:
+                started = False
+            if started:
+                return ActionResult("正在下载并安装更新…（校验签名与哈希，完成后提示重启）",
+                                    effect="update", payload={"state": "applying"})
+        return self.run_update_apply()
+
+    def run_update_apply(self) -> ActionResult:
+        """同步执行安装（worker 线程/测试用）；结果同 ``check()`` 的形状 + ``installed``。"""
+        try:
+            manager = self._update_manager()
+            result = dict(manager.apply() or {})
+        except Exception as exc:
+            result = {"state": "failed_verify", "installed": False,
+                      "message": "安装失败（" + type(exc).__name__ + "：" + str(exc)[:80] + "）"}
+        self.last_update = result
+        if result.get("installed"):
+            version = str(result.get("version") or "")
+            return ActionResult("已安装 " + version + "（重启客户端后生效）。", ok=True,
+                                effect="update", payload=result)
+        state = str(result.get("state") or "")
+        reason = str(result.get("message") or "更新器没有给出原因（state=" + state + "）")
+        return ActionResult("未安装：" + reason, ok=False, effect="update", payload=result)
+
+    def _act_update_download(self, *, confirm=None) -> ActionResult:
+        """「去下载页手动下载」：只在 ``no_artifact`` 时出现（本平台没发包 ≠ 没有更新）。"""
+        url = str(facts.WEB_CONSOLE_URL or "").rstrip("/") + facts.UPDATE_DOWNLOAD_PATH
+        return ActionResult("在浏览器打开下载页：" + url, effect="open_url", payload=url)
 
     # 未接线动作：如实说，不假装成功
     def _act_account_enable_2fa(self, *, confirm=None) -> ActionResult:

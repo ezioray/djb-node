@@ -383,6 +383,7 @@ class LocalDataSource:
                  facts: Callable[[], Mapping[str, Any]] = local_facts,
                  bench: Callable[..., Mapping[str, Any]] = benchmark,
                  store_factory: Callable[[Path], Any] | None = None,
+                 update_status: Callable[[], Mapping[str, Any]] | None = None,
                  clock: Callable[[], float] = time.time,
                  cli_timeout: float = 8.0,
                  log_limit: int = 2000,
@@ -413,6 +414,10 @@ class LocalDataSource:
         self._facts = facts
         self._bench = bench
         self._store_factory = store_factory
+        # G4（RC14 P0）：账户页要显示「当前版本 / 上次检查更新结果」。这里只读**本地**
+        # 记录（`Store.update_state()` + install），**不发网络请求**——真正的检查由
+        # `update.check` 动作在 worker 线程里做。
+        self._update_status = update_status
         self._clock = clock
         # 首启自举结果（bootstrap.start_daemon）：``reason`` / ``log`` 用来解释「节点为什么
         # 没起来」。只有 status 的话页面只能说「daemon 未运行」，真因（缺 djb-node.exe /
@@ -1235,7 +1240,36 @@ class LocalDataSource:
             note = (note + "；" if note else "") + "本机凭据状态不可读（" + type(exc).__name__ + "）"
         if profile is None and not security:
             raise ProviderError("节点资料未接线", hint="登录后重试")
-        return {"profile": profile, "security": security, "note": note}
+        return {"profile": profile, "security": security, "note": note,
+                "update": self._update_detail()}
+
+    def _update_detail(self) -> Mapping[str, Any]:
+        """本机更新状态（版本 / 渠道 / 上次检查 / 上次结果）——**纯本地读**，不联网。
+
+        读不到就 ``Unavailable``（附原因），界面显示「暂不可用（原因）」；
+        **绝不写 0 / 「最新」冒充已知**（客户会以为「我刚检查过、是最新版」）。
+        """
+        try:
+            getter = self._update_status
+            if getter is None:
+                from ..update import open_manager
+                getter = lambda: open_manager(self._home).status()      # noqa: E731
+            status = dict(getter() or {})
+        except Exception as exc:                  # 未初始化 / 库读不了 / 配置坏了
+            # 注意：**不**让整个账户页变成「暂不可用」（账户信息本身还在）；
+            # 只把「更新」这一块标成不可用并写明原因，界面显示「暂不可用（原因）」。
+            return {"unavailable": "更新状态不可读（" + type(exc).__name__ + "："
+                                   + str(exc)[:60] + "）",
+                    "hint": "运行 djb update --status 排查；不影响本机现有功能",
+                    "current_version": None, "channel": None, "verify_state": "",
+                    "checked_at": "", "next_version": "", "bucket": None,
+                    "edition": "", "source_kind": "", "note": ""}
+        return {"current_version": status.get("current_version"),
+                "channel": status.get("channel"), "verify_state": status.get("verify_state") or "",
+                "checked_at": status.get("checked_at") or "",
+                "next_version": status.get("next_version") or "",
+                "bucket": status.get("bucket"), "edition": status.get("edition") or "",
+                "source_kind": status.get("source_kind") or "", "note": ""}
 
     def _logs_section(self) -> Mapping[str, Any]:
         rows = self._logs.tail(limit=200)
