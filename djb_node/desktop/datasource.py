@@ -1029,7 +1029,11 @@ class LocalDataSource:
                                  "model_count": len(record.models),
                                  "verified_models": len(approved),
                                  "max_qps": round(per_model * len(approved), 2),
-                                 "last_probe_at": record.last_probe_at}
+                                 "last_probe_at": record.last_probe_at,
+                                 "base_url": record.base_url,
+                                 "protocol": record.protocol,
+                                 # RC14 I：逐模型底价的「行」= 上游申报过的模型（含停用）
+                                 "models": _model_rows(record, live)}
         return detail
 
     def _token_plan_section(self) -> Mapping[str, Any]:
@@ -1044,6 +1048,8 @@ class LocalDataSource:
         降级口径：daemon 没跑（status 取不到）但本机库可读时，只给上游清单并如实说明
         「预算/在线状态读不到」；两边都读不到才整域「暂不可用」——绝不把缺数据说成 0 条上游。
         """
+        from .. import facts as facts_mod
+
         status = self._safe("status", self._status)
         info: Mapping[str, Any] = status if isinstance(status, Mapping) else {}
         profile = info.get("profile") if isinstance(info.get("profile"), Mapping) else {}
@@ -1086,6 +1092,130 @@ class LocalDataSource:
         return {"upstreams": rows, "limits": dict(limits), "usage": usage,
                 "preset": str(profile.get("preset") or ""),
                 "node": {"node_id": node.get("node_id"), "bound": node.get("bound")},
+                "models": self._bid_models(detail),
+                "bids": self._bids_block(),
+                # 第 1 步的输入初值：协议默认 openai-chat（与 facts 一致）；链接/密钥留空，
+                # 密钥输入框永不预填（空 = 不改），这里只报「本机是否已存」。
+                "protocol": facts_mod.DEFAULT_UPSTREAM_PROTOCOL,
+                "base_url": "",
+                "secret_seen": "本机已存（不显示）" if any(
+                    row.get("protocol") for row in rows) else "未保存",
+                "discover_note": "",
+                "note": note}
+
+    # ── RC14 I/J：一 Key 多模型 + 逐模型底价（**只读投影**，写入在 controller）
+    @staticmethod
+    def _bid_models(detail: Mapping[str, Mapping[str, Any]]
+                    ) -> list[dict[str, Any]]:
+        """页面的「模型」清单：每个上游的已申报模型（含 canonical / enabled）。
+
+        ``detail`` 来自 :meth:`_upstream_capacity_detail`；没有明细就给空数组——
+        页面据此说「还没有上游」，绝不编造模型。
+        """
+        rows: list[dict[str, Any]] = []
+        for upstream_id, item in (detail or {}).items():
+            for model in item.get("models") or []:
+                if not isinstance(model, Mapping):
+                    continue
+                rows.append({"model": str(model.get("model") or ""),
+                             "upstream_id": str(upstream_id),
+                             "canonical": model.get("canonical"),
+                             "enabled": bool(model.get("enabled", True)),
+                             "announceable": model.get("announceable"),
+                             "probe_error_class": model.get("probe_error_class")})
+        return [row for row in rows if row["model"]]
+
+    def _bids_block(self) -> Mapping[str, Any]:
+        """本地底价账本 + 上报闸门 + 云端覆盖（云端没开通就如实说「待云端开通」）。"""
+        from .. import bids as bids_mod
+        from .. import facts as facts_mod
+        from ..config import load_config
+        block: dict[str, Any] = {"rows": {}, "report_blocker": "", "cloud": None,
+                                 "flag": facts_mod.UPSTREAM_BID_FLAG,
+                                 "unit": "USD / 百万 token"}
+        try:
+            book = bids_mod.BidBook(self._store())
+            block["rows"] = book.load()
+            payload = book.report_payload()
+            block["preview"] = payload
+        except Exception as exc:            # 库坏了：底价区降级，不影响整页
+            block["unavailable"] = "本地底价读不到（" + type(exc).__name__ + "）"
+            block["preview"] = {"models": [], "reason": "unavailable"}
+            return block
+        try:
+            config = load_config(Paths(str(self._home)))
+            block["report_blocker"] = bids_mod.report_blocker(config)
+            block["flag_on"] = bids_mod.report_enabled(config)
+        except Exception:
+            block["report_blocker"] = "本机配置读不到：上报开关状态未知（底价只保存在本机）"
+            block["flag_on"] = False
+        # 云端覆盖 / 生效来源（CHG §2.3：node/pricing/suggested 的 source / fallback_from）
+        # 云端未开通 → 不写「未知」了事，也不假装「未覆盖」；给「待云端开通」。
+        suggested = self._pricing_source()
+        if isinstance(suggested, Mapping):
+            block["cloud"] = dict(suggested)
+        return block
+
+    def _pricing_source(self) -> Mapping[str, Any]:
+        """``GET /node/pricing/suggested`` 的 ``source`` / ``fallback_from``（可选）。
+
+        云端（P7）还没出数 → 返回 ``{"state": "pending", "text": "待云端开通"}``。
+        这里**不发请求**：报价建议价由 daemon 侧取，桌面只读本机已存的那份。
+        """
+        try:
+            cached = self._store().get_kv("rc14/pricing_source")
+        except Exception:
+            cached = None
+        if isinstance(cached, Mapping) and cached.get("source"):
+            return {"state": "ok", "source": str(cached.get("source")),
+                    "fallback_from": cached.get("fallback_from"),
+                    "expires_at": cached.get("expires_at")}
+        return {"state": "pending", "text": "待云端开通"}
+
+    def bids_store(self) -> Any:
+        """底价账本用的 store（给 controller 的 ``BidBook``；坏库让调用方自己降级）。"""
+        return self._store()
+
+    def discover_upstream_models(self, base_url: str, protocol: str, secret: str
+                                 ) -> Mapping[str, Any]:
+        """``GET {base}/models`` 拉清单（RC14 I/J 第 2 步），**不写盘**。
+
+        复用 :func:`djb_node.relay.discover_models` 与 ``parse_models_payload``（解耦
+        relay 开关：这里只是发现，不落 relay 配置）。网络调用只允许在 worker 线程发生，
+        所以本方法由 controller 的 ``discover_via`` 钩子调用，Tk 主线程不碰。
+
+        失败一律**返回**结果（不抛）：401/403 → ``unauthorized``；404 → ``no_models_api``；
+        非 JSON/缺 data → ``invalid_payload``；网络 → ``unreachable``。
+        """
+        from .. import facts as facts_mod
+        from .. import relay as relay_mod
+        from .. import upstream as upstream_mod
+
+        base = str(base_url or "").strip().rstrip("/")
+        if not base:
+            raise ProviderError("上游端点不能为空", hint="填到 /v1 就行，例如 https://api.openai.com/v1")
+        proto = str(protocol or facts_mod.DEFAULT_UPSTREAM_PROTOCOL).strip()
+        if proto not in facts_mod.UPSTREAM_PROTOCOLS:
+            raise ProviderError("协议只能是 " + " / ".join(facts_mod.UPSTREAM_PROTOCOLS),
+                                hint="下拉里选一个（openai-chat / anthropic-messages）")
+        profile = relay_mod.RelayProfile(upstream_id="discover", base_url=base)
+        result = relay_mod.discover_models(profile, str(secret or "").strip() or None)
+        rows = [{"model": item.upstream_model_id,
+                 "canonical": item.canonical,
+                 "state": item.state,
+                 "candidates": list(item.candidates)}
+                for item in result.models]
+        note = _DISCOVER_NOTE.get(str(result.error_class or ""), "")
+        if result.error_class is None and not rows:
+            note = "上游返回 0 个模型：检查这个 Key 的权限，或改用「手动填模型」。"
+        return {"base_url": base, "protocol": proto,
+                "models": rows,
+                "rejected": [dict(item) for item in result.rejected],
+                "error_class": result.error_class,
+                "http_status": result.http_status,
+                "latency_ms": result.latency_ms,
+                "mapped": sum(1 for row in rows if row["state"] == "mapped"),
+                "total": len(rows),
                 "note": note}
 
     def _resolve_node_id(self, config: AccessConfig) -> tuple[str, str]:
@@ -1323,6 +1453,38 @@ class LocalDataSource:
         rows = self._logs.tail(limit=200)
         return {"rows": rows, "path": str(self._logs.path),
                 "levels": list(LOG_LEVELS), "note": ""}
+
+
+#: 「读取模型清单」失败时的可操作文案（RC14 I：每种失败都要说下一步）
+_DISCOVER_NOTE: dict[str, str] = {
+    "": "读到模型清单了：填「最低申报价」再点「保存这一行」。",
+    "unauthorized": "密钥无效，或这个 Key 没有读模型列表的权限（401/403）。",
+    "http_404": "这个链接没有 /models 接口（404），改用「手动填模型」。",
+    "invalid_payload": "上游返回的不是标准模型清单（需要 data[].id）。",
+    "unreachable": "连不上这个链接：检查域名、代理与网络后重试。",
+}
+
+
+def _model_rows(record: Any, live: set[tuple[str, str]]) -> list[dict[str, Any]]:
+    """``record.models`` → 逐模型行（``model/canonical/enabled/announceable``）。
+
+    ``announceable`` 直接来自调用方算好的 ``live`` 集合（与公告同一套门控），
+    这里**不重算**：两处各算一遍必然漂移。
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in getattr(record, "models", None) or ():
+        if not isinstance(entry, Mapping):
+            continue
+        model = str(entry.get("id") or entry.get("model") or "").strip()
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        rows.append({"model": model,
+                     "canonical": entry.get("canonical"),
+                     "enabled": bool(entry.get("enabled", True)),
+                     "announceable": (record.id, model) in live})
+    return rows
 
 
 def _sig_prefix(receipt: Mapping[str, Any]) -> str:

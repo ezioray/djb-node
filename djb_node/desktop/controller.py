@@ -120,6 +120,11 @@ class DesktopController:
     update_via: Callable[[str], Any] | None = None
     #: 探针异步通道（RC14 D）：返回 True = 已派给 worker（网络在 worker 线程里跑）
     probe_via: Callable[[], Any] | None = None
+    #: RC14 I：读取模型清单（``GET {base}/models``）的异步通道；返回 True = 已派给 worker。
+    #: 签名 ``(base_url, protocol, secret) -> bool``；没有通道时**同步**跑（单测/无 Tk）。
+    discover_via: Callable[[str, str, str], Any] | None = None
+    #: 最近一次「读取模型清单」的结果（``datasource.discover_upstream_models`` 原样）
+    last_discover: Mapping[str, Any] | None = None
     #: 造 UpdateManager 的工厂（默认按本机 home 装；单测注入假管理器）
     update_factory: Callable[[], Any] | None = None
     #: 最近一次检查结果（``check()`` 原样 payload；界面/日志都用它）
@@ -146,6 +151,26 @@ class DesktopController:
             merged = dict(bench) if isinstance(bench, Mapping) else {}
             merged["benchmark"] = dict(self.benchmark)
             sections["bench"] = merged
+        # RC14 I：Token Plan 页的「选中行 + 该行已存底价」由本层注入（视图层不持有选中态）
+        plan = sections.get("token_plan")
+        if isinstance(plan, Mapping):
+            merged_plan = dict(plan)
+            selected_model = str(self.selected.get("token_plan") or "")
+            merged_plan["selected_model"] = selected_model
+            if selected_model:
+                try:
+                    merged_plan["selected_price"] = self._bids().price_of(selected_model)
+                except Exception:
+                    merged_plan["selected_price"] = ""
+            if self.last_discover is not None:
+                merged_plan["discover_note"] = str(
+                    (self.last_discover or {}).get("note") or "")
+                merged_plan["base_url"] = str(
+                    (self.last_discover or {}).get("base_url") or "")
+                merged_plan["protocol"] = str(
+                    (self.last_discover or {}).get("protocol") or
+                    merged_plan.get("protocol") or "")
+            sections["token_plan"] = merged_plan
         if self.log_level and self.log_level != "all":
             logs = sections.get("logs")
             if isinstance(logs, Mapping):
@@ -530,6 +555,116 @@ class DesktopController:
     def _act_token_plan_open_access(self, *, confirm=None) -> ActionResult:
         return ActionResult("已切到「接入配置」：在那里添加上游凭据、或完成节点绑定。",
                             effect="goto", payload="access")
+
+    # ── RC14 I/J：一 Key 多模型 + 逐模型底价
+    def _bids(self):
+        """底价账本（懒建：只有真用到时才碰本机库）。"""
+        from .. import bids as bids_mod
+
+        store = getattr(self.source, "bids_store", None)
+        if callable(store):
+            return bids_mod.BidBook(store())
+        store = getattr(self.source, "_store", None)
+        if callable(store):
+            try:
+                return bids_mod.BidBook(store())
+            except Exception:
+                return bids_mod.BidBook(None)
+        return bids_mod.BidBook(None)
+
+    def _act_token_plan_discover(self, *, confirm=None) -> ActionResult:
+        """第 2 步：``GET {base}/models`` 拉清单（**网络在 worker 线程**，主线程不等）。"""
+        base_url = str(self.drafts.get("base_url") or "").strip()
+        protocol = str(self.drafts.get("protocol") or "").strip()
+        secret = str(self.drafts.get("upstream_secret") or "").strip()
+        if not base_url:
+            return ActionResult("先填「请求链接」（例如 https://api.openai.com/v1）", ok=False)
+        hook = self.discover_via
+        if hook is not None:
+            try:
+                if hook(base_url, protocol, secret):
+                    return ActionResult("正在读取模型清单…（可以继续操作）", effect="refresh")
+            except Exception:
+                pass                                   # 异步通道坏了：退回同步，别把动作打崩
+        return self.run_discover(base_url, protocol, secret)
+
+    def run_discover(self, base_url: str, protocol: str, secret: str) -> ActionResult:
+        """同步执行「读取模型清单」（worker 与无事件循环环境共用这一段）。"""
+        fn = getattr(self.source, "discover_upstream_models", None)
+        if not callable(fn):
+            return ActionResult("暂不可用（当前数据源不支持读取模型清单）", ok=False)
+        try:
+            result = fn(base_url, protocol, secret)
+        except ProviderError as exc:
+            return ActionResult("读取失败：" + exc.reason, ok=False)
+        except Exception as exc:
+            return ActionResult("读取失败（" + type(exc).__name__ + "）；未保存任何配置。",
+                                ok=False)
+        self.last_discover = result
+        error = str((result or {}).get("error_class") or "")
+        if error:
+            return ActionResult("读取失败：" + str((result or {}).get("note") or error), ok=False)
+        return ActionResult("读到 " + str((result or {}).get("total") or 0) + " 个模型（能对上目录 "
+                            + str((result or {}).get("mapped") or 0) + " 个）。",
+                            effect="refresh",
+                            payload={"state": "done",
+                                     "models": [row.get("model") for row
+                                                in (result or {}).get("models") or []]})
+
+    def _act_token_plan_save_price(self, *, confirm=None) -> ActionResult:
+        """第 3 步：把「最低申报价」写进选中那一行（本地账本，不上报）。"""
+        model = str(self.selected.get("token_plan") or "").strip()
+        price = str(self.drafts.get("min_price") or "").strip()
+        if not model:
+            return ActionResult("先在上面的表格里选一行模型", ok=False)
+        try:
+            saved = self._bids().set_price(model, price)
+        except ValueError as exc:
+            return ActionResult(str(exc), ok=False)
+        except RuntimeError as exc:
+            return ActionResult("保存失败：" + str(exc), ok=False)
+        self.drafts.pop("min_price", None)
+        if not saved:
+            return ActionResult("已移除「" + model + "」的底价（这一行不再申报）",
+                                effect="refresh")
+        return ActionResult("已保存「" + model + "」底价：" + saved
+                            + " USD / 百万 token（只在本机，未上报）", effect="refresh")
+
+    def _act_token_plan_preview_report(self, *, confirm=None) -> ActionResult:
+        """预览「将上报什么」：把本地账本摊成契约形状（不发请求）。"""
+        payload = self._bids().report_payload()
+        models = payload.get("models") or []
+        if not models:
+            return ActionResult("本地还没有任何底价：先在表格里选行、填价、保存", ok=False)
+        lines = "、".join(str(item.get("model")) + "=" + str(item.get("min_price"))
+                         for item in models[:6])
+        more = "（等 " + str(len(models)) + " 个）" if len(models) > 6 else ""
+        return ActionResult("将上报 " + str(len(models)) + " 个模型的底价：" + lines + more
+                            + "；上报目标：" + " / ".join(payload.get("paths") or ())
+                            + "（现在还不会发出去）",
+                            payload={"state": "preview", "payload": payload})
+
+    def _act_token_plan_report(self, *, confirm=None) -> ActionResult:
+        """上报逐模型底价：开关默认关闭；云端未开通时**明确说没发**，不假成功。"""
+        from .. import bids as bids_mod
+        from ..config import Paths, load_config
+
+        config = None
+        home = getattr(self.source, "_home", None)
+        try:
+            if home:
+                config = load_config(Paths(str(home)))
+        except Exception:
+            config = None
+        blocker = bids_mod.report_blocker(config) if config is not None else (
+            "本机配置读不到：无法确认上报开关状态（底价只保存在本机）")
+        if blocker:
+            return ActionResult(blocker + "（未发送任何内容）", ok=False)
+        payload = self._bids().report_payload()
+        if not payload.get("models"):
+            return ActionResult("本地还没有任何底价：没有可上报的内容", ok=False)
+        return ActionResult("上报通道已打开，但云端接口仍需上线后才能提交："
+                            "本次未发送（预览见「预览将上报的内容」）", ok=False)
 
     def _act_token_plan_add_upstream(self, *, confirm=None) -> ActionResult:
         """E（RC14 IA 拆分）：「添加上游」不再跳到「本机设置」（那里根本不能加）。

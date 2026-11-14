@@ -332,6 +332,7 @@ class DesktopApp:
         # ``update_via`` 还是 None 而在**主线程**跑网络检查（正是本条要修的卡顿）。
         self._ensure_update_worker()
         self._ensure_probe_worker()
+        self._ensure_discover_worker()
         self.show_view(controller.view)
 
     # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
@@ -1132,6 +1133,51 @@ class DesktopApp:
         refresh = getattr(self, "_refresh_worker", None)
         if refresh is None or not getattr(refresh, "busy", False):
             self._request_refresh_async(("models", "token_plan"))
+
+    # ── RC14 I：读取模型清单（网络在 worker 线程，主线程只播报）
+    def _ensure_discover_worker(self) -> Any:
+        """惰性建「读取模型清单」worker（与探针/更新同一个 RefreshWorker 模板）。"""
+        worker = getattr(self, "_discover_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        worker = RefreshWorker(lambda sections=None: self._controller.run_discover(
+            str(self._controller.drafts.get("base_url") or "").strip(),
+            str(self._controller.drafts.get("protocol") or "").strip(),
+            str(self._controller.drafts.get("upstream_secret") or "").strip()),
+            apply=self._apply_discover, on_start=self._discover_started,
+            on_busy=self._discover_busy,
+            schedule=lambda delay, fn: root.after(int(delay), fn),
+            cancel=lambda job: root.after_cancel(job))
+        self._discover_worker = worker
+        self._controller.discover_via = self._start_discover
+        return worker
+
+    def _start_discover(self, base_url: str, protocol: str, secret: str) -> bool:
+        worker = self._ensure_discover_worker()
+        if worker is None:
+            return False                   # 无事件循环 → controller 回落同步
+        return bool(worker.start())
+
+    def _discover_started(self) -> None:
+        self._toast("正在读取上游模型清单（GET {base}/models）…", ok=True)
+
+    def _discover_busy(self) -> None:
+        self._toast("上一次读取还没结束，已忽略这次点击", ok=True)
+
+    def _apply_discover(self, result: Any, error: BaseException | None,
+                        sections: Any = None) -> None:
+        if error is not None:
+            self._toast("读取失败（" + type(error).__name__ + "）：" + str(error)[:120], ok=False)
+        else:
+            self._toast(str(getattr(result, "message", "") or "读取完成"),
+                        ok=bool(getattr(result, "ok", False)))
+            if bool(getattr(result, "ok", False)):
+                self._request_refresh_async(("token_plan",))
 
     # ── 双主题（day / night）
     def _theme_button_text(self, narrow: bool | None = None) -> str:
@@ -2282,8 +2328,14 @@ class DesktopApp:
             # 秘密与「只给掩码」的字段都不预填：输入框里的空串 = 不改（_config_for_save 口径）
             empty = field.secret or not getattr(field, "prefill", True)
             variable = tk.StringVar(value="" if empty else field.value)
-            entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
-                              width=28 if per_row > 1 else 44)
+            # RC14 I：协议用**只读下拉**（枚举值不可能非法；也免得客户手打错协议名）。
+            if getattr(field, "choices", ()):
+                entry = ttk.Combobox(block, textvariable=variable,
+                                     values=list(field.choices), state="readonly",
+                                     width=26 if per_row > 1 else 42, style="Kit.TCombobox")
+            else:
+                entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
+                                  width=28 if per_row > 1 else 44)
             if field.secret:
                 entry.configure(show="•")
             entry.grid(row=0, column=1, sticky="ew")
@@ -2513,7 +2565,8 @@ class DesktopApp:
         self._root.mainloop()
 
     def stop(self) -> None:
-        for name in ("_refresh_worker", "_payout_worker", "_update_worker", "_probe_worker"):
+        for name in ("_refresh_worker", "_payout_worker", "_update_worker", "_probe_worker",
+                     "_discover_worker"):
             worker = getattr(self, name, None)
             if worker is None:
                 continue

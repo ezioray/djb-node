@@ -228,6 +228,9 @@ class Field:
     advanced: bool = False
     prefill: bool = True
     revealable: bool | None = None
+    #: 非空 ⇒ 渲染成**只读下拉**（``ttk.Combobox`` + ``state="readonly"``）。
+    #: 只影响渲染；校验仍在动作侧（下拉选不出非法值，但手改配置/老快照可能带别的值）。
+    choices: tuple[str, ...] = ()
 
     def can_reveal(self) -> bool:
         """是否画「显示 / 隐藏」：只有**可编辑**的秘密字段才有意义（只读值本就是掩码）。"""
@@ -1403,6 +1406,52 @@ def _token_plan_usage(plan: Mapping[str, Any], window: str) -> Mapping[str, Any]
     return {}
 
 
+#: 底价列/卡片用的「生效来源」文案（RC14 J：客户得知道哪一层在起作用）
+BID_SOURCE_TEXT = {
+    "cloud": "云端覆盖",
+    "local": "本机底价",
+    "none": "未设价",
+}
+
+
+def _bid_rows(plan: Mapping[str, Any], bids: Mapping[str, Any]) -> list[Row]:
+    """逐模型底价表：``模型 | 上游 | 目录 | 探针 | 本机底价 | 生效来源``。
+
+    「生效来源」按「云端覆盖 > 本机底价 > 未设价」显示（云端没开通就给「待云端开通」，
+    这一列是客户判断「我填的价到底有没有生效」的唯一依据，不许留空也不许写「未知」）。
+    """
+    local = bids.get("rows") if isinstance(bids.get("rows"), Mapping) else {}
+    cloud = bids.get("cloud") if isinstance(bids.get("cloud"), Mapping) else {}
+    cloud_pending = str(cloud.get("state") or "") != "ok"
+    rows: list[Row] = []
+    for item in plan.get("models") or []:
+        if not isinstance(item, Mapping):
+            continue
+        model = str(item.get("model") or "")
+        if not model:
+            continue
+        entry = local.get(model)
+        price = str(entry.get("min_price") or "") if isinstance(entry, Mapping) else ""
+        if cloud_pending & bool(price):
+            source = "本机底价（云端未开通）"
+        elif price:
+            source = BID_SOURCE_TEXT["local"]
+        else:
+            source = BID_SOURCE_TEXT["none"]
+        probe = ("✓ 可公告" if item.get("announceable") else
+                 "✗ " + str(item.get("probe_error_class") or "未通过"))
+        rows.append(Row((model,
+                         _short_id(str(item.get("upstream_id") or ""), 10) or "—",
+                         "✓" if item.get("canonical") else "未映射",
+                         probe,
+                         (price + " 元/百万") if price else "未设价",
+                         source),
+                        key=model,
+                        tone="default" if price else "muted",
+                        narrow=(model, price or "未设价", source)))
+    return rows
+
+
 def _token_plan(snapshot: Snapshot) -> View:
     """共享 Token Plan：共享状态 + 我的上游 + 预算 + 今日用量 + 一个去配置的入口。"""
     plan = _section(snapshot, "token_plan")
@@ -1456,13 +1505,16 @@ def _token_plan(snapshot: Snapshot) -> View:
                    if snapshot.ok("receipts") else UNAVAILABLE)
     notes: list[str] = []
     if bound is False:
-        notes.append("节点还没绑定：先在「接入配置」用网页端一次性绑定码完成绑定，"
+        notes.append("节点还没绑定：先去「账户与安全」用网页端一次性绑定码完成绑定，"
                      "再把 Token Plan 共享出去。")
     if snapshot.ok("token_plan") and not rows:
         notes.append(TOKEN_PLAN_EMPTY + "（A1 直填 Key / A2 本机代理，都在「接入配置」里）。")
     notes.append("验证状态来自本机探针（L2 推理通过 + 结论新鲜）；"
                  "未验证 / 已过期的模型不进容量，也不会产生共享收益。")
     notes.append("「最大 QPS」是本机按并发上限分摊给已验证模型的数值（公告口径），不是实测吞吐。")
+    notes.append("逐模型底价最小 0.01（USD / 百万 token）：填 0 会被云端当「未申报」直接跳过，"
+                 "所以本机就先拦下。")
+    _ = None
     if not (snapshot.ok("access") and snapshot.ok("account")):
         notes.append("接入配置 / 账户数据暂不可用：绑定状态暂时无法确认，点「刷新」重试。")
     if plan.get("note"):
@@ -1480,6 +1532,64 @@ def _token_plan(snapshot: Snapshot) -> View:
     else:
         plan_actions.append(Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）"))
     plan_actions.append(Action("token_plan.refresh", "刷新"))
+
+    # ── RC14 I/J：一 Key 多模型 + 逐模型底价（三步同页）
+    bids = plan.get("bids") if isinstance(plan.get("bids"), Mapping) else {}
+    bid_rows = _bid_rows(plan, bids)
+    cloud = bids.get("cloud") if isinstance(bids.get("cloud"), Mapping) else {}
+    cloud_pending = str(cloud.get("state") or "") != "ok"
+    cloud_text = (("来源 " + str(cloud.get("source"))
+                   + ("（回退自 " + str(cloud.get("fallback_from")) + "）"
+                      if cloud.get("fallback_from") else ""))
+                  if not cloud_pending else str(cloud.get("text") or "待云端开通"))
+    priced = sum(1 for row in bid_rows if row.cells[4] != "未设价")
+    report_blocker = str(bids.get("report_blocker") or "")
+    preview = bids.get("preview") if isinstance(bids.get("preview"), Mapping) else {}
+    preview_models = [item for item in (preview.get("models") or [])
+                      if isinstance(item, Mapping)]
+    discover_note = str(plan.get("discover_note") or "")
+    fields = (
+        Field("协议", str(plan.get("protocol") or ""), key="protocol", editable=True,
+              choices=tuple(facts.UPSTREAM_PROTOCOLS),
+              hint="默认 " + facts.UPSTREAM_PROTOCOL_LABELS.get(
+                  facts.DEFAULT_UPSTREAM_PROTOCOL, facts.DEFAULT_UPSTREAM_PROTOCOL)
+              + "；切换不会改已填的链接"),
+        Field("请求链接", str(plan.get("base_url") or ""), key="base_url", editable=True,
+              prefill=False,
+              hint="填到 /v1 就行（例如 https://api.openai.com/v1）；不要带 key 参数"),
+        # 密钥只存本机 0600；显示按钮由 Field.can_reveal 自动给（G7）
+        Field("密钥", str(plan.get("secret_seen") or "未保存"), key="upstream_secret",
+              editable=True, secret=True, prefill=False,
+              hint="只存本机（0600）；云端只收「已登记」这一个布尔"),
+        Field("最低申报价", str(plan.get("selected_price") or ""), key="min_price",
+              editable=True, prefill=False,
+              hint=((("当前选中的 " + str(plan.get("selected_model")) + " 已存 "
+                       + str(plan.get("selected_price")) + "；") if plan.get("selected_price")
+                      else (("当前选中：" + str(plan.get("selected_model")) + "（未设价）；")
+                            if plan.get("selected_model") else "先在上面的表格里选一行；"))
+                    + "单位 USD / 百万 token，最小 0.01（填 0 会被云端跳过，留空 = 不申报）")),
+        Field("云端覆盖", cloud_text, key="bid_cloud",
+              hint="生效顺序：云端覆盖 > 本机底价 > 未设价"),
+    )
+    if bid_rows:
+        planned = "已设价 " + str(priced) + " / " + str(len(bid_rows)) + " 个模型"
+    else:
+        planned = "还没有上游模型：先填链接与密钥 → 读取模型清单"
+    if cloud_pending:
+        notes.append("云端「按模型设价」接口还没开通（ask-settings / quotes.models[]）："
+                     "底价只保存在本机，上报按钮保持关闭，不会假成功。")
+    plan_actions.extend([
+        Action("token_plan.discover", "读取模型清单（第 2 步）"),
+        Action("token_plan.save_price", "保存这一行",
+               enabled=bool(bid_rows), reason="" if bid_rows else "还没有模型行"),
+        Action("token_plan.preview_report", "预览将上报的内容",
+               enabled=bool(preview_models),
+               reason="" if preview_models else "本地还没有任何底价"),
+        # 上报默认关闭（云端 ask-settings / quotes.models[] 未开通）：置灰 + 说清原因，
+        # 绝不点下去假成功
+        Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,
+               reason=report_blocker),
+    ])
     return View(
         key="token_plan", title="提供 Token Plan",
         subtitle="接入 / 模型清单 / 逐模型底价 / 探针（本页可操作）",
@@ -1494,10 +1604,16 @@ def _token_plan(snapshot: Snapshot) -> View:
             Card("共享预算", budget, budget_meta + "（本机限额设置）", "default"),
             Card("今日已共享", shared_value, shared_meta, "mint" if used else "muted"),
         ),
-        table=Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
-                    narrow_hide=("最近验证",),
-                    note="验证通过且新鲜的模型才会进入共享容量",
-                    empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE)),
+        table=Table(("模型", "上游", "目录", "探针", "本机底价", "生效来源"), tuple(bid_rows),
+                    narrow_hide=("目录",),
+                    note=planned + ("｜" + discover_note if discover_note else ""),
+                    empty=("还没有模型行：填「请求链接」与「密钥」，再点「读取模型清单」。"
+                           if snapshot.ok("token_plan") else UNAVAILABLE)),
+        tables=(Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
+                      narrow_hide=("最近验证",),
+                      note="验证通过且新鲜的模型才会进入共享容量",
+                      empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE)),),
+        fields=fields,
         actions=tuple(plan_actions),
         unavailable=_missing(snapshot, ("token_plan",)),
         notes=tuple(notes),

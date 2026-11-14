@@ -357,7 +357,9 @@ def test_token_plan_lists_upstreams_with_state_models_and_qps():
     view = vw.build_view("token_plan", demo_snapshot())
     text = view.plain_text()
     assert view.table is not None
-    assert [row.cells[0] for row in view.table.rows] == ["up_moonshot_01", "up_local_agent"]
+    # RC14 I/J：主表变成「逐模型底价」，上游清单是第二张表（tables[0]）
+    upstream_table = view.tables[0]
+    assert [row.cells[0] for row in upstream_table.rows] == ["up_moonshot_01", "up_local_agent"]
     assert "✓ 已验证" in text and "◐ 已申报（待验证）" in text
     assert "3 个（已验证 2）" in text                          # 申报数 ≠ 已验证数
     assert "最大 QPS" in text
@@ -368,15 +370,16 @@ def test_token_plan_empty_state_tells_customer_what_to_do():
     view = vw.build_view("token_plan", snapshot)
     text = view.plain_text()
     assert "你还没有接入任何 Token Plan" in text
-    assert "去接入配置" in text                                # 空态必须给下一步，不是只说暂无
+    assert "读取模型清单" in text                               # 空态必须给下一步，不是只说暂无
     assert view.table is not None and not view.table.rows
+    assert not view.tables[0].rows
 
 
 def test_token_plan_unbound_state_points_at_binding():
     snapshot = _token_plan_snapshot(upstreams=[], bound=False)
     text = vw.build_view("token_plan", snapshot).plain_text()
     assert "✕ 未绑定" in text
-    assert "还没绑定" in text and "接入配置" in text
+    assert "还没绑定" in text and "账户与安全" in text
 
 
 def test_token_plan_says_unavailable_instead_of_zero_when_data_missing():
@@ -414,7 +417,7 @@ def test_token_plan_disabled_upstream_is_labelled_not_hidden():
         upstreams=[{"id": "u1", "access_type": "A1", "state": "verified", "enabled": False,
                     "model_count": 2, "verified_models": 2, "max_qps": 0.0}])
     view = vw.build_view("token_plan", snapshot)
-    assert view.table is not None and len(view.table.rows) == 1
+    assert len(view.tables[0].rows) == 1
     assert "已停用" in view.plain_text()
 
 

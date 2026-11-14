@@ -210,6 +210,13 @@ A2_PROMPT_SECTIONS: tuple[str, ...] = ("目标", "约束", "输入", "输出", "
 """03-facts §11：A2 prompt 模板五字段（目标 / 约束 / 输入 / 输出 / 验收）。"""
 UPSTREAM_STATES: tuple[str, ...] = ("declared", "probing", "verified", "rejected")
 DEFAULT_UPSTREAM_PROTOCOL = "openai-chat"
+#: RC14 I：协议二选一（客户端下拉；切换**不改**已填链接）
+UPSTREAM_PROTOCOLS: tuple[str, ...] = ("openai-chat", "anthropic-messages")
+"""上游对话协议（``upstream_protocols.py`` 的实现口径）；默认 ``openai-chat``。"""
+UPSTREAM_PROTOCOL_LABELS: dict[str, str] = {
+    "openai-chat": "OpenAI 兼容（/v1/chat/completions）",
+    "anthropic-messages": "Anthropic（/v1/messages）",
+}
 DEFAULT_MIN_PRICE_UNIT = "usd_per_1m_tokens"
 TOKEN_RELAY_KIND = "token_relay"
 
@@ -641,6 +648,24 @@ FEATURE_FLAGS["supply.attestation.enabled"] = {
     "default": False,
     "description": "模型身份证明（M17 §5 / C12 客户端侧线索采集），默认关闭",
 }
+# ── RC14 I/J 逐模型底价上报（默认关闭：云端 ask-settings / schedule-quotes.models[]
+# 还没有主线实现，见 CHG-2026-11-14-RC14-IMPL §3-B.9；三字段齐全、到期强制关）
+FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2027-06-30",
+    "rollback_rule": "关闭 → 客户端不再上报逐模型底价（本地账本只读保留、报价回到原口径）；"
+                     "djb flags --disable client.upstream.bid_report.enabled 即刻生效，"
+                     "无需迁移、无残留（云端没有收到过任何底价）",
+    "description": "逐模型底价上报到云端（RC14 I/J）；云端接口未开通前保持关闭",
+}
+UPSTREAM_BID_FLAG = "client.upstream.bid_report.enabled"
+UPSTREAM_BID_REPORT_PATHS: tuple[str, ...] = (
+    "/api/v1/user/provider/ask-settings",
+    "/api/v1/schedule/quotes",
+)
+"""逐模型底价最终要写的两个云端路径（P9 / 报价 models[]）；客户端只做本地账本 + 预览。"""
+
 RELAY_FLAG = "client.relay.enabled"
 ATTEST_FLAG = "supply.attestation.enabled"
 FLAG_REQUIRED_FIELDS: tuple[str, ...] = ("owner", "expire_at", "rollback_rule", "default")
