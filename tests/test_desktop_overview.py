@@ -165,13 +165,16 @@ def test_rail_has_setup_today_and_throttle():
     assert all(card.kicker and card.title for card in rail)
 
 
-def test_setup_card_is_read_only_and_hands_writing_to_the_access_page():
+def test_setup_card_is_read_only_and_hands_writing_to_the_two_real_pages():
+    """RC14 E：右栏只做摘要；写入分给**唯一**入口——绑定/收款 → account，价格/凭证 → access。"""
     setup = overview().rail[0]
     assert setup.fields
     assert not any(field.editable for field in setup.fields)  # 同一个配置文件不许两处可写
     assert setup.fields[0].secret is True                     # 凭证只露掩码
-    assert [action.nav for action in setup.actions] == ["access"]
+    assert [action.nav for action in setup.actions] == ["account", "access"]
     assert setup.note == "3 / 3" and setup.badge == "接入完成"
+    # 摘要里不许再出现「可填的收款地址」键（那是第二个入口）
+    assert [field.key for field in setup.fields][-1] == "usdt_state"
 
 
 def test_setup_card_counts_steps_from_the_real_config():

@@ -35,6 +35,7 @@ FLEET = DEPLOY / "fleet" / "djb-fleet.py"
 sys.path.insert(0, str(REPO))
 from djb_node import __version__ as CLIENT_VERSION            # noqa: E402
 from djb_node import facts                                  # noqa: E402
+from djb_node import update_source as UPDATE_SOURCE          # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────── 工具
@@ -425,6 +426,7 @@ def test_offline_package_build_verify_and_tamper(tmp_path: Path) -> None:
     names = sorted(item.name for item in out.iterdir())
     assert "manifest.json" in names and "sha256sums" in names
     assert "verify.sh" in names and "install.sh" in names
+    assert "config.template.json" in names                # 0.3.1：机房通道的显式载体
     assert "sha256sums.sig" not in names                  # 没有密钥就不该有签名
 
     manifest = json.loads(read(out / "manifest.json"))
@@ -433,7 +435,14 @@ def test_offline_package_build_verify_and_tamper(tmp_path: Path) -> None:
     assert manifest["kind"] == "offline"
     assert manifest["runtime_dependencies"] == []
     assert manifest["signature"] is None
-    assert len(manifest["files"]) == 3
+    # 0.3.1（RC8.3-C）：wheel + install.sh + verify.sh + config.template.json
+    assert len(manifest["files"]) == 4
+    assert manifest["channel"] == "machine-room"
+    assert manifest["edition"] == "machine-room"
+    assert manifest["update_source"] == UPDATE_SOURCE.MANIFEST_URL
+    template = json.loads(read(out / "config.template.json"))
+    assert template["update_source"] == UPDATE_SOURCE.MANIFEST_URL
+    assert template["edition"] == "machine-room"
 
     ok = run([str(out / "verify.sh")])
     assert ok.returncode == 0, ok.stdout + ok.stderr
@@ -451,33 +460,79 @@ def test_offline_package_build_verify_and_tamper(tmp_path: Path) -> None:
         assert run([str(out / "verify.sh")]).returncode == 0
 
 
+def test_offline_install_writes_explicit_update_source(tmp_path: Path) -> None:
+    """0.3.1：--djb-home 必须落出**显式 update_source** 的 config.json，dry-run 不写盘。"""
+    out = tmp_path / "pkg"
+    built = run([str(OFFLINE / "build.sh"), "--wheel", str(fake_wheel(tmp_path)),
+                 "--out", str(out)], env={"PYTHON": sys.executable})
+    assert built.returncode == 0, built.stdout + built.stderr
+
+    home = tmp_path / "djb-home"
+    dry = run([str(out / "install.sh"), "--python", sys.executable, "--dry-run",
+               "--djb-home", str(home), "--gateway", "https://gw.example.invalid"])
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert not home.exists()                       # dry-run 一律不写盘
+    assert "config.json" in dry.stdout
+
+    mirror = "https://mirror.internal.example/update-manifest.json"
+    # --config-only：只写配置、不碰 pip（机房真机上 wheel 由镜像铺；测试里假 wheel 装不了）
+    done = run([str(out / "install.sh"), "--python", sys.executable, "--config-only",
+                "--djb-home", str(home), "--gateway", "https://gw.example.invalid",
+                "--update-source", mirror])
+    assert done.returncode == 0, done.stdout + done.stderr
+    config = json.loads(read(home / "config.json"))
+    assert config["update_source"] == mirror       # 显式参数优先于包内模板
+    assert config["edition"] == "machine-room"
+    assert config["gateway_url"] == "https://gw.example.invalid"
+    assert oct(home.stat().st_mode & 0o777) == "0o700"
+    assert oct((home / "config.json").stat().st_mode & 0o777) == "0o600"
+    # 缺 --djb-home 必须拒（不猜安装位置）
+    bad = run([str(out / "install.sh"), "--python", sys.executable, "--config-only"])
+    assert bad.returncode == 2
+
+
 def test_offline_package_signature_roundtrip(tmp_path: Path) -> None:
     if shutil.which("openssl") is None:
         pytest.skip("没有 openssl，跳过签名往返测试")
     key = tmp_path / "sign.pem"
     pub = tmp_path / "verify.pem"
-    subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt",
-                    "rsa_keygen_bits:2048", "-out", str(key)],
+    # RC8：离线包签名统一 Ed25519（openssl dgst 对 Ed25519 在 OpenSSL 3 直接失败）
+    subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(key)],
                    check=True, capture_output=True)
     subprocess.run(["openssl", "pkey", "-in", str(key), "-pubout", "-out", str(pub)],
                    check=True, capture_output=True)
     out = tmp_path / "pkg"
     built = run([str(OFFLINE / "build.sh"), "--wheel", str(fake_wheel(tmp_path)),
                  "--out", str(out)],
-                env={"PYTHON": sys.executable, "DJB_OFFLINE_SIGNING_KEY": str(key)})
+                env={"PYTHON": sys.executable, "DJB_OFFLINE_SIGNING_KEY": str(key),
+                     "DJB_OFFLINE_KEY_ID": "djb-prod-test"})
     assert built.returncode == 0, built.stdout + built.stderr
     assert (out / "sha256sums.sig").is_file()
     manifest = json.loads(read(out / "manifest.json"))
     assert manifest["signature"]["file"] == "sha256sums.sig"
+    assert manifest["signature"]["algorithm"] == "ed25519"
+    assert manifest["signature"]["key_id"] == "djb-prod-test"
 
     good = run([str(out / "verify.sh")], env={"DJB_OFFLINE_VERIFY_KEY": str(pub)})
     assert good.returncode == 0, good.stdout + good.stderr
     assert "签名校验通过" in good.stdout
 
-    # 有签名但没公钥：默认告警继续；STRICT=1 拒绝
-    assert run([str(out / "verify.sh")]).returncode == 0
-    strict = run([str(out / "verify.sh")], env={"DJB_OFFLINE_STRICT": "1"})
-    assert strict.returncode != 0
+    # RC8：有签名但没公钥 -> **默认拒绝**（不再静默降级为仅哈希）；显式 STRICT=0 才允许
+    assert run([str(out / "verify.sh")]).returncode != 0
+    lenient = run([str(out / "verify.sh")], env={"DJB_OFFLINE_STRICT": "0"})
+    assert lenient.returncode == 0, lenient.stdout + lenient.stderr
+    assert "DJB_OFFLINE_STRICT=0" in lenient.stdout
+
+    # RC8：非 Ed25519 私钥必须被 build.sh 直接拒（不许"签了但验不了"）
+    rsa = tmp_path / "rsa.pem"
+    subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt",
+                    "rsa_keygen_bits:2048", "-out", str(rsa)],
+                   check=True, capture_output=True)
+    rejected = run([str(OFFLINE / "build.sh"), "--wheel", str(fake_wheel(tmp_path)),
+                    "--out", str(tmp_path / "rsa-pkg")],
+                   env={"PYTHON": sys.executable, "DJB_OFFLINE_SIGNING_KEY": str(rsa)})
+    assert rejected.returncode == 2
+    assert "Ed25519" in rejected.stderr + rejected.stdout
 
     # 改动 sha256sums -> 签名必然失败
     sums = out / "sha256sums"

@@ -96,14 +96,33 @@ def test_builtin_public_key_is_valid_and_fingerprint_matches():
     assert ed25519.is_valid_public_key_hex(facts.UPDATE_PUBLIC_KEY_HEX)
     raw = bytes.fromhex(facts.UPDATE_PUBLIC_KEY_HEX)
     assert hashlib.sha256(raw).hexdigest()[:12] == facts.UPDATE_PUBLIC_KEY_FINGERPRINT
-    assert facts.UPDATE_KEY_ID == "djb-e2e-2026-11-02"
+    assert facts.UPDATE_KEY_ID == "djb-prod-2026-11-20"
+    assert not facts.UPDATE_KEY_ID.startswith("djb-e2e")      # 生产锚不得再是 E2E 名
     # 内置公钥 != 测试公钥（防止「拿测试密钥当生产锚」）
     assert raw != TEST_PUBLIC_KEY
     anchor = ed25519_anchor()
     assert anchor.to_dict() == {"scheme": "ed25519", "key_id": facts.UPDATE_KEY_ID,
                                 "key_fingerprint": facts.UPDATE_PUBLIC_KEY_FINGERPRINT}
+    # 钥环：primary + transition 双钥，primary 必须是生产锚
+    ring = update.keyring_anchors()
+    assert ring.primary().key_id == facts.UPDATE_KEY_ID
+    assert {a.key_id for a in ring.anchors} == {"djb-prod-2026-11-20", "djb-e2e-2026-11-02"}
+    assert ring.state_of("djb-e2e-2026-11-02") == "transition"
+    # B9 安全裁决：旧 E2E 锚**默认已吊销**（不静默过渡）
+    assert "djb-e2e-2026-11-02" in ring.revoked
+    assert ring.unusable_reason("djb-e2e-2026-11-02") == "已吊销"
+    view = ring.to_dict()
+    assert view["scheme"] == "ed25519"
+    assert view["revoked"] == ["djb-e2e-2026-11-02"]      # B9：默认吊销
+    # RC9 口径（2026-11-11）：owner 已在 388e70b 注入离线签名机生成的**最终**生产公钥，
+    # primary 不再是占位 ⇒ 发布门禁 READY（「占位即拒」路径由 test_update_keyring 用
+    # monkeypatch 的占位钥环单独覆盖，不依赖本仓常量）。
+    assert ring.placeholders == ()
+    ready, reason = update.anchor_release_ready(ring)
+    assert ready is True and "djb-prod-2026-11-20" in reason
     # to_dict 不含任何密钥材料
-    assert facts.UPDATE_PUBLIC_KEY_HEX not in json.dumps(anchor.to_dict())
+    assert facts.UPDATE_PUBLIC_KEY_HEX not in json.dumps(view)
+    assert all("pubkey" not in item for item in view["keys"])
 
 
 def test_sec_auditor_fixture_cross_verification(monkeypatch):
@@ -119,7 +138,10 @@ def test_sec_auditor_fixture_cross_verification(monkeypatch):
     artifact_path = os.path.join(fixture, "artifact.bin")
     manifest = json.loads(open(manifest_path, encoding="utf-8").read())
     data = open(artifact_path, "rb").read()
-    anchor = ed25519_anchor()
+    # fixture 是旧 E2E 钥签的。生产默认已吊销该钥（B9），这里**仅为本测试**临时恢复，
+    # 目的是验证「客户端 Ed25519 实现能与安全席独立实现互验」；不是发布口径。
+    monkeypatch.setattr(facts, "UPDATE_REVOKED_KEY_IDS", ())
+    anchor = update.keyring_anchors().resolve("djb-e2e-2026-11-02")
     body = update.canonical_json(manifest["payload"]).encode("utf-8")
     update._check_signature(body, manifest["signature"], anchor, what="清单")
     update._check_signature(data, manifest["payload"]["artifacts"][0]["signature"], anchor,
@@ -145,16 +167,62 @@ def _find_sec_fixture() -> str | None:
 
 # ─────────────────────────────────────────────────────────── 分桶 / 选择
 def test_actions_and_bucket_eligibility(clock):
-    payload = {"version": "0.2.0", "rollout": {"wave": 1, "pct": 5,
-                                               "since": clock.current.isoformat()}}
-    assert bucket_eligible(3, payload, now=clock())[0] is True
-    assert bucket_eligible(28, payload, now=clock())[0] is False
-    # wave 2 需要 ≥24h 观测
-    payload["rollout"] = {"wave": 2, "pct": 25, "since": clock.current.isoformat()}
-    assert bucket_eligible(10, payload, now=clock())[0] is False
-    later = clock.current + timedelta(seconds=facts.UPDATE_BUCKET_OBSERVE_S + 1)
-    assert bucket_eligible(10, payload, now=later)[0] is True
-    assert bucket_eligible(10, {"version": "0.2.0"}, now=clock())[0] is True
+    base = clock.current
+    payload = {"version": "0.2.0", "rollout": {"wave": 1, "since": base.isoformat()}}
+    # wave 1 = 1%：只有 bucket 0 命中（0.3.4 的 (5,25,100) 在这里会是 5%）
+    assert bucket_eligible(0, payload, now=clock())[0] is True
+    assert bucket_eligible(1, payload, now=clock())[0] is False
+    # wave 2 = 10%，且需要 ≥24h 观测
+    payload["rollout"] = {"wave": 2, "since": base.isoformat()}
+    assert bucket_eligible(9, payload, now=clock())[0] is False
+    later = base + timedelta(seconds=facts.UPDATE_BUCKET_OBSERVE_S + 1)
+    assert bucket_eligible(9, payload, now=later)[0] is True
+    assert bucket_eligible(10, payload, now=later)[0] is False
+    # wave 3 = 50%（48h）/ wave 4 = 100%（72h）
+    payload["rollout"] = {"wave": 3, "since": base.isoformat()}
+    assert bucket_eligible(49, payload, now=later)[0] is False
+    assert bucket_eligible(49, payload, now=base + timedelta(
+        seconds=2 * facts.UPDATE_BUCKET_OBSERVE_S + 1))[0] is True
+    payload["rollout"] = {"wave": 4, "since": base.isoformat()}
+    assert bucket_eligible(99, payload, now=base + timedelta(
+        seconds=3 * facts.UPDATE_BUCKET_OBSERVE_S + 1))[0] is True
+    # 缺 rollout / 缺 wave = 最后一档（100%），与 0.3.4 及更早语义一致：
+    # 有 since 时仍要走完最后一档的观测期（旧码是 observing_wave_3，新码是 observing_wave_4）
+    assert bucket_eligible(99, {"version": "0.2.0"}, now=clock())[0] is True
+    assert bucket_eligible(99, {"version": "0.2.0",
+                                "rollout": {"since": base.isoformat()}},
+                           now=clock()) == (False, "observing_wave_4")
+    assert bucket_eligible(99, {"version": "0.2.0",
+                                "rollout": {"since": base.isoformat()}},
+                           now=base + timedelta(
+                               seconds=3 * facts.UPDATE_BUCKET_OBSERVE_S + 1))[0] is True
+
+
+def test_wave_zero_is_internal_only(clock):
+    payload = {"version": "0.2.0", "rollout": {"wave": 0, "since": clock.current.isoformat()}}
+    # 默认 stable：wave 0 永不命中（等于内部档对公网不存在）
+    ok, reason = bucket_eligible(0, payload, now=clock())
+    assert ok is False and reason == "not_in_wave_0(internal)"
+    # internal 频道：命中，且 reason 自证档位
+    ok, reason = bucket_eligible(57, payload, now=clock(), channel="internal")
+    assert ok is True and reason == "wave_0(internal)"
+    # 回归：`wave: 0` 不能被 `or` 当缺省（旧写法会把 0 → 100%，把内部档漏给全体）
+    assert bucket_eligible(99, payload, now=clock(), channel="internal")[1] == "wave_0(internal)"
+    assert bucket_eligible(99, payload, now=clock())[1] == "not_in_wave_0(internal)"
+
+
+def test_internal_channel_accepts_any_manifest_channel(tmp_path, paths, store, clock, monkeypatch):
+    use_test_anchor(monkeypatch)
+    manager = UpdateManager(paths, store, source="", channel="internal",
+                            client_version="0.1.0", now=clock)
+    manager.source = build_source(tmp_path, version="0.2.0", channel="beta")
+    check = manager.check()
+    assert check["state"] == "eligible"          # internal 是超集：不再 channel_mismatch
+    # 非 internal 的机器仍按频道严格匹配（0.3.4 行为不变）
+    stable = UpdateManager(paths, store, source="", channel="stable",
+                           client_version="0.1.0", now=clock)
+    stable.source = build_source(tmp_path, version="0.2.0", channel="beta")
+    assert stable.check()["state"] == "channel_mismatch"
 
 
 def test_select_artifact():
@@ -251,12 +319,13 @@ def test_status_and_no_rollback(paths, store, clock):
 def test_fail_closed_without_builtin_public_key(tmp_path, paths, store, clock, monkeypatch):
     """内置公钥缺失 -> 拒绝验签；不安装、不改版本、不本地生成密钥（旧的自动生成路径已删）。"""
     use_test_anchor(monkeypatch)
+    monkeypatch.setattr(facts, "UPDATE_KEYRING", ())
     monkeypatch.setattr(facts, "UPDATE_PUBLIC_KEY_HEX", "")
     manager = UpdateManager(paths, store, source="", client_version="0.1.0", now=clock)
     manager.source = build_source(tmp_path)
     check = manager.check()
     assert check["state"] == "failed_verify"
-    assert "公钥缺失" in check["message"]
+    assert "钥环为空" in check["message"] or "公钥缺失" in check["message"]
     result = manager.apply()
     assert result["installed"] is False and result["state"] == "failed_verify"
     assert store.install().version == "0.1.0"
@@ -265,6 +334,8 @@ def test_fail_closed_without_builtin_public_key(tmp_path, paths, store, clock, m
 
 
 def test_invalid_builtin_public_key_fails_closed(paths, store, clock, monkeypatch):
+    monkeypatch.setattr(facts, "UPDATE_KEYRING", (
+        {"key_id": "bad-key", "pubkey_hex": "zz" * 32, "state": "primary"},))
     monkeypatch.setattr(facts, "UPDATE_PUBLIC_KEY_HEX", "zz" * 32)
     manager = UpdateManager(paths, store, source="", now=clock)
     with pytest.raises(UpdateError):

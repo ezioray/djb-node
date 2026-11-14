@@ -379,6 +379,8 @@ class UpstreamManager:
         返回值**只含 spec 1.2.7 `NodeProbeReport` 已定义的字段**
         （upstream_id / reachable / latency_ms / error_class /
         model_checks[model, ok, error_class] / checked_at），可直接上报。
+        加上 RC14 §2.3 的两个**加性**字段 ``models[]``（这轮探了哪些，只含 enabled）与
+        ``not_probed[]{model, reason}``（没探的及原因）；旧服务端忽略未知字段。
         L2/L3 细节（inference_ok / stream_ok / usage_ok / token_usage /
         probe_version / last_probe_at）只落本地：`probe_details()` 可读。
         """
@@ -389,7 +391,12 @@ class UpstreamManager:
         # 协议必须从**记录**传下去（CR-20261106 客户端 P2）：daemon 的周期探针、
         # 启动探针、CLI `djb upstream probe` 全走这一个入口，所以在这一处接线
         # 就覆盖了所有调用方；`record.protocol` 缺省即 `openai-chat`，旧上游行为不变。
-        result = probe_upstream(record.base_url, record.model_ids(),
+        # W6-FIX：只探测 enabled 模型。disabled 模型可能已不在上游 /models 清单，
+        # 若仍参与探针，云端 `_probe_verdict` 会「任一失败即 rejected」，
+        # 导致「停用」无法把上游恢复为 verified（RC13 W6 实测 6/7）。
+        probe_models = [str(item.get("id")) for item in record.models
+                        if item.get("id") and item.get("enabled", True)]
+        result = probe_upstream(record.base_url, probe_models,
                                 credential=secret, http=self.http, timeout=seconds,
                                 protocol=record.protocol)
         checks: list[dict[str, Any]] = [dict(item) for item in result.model_checks]
@@ -424,8 +431,40 @@ class UpstreamManager:
         payload = {"upstream_id": upstream_id, "reachable": result.reachable,
                    "latency_ms": result.latency_ms,
                    "error_class": result.error_class,
-                   "model_checks": checks, "checked_at": stamp}
+                   "model_checks": checks, "checked_at": stamp,
+                   # RC14 §2.3 加性字段（只加不改）：明确「这一轮探了哪些 / 哪些没探」。
+                   # 云端据此判「至少一个 enabled 模型通过即 ok」；旧服务端忽略未知字段。
+                   "models": [str(item.get("model")) for item in checks],
+                   "not_probed": self._not_probed(record, checks, outcomes)}
         return payload
+
+    @staticmethod
+    def _not_probed(record: UpstreamRecord, checks: list[dict[str, Any]],
+                    outcomes: dict[str, probe_mod.ProbeOutcome]) -> list[dict[str, Any]]:
+        """``not_probed[]``：本地记录里有、但这一轮**没探到结论**的模型（原因可读）。
+
+        三种原因（与 W6 的口径一致，不再让「一个没探到」拖垮整条上游）：
+
+        * ``disabled``：模型被停用（本轮本来就不探，见 :meth:`probe` 的 W6-FIX 注释）；
+        * ``budget``：enabled 且进了 L1 清单，但本轮预算/期限到了（``PROBE_PASS_BUDGET_S``），
+          L2/L3 没轮到，留给下一轮，**不算失败**；
+        * ``not_listed``：enabled，但这一轮连 L1 请求都没进（记录在探针过程中被改写等边界）。
+          正常路径上「上游清单没列某模型」会落在 ``model_checks`` 里（``ok=False`` +
+          ``model_not_listed``），不在这里。
+        """
+        rows: list[dict[str, Any]] = []
+        probed = {str(item.get("model")) for item in checks}
+        for raw in record.models:
+            entry = ModelEntry.from_dict(raw)
+            if not entry.id:
+                continue
+            if not entry.enabled:
+                rows.append({"model": entry.id, "reason": "disabled"})
+            elif entry.id not in probed:
+                rows.append({"model": entry.id, "reason": "not_listed"})
+            elif outcomes.get(entry.id) is None:
+                rows.append({"model": entry.id, "reason": "budget"})
+        return rows
 
     @staticmethod
     def _probe_models_payload(record: UpstreamRecord,

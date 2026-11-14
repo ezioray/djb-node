@@ -62,6 +62,14 @@ USER_AGENT = "djb-node/" + CLIENT_VERSION + " (" + PLATFORM + ")"
 #: 客户在生产包里点「打开网页端」会落到预发站。
 WEB_CONSOLE_URL = (os.environ.get("DJB_WEB_CONSOLE") or "").strip() or "https://tkbank.ai"
 
+#: 网页控制台的「账户安全」页路径（2FA / TOTP enroll 与 confirm 都在这一页）。
+#: 客户端不代理 2FA 绑定，只能把客户**送到这一页**（repos/djb-web/app/routes/consumer.py 的
+#: security 路由）；路径只在这里出现一次，改版时不用满仓找字符串。
+WEB_CONSOLE_SECURITY_PATH = "/console/security"
+
+#: 下载页路径（``no_artifact`` 必须给客户一条**能点**的路，而不是只说「暂无安装包」）。
+UPDATE_DOWNLOAD_PATH = "/download"
+
 # ─────────────────────────────────────────────────────────── 状态机（M15 §3 / §5.9）
 DAEMON_STATES: tuple[str, ...] = ("stopped", "starting", "online", "paused", "error", "updating")
 """daemon 运行态（M15 §3 状态机的运行侧投影）。"""
@@ -163,7 +171,8 @@ CONCURRENT_MIN = 1
 CONCURRENT_MAX = 64
 DEFAULT_YIELD_ENABLED = True
 DEFAULT_UPDATE_CHANNEL = "stable"
-UPDATE_CHANNELS: tuple[str, ...] = ("stable", "beta")
+UPDATE_CHANNELS: tuple[str, ...] = ("stable", "beta", "internal")
+"""`internal` = 内部机频道（0.3.5 起）：可见 wave 0 制品，且接受任一频道清单（超集）。"""
 DEFAULT_LOG_LEVEL = "info"
 LOG_LEVELS: tuple[str, ...] = ("info", "debug")
 PORT_MIN = 1024
@@ -201,11 +210,27 @@ A2_PROMPT_SECTIONS: tuple[str, ...] = ("目标", "约束", "输入", "输出", "
 """03-facts §11：A2 prompt 模板五字段（目标 / 约束 / 输入 / 输出 / 验收）。"""
 UPSTREAM_STATES: tuple[str, ...] = ("declared", "probing", "verified", "rejected")
 DEFAULT_UPSTREAM_PROTOCOL = "openai-chat"
+#: RC14 I：协议二选一（客户端下拉；切换**不改**已填链接）
+UPSTREAM_PROTOCOLS: tuple[str, ...] = ("openai-chat", "anthropic-messages")
+"""上游对话协议（``upstream_protocols.py`` 的实现口径）；默认 ``openai-chat``。"""
+UPSTREAM_PROTOCOL_LABELS: dict[str, str] = {
+    "openai-chat": "OpenAI 兼容（/v1/chat/completions）",
+    "anthropic-messages": "Anthropic（/v1/messages）",
+}
 DEFAULT_MIN_PRICE_UNIT = "usd_per_1m_tokens"
 TOKEN_RELAY_KIND = "token_relay"
 
 # ─────────────────────────────────────────────────────────── 更新（03-facts §11 / §8.2）
-UPDATE_BUCKET_WAVES: tuple[int, ...] = (5, 25, 100)
+UPDATE_BUCKET_WAVES: tuple[int, ...] = (1, 10, 50, 100)
+"""分桶灰度百分比，下标 = wave 序号（wave 1 → 1%，wave 4 → 100%）。
+
+0.3.5 起按硬约束阶梯 `1/10/50/100`；0.3.4 及更早的客户端常量是 `(5, 25, 100)`，
+因此**本次 0.3.4 → 0.3.5 升级实际仍只能 5/25/100**（旧代码不认新常量），新阶梯从下一次升级生效。
+见 `reports/RM-20261113/B-PREP/10-GRAY-LADDER.md` §2C。
+"""
+UPDATE_BUCKET_INTERNAL_CHANNEL = "internal"
+"""wave 0 = 内部档：**仅**该更新频道可见（`DJB_UPDATE_CHANNEL=internal` 的内部机）；
+`stable` / `beta` 命中的结果是 `not_in_wave_0`，等于永不进入内部档。"""
 UPDATE_BUCKET_OBSERVE_S = 24 * 3600
 UPDATE_KEEP_VERSIONS = 2
 UPDATE_SIGNATURE_PREFIX = "hmac-sha256:"
@@ -218,12 +243,54 @@ UPDATE_SIGNATURE_ALG_ED25519 = "ed25519"
 # `~/.djb/secrets/e2e/update-signing.key` 0600，客户端永远不持有）。
 # 原来 `UpdateManager.signing_key()` 会在本地随机自生成一把 HMAC 密钥并自动使用——
 # 那等于「客户端自己造信任锚」，任何拿到本机文件的人都能签出「合法」更新（审计 P1-3）。
-UPDATE_PUBLIC_KEY_HEX = "cecc3a253872f8e60b630d57d94e96433aecdfb227d49b74605cc5925e0add73"
-"""内置 Ed25519 公钥（32 字节，hex）。公钥可入仓；私钥不入仓、不入对话、不进诊断包。"""
-UPDATE_KEY_ID = "djb-e2e-2026-11-02"
-"""公钥标识（轮换时改这里 + `UPDATE_PUBLIC_KEY_HEX`；写进 status / 诊断包便于对账）。"""
-UPDATE_PUBLIC_KEY_FINGERPRINT = "30171de47e02"
-"""公钥指纹 sha256(raw pubkey)[:12]，与安全席登记的指纹一致（status 里如实展示）。"""
+#
+# RC8（2026-11-10）起信任锚从「单钥」升级为**钥环 + 双钥过渡 + 吊销**：
+#   * 唯一信任来源是 `UPDATE_KEYRING`（**只放公钥**；私钥只在离线签名机/KMS，
+#     不入仓、不进对话、不进诊断包）；
+#   * `state="primary"` = 当前生产锚；`state="transition"` = 旧锚，只在
+#     `UPDATE_TRANSITION_UNTIL`（含当日）之前被接受，过期是硬失败（不静默降级）；
+#   * 轮换收尾 / 泄露处置：把 key_id 加进 `UPDATE_REVOKED_KEY_IDS` 即吊销（优先于 state）；
+#   * `UPDATE_KEY_ID` / `UPDATE_PUBLIC_KEY_HEX` / `UPDATE_PUBLIC_KEY_FINGERPRINT` 只是
+#     primary 的扁平视图（status / 诊断 / 老调用方兼容），**不要在别处另立信任锚**。
+UPDATE_KEYRING: tuple[dict[str, str], ...] = (
+    {
+        "key_id": "djb-prod-2026-11-20",
+        "pubkey_hex": "7d008ca092ba0eb22881c59cf293465b208f53e0ca2543e715ddb965dc1349b8",
+        "state": "primary",
+        "note": "生产主锚（owner 离线签名机生成；私钥不离开签名机）。"
+                "公钥已注入，release gate READY（ops/release/update_anchor.py）；"
+                "签名只由离线签名机执行，仓库内无私钥。",
+    },
+    {
+        "key_id": "djb-e2e-2026-11-02",
+        "pubkey_hex": "cecc3a253872f8e60b630d57d94e96433aecdfb227d49b74605cc5925e0add73",
+        "state": "transition",
+        "note": "旧 E2E 锚：私钥在 NAS 上，按**已泄露**处理。**默认已吊销**（见 "
+                "UPDATE_REVOKED_KEY_IDS）；仅在 owner 书面 + incident 备案的应急场景，"
+                "才允许临时把 UPDATE_TRANSITION_OVERRIDE 打开并把 key_id 从吊销表移除。",
+    },
+)
+UPDATE_TRANSITION_UNTIL = "2026-11-24"
+"""transition 锚的**硬上限**（UTC，含当日）：即使 owner 应急覆盖也不得越过这一天。"""
+UPDATE_REVOKED_KEY_IDS: tuple[str, ...] = ("djb-e2e-2026-11-02",)
+"""已吊销 key_id（优先于 state）。
+
+RC8 安全裁决（lead 2026-11-10 B9）：旧 E2E 私钥在 NAS（已泄露态），**默认立即吊销**，
+不做静默过渡。存量客户端的自动更新本来就被 dl 502 / 无签名阻断，手动安装包是主路径；
+吊销后旧钥签的清单一律拒装（fail-closed，不会装坏包）。
+"""
+UPDATE_TRANSITION_OVERRIDE = False
+"""**仅应急**：True 时允许已吊销的 transition 锚在 UPDATE_TRANSITION_UNTIL 之前临时可用。
+
+开启条件（缺一不可）：owner 书面批准 + incident 备案 + 显式发布说明；
+默认 False（= 默认吊销、旧钥一律拒）。任何把这里改成 True 的提交都必须同时改 EVIDENCE。
+"""
+UPDATE_KEY_ID = "djb-prod-2026-11-20"
+"""primary 锚标识（写进 status / 诊断包便于对账）。"""
+UPDATE_PUBLIC_KEY_HEX = "7d008ca092ba0eb22881c59cf293465b208f53e0ca2543e715ddb965dc1349b8"
+"""primary 内置 Ed25519 公钥（32 字节 hex；owner 离线签名机生成）。公钥可入仓；私钥不入仓。"""
+UPDATE_PUBLIC_KEY_FINGERPRINT = "d80ec52a2e80"
+"""primary 公钥指纹 sha256(raw pubkey)[:12]，与 UPDATE_KEYRING 同步。"""
 UPDATE_TEST_ENV = "DJB_ENV"
 UPDATE_TEST_ENV_VALUE = "test"
 """test-only mock 验签的环境门：必须显式 `DJB_ENV=test`。"""
@@ -557,7 +624,7 @@ TOKEN_COMPARE_FLAG = "client.token.compare.enabled"
 TOKEN_COMPARE_FLAG_META: dict[str, object] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后只记录上游 usage、不做本地比较",
     "description": "真实请求路径做本地 token 计数与上游 usage 的差异检测（>1% 记 token_mismatch）",
 }
@@ -569,18 +636,61 @@ FEATURE_FLAGS[TOKEN_COMPARE_FLAG] = TOKEN_COMPARE_FLAG_META
 # ── M17 §9 开关（Lead 合并：与 C8 共用同一个 FEATURE_FLAGS 登记表）
 FEATURE_FLAGS["client.relay.enabled"] = {
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 隐藏 relay 接入；已有配置只读、不删除",
     "default": False,
     "description": "第三方中转站接入（M17 §4 / C11），默认关闭",
 }
 FEATURE_FLAGS["supply.attestation.enabled"] = {
     "owner": "platform",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 回退 L2 可达性判定；已有路由/账本不变；已存证明保留只读",
     "default": False,
     "description": "模型身份证明（M17 §5 / C12 客户端侧线索采集），默认关闭",
 }
+# ── RC14 C 设备码自动绑定（默认关闭：关 → 只显示「高级 → 手输绑定码」老入口，
+# 云端 N1–N4 端点保留但客户端不调用，可随时下线，无状态依赖）
+FEATURE_FLAGS["client.binding.device_flow.enabled"] = {
+    "default": False,
+    "owner": "lead",
+    "expire_at": "2027-03-31",
+    "rollback_rule": "置 false → 只显示「粘贴绑定码」老入口；N1–N4 端点保留但客户端不调用，"
+                     "云端可随时下线（无状态依赖）",
+    "description": "设备码自动绑定（POST /node/binding/device + poll，网页 /activate 确认；RC14 C）",
+}
+DEVICE_FLOW_FLAG = "client.binding.device_flow.enabled"
+DEVICE_FLOW_PATHS = ("/api/v1/node/binding/device", "/api/v1/node/binding/device/poll")
+
+# ── RC14 B 首启引导（默认关闭：关 → 不渲染引导视图，onboarding.json 保留但不读，
+# 零数据迁移；QA 截图基线不受影响）
+FEATURE_FLAGS["client.onboarding.enabled"] = {
+    "default": False,
+    "owner": "lead",                     # 设计 §5.4 原表：lead（待指定到人）
+    "expire_at": "2027-03-31",
+    "rollback_rule": "置 false 重启客户端 → 不渲染引导视图；desktop/onboarding.json 保留但"
+                     "不读，零数据迁移（可用 djb onboarding --reset 清状态）",
+    "description": "首启引导（3 步 + 完成页，每步可跳过；RC14 B）",
+}
+ONBOARDING_FLAG = "client.onboarding.enabled"
+
+# ── RC14 I/J 逐模型底价上报（默认关闭：云端 ask-settings / schedule-quotes.models[]
+# 还没有主线实现，见 CHG-2026-11-14-RC14-IMPL §3-B.9；三字段齐全、到期强制关）
+FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
+    "default": False,
+    "owner": "lead",                     # 设计 §5.4：竞价/上报类开关统一 owner=lead
+    "expire_at": "2027-03-31",           # 与 §5.4 表的到期日一致
+    "rollback_rule": "关闭 → 客户端不再上报逐模型底价（本地账本只读保留、报价回到原口径）；"
+                     "djb flags --disable client.upstream.bid_report.enabled 即刻生效，"
+                     "无需迁移、无残留（云端没有收到过任何底价）",
+    "description": "逐模型底价上报到云端（RC14 I/J）；云端接口未开通前保持关闭",
+}
+UPSTREAM_BID_FLAG = "client.upstream.bid_report.enabled"
+UPSTREAM_BID_REPORT_PATHS: tuple[str, ...] = (
+    "/api/v1/user/provider/ask-settings",
+    "/api/v1/schedule/quotes",
+)
+"""逐模型底价最终要写的两个云端路径（P9 / 报价 models[]）；客户端只做本地账本 + 预览。"""
+
 RELAY_FLAG = "client.relay.enabled"
 ATTEST_FLAG = "supply.attestation.enabled"
 FLAG_REQUIRED_FIELDS: tuple[str, ...] = ("owner", "expire_at", "rollback_rule", "default")
@@ -594,12 +704,12 @@ FLAG_REQUIRED_FIELDS: tuple[str, ...] = ("owner", "expire_at", "rollback_rule", 
 FEATURE_FLAGS["client.probe.periodic.enabled"] = {
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-15T00:00:00+08:00",
+    "expire_at": "2027-06-30T00:00:00+08:00",
     "rollback_rule": "环境变量 DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false 或配置 "
                      "feature_flags[\"client.probe.periodic.enabled\"]=false（djb flags --disable）"
                      "即停周期复探，只保留手动 probe（djb upstream probe），公告按已存 "
                      "last_probe_at 判新鲜；或 git revert 本提交",
-    "description": "客户端周期复探（L2/L3），0.2.5 起默认开启（显式关闭仍生效）",
+    "description": "客户端周期复探（L2/L3），0.2.5 起默认开启（显式关闭仍生效）；2026-11-09 复核：续期至 2027-06-30（原 2026-12-15 会在 12-16 静默 fail-closed，见 reports/RLS-20261109-CLIENT-025/DECISION-PROBE-FLAG-RENEWAL.md）",
 }
 PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
 
@@ -609,7 +719,7 @@ PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
 FEATURE_FLAGS["client.quotes.publish.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 停发新报价（daemon 报价环不启动、CLI publish 拒发）；"
                      "已发报价 ≤ TTL 自然过期，不改账本、无残留",
     "description": "客户端周期报价发布（design/17 §15；TTL=2×周期），默认关闭",
@@ -625,7 +735,7 @@ QUOTES_FLAG = "client.quotes.publish.enabled"
 FEATURE_FLAGS["client.channel.enabled"] = {
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": ("显式写盘 false 即停长轮询、退回无通道模式（已取 job 尽力回传后停止；"
                       "本地显式关闭优先于服务端 channel_required）。"
                       "回滚=djb flags --disable client.channel.enabled + 重启 daemon"),
@@ -671,7 +781,7 @@ CHANNEL_REQUIRED_KV = "channel"
 FEATURE_FLAGS["client.model_sync.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后停拉取、保留已应用版本（本地 model_sync.json 只读不删）",
     "description": "客户端模型/tokenizer 同步（M18b）：拉签名 bundle、校验后热应用，默认关闭",
 }
@@ -710,7 +820,7 @@ MODEL_SYNC_DRIFT_FIELDS: tuple[str, ...] = ("tokenizer_family", "tokenizer_versi
 FEATURE_FLAGS["client.notifications.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后停拉取、保留本地消息与待补发读态（本地只读不删）",
     "description": "客户端消息中心（C16）：拉取站内信、未读/已读/ack、离线补拉，默认关闭",
 }
@@ -730,7 +840,7 @@ FEATURE_FLAGS[MACHINE_PROFILE_FLAG] = {
 FEATURE_FLAGS[UPDATE_MOCK_FLAG] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭即回到内置公钥验签（唯一信任锚）；mock 不产生任何持久状态，"
                      "已安装版本与回滚点不变",
     "description": "自动更新验签的 test-only HMAC mock（必须同时满足 DJB_ENV=test + "
@@ -774,7 +884,7 @@ NOTIFICATIONS_ACTIONS: tuple[str, ...] = ("read", "ack")
 FEATURE_FLAGS["client.tray.control.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后托盘暂停/恢复退回命令指南；不改变 daemon 状态，不写离线偏好",
     "description": "托盘用户确认后暂停/恢复；先读状态、独立回读、到期强制关闭",
 }
@@ -786,7 +896,7 @@ FEATURE_FLAGS["client.ipc.windows.enabled"] = {
     # 关掉即回到「控制不可用 + 可行动提示」，不退回 TCP、不改 daemon 运行偏好。
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": ("关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好。回滚=成对改动：default→False 且 ipc_windows.py 的 tripwire 判据改回 `is not False`（只改一处=半截回滚：tripwire 会 fail closed，所有 Windows 控制用例会以「开关不可用」skip）"),
     "description": "Windows同SID/session/integrity安全命名管道；不解禁GUI托盘控制",
 }

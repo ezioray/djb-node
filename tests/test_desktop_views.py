@@ -10,6 +10,7 @@ import pytest
 
 from djb_node.desktop import access as ac
 from djb_node.desktop import datasource as ds
+from djb_node.desktop.datasource import Snapshot
 from djb_node.desktop import views as vw
 from djb_node.desktop.app import demo_snapshot
 from djb_node.desktop.controller import ControlOutcome, DesktopController
@@ -18,8 +19,8 @@ SECRET = "djb_sk_live_9f2c41aa77be"
 #: 侧栏顺序 = IA 顺序（4 组：运行 → 收益 → 接入 → 系统；见 views.NAV_SECTIONS）
 SPEC_ORDER = ["overview", "bench", "gpu", "models", "tasks", "receipts", "earnings",
               "token_plan", "agent", "access", "yield", "account", "logs"]
-SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "可提供模型", "任务队列", "收据", "收益",
-               "共享 Token Plan", "Agent 接入", "接入配置", "让路/节能", "账户与安全",
+SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "模型与探针", "任务队列", "收据", "收益",
+               "提供 Token Plan", "Agent 接入", "本机设置", "让路/节能", "账户与安全",
                "日志"]
 #: 分组口径（00-PLAN §1.1 已裁决）：组 key / 中文名 / 拉丁微标 / 成员顺序
 SPEC_SECTIONS = [
@@ -174,10 +175,60 @@ def test_gpu_absent_keeps_the_overview_gauge_honest():
 
 
 def test_models_incompatible_rows_greyed_with_reason():
+    """云端目录（附加表）里不兼容的模型仍要标灰 + 给原因（0.3.6 的验收不回退）。"""
     view = vw.build_view("models", demo_snapshot())
-    greyed = [row for row in view.table.rows if row.disabled]
+    catalog = view.tables[0]                      # 主表已换成探针事实（RC14 D）
+    greyed = [row for row in catalog.rows if row.disabled]
     assert greyed, "演示数据里应有不兼容模型"
     assert all(row.cells[-1] for row in greyed), "标灰必须给原因"
+
+
+def test_models_page_projects_probe_details_with_three_state_columns():
+    """D（RC14）：探针表纯投影 probe_details()，三态不混（None ≠ False）。"""
+    view = vw.build_view("models", demo_snapshot())
+    assert view.title == "模型与探针"
+    assert view.table.columns[:3] == ("模型", "上游", "最近探测")
+    assert set(view.table.columns[3:6]) == {"L2", "L3", "用量"}
+    rows = {row.cells[0]: row for row in view.table.rows}
+    assert len(rows) == 4, "演示数据的四行探针结论都该出现"
+    # 通过：三列全 ✓、状态可公告
+    ok = rows["qwen2.5-7b-instruct"]
+    assert ok.cells[3:6] == ("✓", "✓", "✓") and ok.cells[6] == "可公告"
+    # L3 失败：L2 ✓ / L3 ✗，状态「降级：流式不可用」，原因翻译成人话
+    degraded = rows["llama-3.1-8b-instruct"]
+    assert degraded.cells[3:6] == ("✓", "✕", "✓")
+    assert degraded.cells[6].startswith("降级")
+    assert "流式不可用" in degraded.cells[7]
+    # 失败：L2 ✗，原因「密钥被拒」
+    failed = rows["claude-3-7-sonnet"]
+    assert failed.cells[3] == "✕" and failed.cells[6] == "失败"
+    assert "密钥被拒" in failed.cells[7]
+    # 从未探测：三列全是「—」（不是 ✗），最近探测「从未」
+    never = rows["gpt-4o-mini"]
+    assert never.cells[3:6] == ("—", "—", "—")
+    assert never.cells[2] == "从未" and never.cells[6] == "未探测"
+
+
+def test_models_page_counts_and_probe_action():
+    view = vw.build_view("models", demo_snapshot())
+    cards = {card.title: card.value for card in view.cards}
+    assert cards["可公告"] == "1 个" and cards["从未探测"] == "1 个"
+    actions = {action.key: action for action in view.actions}
+    assert actions["probe.run"].enabled is True
+    # 两个新鲜窗口的数字只能来自 facts（900 / 600）
+    assert any("15 分钟内" in note for note in view.notes)
+    assert any("10 分钟内" in note for note in view.notes)
+
+
+def test_models_page_without_upstreams_says_where_to_start():
+    """没有上游时：探针表空态指路「提供 Token Plan」，且「立即探测」置灰带原因。"""
+    sections = dict(demo_snapshot().sections)
+    sections["models"] = {"catalog": [], "local": [], "online": True, "note": ""}
+    view = vw.build_view("models", Snapshot(sections=sections))
+    assert "提供 Token Plan" in view.table.empty
+    actions = {action.key: action for action in view.actions}
+    assert actions["probe.run"].enabled is False
+    assert "还没有接入上游" in actions["probe.run"].reason
 
 
 def test_yield_actions_follow_state():
@@ -196,22 +247,65 @@ def test_yield_actions_follow_state():
     assert "已暂停" in paused.plain_text()
 
 
-def test_access_fields_include_every_required_config():
+def test_access_fields_are_contribution_node_only():
+    """本机设置页只放**本机**配置；绑定与收款已搬去「账户与安全」（RC14 E）。
+
+    字段收敛到 node_id / 两个排障只读 / 价格模式 / 节点凭证；``usdt_address`` 与
+    API Key / 两个上游地址都不在本页（前者的唯一位在账户页，见下一个用例）。
+    """
     view = vw.build_view("access", demo_snapshot())
     keys = {field.key for field in view.fields}
-    for needed in ("node_id", "node_secret", "api_key", "price_mode", "usdt_address",
-                   "openai_base_url", "anthropic_base_url"):
+    for needed in ("node_id", "node_secret", "price_mode", "daemon_state", "register_state"):
         assert needed in keys, needed
+    for removed in ("api_key", "openai_base_url", "anthropic_base_url", "usdt_address"):
+        assert removed not in keys, removed
+    assert view.title == "本机设置"
+    assert "API Key" not in view.plain_text()
+    assert "OpenAI 请求地址" not in view.plain_text()
+    assert "Anthropic 请求地址" not in view.plain_text()
     secrets = [f for f in view.fields if f.secret]
-    assert {f.key for f in secrets} >= {"node_secret", "api_key"}
+    assert {f.key for f in secrets} == {"node_secret"}
     assert all("…" in f.value or f.value in ("—", "未设置") for f in secrets)
 
 
+def test_access_removed_fields_stay_in_model_and_validate():
+    """「UI 移除、模型保留」：字段与校验规则一个都没删，老配置文件照常读。
+
+    这条是给 release-manager 的护栏：页面精简**不许**顺手删 ``AccessConfig`` 字段或放宽
+    ``validate()``（否则老配置 / 老 profile 会被判不合法）。
+    """
+    fields = set(ac.AccessConfig.__dataclass_fields__)
+    assert {"api_key", "openai_base_url", "anthropic_base_url"} <= fields
+    config = ac.AccessConfig(api_key="k", openai_base_url="http://127.0.0.1:1717/v1",
+                             anthropic_base_url="http://127.0.0.1:1717")
+    config.validate()                        # 三个字段仍然参与校验，且合法值不被拒
+    broken = ac.AccessConfig(openai_base_url="ftp://上游改坏了")
+    with pytest.raises(ValueError):
+        broken.validate()
+    # 收款地址校验只加不改：TRC20 仍被接受（老配置兼容），仅「提交云端」这条路只放行 EVM
+    trc20 = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"     # 合法 base58，验「老配置仍能读」
+    assert ac.validate_address(trc20) == trc20
+
+
 def test_unwired_views_say_unavailable_not_fake_success():
-    for key, action in (("models", "models.save"), ("receipts", "receipts.verify"),
+    for key, action in (("receipts", "receipts.verify"),
                         ("earnings", "earnings.export"), ("account", "account.logout")):
         view = vw.build_view(key, demo_snapshot())
         assert action in {a.key for a in view.actions}, key
+
+
+def test_models_page_no_longer_promises_a_save_that_does_nothing():
+    """G1-1（RC14 P0）：模型页摘掉「保存并上报意向」，且不再写「逐模型开关」。
+
+    三处一起改才算修好：按钮（点了永远无声）、表头note（暗示可编辑）、副标题
+    （「逐模型开关」是**不存在**的能力）。只删按钮而留文案 = 同一个谎话换个地方说。
+    """
+    view = vw.build_view("models", demo_snapshot())
+    assert all("models." not in action.key for action in view.actions)
+    assert "逐模型开关" not in (view.subtitle or "")
+    assert "逐模型开关" not in " ".join(view.notes)
+    # 但必须留下**去哪里设置**的指路（否则客户不知道该点哪）
+    assert any("Token Plan" in note for note in view.notes)
 
 
 # ─────────────────────────────── 共享 Token Plan（第 13 个导航页，任务 A）
@@ -238,7 +332,7 @@ def test_token_plan_nav_item_sits_before_access_in_earn_section():
     R2 分组后它从平铺第 9 项变为第 8 项（组内顺序变了，产品意图没变）：
     先看到「共享了什么、还能共享多少」，再进「接入」组动手。
     """
-    assert ("token_plan", "共享 Token Plan") in vw.VIEWS
+    assert ("token_plan", "提供 Token Plan") in vw.VIEWS
     order = list(vw.VIEW_KEYS)
     assert order.index("token_plan") == 7                     # 第 8 项
     assert order.index("token_plan") < order.index("access")
@@ -253,9 +347,9 @@ def test_token_plan_key_is_showable_and_renders_plain_text(tmp_path):
     """tools/live_views.py 与无显示环境验收都走 controller.show(key).plain_text()。"""
     controller = make_controller(tmp_path)
     view = controller.show("token_plan")
-    assert view.key == "token_plan" and view.title == "共享 Token Plan"
+    assert view.key == "token_plan" and view.title == "提供 Token Plan"
     text = view.plain_text()
-    assert text.startswith("# 共享 Token Plan")
+    assert text.startswith("# 提供 Token Plan")
     assert controller.view == "token_plan"
 
 
@@ -263,7 +357,9 @@ def test_token_plan_lists_upstreams_with_state_models_and_qps():
     view = vw.build_view("token_plan", demo_snapshot())
     text = view.plain_text()
     assert view.table is not None
-    assert [row.cells[0] for row in view.table.rows] == ["up_moonshot_01", "up_local_agent"]
+    # RC14 I/J：主表变成「逐模型底价」，上游清单是第二张表（tables[0]）
+    upstream_table = view.tables[0]
+    assert [row.cells[0] for row in upstream_table.rows] == ["up_moonshot_01", "up_local_agent"]
     assert "✓ 已验证" in text and "◐ 已申报（待验证）" in text
     assert "3 个（已验证 2）" in text                          # 申报数 ≠ 已验证数
     assert "最大 QPS" in text
@@ -274,15 +370,16 @@ def test_token_plan_empty_state_tells_customer_what_to_do():
     view = vw.build_view("token_plan", snapshot)
     text = view.plain_text()
     assert "你还没有接入任何 Token Plan" in text
-    assert "去接入配置" in text                                # 空态必须给下一步，不是只说暂无
+    assert "读取模型清单" in text                               # 空态必须给下一步，不是只说暂无
     assert view.table is not None and not view.table.rows
+    assert not view.tables[0].rows
 
 
 def test_token_plan_unbound_state_points_at_binding():
     snapshot = _token_plan_snapshot(upstreams=[], bound=False)
     text = vw.build_view("token_plan", snapshot).plain_text()
     assert "✕ 未绑定" in text
-    assert "还没绑定" in text and "接入配置" in text
+    assert "还没绑定" in text and "账户与安全" in text
 
 
 def test_token_plan_says_unavailable_instead_of_zero_when_data_missing():
@@ -320,7 +417,7 @@ def test_token_plan_disabled_upstream_is_labelled_not_hidden():
         upstreams=[{"id": "u1", "access_type": "A1", "state": "verified", "enabled": False,
                     "model_count": 2, "verified_models": 2, "max_qps": 0.0}])
     view = vw.build_view("token_plan", snapshot)
-    assert view.table is not None and len(view.table.rows) == 1
+    assert len(view.tables[0].rows) == 1
     assert "已停用" in view.plain_text()
 
 
@@ -427,10 +524,21 @@ def test_controller_save_without_reload_says_restart(tmp_path):
 
 def test_controller_unwired_action_is_honest(tmp_path):
     controller = make_controller(tmp_path)
-    for key in ("models.save", "account.enable_2fa", "nope.unknown"):
+    for key in ("account.enable_2fa", "nope.unknown"):
         result = controller.action(key)
         assert result.ok is False, key
         assert "暂不可用" in result.message, key
+
+
+def test_controller_2fa_opens_the_console_security_page(tmp_path, monkeypatch):
+    """G1-2：2FA 的**真入口**——把客户送到控制台安全页，而不是回一句「暂不可用」。"""
+    from djb_node import facts
+
+    monkeypatch.setattr(facts, "WEB_CONSOLE_URL", "https://console.example.test")
+    result = make_controller(tmp_path).action("account.open_2fa_page")
+    assert result.effect == "open_url"
+    assert result.payload == "https://console.example.test" + facts.WEB_CONSOLE_SECURITY_PATH
+    assert result.payload.endswith("/console/security")
 
 
 def test_receipts_verify_and_earnings_export_are_no_longer_stubs(tmp_path):
@@ -505,7 +613,7 @@ def test_controller_action_exception_does_not_escape(tmp_path):
 
 def test_access_view_says_unsaved_when_no_config_file(tmp_path):
     """没保存过就说「尚未保存」：不许把「默认值通过校验」说成配置有效。"""
-    from djb_node.desktop.datasource import FakeDataSource
+    from djb_node.desktop.datasource import Snapshot, FakeDataSource
 
     config = {"node_id": "—", "node_secret": "未设置", "api_key": "未设置",
               "price_mode": "auto", "price_mode_label": "跟随平台建议价",
@@ -986,3 +1094,105 @@ def test_unique_iid_never_repeats_and_keeps_plain_key():
     used.add("a#2")
     assert unique_iid("a", used) == "a#3"
     assert unique_iid("", used) == ""      # 空 key 交给 Tk 自动编号
+
+
+def test_account_bind_entry_survives_unavailable_account_domain():
+    """正式环境实测（0.3.0）：未登录时账户域本身不可用，账户页只剩一行「暂不可用」，
+    绑定按钮被一起藏掉 → 用户没有任何可点的下一步。绑定入口必须与「域不可用」解耦。"""
+    snapshot = ds.FakeDataSource({
+        "account": ds.Unavailable("云端未接通（未登录节点：本机尚未注册节点）"),
+        "access": {"binding": {"state": "unbound"}},
+    }, source="test").snapshot()
+    view = vw.build_view("account", snapshot)
+    keys = [action.key for action in view.actions]
+    assert "account.bind" in keys and "account.open_web" in keys
+    bind = next(action for action in view.actions if action.key == "account.bind")
+    assert bind.primary is True
+    text = view.plain_text()
+    assert "绑定网页端" in text
+    assert "不是配置损坏" in text                     # 红字旁边给出可操作解释
+    assert "账户/节点 → 生成绑定码" in text            # 可照抄的步骤仍在
+
+
+# ─────────────────────────── 接入配置：节点 ID 上屏 + 复制（P0-node，2026-11-12）
+def _access_snapshot(*, node_id="", source="", secrets=False):
+    """接入配置页快照：只覆盖 access 域，其余沿用 demo 数据。
+
+    ``node_id`` / ``source`` 由 datasource._resolve_node_id 产出（config/credentials/store/""）。
+    """
+    config = ac.AccessConfig(node_secret="djb_ck_live_secret_value" if secrets else "",
+                             api_key=SECRET if secrets else "").display()
+    sections = dict(demo_snapshot().sections)
+    sections["access"] = {"config": config, "valid": True, "saved": True, "binding": None,
+                          "node_id": node_id, "node_id_source": source,
+                          "note": "", "path": "~/.djb/desktop/access-config.json"}
+    return ds.Snapshot(sections)
+
+
+def test_access_shows_node_id_from_credentials_readonly_and_copyable():
+    """凭证里有 node_id 而 access.json 没有：页面要显示真值，且只读 + 可一键复制。
+
+    只读是必须的：动作执行前会把所有可编辑字段收成草稿（app._on_action），
+    节点 ID 若可编辑，「保存并回读」就会把展示值写回 access.json。
+    """
+    view = vw.build_view("access", _access_snapshot(node_id="nd_from_credentials",
+                                                   source="credentials"))
+    field = next(item for item in view.fields if item.key == "node_id")
+    assert field.value == "nd_from_credentials"
+    assert field.editable is False and "只读" in field.hint
+    action = next(item for item in view.actions if item.key == "access.copy_node_id")
+    assert action.enabled is True
+    assert "nd_from_credentials" in view.plain_text()
+
+
+def test_access_without_node_id_explains_the_real_reason():
+    """三级回退全空 → **不说**「先启动一次」（客户已经启动了，照着做也没用）。
+
+    改成：值说「尚未生成 + 卡在哪一环」，提示给真因/下一步，复制动作置灰并指向原因。
+    """
+    view = vw.build_view("access", _access_snapshot())
+    field = next(item for item in view.fields if item.key == "node_id")
+    assert field.value != "先启动一次"
+    assert "尚未生成" in field.value
+    assert field.editable is False
+    assert field.hint                       # 有下一步，不是空白
+    action = next(item for item in view.actions if item.key == "access.copy_node_id")
+    assert action.enabled is False
+    assert "先启动" not in action.reason     # 旧误导文案必须消失
+    assert "注册状态" in action.reason or "节点进程" in action.reason
+    assert "先启动一次" not in view.plain_text()
+
+
+def test_access_secrets_stay_masked_after_node_id_change():
+    """加了节点 ID 之后，秘密字段仍然只显示掩码，明文不上屏。"""
+    view = vw.build_view("access", _access_snapshot(node_id="nd_x", source="credentials",
+                                                   secrets=True))
+    text = view.plain_text()
+    assert SECRET not in text
+    assert "djb_ck_live_secret_value" not in text
+    secrets = {field.key: field for field in view.fields if field.secret}
+    # 节点凭证 = 节点密钥（唯一还在页面上的秘密）；api_key 已从 UI 移除，自然也不上屏
+    assert "…" in secrets["node_secret"].value
+    assert "api_key" not in secrets
+
+
+def test_access_node_id_keeps_legacy_config_value_for_demo_snapshots():
+    """没有新字段的调用方（demo / FakeDataSource）行为不变：仍显示 config 里的手填值。"""
+    view = vw.build_view("access", demo_snapshot())
+    field = next(item for item in view.fields if item.key == "node_id")
+    assert field.value == "node-7c31"
+    assert field.editable is True          # 手填值保持可编辑（与 0.3.2 一致）
+
+
+def test_access_copy_node_id_action_returns_clipboard_payload(tmp_path):
+    """动作只把节点 ID 交给剪贴板（effect=copy），不写配置、不发请求。"""
+    snapshot = _access_snapshot(node_id="nd_copy_me", source="credentials")
+    controller = make_controller(tmp_path, sections=dict(snapshot.sections))
+    result = controller.action("access.copy_node_id")
+    assert result.ok and result.effect == "copy" and result.payload == "nd_copy_me"
+
+    empty = make_controller(tmp_path, sections=dict(_access_snapshot().sections))
+    missing = empty.action("access.copy_node_id")
+    assert missing.ok is False
+    assert "接入配置" in missing.message            # 指向能看原因的地方
+    assert "先启动一次" not in missing.message

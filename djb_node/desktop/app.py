@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""桌面主窗口（Tk）：侧栏 12 视图 + 内容区 + 状态栏；逻辑全在 controller。
+"""桌面主窗口（Tk）：侧栏 13 页（IA 五组，可回滚四组）+ 内容区 + 状态栏；逻辑全在 controller。
 
 约束
 ====
@@ -29,9 +29,11 @@ from .access import ACCESS_FILE, RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, R
 from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
+from ..platform.no_window import subprocess_window_kwargs
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
+from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
 from . import platform_ui
-from .views import (NAV_SECTIONS, VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
+from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
                     Metric, RailCard, Row, Table, View, page_kicker)
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
@@ -53,11 +55,81 @@ NAV_ICONS = {
 
 #: 页头眉标：**组名 / 页名** 两级（B3），如 ``RUN / OVERVIEW``。
 #:
-#: 数据口径在 :func:`djb_node.desktop.views.page_kicker`（组名来自 ``NAV_SECTIONS``），
-#: 这里只做「13 个视图各一条」的派生，不再手写第二份表；整串 ASCII，走 mono 不会跳基线。
+#: 这是 **0.3.4 口径**的派生（组名来自 ``views.NAV_SECTIONS``），保留给旧调用方与截图基线；
+#: 窗口实际用的是实例级 ``self._ia_kickers``（跟着 ``DJB_UI_IA`` 走，回滚时与本表逐项相等）。
 PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 
+#: 这些 effect 由**自己的渲染函数**播报结果（打开浏览器 / 打开目录 / 派发收款提交）。
+#:
+#: 它们在 :meth:`DesktopApp._on_action` 的通用播报里要跳过，否则「已在浏览器打开」会被
+#: 动作自带的一句「网页端：https://…」覆盖掉——那正好抹掉了「打不开」这个关键差别。
+SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "update", "probe")
+
 TOP_NAV_KEYS = VIEW_KEYS
+
+# ── IA 接线（第三轮）：侧栏 / 快捷键 / 窄窗下拉 / 页头眉标全部由 ``ia.py`` 驱动
+#
+# 数据源只有一处：:mod:`djb_node.desktop.ia`。``DJB_UI_IA=legacy`` 回滚到 0.3.4 的 4 组 13 页
+# （``ia.IA_SECTIONS_LEGACY`` 与 ``views.NAV_SECTIONS`` 逐项相等，测试钉住）；未设/未识别 = 方案 A。
+# 本节所有函数都是**纯数据**（不碰 Tk），canonical 断言在 ``tests/test_desktop_ia_wiring.py``。
+
+
+def ia_state(raw: object = None, *, env: Mapping[str, str] | None = None) -> ia.IaDecision:
+    """裁决当前 IA 模式：``DJB_UI_IA=legacy`` 回 0.3.4，其余/未设 = 方案 A（5 组）。"""
+    source: Mapping[str, str] = os.environ if env is None else env
+    return ia.resolve_ia(source.get("DJB_UI_IA") if raw is None else raw)
+
+
+def nav_order(decision: ia.IaDecision) -> tuple[str, ...]:
+    """侧栏顺序 = 快捷键顺序 = 窄窗下拉顺序（一个数组三处共用）。"""
+    return ia.flat_keys(decision.sections)
+
+
+def nav_kicker(decision: ia.IaDecision, key: str) -> str:
+    """页头眉标「组名 / 页名」：组名取**当前生效表**里的所属组（回滚时自然是旧组名）。"""
+    spec = ia.page(key)
+    section = next((part for part in decision.sections if key in part.keys), None)
+    return (section.micro + " / " + spec.kicker) if section is not None else spec.kicker
+
+
+def nav_plan(decision: ia.IaDecision) -> tuple[tuple[ia.SectionSpec, tuple[tuple[str, str, str, str], ...]], ...]:
+    """侧栏渲染计划：(分组, ((key, 标题, 图标, 徽标), ...))——纯数据，可无窗口逐项断言。"""
+    plan = []
+    for section in decision.sections:
+        # 徽标只在方案 A 显示：legacy 回滚必须与 0.3.4 **逐项相等**（旧版没有 BETA）
+        items = tuple((key, ia.page(key).title, NAV_ICONS.get(key, "dot"),
+                       "BETA" if (ia.page(key).beta and decision.mode != "legacy") else "")
+                      for key in section.keys)
+        plan.append((section, items))
+    return tuple(plan)
+
+
+def nav_combo_values(decision: ia.IaDecision) -> tuple[str, ...]:
+    """窄窗导航下拉的取值（``1 · 总览``）：顺序与侧栏一致，编号即 Ctrl+N。"""
+    return tuple(str(index) + " · " + ia.page(key).title
+                 for index, key in enumerate(nav_order(decision), start=1))
+
+
+def route_for(key: str, renderable: Any) -> tuple[str, Any]:
+    """视图路由：``("view", key)`` / ``("placeholder", PageSpec)`` / ``("unknown", None)``。
+
+    IA 注册表（``ia.PAGES``）里可以出现**还没有渲染实现**的页：这类页给占位空态，
+    不许把窗口打崩；不在注册表里的 key 按老行为回到当前页（深链校验仍走 ia.page）。
+    """
+    try:
+        spec = ia.page(key)
+    except KeyError:
+        return ("unknown", None)
+    if key in renderable:
+        return ("view", key)
+    return ("placeholder", spec)
+
+
+def placeholder_view(spec: ia.PageSpec) -> View:
+    """占位页的空态：说清「已进 IA、内容待实现」，不是报错也不是「暂无数据」。"""
+    subtitle = spec.subtitle or "该页已纳入 IA 基线，内容实现排在后续切片。"
+    return View(key=spec.key, title=spec.title, subtitle=subtitle,
+                notes=("占位页：导航可达、空态渲染（非故障、非无数据）。",))
 
 #: 视图切换快捷键（B5）：Ctrl+1…9 直达前 9 项，Ctrl+Shift+1…4 直达后 4 项。
 #:
@@ -169,6 +241,14 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def _device_error(exc: BaseException) -> Any:
+    """后台线程兜底：把异常变成一条**不假成功**的结果（线程里不能抛给 Tk）。"""
+    from .controller import ActionResult
+
+    return ActionResult("绑定流程出错（" + type(exc).__name__ + "）：未绑定；"
+                        "可以用高级→手输绑定码", ok=False)
+
+
 class DesktopApp:
     """主窗口：一个 sidebar + 一个内容区（视图切换只重画内容区，不重建侧栏）。"""
 
@@ -204,6 +284,12 @@ class DesktopApp:
             self._scale = 1.0
         self._px = lambda n: int(round(float(n) * self._scale))
         self._controller = controller
+        #: S2：取数 worker（惰性建，见 _ensure_refresh_worker）
+        self._refresh_worker: Any = None
+        #: USDT 收款地址提交 worker（惰性建，见 _ensure_payout_worker）；目标地址与提示文案
+        self._payout_worker: Any = None
+        self._payout_target = ""
+        self._payout_note = ""
         if getattr(controller, "save_path", None) is None:
             controller.save_path = _make_save_path(lambda: self._root)
         if getattr(controller, "ask_code", None) is None:
@@ -211,8 +297,17 @@ class DesktopApp:
         self._bus = bus
         self._on_quit = on_quit
         self._unsubscribe = None
+        # IA 模式在构造时定一次：DJB_UI_IA=legacy → 0.3.4 四组；其余 → 方案 A 五组。
+        # 侧栏 / Ctrl+N / 窄窗下拉 / 页头眉标全部读这里，不在别处再派生第二份顺序。
+        self._ia = ia_state()
+        self._ia_order = nav_order(self._ia)
+        self._ia_kickers = {key: nav_kicker(self._ia, key) for key in self._ia_order}
         self._nav_buttons: dict[str, Any] = {}
         self._fields: dict[str, Any] = {}
+        #: 密码框的「显示 / 隐藏」按钮（key → Button）：窗口级测试要点它验证真能切换
+        self._reveal_buttons: dict[str, Any] = {}
+        #: 可编辑字段的输入框（key → Entry）：窗口级测试要直接读 ``show`` 选项
+        self._entries: dict[str, Any] = {}
         self._row_notes: dict[str, str] = {}
         self._tree: Any = None
         self._detail: Any = None
@@ -241,6 +336,18 @@ class DesktopApp:
                         lambda event: self._apply_layout(getattr(event, "width", None)), add="+")
         if self._bus is not None:
             self._unsubscribe = self._bus.subscribe(self._on_bus)
+        # G4：更新 worker 在窗口起来时就接上——否则第一次点「检查更新」会因为
+        # ``update_via`` 还是 None 而在**主线程**跑网络检查（正是本条要修的卡顿）。
+        self._ensure_update_worker()
+        self._ensure_probe_worker()
+        self._ensure_discover_worker()
+        self._controller.device_via = self._start_device_flow
+        bind = getattr(self._root, "bind", None)
+        if callable(bind):
+            try:
+                bind("<Escape>", self._on_escape, add="+")
+            except Exception:                            # pragma: no cover - 无窗口
+                pass
         self.show_view(controller.view)
 
     # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
@@ -271,8 +378,9 @@ class DesktopApp:
         self._fonts = kit.fonts_for(self._root, scale=self._scale)
         kit.apply_kit_styles(self._root, self._ttk)
         if self._scale != 1.0:
-            try:                                   # 行高跟着字号一起放大（26 → 32@125%）
-                self._ttk.Style().configure("Kit.Treeview", rowheight=self._px(26))
+            try:                                   # 行高跟着字号一起放大（28 → 35@125%）；口径同 ui_kit.table_rowheight
+                self._ttk.Style().configure(
+                    "Kit.Treeview", rowheight=kit.table_rowheight(self._scale))
                 # 必须从**基常量**派生：原地写 self._px(NavItem.HEIGHT) 会让类属性
                 # 每开一个窗口就再乘一次 scale（34→35→36→…），同进程第二个窗口起布局漂移。
                 kit.NavItem.HEIGHT = self._px(kit.NAV_ITEM_HEIGHT)
@@ -323,8 +431,7 @@ class DesktopApp:
         # 窄窗导航下拉（<760 时替代侧栏；一个视图都不少）
         self._nav_combo = self._ttk.Combobox(
             self._page_actions, state="readonly", takefocus=True, width=18,
-            values=[str(i) + " · " + VIEW_TITLES[key]
-                    for i, key in enumerate(VIEW_KEYS, start=1)])
+            values=list(nav_combo_values(self._ia)))
         self._nav_combo.bind("<<ComboboxSelected>>", self._on_nav_combo)
         self._nav_combo.pack(side="right")
         self._nav_combo.pack_forget()
@@ -353,12 +460,12 @@ class DesktopApp:
             splinesteps=12, fill=dual.chart("mint_bright"),
             outline=dual.chart("mint_bright"))
         logo.create_text(self._px(12), self._px(12), text="D", fill=dual.color("ink"),
-                         font=fonts.sans(kit.PX_CARD, bold=True))
-        tk.Label(brand, text="DJB 联脑", font=fonts.sans(kit.PX_CARD, bold=True),
+                         font=fonts.sans(kit.px("h2"), bold=True))
+        tk.Label(brand, text="DJB 联脑", font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("ink"), background=dual.color("surface")).pack(
                      side="left", padx=(8, 0))
         self._brand_sub = tk.Label(brand, text="· 节点工作台",
-                                   font=fonts.sans(kit.PX_SMALL),
+                                   font=fonts.sans(kit.px("small")),
                                    foreground=dual.color("muted_text"),
                                    background=dual.color("surface"))
         self._brand_sub.pack(side="left", padx=(6, 0))
@@ -368,18 +475,18 @@ class DesktopApp:
         right.pack(side="right", padx=(0, 12))
         self._header_right = right
         self._refresh_button = kit.Button(right, "刷新", self.refresh, kind="ghost",
-                                          ground=dual.color("surface"), px=kit.PX_SMALL,
+                                          ground=dual.color("surface"), px=kit.px("small"),
                                           height=self._px(26), pad=self._px(10))
         self._theme_button = kit.Button(right, self._theme_button_text(), self.toggle_theme,
                                         kind="ghost", ground=dual.color("surface"),
-                                        px=kit.PX_SMALL, height=self._px(26), pad=self._px(10))
+                                        px=kit.px("small"), height=self._px(26), pad=self._px(10))
         self._log_button = kit.Button(right, "打开日志", lambda: self.show_view("logs"),
                                       kind="ghost", ground=dual.color("surface"),
-                                      px=kit.PX_SMALL, height=self._px(26), pad=self._px(10))
+                                      px=kit.px("small"), height=self._px(26), pad=self._px(10))
         self._tune_button = kit.Button(right, "调整贡献", lambda: self.show_view("yield"),
                                        kind="primary", ground=dual.color("surface"),
-                                       px=kit.PX_SMALL, height=self._px(26), pad=self._px(12))
-        self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.PX_MICRO),
+                                       px=kit.px("small"), height=self._px(26), pad=self._px(12))
+        self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.px("micro")),
                                     foreground=dual.color("muted_text"),
                                     background=dual.color("surface"))
         self._pack_header_right(narrow=False)
@@ -408,9 +515,9 @@ class DesktopApp:
         ident = tk.Frame(side, background=ground)
         ident.pack(fill="x", padx=16, pady=(14, 10))
         self._ident = ident
-        tk.Label(ident, text="NODE / EDGE", font=fonts.mono(kit.PX_MICRO),
+        tk.Label(ident, text="NODE / EDGE", font=fonts.mono(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground, anchor="w").pack(fill="x")
-        self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.PX_CARD, bold=True),
+        self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.px("h2"), bold=True),
                                     foreground=dual.color("ink"), background=ground, anchor="w")
         self._ident_name.pack(fill="x", pady=(2, 2))
         line = tk.Frame(ident, background=ground)
@@ -419,11 +526,11 @@ class DesktopApp:
                                     highlightthickness=0, takefocus=0)
         self._ident_dot.pack(side="left")
         self._ident_dot.create_oval(2, 2, 8, 8, fill=dual.color("mint_text"), outline="")
-        self._ident_state = tk.Label(line, text="状态未知", font=fonts.sans(kit.PX_MICRO),
+        self._ident_state = tk.Label(line, text="状态未知", font=fonts.sans(kit.px("micro")),
                                      foreground=dual.color("muted_text"), background=ground,
                                      anchor="w")
         self._ident_state.pack(side="left", padx=(4, 0))
-        self._ident_meta = tk.Label(ident, text="—", font=fonts.sans(kit.PX_MICRO),
+        self._ident_meta = tk.Label(ident, text="—", font=fonts.sans(kit.px("micro")),
                                     foreground=dual.color("muted_text"), background=ground,
                                     anchor="w", justify="left")
         self._ident_meta.pack(fill="x", pady=(4, 0))
@@ -450,20 +557,20 @@ class DesktopApp:
         self._nav_inner.bind("<Configure>", self._on_nav_inner_resize)
         self._nav_canvas.bind("<Configure>", self._on_nav_canvas_resize)
         self._nav_section_headers: dict[str, Any] = {}
-        for index, section in enumerate(NAV_SECTIONS):
-            self._render_nav_section(section, first=index == 0)
+        for index, (section, items) in enumerate(nav_plan(self._ia)):
+            self._render_nav_section(section, items, first=index == 0)
         kit.Divider(side, color=dual.color("line")).pack(fill="x", padx=12)
         foot = tk.Frame(side, background=ground)
         foot.pack(fill="x", padx=16, pady=(8, 10))
         from ..facts import CLIENT_VERSION
         self._version_label = tk.Label(
-            foot, text="v" + CLIENT_VERSION, font=fonts.mono(kit.PX_MICRO),
+            foot, text="v" + CLIENT_VERSION, font=fonts.mono(kit.px("micro")),
             foreground=dual.color("muted_text"), background=ground, anchor="w")
         self._version_label.pack(side="left")
         self._demo_chip = None
         if getattr(self._controller.snapshot, "source", "") == "demo":
             self._demo_chip = kit.Chip(foot, "演示数据", tone="amber", ground=ground,
-                                       px=kit.PX_MICRO, height=17)
+                                       px=kit.px("micro"), height=17)
             self._demo_chip.pack(side="right")
 
     def _font_for(self, text: str, px: int, *, bold: bool = False) -> Any:
@@ -482,25 +589,29 @@ class DesktopApp:
             return self._fonts.mono(px, bold=bold)
         return self._fonts.sans(px, bold=bold)
 
-    def _render_nav_section(self, section: Any, *, first: bool = False) -> None:
-        """一个分组：10px 分组头（拉丁微标 + 中文组名）+ 该组导航项。
+    def _render_nav_section(self, section: Any,
+                            items: tuple[tuple[str, str, str, str], ...] = (),
+                            *, first: bool = False) -> None:
+        """一个分组：micro 档分组头（拉丁微标 + 中文组名）+ 该组导航项。
 
-        只是给既有 :class:`ui_kit.NavItem` 加一层结构；选中态/图标/窄窗下拉都不变。
+        分组/顺序/标题/徽标全部来自 :func:`nav_plan`（IA 单一数据源）；本方法只负责画。
+        ``BETA`` 徽标走 :class:`ui_kit.NavItem` 自带的右侧计数位（等宽 micro 档），
+        与「暂不可用」的置灰是两件事：BETA 可点，只是标明能力滞后。
         """
         kit, tk = self._kit, self._tk
         ground = dual.color("surface3")
         head = tk.Frame(self._nav_inner, background=ground)
         head.pack(fill="x", padx=6, pady=(0 if first else 10, 2))
-        tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.PX_MICRO),
+        tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground,
                  anchor="w").pack(side="left")
-        tk.Label(head, text=section.title, font=self._fonts.sans(kit.PX_MICRO),
+        tk.Label(head, text=section.title, font=self._fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground,
                  anchor="w").pack(side="left", padx=(6, 0))
         self._nav_section_headers[section.key] = head
-        for key in section.keys:
-            item = kit.NavItem(self._nav_inner, text=VIEW_TITLES[key],
-                               icon=NAV_ICONS.get(key, "dot"), ground=ground,
+        for key, label, icon, badge in items:
+            item = kit.NavItem(self._nav_inner, text=label, icon=icon, count=badge,
+                               ground=ground,
                                command=lambda name=key: self.show_view(name))
             item.pack(fill="x", pady=1)
             self._nav_buttons[key] = item
@@ -604,19 +715,19 @@ class DesktopApp:
         self._pagehead = head
         left = tk.Frame(head, background=dual.color("bg"))
         left.grid(row=0, column=0, sticky="w", padx=(self._px(26), 0), pady=(self._px(12), self._px(12)))
-        self._page_kicker = tk.Label(left, text="OVERVIEW", font=fonts.for_text("OVERVIEW", kit.PX_MICRO),
+        self._page_kicker = tk.Label(left, text="OVERVIEW", font=fonts.for_text("OVERVIEW", kit.px("micro")),
                                      foreground=dual.color("muted_text"),
                                      background=dual.color("bg"), anchor="w")
         self._page_kicker.pack(anchor="w")
         self._view_title = tk.Label(left, text=VIEW_TITLES[self._controller.view],
-                                    font=fonts.sans(kit.PX_H1, bold=True),
+                                    font=fonts.sans(kit.px("h1"), bold=True),
                                     foreground=dual.color("ink"), background=dual.color("bg"),
                                     anchor="w")
         self._view_title.pack(anchor="w")
         right = tk.Frame(head, background=dual.color("bg"))
         right.grid(row=0, column=1, sticky="e", padx=(0, self._px(26)))
         self._page_actions = right
-        self._snapshot_label = tk.Label(right, text="数据截至 —", font=fonts.sans(kit.PX_MICRO),
+        self._snapshot_label = tk.Label(right, text="数据截至 —", font=fonts.sans(kit.px("micro")),
                                         foreground=dual.color("muted_text"),
                                         background=dual.color("bg"))
         self._snapshot_label.pack(side="left", padx=(0, 10))
@@ -631,11 +742,11 @@ class DesktopApp:
         bar.grid_propagate(False)
         bar.pack_propagate(False)
         self._statusbar = bar
-        self._status = tk.Label(bar, text=DEFAULT_MESSAGE, font=fonts.sans(kit.PX_MICRO),
+        self._status = tk.Label(bar, text=DEFAULT_MESSAGE, font=fonts.sans(kit.px("micro")),
                                 foreground=dual.color("muted_text"),
                                 background=dual.color("surface3"), anchor="w")
         self._status.pack(side="left", padx=(self._px(14), 0), pady=self._px(4))
-        self._status_right = tk.Label(bar, text="—", font=fonts.sans(kit.PX_MICRO),
+        self._status_right = tk.Label(bar, text="—", font=fonts.sans(kit.px("micro")),
                                       foreground=dual.color("muted_text"),
                                       background=dual.color("surface3"), anchor="e")
         self._status_right.pack(side="right", padx=(0, self._px(14)), pady=self._px(4))
@@ -705,7 +816,7 @@ class DesktopApp:
     def _bind_keys(self) -> None:
         self._root.bind("<F5>", lambda _e: self.refresh())
         # B5：13 个视图全部可键盘直达（Ctrl+1…9 / Ctrl+Shift+1…4）+ 前后循环兜底
-        for sequence, key in view_shortcut_bindings():
+        for sequence, key in view_shortcut_bindings(keys=self._ia_order):
             self._root.bind(sequence, lambda _e, name=key: self.show_view(name))
         self._root.bind("<Control-Prior>", lambda _e: self._step_view(-1))
         self._root.bind("<Control-Next>", lambda _e: self._step_view(1))
@@ -715,18 +826,29 @@ class DesktopApp:
     def _step_view(self, step: int) -> None:
         """Ctrl+PageUp/PageDown：按 IA 顺序前后切（13 个视图循环，不依赖键盘布局）。"""
         try:
-            key = self._controller.next_view(int(step)).key
+            current = self._ia_order.index(self._controller.view)
+            key = self._ia_order[(current + int(step)) % len(self._ia_order)]
         except Exception:                            # pragma: no cover - 控制器异常
             return
         self.show_view(key)
 
     # ── 渲染
     def show_view(self, key: str) -> View:
-        """切视图并立即完成布局（截图脚本依赖这一点）。"""
-        try:
-            view = self._controller.show(key)
-        except ValueError:
+        """切视图并立即完成布局（截图脚本依赖这一点）。
+
+        IA 注册表里还没有渲染实现的页 → 占位空态（可点、可截图、不崩）；
+        完全未知的 key → 回到当前页（与 0.3.4 的 ``ValueError`` 行为一致）。
+        """
+        route, payload = route_for(key, VIEW_TITLES)
+        if route == "unknown":
             return self._controller.current()
+        if route == "placeholder":
+            view = placeholder_view(payload)
+        else:
+            try:
+                view = self._controller.show(key)
+            except ValueError:                       # pragma: no cover - 与 route 双保险
+                return self._controller.current()
         self._render(view)
         self._sync_nav(key)
         self._update_status()
@@ -739,11 +861,384 @@ class DesktopApp:
         self._page_fade()
         return view
 
-    def refresh(self) -> View:
+    def refresh(self) -> View | None:
+        """刷新（交互路径：按钮 / F5 / Ctrl-R）。**取数在 worker 线程**，不阻塞主线程。
+
+        返回 ``None`` 表示结果稍后到（:meth:`refresh_now` 是同步版，给 ``--shot`` /
+        没有事件循环的场景用）。重复点击不叠加：只会更新一次「正在刷新…」。
+        """
+        worker = self._ensure_refresh_worker()
+        if worker is None:                         # 没有 after()（假 root / 无窗口）
+            return self.refresh_now()
+        if not worker.start():
+            return None
+        return None
+
+    def refresh_now(self) -> View:
+        """同步刷新（阻塞到取数完成）：截图脚本 / 单测 / 无事件循环环境专用。"""
         view = self._controller.refresh()
         self._render(view)
         self._update_status()
         return view
+
+    def _ensure_refresh_worker(self) -> Any:
+        """惰性建 worker：``schedule`` 用 ``root.after``，``cancel`` 用 ``after_cancel``。
+
+        ``after`` 是**主线程**的东西：worker 线程只置一个 Event，主线程轮询取结果。
+        """
+        worker = getattr(self, "_refresh_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(self._controller.source.snapshot,
+                               apply=self._apply_refresh,
+                               on_start=self._refresh_started,
+                               on_busy=self._refresh_busy,
+                               on_finish=self._refresh_finished,
+                               schedule=schedule, cancel=cancel)
+        self._refresh_worker = worker
+        # 动作里（登出/绑定/暂停后）的刷新也走异步：否则那几次点击照样冻住窗口
+        self._controller.refresh_via = self._request_refresh_async
+        return worker
+
+    # ── 刷新回调（全部在主线程执行）
+    def _request_refresh_async(self, sections: Any = None) -> None:
+        worker = self._ensure_refresh_worker()
+        if worker is None:
+            self._controller.refresh(sections)     # 没有事件循环：退回同步
+            return
+        worker.start(sections)
+
+    def _refresh_started(self) -> None:
+        """(a) 立即反馈：按钮文案 + 状态栏，在取数**开始之前**就变。"""
+        button = getattr(self, "_refresh_button", None)
+        if button is not None:
+            try:
+                button.set_text("刷新中…")
+            except Exception:                      # pragma: no cover - 控件已销毁
+                pass
+        self._toast("正在刷新…（可以继续拖动/切页）", ok=True)
+
+    def _refresh_busy(self) -> None:
+        """(c) 并发闸门：重复点击只提示，不再派发第二个取数。"""
+        self._toast("正在刷新…上一次还没结束，已忽略这次点击", ok=True)
+
+    def _refresh_finished(self) -> None:
+        button = getattr(self, "_refresh_button", None)
+        if button is not None:
+            try:
+                button.set_text("刷新")
+            except Exception:                      # pragma: no cover
+                pass
+
+    def _apply_refresh(self, fresh: Any, error: BaseException | None,
+                       sections: Any = None) -> None:
+        """(d) 结果落地：合并快照 → 渲染 → 状态栏。异常已经在这里变成「刷新失败」。"""
+        view = self._controller.apply_refresh(fresh, sections=sections, error=error)
+        self._render(view)
+        self._update_status()
+        worker = getattr(self, "_refresh_worker", None)
+        duration = getattr(worker, "last_duration_s", 0.0) or 0.0
+        message = str(self._controller.message or "")
+        if duration and message.startswith("已刷新"):
+            message += "（用时 %.1f s）" % duration
+        self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
+
+    # ── 检查更新 / 安装更新（G4 / RC14 P0）：网络 + 签名校验，绝不在主线程
+    def _ensure_update_worker(self) -> Any:
+        """惰性建更新 worker（同一个 :class:`RefreshWorker` 模板，``kind`` 区分 check/apply）。"""
+        worker = getattr(self, "_update_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        def fetch(sections: Any = None) -> Any:
+            kind = str(getattr(self, "_update_kind", "check"))
+            if kind == "apply":
+                return self._controller.run_update_apply()
+            return self._controller.run_update_check()
+
+        worker = RefreshWorker(fetch, apply=self._apply_update_worker,
+                               on_start=self._update_started,
+                               on_busy=self._update_busy,
+                               schedule=schedule, cancel=cancel)
+        self._update_worker = worker
+        # 动作入口：controller 侧只认「有没有异步通道」，具体 check/apply 由本层记 kind
+        self._controller.update_via = self._start_update
+        return worker
+
+    def _start_update(self, kind: str = "check") -> bool:
+        """controller 的动作回调进来：派给 worker（返回 True = 已派出）。"""
+        self._update_kind = "apply" if str(kind) == "apply" else "check"
+        worker = self._ensure_update_worker()
+        if worker is None:
+            return False                  # 无事件循环 → controller 回落同步
+        return bool(worker.start())
+
+    def _update_started(self) -> None:
+        self._toast("正在检查更新…" if getattr(self, "_update_kind", "check") == "check"
+                    else "正在下载并安装更新…", ok=True)
+
+    def _update_busy(self) -> None:
+        self._toast("上一次更新操作还没结束，已忽略这次点击", ok=True)
+
+    def _apply_update_worker(self, result: Any, error: BaseException | None,
+                             sections: Any = None) -> None:
+        if error is not None:
+            self._toast("更新操作失败（" + type(error).__name__ + "）：" + str(error)[:120],
+                        ok=False)
+            return
+        if result is None:
+            self._toast("更新操作失败：没有拿到结果", ok=False)
+            return
+        self._apply_update(getattr(result, "payload", None) or {},
+                           ok=bool(getattr(result, "ok", False)),
+                           message=str(getattr(result, "message", "") or ""))
+
+    def _apply_update(self, payload: Any, *, ok: bool | None = None,
+                      message: str = "") -> None:
+        """把一次更新结果讲给客户听（G4-3/G4-4）：发生了什么 + 下一步 + 能点就点。
+
+        ``payload`` 是 ``check()``/``apply()`` 的原始结果（含 ``state``）；``message``
+        是 controller 已经翻好的人话（优先用它，避免两层文案打架）。
+        """
+        from ..update import guidance
+        state = str((payload or {}).get("state") or "") if hasattr(payload, "get") else ""
+        if state in ("checking", "applying"):
+            # 派发那一瞬间已经在 ``_update_started`` 里播报过（同一句话），这里不再重复
+            return
+        info = guidance(payload if hasattr(payload, "get") else None)
+        text = message or (info["title"] + ("（" + info["detail"] + "）" if info["detail"] else "")
+                          + " — 下一步：" + info["next"])
+        self._toast(text, ok=bool(ok if ok is not None else info["ok"]))
+        # 下载类动作直接把客户送到下载页（no_artifact 的「下一步」不能只是一句话）
+        url = str(info.get("url") or "")
+        if info.get("action") == "download" and url:
+            self._open_url(url)
+        # 结果落地后重画账户页（「上次结果」那三行要立刻反映新状态）
+        self._render(self._controller.current())
+        self._update_status()
+
+    # ── USDT 收款地址提交（owner 2026-11-13 方案 B：客户端直接提交云端）
+    def _ensure_payout_worker(self) -> Any:
+        """惰性建「提交收款地址」worker：复用 W1 的 :class:`RefreshWorker` 模式。
+
+        同一个模式解决同一个问题（主线程不碰网络）：worker 线程只跑
+        ``controller.submit_payout``（纯数据层调用，不碰控件），主线程用 ``after`` 轮询取结果。
+        """
+        worker = getattr(self, "_payout_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(
+            lambda sections=None: self._controller.submit_payout(self._payout_target),
+            apply=self._apply_payout, on_start=self._payout_started,
+            on_busy=self._payout_busy, schedule=schedule, cancel=cancel)
+        self._payout_worker = worker
+        return worker
+
+    def _start_payout_submit(self, address: str, message: str = "") -> None:
+        """派发一次提交；没有事件循环（截图脚本/单测）才退回同步，行为和按钮一致。"""
+        self._payout_target = str(address)
+        self._payout_note = str(message or "")
+        worker = self._ensure_payout_worker()
+        if worker is None:
+            result = self._controller.submit_payout(self._payout_target)
+            self._toast(str(result.message), ok=bool(result.ok))
+            self._request_refresh_async(("access",))
+            return
+        worker.start()                     # 忙时走 on_busy（不叠加第二个 POST）
+
+    def _payout_started(self) -> None:
+        self._toast(self._payout_note or "正在提交收款地址到云端…", ok=True)
+
+    def _payout_busy(self) -> None:
+        self._toast("正在提交…上一次还没结束，已忽略这次点击", ok=True)
+
+    def _apply_payout(self, result: Any, error: BaseException | None,
+                      sections: Any = None) -> None:
+        """结果落地（主线程）：先 toast 说清成败，再异步重拉云端状态（GET 也不在主线程）。"""
+        if error is not None:
+            self._toast("提交失败（" + type(error).__name__ + "）；地址未变更", ok=False)
+        elif result is None:
+            self._toast("提交失败：没有拿到结果；地址未变更", ok=False)
+        else:
+            self._toast(str(getattr(result, "message", "") or "提交完成"),
+                        ok=bool(getattr(result, "ok", False)))
+        refresh = getattr(self, "_refresh_worker", None)
+        if refresh is None or not getattr(refresh, "busy", False):
+            self._request_refresh_async(("access",))
+
+    # ── 探针（RC14 D）：「立即探测」也要在 worker 里跑（网络 10 s 级）
+    def _ensure_probe_worker(self) -> Any:
+        """惰性建探针 worker：与刷新/更新同一个 :class:`RefreshWorker` 模板。"""
+        worker = getattr(self, "_probe_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(lambda sections=None: self._controller.run_probe(),
+                               apply=self._apply_probe, on_start=self._probe_started,
+                               on_busy=self._probe_busy,
+                               schedule=schedule, cancel=cancel)
+        self._probe_worker = worker
+        self._controller.probe_via = self._start_probe
+        return worker
+
+    def _start_probe(self) -> bool:
+        worker = self._ensure_probe_worker()
+        if worker is None:
+            return False                   # 无事件循环 → controller 回落同步
+        return bool(worker.start())
+
+    def _probe_started(self) -> None:
+        self._toast("正在探测上游（L1 列表 + L2 推理 / L3 流式，通常 10 秒内）…", ok=True)
+
+    def _probe_busy(self) -> None:
+        self._toast("上一次探测还没结束，已忽略这次点击", ok=True)
+
+    def _apply_probe(self, result: Any, error: BaseException | None,
+                     sections: Any = None) -> None:
+        if error is not None:
+            self._toast("探测失败（" + type(error).__name__ + "）：" + str(error)[:120], ok=False)
+        elif result is None:
+            self._toast("探测失败：没有拿到结果", ok=False)
+        else:
+            self._toast(str(getattr(result, "message", "") or "探测完成"),
+                        ok=bool(getattr(result, "ok", False)))
+        # 结论落库后再取一次数（探针表/容量卡片要立刻反映新结论）；GET 也不在主线程
+        refresh = getattr(self, "_refresh_worker", None)
+        if refresh is None or not getattr(refresh, "busy", False):
+            self._request_refresh_async(("models", "token_plan"))
+
+    # ── RC14 C 设备码绑定（轮询在后台线程；主线程只播报 + 重画）
+    def _ensure_device_runner(self) -> bool:
+        """首点建线程；轮询节奏由 ``device_flow`` 决定（5/15/30 秒，10 分钟停）。"""
+        if getattr(self, "_device_thread", None) is not None and self._device_thread.is_alive():
+            return True
+        if not callable(getattr(self._root, "after", None)):
+            return False
+        import threading
+
+        stop = threading.Event()
+        self._device_stop = stop
+
+        def work() -> None:
+            try:
+                result = self._controller.run_device_flow(stop=stop.is_set)
+            except Exception as exc:                     # 后台线程绝不把异常抛给 Tk
+                result = _device_error(exc)
+            self._ui_call(lambda: self._apply_device(result))
+
+        thread = threading.Thread(target=work, name="djb-device-flow", daemon=True)
+        self._device_thread = thread
+        thread.start()
+        return True
+
+    def _ui_call(self, fn: Any) -> None:
+        """把回调排队回主线程（Tk 只能在自己的线程里改界面）。"""
+        after = getattr(self._root, "after", None)
+        if callable(after):
+            try:
+                after(0, fn)
+                return
+            except Exception:                            # pragma: no cover - 窗口已销毁
+                pass
+        fn()
+
+    def _start_device_flow(self, _flow: Any = None) -> bool:
+        if not self._controller.device_flow_enabled():
+            return False
+        return self._ensure_device_runner()
+
+    def _apply_device(self, result: Any) -> None:
+        message = str(getattr(result, "message", "") or "绑定流程结束")
+        self._toast(message, ok=bool(getattr(result, "ok", False)))
+        if bool(getattr(result, "ok", False)):
+            self._request_refresh_async(("account", "overview", "access"))
+
+    # ── RC14 I：读取模型清单（网络在 worker 线程，主线程只播报）
+    def _ensure_discover_worker(self) -> Any:
+        """惰性建「读取模型清单」worker（与探针/更新同一个 RefreshWorker 模板）。"""
+        worker = getattr(self, "_discover_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        worker = RefreshWorker(lambda sections=None: self._controller.run_discover(
+            str(self._controller.drafts.get("base_url") or "").strip(),
+            str(self._controller.drafts.get("protocol") or "").strip(),
+            str(self._controller.drafts.get("upstream_secret") or "").strip()),
+            apply=self._apply_discover, on_start=self._discover_started,
+            on_busy=self._discover_busy,
+            schedule=lambda delay, fn: root.after(int(delay), fn),
+            cancel=lambda job: root.after_cancel(job))
+        self._discover_worker = worker
+        self._controller.discover_via = self._start_discover
+        return worker
+
+    def _start_discover(self, base_url: str, protocol: str, secret: str) -> bool:
+        worker = self._ensure_discover_worker()
+        if worker is None:
+            return False                   # 无事件循环 → controller 回落同步
+        return bool(worker.start())
+
+    def _discover_started(self) -> None:
+        self._toast("正在读取上游模型清单（GET {base}/models）…", ok=True)
+
+    def _discover_busy(self) -> None:
+        self._toast("上一次读取还没结束，已忽略这次点击", ok=True)
+
+    def _apply_discover(self, result: Any, error: BaseException | None,
+                        sections: Any = None) -> None:
+        if error is not None:
+            self._toast("读取失败（" + type(error).__name__ + "）：" + str(error)[:120], ok=False)
+        else:
+            self._toast(str(getattr(result, "message", "") or "读取完成"),
+                        ok=bool(getattr(result, "ok", False)))
+            if bool(getattr(result, "ok", False)):
+                self._request_refresh_async(("token_plan",))
 
     # ── 双主题（day / night）
     def _theme_button_text(self, narrow: bool | None = None) -> str:
@@ -962,6 +1457,7 @@ class DesktopApp:
         # 已销毁的 Treeview（换肤时 TclError: invalid command name ...!treeview）
         self._tree = None
         self._table = None
+        self._tables = []                    # [(Table, Treeview)]：主表 + 附加表（见 _render_table）
         self._detail = None
         self._row_cells = {}
         self._row_notes = {}
@@ -977,27 +1473,30 @@ class DesktopApp:
 
     def _apply_narrow_cells(self, narrow: bool) -> None:
         """窄窗用行级紧凑文案，回宽恢复完整文案（数据两份都在视图里，不丢字段）。"""
-        table = getattr(self, "_table", None)
-        tree = getattr(self, "_tree", None)
-        if table is None or tree is None:
-            return
-        for row in getattr(table, "rows", ()) or ():
-            iid = row.key or ""
-            if not iid:
-                continue
-            compact = getattr(row, "narrow", ())
-            values = (compact if narrow and compact and len(compact) == len(row.cells)
-                      else row.cells)
-            try:
-                tree.item(iid, values=values)
-            except Exception:                        # pragma: no cover - 行已被重建
-                pass
+        pairs = list(getattr(self, "_tables", ()) or ())
+        if not pairs:
+            table = getattr(self, "_table", None)
+            tree = getattr(self, "_tree", None)
+            if table is not None and tree is not None:
+                pairs = [(table, tree)]
+        for table, tree in pairs:
+            for row in getattr(table, "rows", ()) or ():
+                iid = row.key or ""
+                if not iid:
+                    continue
+                compact = getattr(row, "narrow", ())
+                values = (compact if narrow and compact and len(compact) == len(row.cells)
+                          else row.cells)
+                try:
+                    tree.item(iid, values=values)
+                except Exception:                    # pragma: no cover - 行已被重建
+                    pass
 
     def _on_nav_combo(self, _event=None) -> None:
         value = str(self._nav_combo.get() or "")
         if "·" in value:
             index = value.split("·", 1)[0].strip()
-            for position, key in enumerate(VIEW_KEYS, start=1):
+            for position, key in enumerate(self._ia_order, start=1):
                 if str(position) == index:
                     self.show_view(key)
                     return
@@ -1008,8 +1507,8 @@ class DesktopApp:
         combo = getattr(self, "_nav_combo", None)
         if combo is not None:
             try:                                           # 窄窗下拉与侧栏保持同一状态
-                index = VIEW_KEYS.index(key) + 1
-                combo.set(str(index) + " · " + VIEW_TITLES[key])
+                index = self._ia_order.index(key) + 1
+                combo.set(str(index) + " · " + ia.page(key).title)
             except Exception:                              # pragma: no cover - 视图名变了
                 pass
 
@@ -1069,8 +1568,14 @@ class DesktopApp:
         self._snapshot_label.configure(text="数据截至 " + stamp)
 
     def _status_line(self) -> str:
-        """状态条左侧消息：窄窗只留前两段（否则会挤到右侧的 GPU/版本上去）。"""
+        """状态条左侧消息：窄窗只留前两段（否则会挤到右侧的 GPU/版本上去）。
+
+        ``DJB_UI_IA`` 写了但没识别（``ia.ignored``）时追加一句：不静默当默认。
+        """
         line = sync_shortcut_hint(self._controller.status_line())
+        decision = getattr(self, "_ia", None)
+        if decision is not None and getattr(decision, "ignored", False):
+            line = line + " · DJB_UI_IA=" + str(decision.raw) + " 未识别，已按 share 生效"
         if not getattr(self, "_narrow", False):
             return line
         parts = [part.strip() for part in line.split("·") if part.strip()]
@@ -1125,13 +1630,56 @@ class DesktopApp:
             child.destroy()
         self._fields.clear()
         self._vars.clear()
+        self._reveal_buttons.clear()         # 按钮随旧控件销毁，不能留悬空引用
+        self._entries.clear()
         self._row_notes.clear()
         self._tree = None
         self._detail = None
         self._table = None
+        self._tables = []                    # [(Table, Treeview)]：主表 + 附加表（见 _render_table）
         self._wrap_targets = []
 
     # ── 渲染入口
+    def _on_escape(self, event: Any = None) -> None:
+        """Esc = 跳过当前引导步骤（设计 §3.4）；引导不在时什么都不做。"""
+        try:
+            if self._controller.onboarding_visible():
+                self._on_action("onboarding.skip")
+        except Exception:                                # 状态读不到：不要拦 Esc
+            return None
+        return None
+
+    def _render_onboarding(self, body: Any) -> None:
+        """首启引导面板（应用内、非模态）。渲染失败绝不影响主界面。"""
+        try:
+            panel = self._controller.onboarding_panel()
+        except Exception:                                # 状态文件坏了：不画，别崩窗口
+            panel = None
+        if panel is None:
+            return
+        tk = self._tk
+        kit = self._kit
+        ground = dual.color("surface")
+        card = kit.RoundedCard(body, ground=dual.color("bg"), pad=(16, 12))
+        card.pack(fill="x", pady=(0, 10))
+        inner = card.body
+        tk.Label(inner, text=panel.title, font=self._fonts.sans(kit.px("h2"), bold=True),
+                 foreground=dual.color("ink"), background=ground, anchor="w").pack(anchor="w")
+        self._wrap(tk.Label(inner, text=panel.body, font=self._fonts.sans(kit.px("small")),
+                            foreground=dual.color("muted_text"), background=ground,
+                            anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
+                                anchor="w", pady=(4, 8))
+        row = tk.Frame(inner, background=ground)
+        row.pack(anchor="w")
+        for action in panel.actions:
+            button = kit.Button(row, action.label,
+                                (lambda key: (lambda: self._on_action(key)))(action.key),
+                                kind="primary" if action.primary else "ghost",
+                                ground=ground, px=kit.px("small"), height=30, pad=12,
+                                enabled=bool(action.enabled))
+            button.pack(side="left", padx=(0, 8))
+        self._onboarding_panel = card
+
     def _render(self, view: View) -> None:
         """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。"""
         tk = self._tk
@@ -1143,19 +1691,22 @@ class DesktopApp:
         self._clear()
         self._view_title.configure(text=view.title)
         self._set_font(self._page_kicker,
-                       PAGE_KICKERS.get(view.key, view.key.upper()), kit.PX_MICRO)
+                       self._ia_kickers.get(view.key, view.key.upper()), kit.px("micro"))
         pad = (12, 6) if self._rendered_narrow else (26, 6)
         self._content_pad = pad
         body = tk.Frame(self._content, background=dual.color("bg"), bd=0, highlightthickness=0)
         body.pack(fill="both", expand=True, padx=pad[0], pady=pad[1])
         self._body = body
+        # RC14 B：首次引导面板 —— **不是模态**：画在正文最上方，不拦点击、不挡导航；
+        # 每步都有「跳过这一步」，第一步还有「跳过设置，直接进入」。开关关 → 不画。
+        self._render_onboarding(body)
         if view.subtitle:
-            self._wrap(tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.PX_SMALL),
+            self._wrap(tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.px("small")),
                               foreground=dual.color("muted_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
                                   anchor="w", pady=(0, 4))
         for text in view.unavailable:
-            self._wrap(tk.Label(body, text="! " + text, font=self._fonts.sans(kit.PX_SMALL),
+            self._wrap(tk.Label(body, text="! " + text, font=self._fonts.sans(kit.px("small")),
                               foreground=dual.color("amber_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
                                   anchor="w", pady=(0, 4))
@@ -1166,7 +1717,7 @@ class DesktopApp:
         for note in view.notes:
             if not note:
                 continue
-            self._wrap(tk.Label(body, text="· " + note, font=self._fonts.sans(kit.PX_MICRO),
+            self._wrap(tk.Label(body, text="· " + note, font=self._fonts.sans(kit.px("micro")),
                               foreground=dual.color("muted_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
                                   anchor="w", pady=(2, 0))
@@ -1199,8 +1750,16 @@ class DesktopApp:
         label.bind("<Configure>", lambda event, target=label: self._fit_wrap(target), add="+")
         return label
 
+    #: 换行宽「变大」的最小步长（px）。同一帧里列宽会因滚动条出现/消失抖 1px，
+    #: 若逐像素追着改：wraplength → 行数 → 高度 → 滚动条 → 列宽 形成回环，
+    #: ``update_idletasks`` **永不返回**（0.3.6 接入页长提示实测复现）。两个钉子：
+    #: tests/test_desktop_payout.py::test_fit_wrap_follows_shrink_but_steps_growth
+    #: 与 ::test_real_tk_access_page_folds_advanced_and_never_prefills_mask（修前会挂死）。
+    #: 策略：**变窄立刻跟**（保证不裁字），变宽按 24px 步进（抖动吃掉，最多多折一行）。
+    WRAP_GROW_STEP = 24
+
     def _fit_wrap(self, label: Any, width: int | None = None) -> None:
-        """把单条 label 的换行宽钳到它实际分到的宽度（只减不增，防抖）。"""
+        """把单条 label 的换行宽钳到它实际分到的宽度（变窄立刻跟、变宽按步进）。"""
         try:
             span = int(label.winfo_width() if width is None else width)
         except Exception:                            # pragma: no cover - 控件已销毁
@@ -1212,11 +1771,12 @@ class DesktopApp:
             current = int(float(label.cget("wraplength")))
         except Exception:                            # pragma: no cover - 防御
             current = -1
-        if current != span:
+        if current <= 0 or span < current or span - current >= self.WRAP_GROW_STEP:
             try:
                 label.configure(wraplength=span)
             except Exception:                        # pragma: no cover - 控件已销毁
                 pass
+
 
     def _rewrap(self) -> None:
         """宽度变了但没跨断点：只更新换行宽度，不重建控件。"""
@@ -1283,6 +1843,8 @@ class DesktopApp:
         if view.table is not None:
             # 总览只放「最近几张」：整页要一屏装下（G-16），完整列表在「收据」页
             self._render_table(view.table, parent=left, max_rows=4)
+        for extra in view.tables:
+            self._render_table(extra, parent=left, max_rows=4, primary=False)
         for card in view.rail:
             self._render_rail_card(right, card)
         if view.actions:
@@ -1307,25 +1869,25 @@ class DesktopApp:
             gauge.set(hero.gauge.ratio, hero.gauge.value, hero.gauge.label)
         text = tk.Frame(top, background=surface)
         text.pack(side="left", fill="both", expand=True)
-        tk.Label(text, text=hero.kicker, font=fonts.for_text(hero.kicker, kit.PX_MICRO),
+        tk.Label(text, text=hero.kicker, font=fonts.for_text(hero.kicker, kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
         head = tk.Frame(text, background=surface)
         head.pack(fill="x", pady=(2, 0))
-        tk.Label(head, text=hero.title, font=fonts.sans(kit.PX_HERO, bold=True),
+        tk.Label(head, text=hero.title, font=fonts.sans(kit.px("hero"), bold=True),
                  foreground=dual.color("ink"), background=surface, anchor="w").pack(side="left")
         if hero.chip:
             kit.Chip(head, hero.chip, tone=hero.chip_tone, ground=surface,
-                     px=kit.PX_MICRO, height=19).pack(side="left", padx=(10, 0))
-        body_label = tk.Label(text, text=hero.body, font=fonts.sans(kit.PX_SMALL),
+                     px=kit.px("micro"), height=19).pack(side="left", padx=(10, 0))
+        body_label = tk.Label(text, text=hero.body, font=fonts.sans(kit.px("small")),
                               foreground=dual.color("ink2"), background=surface, anchor="w",
                               justify="left")
         body_label.pack(fill="x", pady=(4, 0))
         runtime = tk.Frame(text, background=surface)
         runtime.pack(fill="x", pady=(3, 0))
-        tk.Label(runtime, text=hero.runtime_label, font=fonts.sans(kit.PX_MICRO),
+        tk.Label(runtime, text=hero.runtime_label, font=fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface).pack(side="left")
         tk.Label(runtime, text=hero.runtime,
-                 font=fonts.for_text(hero.runtime, kit.PX_BODY, bold=True),
+                 font=fonts.for_text(hero.runtime, kit.px("body"), bold=True),
                  foreground=dual.color("ink"), background=surface).pack(side="left", padx=(6, 0))
         # 说明文字按卡片实际宽度换行（窗口变宽/变窄都不截断）
         def _fit(_event: Any = None) -> None:
@@ -1346,7 +1908,7 @@ class DesktopApp:
                 metrics.columnconfigure(index, weight=1, uniform="metric")
                 cell = kit.StatCell(metrics, label=metric.label, value=metric.value,
                                     unit=metric.unit, note=metric.note, ground=surface,
-                                    value_px=kit.PX_NUM_L, align="w")
+                                    value_px=kit.px("h1"), align="w")
                 cell.grid(row=0, column=index, sticky="nsew", padx=(0, 10))
         if hero.actions or hero.hint:
             foot = tk.Frame(body, background=surface)
@@ -1355,7 +1917,7 @@ class DesktopApp:
             if hero.hint:
                 # B6：提示先 pack（side=right）并限宽换行 —— 旧实现里它排在按钮后面，
                 # 剩余宽度不够时被内容画布右缘裁掉（「已授权 1 个客户端」就是这样丢字的）。
-                tk.Label(foot, text=hero.hint, font=fonts.sans(kit.PX_MICRO),
+                tk.Label(foot, text=hero.hint, font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface,
                          anchor="e", justify="right", wraplength=240).pack(
                              side="right", padx=(10, 0))
@@ -1375,16 +1937,16 @@ class DesktopApp:
         left = tk.Frame(head, background=surface)
         left.pack(side="left")
         tk.Label(left, text=chart.kicker or "CHART",
-                 font=fonts.for_text(chart.kicker or "CHART", kit.PX_MICRO),
+                 font=fonts.for_text(chart.kicker or "CHART", kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
-        tk.Label(left, text=chart.title, font=fonts.sans(kit.PX_CARD, bold=True),
+        tk.Label(left, text=chart.title, font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("ink"), background=surface, anchor="w").pack(fill="x")
         if chart.caption:
-            tk.Label(head, text=chart.caption, font=fonts.sans(kit.PX_MICRO),
+            tk.Label(head, text=chart.caption, font=fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface).pack(
                          side="right", pady=(10, 0))
         if chart.empty:
-            tk.Label(body, text=chart.empty, font=fonts.sans(kit.PX_SMALL),
+            tk.Label(body, text=chart.empty, font=fonts.sans(kit.px("small")),
                      foreground=dual.color("amber_text"), background=surface, anchor="w",
                      justify="left", wraplength=520).pack(anchor="w", pady=(12, 4))
             return
@@ -1393,9 +1955,9 @@ class DesktopApp:
         bars.set(chart.values, axis=chart.labels)
         foot = tk.Frame(body, background=surface)
         foot.pack(fill="x", pady=(2, 0))
-        tk.Label(foot, text=chart.peak, font=fonts.for_text(chart.peak, kit.PX_MICRO),
+        tk.Label(foot, text=chart.peak, font=fonts.for_text(chart.peak, kit.px("micro")),
                  foreground=dual.color("mint_text"), background=surface).pack(side="left")
-        tk.Label(foot, text=chart.foot, font=fonts.sans(kit.PX_MICRO),
+        tk.Label(foot, text=chart.foot, font=fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface).pack(side="right")
 
     def _render_rail_card(self, parent: Any, card: RailCard) -> None:
@@ -1408,19 +1970,19 @@ class DesktopApp:
         body = box.body
         head = tk.Frame(body, background=surface)
         head.pack(fill="x")
-        tk.Label(head, text=card.kicker, font=fonts.for_text(card.kicker, kit.PX_MICRO),
+        tk.Label(head, text=card.kicker, font=fonts.for_text(card.kicker, kit.px("micro")),
                  foreground=dual.color("muted_text"), background=surface, anchor="w").pack(side="left")
         if card.note:
             tk.Label(head, text=card.note,
-                     font=fonts.for_text(card.note, kit.PX_MICRO, bold=True),
+                     font=fonts.for_text(card.note, kit.px("micro"), bold=True),
                      foreground=dual.color("mint_text"), background=surface).pack(side="right")
         title = tk.Frame(body, background=surface)
         title.pack(fill="x", pady=(2, 0))
-        tk.Label(title, text=card.title, font=fonts.sans(kit.PX_CARD, bold=True),
+        tk.Label(title, text=card.title, font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("ink"), background=surface, anchor="w").pack(side="left")
         if card.badge:
             kit.Chip(title, card.badge, tone=card.badge_tone, ground=surface,
-                     px=kit.PX_MICRO, height=18).pack(side="right")
+                     px=kit.px("micro"), height=18).pack(side="right")
         if card.kind == "stats" and card.stats:
             grid = tk.Frame(body, background=surface)
             grid.pack(fill="x", pady=(6, 0))
@@ -1428,7 +1990,7 @@ class DesktopApp:
                 row, column = divmod(index, 2)
                 grid.columnconfigure(column, weight=1, uniform="today")
                 kit.StatCell(grid, label=stat.label, value=stat.value, unit=stat.unit,
-                             note=stat.note, ground=surface, value_px=kit.PX_NUM_L,
+                             note=stat.note, ground=surface, value_px=kit.px("h1"),
                              mono_value=True).grid(row=row, column=column, sticky="nsew",
                                                   padx=(0, 10), pady=(0, 2))
         if card.kind == "setup" and card.fields:
@@ -1437,11 +1999,11 @@ class DesktopApp:
             for field in card.fields:
                 line = tk.Frame(form, background=surface)
                 line.pack(fill="x", pady=(0, 5))
-                tk.Label(line, text=field.label, font=fonts.sans(kit.PX_MICRO),
+                tk.Label(line, text=field.label, font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface,
                          anchor="w", width=12).pack(side="left")
                 tk.Label(line, text=field.value,
-                         font=fonts.for_text(field.value, kit.PX_SMALL),
+                         font=fonts.for_text(field.value, kit.px("small")),
                          foreground=dual.color("ink"), background=surface,
                          anchor="w").pack(side="left", fill="x", expand=True)
         if card.kind == "throttle":
@@ -1450,17 +2012,17 @@ class DesktopApp:
             for label, value, tone in card.rows:
                 line = tk.Frame(box_rows, background=surface)
                 line.pack(fill="x", pady=(0, 2))
-                tk.Label(line, text=label, font=fonts.sans(kit.PX_MICRO),
+                tk.Label(line, text=label, font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface,
                          anchor="w").pack(side="left")
                 colour = {"mint": "mint_text", "amber": "amber_text", "red": "red_text",
                           "muted": "muted_text"}.get(tone, "ink")
-                tk.Label(line, text=value, font=fonts.for_text(value, kit.PX_SMALL),
+                tk.Label(line, text=value, font=fonts.for_text(value, kit.px("small")),
                          foreground=dual.color(colour), background=surface).pack(side="right")
             if card.toggle is not None:
                 line = tk.Frame(box_rows, background=surface)
                 line.pack(fill="x", pady=(2, 0))
-                tk.Label(line, text=card.toggle[0], font=fonts.sans(kit.PX_MICRO),
+                tk.Label(line, text=card.toggle[0], font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface).pack(side="left")
                 # 开关只读：点它等于「去让路页改」，这里不假装能改（无对应后端动作）
                 kit.Switch(line, on=bool(card.toggle[1]), ground=surface,
@@ -1471,10 +2033,10 @@ class DesktopApp:
             label, ratio, value_text = card.progress
             head_row = tk.Frame(body, background=surface)
             head_row.pack(fill="x", pady=(4, 0))
-            tk.Label(head_row, text=label, font=fonts.sans(kit.PX_MICRO),
+            tk.Label(head_row, text=label, font=fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface).pack(side="left")
             tk.Label(head_row, text=value_text,
-                     font=fonts.for_text(value_text, kit.PX_MICRO),
+                     font=fonts.for_text(value_text, kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface).pack(side="right")
             track = tk.Canvas(body, width=1, height=6, background=surface, bd=0,
                               highlightthickness=0, takefocus=0)
@@ -1498,7 +2060,7 @@ class DesktopApp:
         for action in card.actions:
             self._render_action(foot, action, ground=surface)
         if card.foot:
-            tk.Label(body, text=card.foot, font=fonts.sans(kit.PX_MICRO),
+            tk.Label(body, text=card.foot, font=fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=surface, anchor="w",
                      justify="left", wraplength=300).pack(anchor="w", pady=(5, 0))
 
@@ -1523,6 +2085,8 @@ class DesktopApp:
                 self._render_action(bar, action)
         if view.table is not None:
             self._render_table(view.table)
+        for extra in view.tables:                     # RC14 D：模型与探针页的第二张表
+            self._render_table(extra, primary=False)
 
     def _cards_per_row(self, count: int = 0) -> int:
         """宽窗 4 张、中宽 2 张、窄窗 1 张（设计是四宫格；不许再把第三张挤出窗口）。
@@ -1548,17 +2112,17 @@ class DesktopApp:
         box = kit.RoundedCard(parent, ground=dual.color("bg"), pad=(14, 11))
         box.grid(row=row, column=column, sticky="nsew", padx=(0, 10), pady=(0, 10))
         body = box.body
-        tk.Label(body, text=card.title, font=fonts.sans(kit.PX_CARD, bold=True),
+        tk.Label(body, text=card.title, font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("muted_text"), background=surface, anchor="w").pack(fill="x")
         tone = {"mint": "mint_text", "amber": "amber_text", "red": "red_text",
                 "muted": "muted_text"}.get(card.tone, "ink")
-        value = tk.Label(body, text=card.value, font=fonts.sans(kit.PX_NUM_L, bold=True),
+        value = tk.Label(body, text=card.value, font=fonts.sans(kit.px("h1"), bold=True),
                          foreground=dual.color(tone), background=surface, anchor="w",
                          justify="left")
         value.pack(fill="x", pady=(3, 0))
         meta = None
         if card.meta:
-            meta = tk.Label(body, text=card.meta, font=fonts.sans(kit.PX_MICRO),
+            meta = tk.Label(body, text=card.meta, font=fonts.sans(kit.px("micro")),
                             foreground=dual.color("muted_text"), background=surface,
                             anchor="w", justify="left")
             meta.pack(fill="x", pady=(3, 0))
@@ -1591,17 +2155,23 @@ class DesktopApp:
             (lambda key=action.key: self._on_action(key))
         button = kit.Button(parent, action.label, target,
                             kind="primary" if action.primary else "ghost", ground=base,
-                            px=kit.PX_SMALL, height=29, pad=12, enabled=action.enabled)
+                            px=kit.px("small"), height=29, pad=12, enabled=action.enabled)
         button.pack(side="left", padx=(0, 8))
         if not action.enabled and action.reason:
-            tk.Label(parent, text=action.reason, font=self._fonts.sans(kit.PX_MICRO),
+            tk.Label(parent, text=action.reason, font=self._fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"), background=base).pack(
                          side="left", padx=(0, 10))
 
     def _render_table(self, table: Table, parent: Any = None,
-                      max_rows: int = 12) -> None:
-        """表格：保留 ttk.Treeview（``_tree`` / ``_row_cells`` 是既有契约），只换外观。"""
-        self._table = table
+                      max_rows: int = 12, primary: bool = True) -> None:
+        """表格：保留 ttk.Treeview（``_tree`` / ``_row_cells`` 是既有契约），只换外观。
+
+        ``primary=False`` 是**附加表**（RC14 D：模型与探针页的云端目录）：照常渲染并登记到
+        ``self._tables``，但**不覆盖** ``_table`` / ``_tree`` / ``_row_cells`` / ``_detail``——
+        详情抽屉、窄窗紧凑文案都只服务主表，附加表抢走它们会让探针表点开没反应。
+        """
+        if primary:
+            self._table = table
         narrow = self._is_narrow()
         tk, ttk = self._tk, self._ttk
         kit = self._kit
@@ -1645,22 +2215,34 @@ class DesktopApp:
         self._fit_columns(tree)
         tree.bind("<Configure>", lambda _event, view=tree: self._fit_columns(view), add="+")
         if not table.rows:
-            tk.Label(body, text=table.empty, font=self._fonts.sans(kit.PX_SMALL),
+            tk.Label(body, text=table.empty, font=self._fonts.sans(kit.px("small")),
                      foreground=dual.color("muted_text"), background=dual.color("surface"),
                      anchor="w").pack(anchor="w", pady=(10, 2))
+        if not primary:
+            # 附加表：只登记（列宽/窄窗适配要能一起遍历），不抢主表的契约字段
+            self._tables = list(getattr(self, "_tables", ()) or ()) + [(table, tree)]
+            if table.note:
+                self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.px("micro")),
+                                    foreground=dual.color("muted_text"),
+                                    background=dual.color("surface"), anchor="w",
+                                    justify="left",
+                                    wraplength=self._wrap_hint())).pack(anchor="w", pady=(4, 0))
+            return
         # 详情抽屉：选中一行就在表格下面展开字段（键盘 ↑↓ 也生效；本轮不改抽屉形态）
         self._detail = tk.Frame(body, background=dual.color("surface3"), bd=0,
                                 highlightthickness=0)
         self._detail_columns = tuple(table.columns)
         self._tree = tree
+        # 主表也登记（窄窗紧凑文案要能连附加表一起遍历；见 _apply_narrow_cells）
+        self._tables = list(getattr(self, "_tables", ()) or ()) + [(table, tree)]
         if table.rows:
             tree.bind("<<TreeviewSelect>>", self._on_row_select)
             tk.Label(body, text="选中一行看详情（↑↓ 或点击）",
-                     font=self._fonts.sans(kit.PX_MICRO),
+                     font=self._fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"),
                      background=dual.color("surface")).pack(anchor="w", pady=(6, 0))
         if table.note:
-            self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.PX_MICRO),
+            self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.px("micro")),
                               foreground=dual.color("muted_text"),
                               background=dual.color("surface"), anchor="w",
                               justify="left", wraplength=self._wrap_hint())).pack(anchor="w", pady=(4, 0))
@@ -1760,24 +2342,30 @@ class DesktopApp:
         for column, value in zip(self._detail_columns, values):
             line = self._tk.Frame(detail, background=surface)
             line.pack(fill="x", pady=1, padx=10)
-            self._tk.Label(line, text=column, font=fonts.sans(self._kit.PX_MICRO),
+            self._tk.Label(line, text=column, font=fonts.sans(self._kit.px("micro")),
                            foreground=dual.color("muted_text"), background=surface,
                            width=12, anchor="w").pack(side="left")
             self._tk.Label(line, text=str(value),
-                           font=fonts.for_text(str(value), self._kit.PX_SMALL),
+                           font=fonts.for_text(str(value), self._kit.px("small")),
                            foreground=dual.color("ink"), background=surface,
                            anchor="w").pack(side="left")
         note = self._row_notes.get(selection[0], "")
         if note:
             self._wrap(tk.Label(detail, text="原因：" + note,
-                                    font=fonts.sans(self._kit.PX_MICRO),
+                                    font=fonts.sans(self._kit.px("micro")),
                                     foreground=dual.color("amber_text"), background=surface,
                                     anchor="w", justify="left",
                                     wraplength=self._wrap_hint())).pack(anchor="w", padx=10, pady=(4, 6))
 
     def _render_fields(self, fields: Sequence[Field], view_key: str,
                        parent: Any = None) -> None:
-        """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。"""
+        """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。
+
+        ``Field.advanced`` 的字段**默认折叠**在「高级（排障用）」按钮后面（接入页的
+        节点凭证就是这种：排障要用，但绝不该占首屏——owner 2026-11-13「页面太复杂」）。
+        ``Field.prefill=False`` 的可编辑框留空（掩码值只进 hint），避免一点保存就把掩码
+        当真实值写回配置。
+        """
         kit, tk, ttk = self._kit, self._tk, self._ttk
         fonts = self._fonts
         surface = dual.color("surface")
@@ -1785,61 +2373,140 @@ class DesktopApp:
         card = kit.RoundedCard(target, ground=dual.color("bg"), pad=(16, 14))
         card.pack(fill="x", pady=(0, 10))
         body = card.body
-        editable = any(field.editable for field in fields)
+        normal = [field for field in fields if not getattr(field, "advanced", False)]
+        advanced = [field for field in fields if getattr(field, "advanced", False)]
+        editable = any(field.editable for field in normal)
         tk.Label(body, text="可编辑字段" if editable else "详情",
-                 font=fonts.sans(kit.PX_CARD, bold=True), foreground=dual.color("ink"),
+                 font=fonts.sans(kit.px("h2"), bold=True), foreground=dual.color("ink"),
                  background=surface, anchor="w").pack(anchor="w", pady=(0, 10))
-        per_row = 1 if (self._is_narrow() or len(fields) <= 2) else 2
+        per_row = 1 if (self._is_narrow() or len(normal) <= 2) else 2
+
+        def build(container: Any, rows: Sequence[Field]) -> None:
+            for column in range(per_row):
+                container.columnconfigure(column, weight=1, uniform="field")
+            for index, field in enumerate(rows):
+                row, column = divmod(index, per_row)
+                self._render_field(container, row, column, field, per_row)
+
         grid = tk.Frame(body, background=surface)
         grid.pack(fill="x")
-        for column in range(per_row):
-            grid.columnconfigure(column, weight=1, uniform="field")
-        for index, field in enumerate(fields):
-            row, column = divmod(index, per_row)
-            block = tk.Frame(grid, background=surface)
-            block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
-            # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
-            block.columnconfigure(0, minsize=104)
-            block.columnconfigure(1, weight=1)
-            tk.Label(block, text=field.label, font=fonts.sans(kit.PX_MICRO),
-                     foreground=dual.color("muted_text"), background=surface,
-                     anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
-            if field.editable:
-                variable = tk.StringVar(value="" if field.secret else field.value)
+        build(grid, normal)
+        if not advanced:
+            return
+        # 折叠区：默认不 pack（= 不占高度）；按钮文案在「高级」与「收起高级」之间切
+        hidden = tk.Frame(body, background=surface)
+        toggle = kit.Button(body, "高级（排障用）", lambda: _toggle(),
+                            kind="ghost", ground=surface, px=kit.px("small"),
+                            height=26, pad=10)
+        toggle.pack(anchor="w", pady=(2, 0))
+        # 留给真窗口取证（tests/test_desktop_payout.py）：折叠区/按钮不在首屏，也得能被点开
+        self._advanced_panel = hidden
+        self._advanced_toggle = toggle
+        state = {"open": False}
+
+        def _toggle() -> None:
+            state["open"] = not state["open"]
+            if state["open"]:
+                build(hidden, advanced)
+                hidden.pack(fill="x", pady=(6, 0), before=toggle)
+                toggle.set_text("收起高级")
+            else:
+                hidden.pack_forget()
+                toggle.set_text("高级（排障用）")
+
+    def _render_field(self, container: Any, row: int, column: int, field: Field,
+                      per_row: int) -> None:
+        """画一个字段格（从 :meth:`_render_fields` 拆出来：折叠区复用同一套画法）。"""
+        kit, tk, ttk = self._kit, self._tk, self._ttk
+        fonts = self._fonts
+        surface = dual.color("surface")
+        block = tk.Frame(container, background=surface)
+        block.grid(row=row, column=column, sticky="nsew", padx=(0, 18), pady=(0, 10))
+        # 标签列用像素 minsize（Tk 的 width= 是按「0 字宽」算的，中文标签会被截）
+        block.columnconfigure(0, minsize=104)
+        block.columnconfigure(1, weight=1)
+        tk.Label(block, text=field.label, font=fonts.sans(kit.px("micro")),
+                 foreground=dual.color("muted_text"), background=surface,
+                 anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        if field.editable:
+            # 秘密与「只给掩码」的字段都不预填：输入框里的空串 = 不改（_config_for_save 口径）
+            empty = field.secret or not getattr(field, "prefill", True)
+            variable = tk.StringVar(value="" if empty else field.value)
+            # RC14 I：协议用**只读下拉**（枚举值不可能非法；也免得客户手打错协议名）。
+            if getattr(field, "choices", ()):
+                entry = ttk.Combobox(block, textvariable=variable,
+                                     values=list(field.choices), state="readonly",
+                                     width=26 if per_row > 1 else 42, style="Kit.TCombobox")
+            else:
                 entry = ttk.Entry(block, textvariable=variable, style="Kit.TEntry",
                                   width=28 if per_row > 1 else 44)
-                if field.secret:
-                    entry.configure(show="•")
-                entry.grid(row=0, column=1, sticky="ew")
-                hint = field.hint or ""
-                if field.secret:
-                    hint = ("当前 " + field.value + "｜" + hint).strip("｜")
-                if hint:
-                    self._wrap_to_column(tk.Label(
-                        block, text=hint, font=fonts.sans(kit.PX_MICRO),
-                        foreground=dual.color("muted_text"), background=surface,
-                        anchor="w", justify="left",
-                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
-                                                            pady=(3, 0))
-                self._fields[field.key] = field
-                self._vars[field.key] = variable
-            else:
-                # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
-                # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
-                value_label = self._wrap_to_column(tk.Label(
-                    block, text=field.value,
-                    font=fonts.for_text(field.value, kit.PX_SMALL),
-                    foreground=dual.color("ink"), background=surface,
+            if field.secret:
+                entry.configure(show="•")
+            entry.grid(row=0, column=1, sticky="ew")
+            # G7（RC14）：秘密字段右侧「显示 / 隐藏」。只切 Entry 的 show 选项——
+            # 不复制、不写日志、不进快照；输入框里的内容本来就只是客户刚粘的那串。
+            if getattr(field, "can_reveal", lambda: False)():
+                reveal = self._render_reveal_button(block, field, entry, surface)
+                if reveal is not None:
+                    self._reveal_buttons[field.key] = reveal
+            hint = field.hint or ""
+            if field.secret:
+                hint = ("当前 " + field.value + "｜" + hint).strip("｜")
+            if hint:
+                self._wrap_to_column(tk.Label(
+                    block, text=hint, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("muted_text"), background=surface,
                     anchor="w", justify="left",
-                    wraplength=self._wrap_hint()))
-                value_label.grid(row=0, column=1, sticky="we")
-                if field.hint:
-                    self._wrap_to_column(tk.Label(
-                        block, text=field.hint, font=fonts.sans(kit.PX_MICRO),
-                        foreground=dual.color("muted_text"), background=surface,
-                        anchor="w", justify="left",
-                        wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
-                                                            pady=(3, 0))
+                    wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
+                                                        pady=(3, 0))
+            self._fields[field.key] = field
+            self._vars[field.key] = variable
+            self._entries[field.key] = entry
+        else:
+            # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
+            # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
+            value_label = self._wrap_to_column(tk.Label(
+                block, text=field.value,
+                font=fonts.for_text(field.value, kit.px("small")),
+                foreground=dual.color("ink"), background=surface,
+                anchor="w", justify="left",
+                wraplength=self._wrap_hint()))
+            value_label.grid(row=0, column=1, sticky="we")
+            if field.hint:
+                self._wrap_to_column(tk.Label(
+                    block, text=field.hint, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("muted_text"), background=surface,
+                    anchor="w", justify="left",
+                    wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
+                                                        pady=(3, 0))
+
+    def _entry_for(self, key: str) -> Any:
+        """取某字段的输入框（没有该字段 → ``None``）；给窗口级测试与「显示密码」用。"""
+        return self._entries.get(str(key))
+
+    def _render_reveal_button(self, block: Any, field: Field, entry: Any,
+                              surface: str) -> Any:
+        """密码框的「显示 / 隐藏」（RC14 G7）：画在输入框**右侧**，点一下才看得见。
+
+        只做一件事：``entry.configure(show=""/"•")`` + 按钮文案切换。
+        **不**把值写进日志、不复制到剪贴板、不改 ``_vars``（保存路径读到的还是同一串）。
+        """
+        kit, tk = self._kit, self._tk
+        state = {"shown": False}
+        button = kit.Button(block, "显示", lambda: _toggle(), kind="ghost", ground=surface,
+                            px=kit.px("micro"), height=26, pad=8)
+        button.grid(row=0, column=2, sticky="w", padx=(6, 0))
+        del tk                                        # 只用 kit 的按钮，避免两套样式
+
+        def _toggle() -> None:
+            state["shown"] = not state["shown"]
+            try:
+                entry.configure(show="" if state["shown"] else "•")
+            except Exception:                          # pragma: no cover - 控件已销毁
+                return
+            button.set_text("隐藏" if state["shown"] else "显示")
+
+        return button
 
     # ── 动作
     def _on_action(self, key: str) -> None:
@@ -1849,26 +2516,75 @@ class DesktopApp:
             except Exception:                            # 变量随旧视图销毁：跳过，不让动作静默不执行
                 continue
         result = self._controller.action(key, confirm=self._confirm)
+        copied = True
         if result.effect == "copy":
-            self._copy(result.payload)
+            copied = self.copy_text(result.payload)
         elif result.effect == "open_dir":
             self._open_dir(result.payload)
         elif result.effect == "open_url":
             self._open_url(result.payload)
+        elif result.effect == "probe":
+            # 「已派发」由 _probe_started 播报；只有同步回落时这里才拿到最终结论，
+            # 否则 worker 侧结束时 _apply_probe 播报（两条路都只播一次）
+            if str((result.payload or {}).get("state") or "") == "done":
+                self._apply_probe(result, None)
+        elif result.effect == "update":
+            # G4-3：九状态逐个翻译成「发生了什么 + 下一步」，下载类动作顺手打开下载页
+            self._apply_update(result.payload, ok=result.ok, message=result.message)
         elif result.effect == "goto" and result.payload:
             self.show_view(str(result.payload))       # 例如「共享 Token Plan」→「接入配置」
+        elif result.effect == "payout_submit":
+            # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
+            self._start_payout_submit(str(result.payload), result.message)
         elif result.effect in ("refresh", "access", "bench", "control", "reload"):
             self._render(self._controller.current())
         self._update_status()
-        if result.effect in ("save", "access", "reload", "control", "export", "verify") and result.message:
+        # "copy" 漏在名单外 = 复制成功/失败都零反馈（S4：客户说「点了没反应」）
+        if result.effect == "copy" and not copied:
+            self._toast("复制失败：剪贴板写入被拒绝（可能有别的程序占着剪贴板），请再点一次",
+                        ok=False)
+        elif result.effect == "copy":
+            if result.message:
+                self._toast(result.message, ok=result.ok)
+        elif result.effect in SELF_REPORTING_EFFECTS:
+            # 这几条在自己的渲染函数里已经播报（``_open_url`` / ``_open_dir`` / 收款 worker），
+            # 再播一次会让后一条把「已打开 / 未打开」这类关键差别盖掉。
+            pass
+        # G1-0（RC14 P0）：白名单 → **黑名单**。旧实现只播报
+        # ("save","access","reload","control","export","verify","copy") 六种 effect，
+        # 于是 effect="" 的 8 处（模型意向上报 / 跑分失败 / 空节点 ID / 收据未选中 /
+        # 控制通道未接通 / 登出无节点 / 日志无行 / 日志路径未知）全部**点了没反应**。
+        # 现在：**失败必报**，成功只要有话就说；只有「用户自己取消」和「刷新中…」
+        # （``_refresh_started`` 已经播过，重复会盖掉忙态提示）两种例外。
+        elif (result.effect != "cancelled" and result.message
+              and not (result.effect == "refresh" and result.ok)):
             self._toast(result.message, ok=result.ok)
 
-    def _copy(self, text: str) -> None:
+    def copy_text(self, text: str) -> bool:
+        """把文本放进系统剪贴板；**必须** ``update()`` 一次才算真的写进去。
+
+        真机事故（S4）：Tk 的 ``clipboard_append`` 只是把内容登记给本进程，X11/Win32 的
+        剪贴板所有权要等事件循环处理一次才转移；不 ``update()`` 就退出/切窗口，粘贴出来
+        是**旧内容或空**。旧实现还 ``except Exception: pass``，失败连日志都没有。
+        返回是否成功；失败原因交给调用方 toast（不再静默）。
+        """
         try:
             self._root.clipboard_clear()
-            self._root.clipboard_append(text)
-        except Exception:
-            pass
+            self._root.clipboard_append(str(text))
+            updater = getattr(self._root, "update", None)
+            if callable(updater):
+                updater()
+            return True
+        except Exception as exc:                      # noqa: BLE001 - 剪贴板可能被别的程序占着
+            try:
+                from ..logging_setup import event
+                event("desktop.copy_failed", error=type(exc).__name__)
+            except Exception:
+                pass
+            return False
+
+    def _copy(self, text: str) -> None:
+        self.copy_text(text)
 
     def _open_dir(self, path: str) -> None:
         """只做「显示路径」：不自动调用系统文件管理器（避免在无桌面环境弹错）。"""
@@ -1885,15 +2601,26 @@ class DesktopApp:
         return str(value).strip() if value else None
 
     def _open_url(self, url: str) -> None:
-        """用系统浏览器打开网页端；打不开就把地址留在状态栏（不静默失败）。"""
+        """用系统浏览器打开网页端；打不开就把地址留在状态栏（不静默失败）。
+
+        G1-2 的附加要求：**先校验协议头**。``DJB_WEB_CONSOLE`` 配错（或动作给错）时，
+        ``webbrowser`` 可能把 ``ftp:`` / 空 scheme 交给系统处理器，甚至什么都不发生——
+        客户看到「点了没反应」。这里直接报错，并把地址原样留在状态栏供手工复制。
+        """
         if not url:
+            self._toast("打开失败：链接为空（配置可能缺失）", ok=False)
+            return
+        lowered = str(url).strip().lower()
+        if not (lowered.startswith("http://") or lowered.startswith("https://")):
+            self._toast("打开失败：不是 http(s) 链接，已拒绝调用浏览器（" + str(url) + "）",
+                        ok=False)
             return
         try:
             import webbrowser
-            opened = bool(webbrowser.open(url))
+            opened = bool(webbrowser.open(str(url)))
         except Exception:
             opened = False
-        self._toast(("已在浏览器打开：" if opened else "浏览器未能自动打开，请手动访问：") + url,
+        self._toast(("已在浏览器打开：" if opened else "浏览器未能自动打开，请手动访问：") + str(url),
                     ok=opened)
 
     def _toast(self, message: str, *, ok: bool = True) -> None:
@@ -1942,6 +2669,15 @@ class DesktopApp:
         self._root.mainloop()
 
     def stop(self) -> None:
+        for name in ("_refresh_worker", "_payout_worker", "_update_worker", "_probe_worker",
+                     "_discover_worker"):
+            worker = getattr(self, name, None)
+            if worker is None:
+                continue
+            try:
+                worker.close()
+            except Exception:                      # pragma: no cover - 已关闭/线程已退
+                pass
         if self._unsubscribe is not None:
             try:
                 self._unsubscribe()
@@ -2021,6 +2757,34 @@ _DEMO_SECTIONS = {
             {"id": "mixtral-8x7b", "context": 32768, "offered": False,
              "reason": "需要 ≥24GB 显存，本机不满足"}],
             "local": [{"id": "qwen2.5-7b-instruct", "state": "applied"}],
+            # 探针事实（截图基线）：四种状态各来一行，页面才看得出「三态不混」
+            "probe": {"rows": [
+                {"upstream_id": "u1", "base_url": "https://api.example-relay.com/v1",
+                 "model": "qwen2.5-7b-instruct", "enabled": True,
+                 "inference_ok": True, "stream_ok": True, "usage_ok": True,
+                 "probe_version": 3, "last_probe_at": "2026-11-14T11:58:00+0800",
+                 "probe_error_class": None, "probe_age_s": 132, "fresh": True,
+                 "announceable": True},
+                {"upstream_id": "u1", "base_url": "https://api.example-relay.com/v1",
+                 "model": "llama-3.1-8b-instruct", "enabled": True,
+                 "inference_ok": True, "stream_ok": False, "usage_ok": True,
+                 "probe_version": 3, "last_probe_at": "2026-11-14T11:57:00+0800",
+                 "probe_error_class": "stream_failed", "probe_age_s": 192,
+                 "fresh": True, "announceable": False},
+                {"upstream_id": "u2", "base_url": "https://api.another-relay.net",
+                 "model": "claude-3-7-sonnet", "enabled": True,
+                 "inference_ok": False, "stream_ok": None, "usage_ok": None,
+                 "probe_version": 3, "last_probe_at": "2026-11-14T11:50:00+0800",
+                 "probe_error_class": "unauthorized", "probe_age_s": 612,
+                 "fresh": False, "announceable": False},
+                {"upstream_id": "u2", "base_url": "https://api.another-relay.net",
+                 "model": "gpt-4o-mini", "enabled": True,
+                 "inference_ok": None, "stream_ok": None, "usage_ok": None,
+                 "probe_version": None, "last_probe_at": None,
+                 "probe_error_class": None, "probe_age_s": None, "fresh": False,
+                 "announceable": False}],
+                "periodic_s": 450, "fresh_window_s": 900, "quote_window_s": 600,
+                "note": ""},
             "online": True, "note": ""},
         "tasks": {"rows": [
             {"id": "t-8821", "state": "running", "elapsed_s": 12, "tokens": 1536},
@@ -2091,12 +2855,18 @@ _DEMO_SECTIONS = {
                    "config": {"node_id": "node-7c31", "node_secret": "djb_ns_…4e11",
                               "api_key": "djb_sk_…abcd", "price_mode": "auto",
                               "price_mode_label": "跟随平台建议价",
-                              "price_note": "—", "usdt_address": "TQn9Xa…7f3d",
+                              "price_note": "—", "usdt_address": "0x3f7c…9a2c",
                               "openai_base_url": "http://127.0.0.1:1717/v1",
                               "anthropic_base_url": "http://127.0.0.1:1717",
                               "agent_downlink_url": "http://127.0.0.1:1717/agent",
                               "scoped_token": "djb_sc_…9f2c"},
                    "valid": True, "binding": {"state": "bound", "node_id": "node-7c31"},
+                   # 收款地址云端状态（方案 B）：演示数据给「已生效」，截图才看得到正向态
+                   "payout": {"ok": True, "can_submit": True, "reason": "", "hint": "",
+                              "data": {"address": "0x3f7c9a1b2d3e4f5a6b7c8d9e0f1a2b3c4d5e9a2c",
+                                       "status": "whitelisted", "cooldown_until": None,
+                                       "updated_at": "2026-11-01T04:30:00Z",
+                                       "label": "默认收款"}},
                    "note": "", "path": "~/.djb/desktop/access-config.json"},
         # 共享 Token Plan（第 9 项）：演示数据必须给「有上游」的形状，
         # 否则截图里只有空态，客户看不到「我的 Token Plan」长什么样。
@@ -2167,7 +2937,16 @@ def unique_iid(key: str, used: set[str]) -> str:
 
 
 def _make_cli_runner(home):
-    """本机命令通道：显式带上 ``DJB_HOME``，避免子进程读到别的 home。"""
+    """本机命令通道：显式带上 ``DJB_HOME``，避免子进程读到别的 home。
+
+    ``home is None`` 必须在这里解析成**真实目录**：旧实现写 ``str(home)`` → 子进程拿到
+    ``DJB_HOME=None``（字符串），CLI 会把 ``<cwd>/None`` 当数据目录 → 一律「本机未初始化」。
+    """
+    if home is None:
+        from ..config import resolve_home
+        home = resolve_home()
+    home = os.fspath(home)
+
     def run(argv):
         import subprocess
         import sys
@@ -2183,7 +2962,8 @@ def _make_cli_runner(home):
             # 否则中文 Windows 上按 cp936 解会 UnicodeDecodeError → 动作区报错。
             completed = subprocess.run(command, capture_output=True,
                                        encoding="utf-8", errors="replace", timeout=20,
-                                       env=env, stdin=subprocess.DEVNULL, check=False)
+                                       env=env, stdin=subprocess.DEVNULL, check=False,
+                                       **subprocess_window_kwargs())
         except subprocess.TimeoutExpired:
             raise ProviderError("本地命令超时（20s）") from None
         except OSError as exc:
@@ -2213,7 +2993,10 @@ def _make_reloader(home: str | os.PathLike | None):
             from ..errors import NotRunningError, UsageError
         except ImportError:                       # pragma: no cover - 防御
             return RELOAD_UNSUPPORTED, ""
-        paths = Paths(str(home) if home else os.path.expanduser("~/.djb"))
+        # 与数据层同一个解析口径（Windows 是 %APPDATA%\DJB，不是 ~/.djb）：
+        # 写死 ~/.djb 时「保存并回读」会连到不存在的 socket → 永远「daemon 未运行」。
+        from ..config import resolve_home
+        paths = Paths(os.fspath(home) if home else resolve_home())
         try:
             response = ControlClient(paths).call({"cmd": "reload"}, timeout=15.0)
         except NotRunningError:
@@ -2238,10 +3021,21 @@ def demo_source() -> FakeDataSource:
 
 
 def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False,
-                    cloud: Any | None = None, bus: Any | None = None) -> DesktopController:
-    """装配：数据源 + 接入配置服务 + 控制通道 + 状态总线。"""
+                    cloud: Any | None = None, bus: Any | None = None,
+                    boot: Mapping[str, Any] | None = None) -> DesktopController:
+    """装配：数据源 + 接入配置服务 + 控制通道 + 状态总线。
+
+    ``home`` **只解析一次**（S3 根因，见 REPORT）：``None`` 时各下游曾各自找默认目录——
+    数据层用 ``resolve_home()``（Windows = ``%APPDATA%\\DJB``），action CLI 用了
+    ``str(None)`` = 字符串 ``"None"``（= 当前工作目录下的 ``None`` 目录），控制通道 / 热重载
+    又写死 ``~/.djb``。结果：同一个窗口里「取数去 A、保存去 B、控制去 C」，
+    在真机上表现成「节点绑定不可用 / 保存了不生效」。
+    """
     from ..gui.state import ControlBus
     bus = bus if bus is not None else ControlBus()
+    if home is None and not demo:
+        home = _default_home()             # 与 LocalDataSource / bootstrap 同一个解析口径
+    home = None if home is None else os.fspath(home)
     if demo:
         source: Any = demo_source()
     else:
@@ -2249,12 +3043,20 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
             # 没显式注入就按 ~/.djb 自己装：没登录节点时是 None（视图照常显示「暂不可用」）
             from .nodecloud import NodeCloudClient
             cloud = NodeCloudClient.from_home(home)
-        source = LocalDataSource(home=home, cloud=cloud)
+        source = LocalDataSource(home=home, cloud=cloud, boot=boot)
     store = FileAccessStore(None if home is None else
                             os.path.join(str(home), ACCESS_FILE))
     access = AccessService(store, reloader=_make_reloader(home))
+    factory = None
+    if not demo:
+        def factory() -> Any:              # noqa: ANN401 - 惰性构造（worker 线程里调用）
+            from ..update import open_manager
+            return open_manager(home)
     return DesktopController(source, access=access, control=LocalControlChannel(home), bus=bus,
-                             cli=_make_cli_runner(home) if not demo else None)
+                             cli=_make_cli_runner(home) if not demo else None,
+                             # G4：更新检查要 UpdateManager（本机 paths/store/config），
+                             # 由装配层注入，controller 不自己找 home（S3 教训）
+                             update_factory=factory)
 
 
 def _default_home() -> str:
@@ -2274,13 +3076,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="关闭首启自举（测试/离线环境：不建目录、不起节点）")
     args = parser.parse_args(list(argv) if argv is not None else None)
     boot_line = ""
+    daemon: Mapping[str, Any] | None = None
     if not args.demo and not args.no_auto:
         # 首启自举（2026-11-06 外部客户实测：装完只看到「云端未接通/本机未初始化」）
         from ..bootstrap import ensure_ready, start_daemon, summary_text
         boot = ensure_ready(home=args.home)
         daemon = start_daemon(home=args.home)
         boot_line = summary_text(boot, daemon)
-    controller = make_controller(home=args.home, demo=args.demo)
+    # 自举结论（尤其 start_daemon 的 no-cli / timeout）要带进数据层：
+    # 「接入配置」页的「节点进程」字段靠它说出真因，而不是只说「daemon 未运行」
+    controller = make_controller(home=args.home, demo=args.demo, boot=daemon)
     try:
         # prefs_home 必须显式给：demo 数据源没有 home，不给就会把主题偏好写到真实 ~/.djb
         app = DesktopApp(controller, on_quit=lambda: None,
@@ -2334,7 +3139,8 @@ def _shoot(app: DesktopApp, directory: str) -> list[str]:
                     continue
             try:
                 window_id = str(app._root.winfo_id())
-                subprocess.run(["import", "-window", window_id, target], check=False, timeout=30)
+                subprocess.run(["import", "-window", window_id, target], check=False,
+                               timeout=30, **subprocess_window_kwargs())
             except (OSError, subprocess.SubprocessError):
                 continue
             if os.path.exists(target):

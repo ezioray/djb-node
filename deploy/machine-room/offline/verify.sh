@@ -37,16 +37,18 @@ if [ -f sha256sums.sig ]; then
     if [ -n "${DJB_OFFLINE_VERIFY_KEY:-}" ]; then
         [ -f "$DJB_OFFLINE_VERIFY_KEY" ] || fail "公钥不存在：$DJB_OFFLINE_VERIFY_KEY"
         command -v openssl >/dev/null 2>&1 || fail "包内有签名，但本机没有 openssl"
-        if openssl dgst -sha256 -verify "$DJB_OFFLINE_VERIFY_KEY" \
-                -signature sha256sums.sig sha256sums >/dev/null 2>&1; then
-            echo "verify: 签名校验通过（openssl dgst -sha256 -verify）"
+        # RC8：Ed25519 只能用 pkeyutl -rawin（openssl dgst 对 Ed25519 在 OpenSSL 3 直接失败）
+        if openssl pkeyutl -verify -pubin -inkey "$DJB_OFFLINE_VERIFY_KEY" -rawin \
+                -in sha256sums -sigfile sha256sums.sig >/dev/null 2>&1; then
+            echo "verify: 签名校验通过（Ed25519 / openssl pkeyutl -rawin）"
         else
             fail "签名校验不通过（sha256sums 被改过，或公钥不对）"
         fi
-    elif [ "${DJB_OFFLINE_STRICT:-0}" = "1" ]; then
-        fail "包内有签名但未提供 DJB_OFFLINE_VERIFY_KEY（STRICT=1 拒绝降级为仅哈希）"
+    elif [ "${DJB_OFFLINE_STRICT:-1}" = "1" ]; then
+        # RC8：**默认严格**。有签名却不给公钥 = 无法证明完整性，不能"只校验哈希"就放行。
+        fail "包内有签名但未提供 DJB_OFFLINE_VERIFY_KEY（默认 STRICT=1；确需降级显式 DJB_OFFLINE_STRICT=0）"
     else
-        echo "verify: 警告：包内有签名但未提供 DJB_OFFLINE_VERIFY_KEY，跳过签名校验（仅校验哈希）"
+        echo "verify: 警告：已显式 DJB_OFFLINE_STRICT=0，包内有签名但跳过签名校验（仅校验哈希）"
     fi
 else
     echo "verify: 未签名，仅校验哈希"

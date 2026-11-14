@@ -27,13 +27,13 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from . import ed25519, facts
+from . import ed25519, facts, update_source
 from .config import Paths, feature_flag, load_config
-from .errors import NetworkError, UpdateError
+from .errors import NetworkError, NotInstalledError, UpdateError
 from .httpclient import HttpClient
 from .logging_setup import event
 from .store import Store, UpdateRecord
@@ -72,18 +72,168 @@ def _fingerprint(material: bytes) -> str:
     return hashlib.sha256(material).hexdigest()[:12]
 
 
+def _anchor_from_hex(text: Any, *, key_id: str, where: str) -> TrustAnchor:
+    raw = str(text or "").strip()
+    if not raw:
+        raise UpdateError(where + "公钥缺失：拒绝验签（fail-closed；不会本地自生成密钥）")
+    if not ed25519.is_valid_public_key_hex(raw):
+        raise UpdateError(where + "公钥非法（不是合法 Ed25519 公钥）：拒绝验签（fail-closed）")
+    material = bytes.fromhex(raw)
+    return TrustAnchor(facts.UPDATE_SIGNATURE_ALG_ED25519, material, key_id,
+                       _fingerprint(material))
+
+
 def ed25519_anchor(public_key_hex: str | None = None, *,
                    key_id: str | None = None) -> TrustAnchor:
-    """内置公钥信任锚；公钥缺失/非法 → 抛 UpdateError（fail-closed）。"""
-    text = (public_key_hex if public_key_hex is not None
-            else getattr(facts, "UPDATE_PUBLIC_KEY_HEX", "") or "").strip()
-    if not text:
-        raise UpdateError("内置更新公钥缺失：拒绝验签（fail-closed；不会本地自生成密钥）")
-    if not ed25519.is_valid_public_key_hex(text):
-        raise UpdateError("内置更新公钥非法（不是合法 Ed25519 公钥）：拒绝验签（fail-closed）")
-    material = bytes.fromhex(text)
-    return TrustAnchor(facts.UPDATE_SIGNATURE_ALG_ED25519, material,
-                       key_id or facts.UPDATE_KEY_ID, _fingerprint(material))
+    """**primary 单钥视图**；显式传 hex/key_id 时用它构造（测试/工具用）。
+
+    公钥缺失/非法 → 抛 UpdateError（fail-closed）。生产验签请用 keyring_anchors()
+    （钥环 + 双钥过渡 + 吊销）。
+    """
+    if public_key_hex is not None or key_id is not None:
+        return _anchor_from_hex(public_key_hex, key_id=key_id or facts.UPDATE_KEY_ID,
+                               where="内置更新")
+    primary = keyring_anchors().primary()
+    if primary is None:
+        raise UpdateError("内置更新钥环里没有 primary 公钥：拒绝验签（fail-closed）")
+    return primary
+
+
+@dataclass(frozen=True)
+class AnchorSet:
+    """信任钥环视图：primary / transition 双钥 + 吊销 + 过渡到期（RC8）。
+
+    口径：
+
+    * **清单验签精确取钥**：payload 声明 key_id 时用 resolve()（未知 / 已吊销 /
+      过渡到期一律拒，不"拿别的钥试一下"）；
+    * **制品验签**用 verify_any（制品条目没有 key_id），但只试「可用钥」；
+    * 吊销优先于 state；transition 锚过了 UPDATE_TRANSITION_UNTIL 当天即失效
+      （期限写坏按过期处理，fail-closed）。
+    """
+
+    anchors: tuple[TrustAnchor, ...]
+    states: tuple[tuple[str, str], ...] = ()
+    revoked: tuple[str, ...] = ()
+    transition_until: str = ""
+    placeholders: tuple[str, ...] = ()
+    transition_override: bool = False
+
+    def state_of(self, key_id: str) -> str:
+        for known, state in self.states:
+            if known == key_id:
+                return state
+        return "unknown"
+
+    def _expired(self, key_id: str) -> bool:
+        if self.state_of(key_id) != "transition" or not self.transition_until:
+            return False
+        try:
+            last_day = date.fromisoformat(str(self.transition_until))
+        except ValueError:
+            return True                      # 期限写坏 = 视为过期（fail-closed）
+        return utcnow().date() > last_day
+
+    def unusable_reason(self, key_id: str) -> str | None:
+        """该 key_id 不可用的原因；可用返回 None（吊销 > 占位 > 过渡到期）。"""
+        if key_id in self.revoked:
+            # 应急覆盖：仅 transition 锚、且硬上限日期未到（owner 书面 + incident 才允许）
+            if self.transition_override and self.state_of(key_id) == "transition":
+                if self._expired(key_id):
+                    return "过渡期已结束（" + str(self.transition_until) + "）"
+                return None
+            return "已吊销"
+        if key_id in self.placeholders:
+            return "占位公钥（owner 尚未注入最终生产公钥）"
+        if self._expired(key_id):
+            return "过渡期已结束（" + str(self.transition_until) + "）"
+        return None
+
+    def usable(self) -> tuple[TrustAnchor, ...]:
+        return tuple(a for a in self.anchors if self.unusable_reason(a.key_id) is None)
+
+    def resolve(self, key_id: str) -> TrustAnchor:
+        for anchor in self.anchors:
+            if anchor.key_id == key_id:
+                why = self.unusable_reason(key_id)
+                if why is not None:
+                    raise UpdateError("清单 key_id（" + key_id + "）" + why + "（拒绝安装）")
+                return anchor
+        known = ", ".join(a.key_id for a in self.anchors) or "(空)"
+        raise UpdateError("清单 key_id（" + key_id + "）不在本机信任钥环里（已知："
+                          + known + "）（拒绝安装）")
+
+    def primary(self) -> TrustAnchor | None:
+        for anchor in self.anchors:
+            if self.state_of(anchor.key_id) == "primary":
+                return anchor
+        return self.anchors[0] if self.anchors else None
+
+    def to_dict(self) -> dict[str, Any]:
+        primary = self.primary()
+        return {
+            "scheme": facts.UPDATE_SIGNATURE_ALG_ED25519,
+            "key_id": primary.key_id if primary else None,
+            "key_fingerprint": primary.fingerprint if primary else None,
+            "keys": [{"key_id": a.key_id, "state": self.state_of(a.key_id),
+                      "fingerprint": a.fingerprint,
+                      "status": self.unusable_reason(a.key_id) or "usable"}
+                     for a in self.anchors],
+            "revoked": list(self.revoked),
+            "transition_until": self.transition_until,
+        }
+
+
+def keyring_anchors() -> AnchorSet:
+    """从 facts.UPDATE_KEYRING 构造信任钥环（**唯一信任来源**，fail-closed）。"""
+    entries = tuple(getattr(facts, "UPDATE_KEYRING", ()) or ())
+    if not entries:
+        raise UpdateError("内置更新钥环为空：拒绝验签（fail-closed）")
+    anchors: list[TrustAnchor] = []
+    states: list[tuple[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise UpdateError("内置更新钥环条目不是对象：拒绝验签（fail-closed）")
+        key_id = str(entry.get("key_id") or "").strip()
+        if not key_id:
+            raise UpdateError("内置更新钥环有条目缺 key_id：拒绝验签（fail-closed）")
+        anchors.append(_anchor_from_hex(entry.get("pubkey_hex"), key_id=key_id,
+                                        where="内置更新密钥 " + key_id + " 的"))
+        states.append((key_id, str(entry.get("state") or "unknown")))
+    placeholders = tuple(
+        str(entry.get("key_id") or "").strip()
+        for entry in entries
+        if str(entry.get("placeholder") or "").lower() in ("1", "true", "yes")
+    )
+    return AnchorSet(
+        anchors=tuple(anchors),
+        states=tuple(states),
+        revoked=tuple(getattr(facts, "UPDATE_REVOKED_KEY_IDS", ()) or ()),
+        transition_until=str(getattr(facts, "UPDATE_TRANSITION_UNTIL", "") or ""),
+        placeholders=placeholders,
+        transition_override=bool(getattr(facts, "UPDATE_TRANSITION_OVERRIDE", False)),
+    )
+
+
+def anchor_release_ready(anchor: Any = None) -> tuple[bool, str]:
+    """**发布门禁**：primary 锚必须是 owner/离线签名机给的最终公钥（非占位）。
+
+    返回 (ready, reason)；release 侧（ops/release/sign-update-manifest.py、
+    manifest-gen.py --check）必须调这个函数，False 就拒绝签名/拒绝发版。
+    """
+    try:
+        anchor_set = _as_anchor(anchor) if anchor is not None else keyring_anchors()
+    except UpdateError as exc:
+        return False, "钥环不可用：" + str(exc)
+    primary = anchor_set.primary()
+    if primary is None:
+        return False, "钥环里没有 primary 公钥"
+    why = anchor_set.unusable_reason(primary.key_id)
+    if why is not None:
+        return False, "primary（" + primary.key_id + "）" + why
+    if anchor_set.state_of(primary.key_id) != "primary":
+        return False, "primary 锚 state 不是 primary"
+    return True, "primary=" + primary.key_id + " fp=" + primary.fingerprint
 
 
 def mock_anchor(key: bytes, *, key_id: str = "mock-test-only") -> TrustAnchor:
@@ -94,13 +244,37 @@ def mock_anchor(key: bytes, *, key_id: str = "mock-test-only") -> TrustAnchor:
                        _fingerprint(bytes(key)))
 
 
-def _as_anchor(value: Any) -> TrustAnchor:
-    """兼容旧调用：裸 bytes 视为 test-only HMAC 锚（内部工具 / 测试用）。"""
-    if isinstance(value, TrustAnchor):
+def _as_anchor(value: Any) -> AnchorSet:
+    """归一化验签锚：AnchorSet / 单 TrustAnchor / 裸 bytes（test-only HMAC）。"""
+    if isinstance(value, AnchorSet):
         return value
+    if isinstance(value, TrustAnchor):
+        return AnchorSet((value,))
     if isinstance(value, (bytes, bytearray)):
-        return mock_anchor(bytes(value))
-    raise UpdateError("验签锚缺失（需要 TrustAnchor）")
+        return AnchorSet((mock_anchor(bytes(value)),))
+    raise UpdateError("验签锚缺失（需要 TrustAnchor / AnchorSet）")
+
+
+def _verify_any(data: bytes, signature: str, anchor_set: AnchorSet,
+                *, what: str) -> TrustAnchor:
+    """任一「可用钥」验过即可（制品条目没有 key_id）；全失败才拒。"""
+    usable = anchor_set.usable()
+    if not usable:
+        raise UpdateError(what + "验签失败：信任钥环里没有可用公钥（全部吊销/过期或为空）")
+    if len(usable) == 1:
+        # 单钥时保留原始错误（形态非法 / 校验失败），诊断信息不丢
+        _check_signature(data, signature, usable[0], what=what)
+        return usable[0]
+    errors: list[str] = []
+    for anchor in usable:
+        try:
+            _check_signature(data, signature, anchor, what=what)
+            return anchor
+        except UpdateError as exc:
+            errors.append(str(exc))
+    if errors and all("形态非法" in item for item in errors):
+        raise UpdateError(what + "签名形态非法（要求 " + facts.UPDATE_ED25519_PREFIX + "…）")
+    raise UpdateError(what + "签名校验失败（拒绝安装）")
 
 
 # ─────────────────────────────────────────────────────────── 清单 / 签名
@@ -140,16 +314,21 @@ def verify_manifest(manifest: Any, anchor: Any) -> dict[str, Any]:
         raise UpdateError("更新清单缺 payload")
     if not isinstance(signature, str) or not SIG_RE.match(signature):
         raise UpdateError("更新清单签名缺失或格式非法")
-    _check_signature(canonical_json(payload).encode("utf-8"), signature, _as_anchor(anchor),
-                     what="更新清单")
+    anchor_set = _as_anchor(anchor)
+    # 形态先行：钥环只要有 ed25519 锚，hmac 形态一律按"签名降级"拒（不等到取钥阶段）
+    if (any(item.scheme == facts.UPDATE_SIGNATURE_ALG_ED25519 for item in anchor_set.anchors)
+            and not signature.startswith(facts.UPDATE_ED25519_PREFIX)):
+        raise UpdateError("更新清单签名形态非法（要求 "
+                          + facts.UPDATE_ED25519_PREFIX + "…）")
+    body = canonical_json(payload).encode("utf-8")
     declared_key = payload.get("key_id")
     if declared_key is not None:
-        anchor_view = _as_anchor(anchor)
-        if str(declared_key) != anchor_view.key_id:
-            # 密钥轮换的诚实口径：清单声明的 key_id 与本地信任锚不一致 -> 拒绝
-            # （不是「静默用旧公钥验过」，那会让轮换看起来成功、其实没换）。
-            raise UpdateError("清单 key_id（" + str(declared_key) + "）与本机信任锚（"
-                             + anchor_view.key_id + "）不一致（拒绝安装）")
+        # RC8 钥环口径：精确取钥（未知 / 已吊销 / 过渡到期一律拒，不"换把钥试试"）
+        matched = anchor_set.resolve(str(declared_key))
+        _check_signature(body, signature, matched, what="更新清单")
+    else:
+        # 旧清单（无 key_id）容忍：任一可用钥验过即可（轮换前的兼容窗口）
+        _verify_any(body, signature, anchor_set, what="更新清单")
     version = payload.get("version")
     if not isinstance(version, str) or not VERSION_RE.match(version):
         raise UpdateError("更新清单 version 非法")
@@ -168,15 +347,24 @@ def verify_manifest(manifest: Any, anchor: Any) -> dict[str, Any]:
     return payload
 
 
-def verify_artifact(data: bytes, artifact: dict[str, Any], anchor: Any) -> None:
-    """先比 sha256（便宜、快速拒），再验签（贵）——**顺序不要调换**。"""
+def verify_artifact(data: bytes, artifact: dict[str, Any], anchor: Any,
+                    *, key_id: str | None = None) -> None:
+    """先比 sha256（便宜、快速拒），再验签（贵）——**顺序不要调换**。
+
+    key_id 给定时只认该钥（清单已声明 key_id 时用，绑定"清单钥 == 制品钥"）；
+    不给则在钥环的可用钥里任一验过即可（旧清单兼容）。
+    """
     digest = hashlib.sha256(data).hexdigest()
     if digest != artifact.get("sha256"):
         raise UpdateError("下载包哈希不一致（拒绝安装）")
     signature = artifact.get("signature")
     if not isinstance(signature, str):
         raise UpdateError("下载包缺签名（拒绝安装）")
-    _check_signature(data, signature, _as_anchor(anchor), what="下载包")
+    anchor_set = _as_anchor(anchor)
+    if key_id is not None:
+        _check_signature(data, signature, anchor_set.resolve(key_id), what="下载包")
+        return
+    _verify_any(data, signature, anchor_set, what="下载包")
 
 
 def select_artifact(payload: dict[str, Any], *, os_name: str = facts.PLATFORM,
@@ -195,18 +383,29 @@ def select_artifact(payload: dict[str, Any], *, os_name: str = facts.PLATFORM,
 
 
 def bucket_eligible(bucket: int, payload: dict[str, Any], *,
-                    now: datetime | None = None) -> tuple[bool, str]:
-    """分桶灰度：wave 1/2/3 对应 5% / 25% / 100%，每桶观测 ≥24 h。"""
+                    now: datetime | None = None,
+                    channel: str = facts.DEFAULT_UPDATE_CHANNEL) -> tuple[bool, str]:
+    """分桶灰度：wave 0 = 内部档（仅 internal 频道）；wave 1..N 对应 `facts.UPDATE_BUCKET_WAVES`。
+
+    * `wave` 缺省 = 最后一档（100%），与 0.3.4 及更早一致；
+    * `wave: 0` 必须显式写死在清单里（不能用 `or` 取缺省，否则 0 被当成缺省 → 100%）；
+    * 观测期仍是 `UPDATE_BUCKET_OBSERVE_S × (wave - 1)`：wave 0/1 无等待，wave 4 需 72 h 累计。
+    """
     moment = now or utcnow()
     rollout = payload.get("rollout")
     if not isinstance(rollout, dict):
         return True, "no_rollout"
     try:
-        wave = int(rollout.get("wave") or len(facts.UPDATE_BUCKET_WAVES))
+        raw_wave = rollout.get("wave")
+        wave = len(facts.UPDATE_BUCKET_WAVES) if raw_wave is None else int(raw_wave)
         since = parse_iso(rollout.get("since"))
     except (TypeError, ValueError):
         return False, "bad_rollout"
-    wave = max(1, min(wave, len(facts.UPDATE_BUCKET_WAVES)))
+    wave = max(0, min(wave, len(facts.UPDATE_BUCKET_WAVES)))
+    if wave == 0:
+        if channel != facts.UPDATE_BUCKET_INTERNAL_CHANNEL:
+            return False, "not_in_wave_0(internal)"
+        return True, "wave_0(internal)"
     pct = int(facts.UPDATE_BUCKET_WAVES[wave - 1])
     if int(bucket) >= pct:
         return False, "not_in_wave_" + str(wave) + "_(" + str(pct) + "%)"
@@ -224,6 +423,7 @@ class UpdateManager:
                  client_version: str = facts.CLIENT_VERSION,
                  http: HttpClient | None = None,
                  config: Any = None,
+                 edition: str = "",
                  now: Callable[[], datetime] = utcnow) -> None:
         self.paths = paths
         self.store = store
@@ -231,6 +431,7 @@ class UpdateManager:
         self.channel = channel if channel in facts.UPDATE_CHANNELS \
             else facts.DEFAULT_UPDATE_CHANNEL
         self.client_version = client_version
+        self.edition = edition or ""
         self.http = http or HttpClient(timeout=15.0)
         self._config = config
         self._now = now
@@ -251,16 +452,16 @@ class UpdateManager:
             return False
         return bool(feature_flag(self._effective_config(), facts.UPDATE_MOCK_FLAG))
 
-    def trust_anchor(self) -> TrustAnchor:
-        """本次验签的信任锚；不可用一律抛 UpdateError（fail-closed）。
+    def trust_anchor(self) -> Any:
+        """本次验签的信任锚（AnchorSet）；不可用一律抛 UpdateError（fail-closed）。
 
-        判定顺序（都不满足 → 内置公钥）：
+        判定顺序（都不满足 → 内置钥环）：
 
-        1. `DJB_ENV=test` **且** 开关 ``client.update.mock_signature.enabled`` 打开
-           **且** 显式给了 `DJB_UPDATE_SIGNING_KEY` → test-only HMAC 锚；
-        2. 否则 → 内置 Ed25519 公钥（唯一生产信任锚）。
+        1. DJB_ENV=test **且** 开关 client.update.mock_signature.enabled 打开
+           **且** 显式给了 DJB_UPDATE_SIGNING_KEY → test-only HMAC 锚（单钥）；
+        2. 否则 → facts.UPDATE_KEYRING 构造的钥环（primary + transition + 吊销）。
 
-        开启了 mock 却没给密钥 → 直接失败（**不静默回退**、**不本地生成**）。
+        开启了 mock 却没给密钥 → 直接失败（不静默回退、不本地生成）。
         """
         if self.mock_requested():
             raw = os.environ.get(MOCK_KEY_ENV, "").strip()
@@ -271,8 +472,8 @@ class UpdateManager:
                 key = bytes.fromhex(raw)
             except ValueError as exc:
                 raise UpdateError("mock 验签密钥不是合法 hex（fail-closed）") from exc
-            return mock_anchor(key)
-        return ed25519_anchor()
+            return AnchorSet((mock_anchor(key),))
+        return keyring_anchors()
 
     # ── 清单获取
     def _load_manifest(self) -> dict[str, Any] | None:
@@ -308,7 +509,10 @@ class UpdateManager:
         if parsed.scheme in ("http", "https"):
             response = self.http.request("GET", raw, timeout=60.0)
             if response.status != 200:
-                raise UpdateError("下载安装包失败（HTTP " + str(response.status) + "）")
+                # RC8：制品下载失败是**网络类**（DL 502/超时/CDN 故障），
+                # 不能记成 failed_verify（会误导监控，也会把退出码算成 7）。
+                raise NetworkError("下载安装包失败（HTTP " + str(response.status) + "）",
+                                   code=facts.LOCAL_ERROR_CODES["upstream_error"])
             if len(response.body) > ARTIFACT_MAX_BYTES:
                 raise UpdateError("安装包过大（> " + str(ARTIFACT_MAX_BYTES) + " 字节）")
             return response.body
@@ -338,11 +542,15 @@ class UpdateManager:
             anchor_info = {"scheme": None, "key_id": None, "key_fingerprint": None}
             anchor_available = False
             anchor_error = str(exc)
+        resolved = update_source.resolve(self.source, edition=self.edition)
         return {"channel": self.channel, "current_version": install.version,
                 "recorded_current": state.current_version, "next_version": state.next_version,
                 "rollback_to": state.rollback_to, "verify_state": state.verify_state,
                 "bucket": install.bucket, "checked_at": state.checked_at,
                 "source": self.source or "(mock: versions/mock-manifest.json)",
+                # 0.3.1（RC8.3-C）：更新源显式化 —— 只加字段，不动既有键
+                "source_kind": resolved.kind, "source_origin": resolved.origin,
+                "edition": resolved.edition, "source_channel": resolved.channel,
                 "signature": {**anchor_info, "available": anchor_available,
                               "error": anchor_error,
                               "mock": bool(self.mock_requested())}}
@@ -386,7 +594,8 @@ class UpdateManager:
             return base
         version = str(payload["version"])
         channel = str(payload.get("channel") or facts.DEFAULT_UPDATE_CHANNEL)
-        if channel != self.channel:
+        # internal 是超集频道：内部机可收任一频道清单；wave 0 仍由 bucket_eligible 独占
+        if self.channel != facts.UPDATE_BUCKET_INTERNAL_CHANNEL and channel != self.channel:
             base.update({"state": "channel_mismatch",
                          "message": "清单频道为 " + channel + "，本机为 " + self.channel,
                          "current_version": self.store.install().version})
@@ -401,7 +610,8 @@ class UpdateManager:
             self._record("up_to_date", None, version)
             return base
         install = self.store.install()
-        eligible, reason = bucket_eligible(install.bucket, payload, now=moment)
+        eligible, reason = bucket_eligible(install.bucket, payload, now=moment,
+                                           channel=self.channel)
         base.update({"eligible": eligible, "bucket": install.bucket, "rollout_reason": reason})
         if not eligible:
             base.update({"state": "not_eligible",
@@ -460,8 +670,14 @@ class UpdateManager:
             version = str(payload["version"])
             artifact = select_artifact(payload)
             data = self._download(artifact)
-            verify_artifact(data, artifact, key)
-        except (UpdateError, NetworkError) as exc:
+            verify_artifact(data, artifact, key, key_id=payload.get("key_id"))
+        except NetworkError as exc:
+            # RC8：下载阶段的网络失败（502/超时）是网络类（退出码 6），不是验签失败
+            self._record("offline", None, None)
+            event("update.download_failed", level="warning", error=str(exc)[:120])
+            return {"installed": False, "state": "download_failed", "message": str(exc),
+                    "current_version": self.store.install().version}
+        except UpdateError as exc:
             self._record("failed_verify", None, None)
             event("update.verify_failed", level="warning", error=str(exc)[:120])
             return {"installed": False, "state": "failed_verify", "message": str(exc)}
@@ -476,7 +692,7 @@ class UpdateManager:
             # 首次启动自检：读回文件重新校验（防写坏 / 防半包）
             with open(os.path.join(target_dir, "artifact.bin"), "rb") as handle:
                 readback = handle.read()
-            verify_artifact(readback, artifact, key)
+            verify_artifact(readback, artifact, key, key_id=payload.get("key_id"))
             self._activate(version, previous)
         except (OSError, UpdateError) as exc:
             self._rollback_files(target_dir)
@@ -543,6 +759,116 @@ class UpdateManager:
             shutil.rmtree(os.path.join(self.paths.versions_dir, oldest), ignore_errors=True)
             removed.append(oldest)
         return removed
+
+
+#: 九状态 → **客户能做的下一步**（RC14 P0 G4-4）。
+#:
+#: 为什么单独一张表：``check()`` 返回的是工程口径（``state`` + ``message``），直接丢给客户
+#: 就变成「只有状态码的 toast」——客户既不知道下一步，也不知道能不能信。这张表把每个状态
+#: 翻成三件事：**发生了什么 / 怎么办 / 有没有一键动作**，并且 ``no_artifact`` 必须带下载页
+#: （只写「暂无安装包」客户会以为「没有更新」，实际是「我们没给这个平台发包」）。
+#:
+#: ``action`` 取值（渲染层按它决定放哪颗按钮）：
+#: ``retry``（重试）/ ``apply``（安装）/ ``download``（去下载页）/ ``contact``（联系客服）/
+#: ``wait``（等下一波）/ ``none``（无需操作）。
+STATE_GUIDANCE: dict[str, dict[str, str]] = {
+    "offline": {"title": "网络不通，没拿到更新清单",
+                "next": "检查网络/代理后重试；离线不影响本机现有功能", "action": "retry"},
+    "invalid": {"title": "更新源异常，**不要安装**",
+                "next": "清单格式/签名不合法；把这条提示发给客服，别自己动手", "action": "contact"},
+    "no_source": {"title": "本渠道暂无更新源",
+                  "next": "本渠道没有配置更新源；需要离线包请找客服", "action": "contact"},
+    "failed_verify": {"title": "校验失败，已拒装（安全拦截）",
+                      "next": "版本未变；把这条提示发给客服核查更新源", "action": "contact"},
+    "channel_mismatch": {"title": "清单渠道与本机不一致",
+                         "next": "不提供一键切渠道；请装回本渠道的安装包（找客服）",
+                         "action": "contact"},
+    "up_to_date": {"title": "已是最新版本", "next": "无需操作", "action": "none"},
+    "not_eligible": {"title": "灰度未命中，本轮不更新",
+                     "next": "观察期结束后会自动再检查；也可稍后再点一次「检查更新」",
+                     "action": "wait"},
+    "no_artifact": {"title": "本平台暂无安装包",
+                    "next": "去下载页手动下载安装包（不是「没有更新」）", "action": "download"},
+    "eligible": {"title": "有可用更新", "next": "点「安装更新」（重启后生效）或执行 djb update --apply",
+                 "action": "apply"},
+}
+
+#: 这些状态算「检查本身成功」（toast 打勾）；其余按失败/受限处理（黄/红提示）。
+GUIDANCE_OK_STATES = ("up_to_date", "eligible", "not_eligible", "no_artifact")
+
+
+def guidance(result: dict[str, Any] | None, *,
+             web_console: str | None = None) -> dict[str, Any]:
+    """把 ``check()`` 的结果翻成客户可执行的一段话（九状态全覆盖，纯函数、可无网单测）。
+
+    返回 ``{"state","title","detail","next","action","url","ok"}``：
+    ``detail`` 带上工程细节（当前/可用版本、桶、渠道），``url`` 只有下载类动作才有。
+    任何未知 state 也**不返回空**——退回「未知状态 + 找客服」，绝不出现「只有状态码」。
+    """
+    result = dict(result or {})
+    state = str(result.get("state") or "unknown")
+    row = STATE_GUIDANCE.get(state) or {
+        "title": "更新检查返回了未知状态（" + state + "）",
+        "next": "把这条提示发给客服", "action": "contact"}
+    title = row["title"]
+    action = row["action"]
+    detail_bits: list[str] = []
+    current = str(result.get("current_version") or "").strip()
+    if current:
+        detail_bits.append("当前 " + current)
+    if result.get("manifest_version"):
+        detail_bits.append("可用 " + str(result["manifest_version"]))
+    if state == "channel_mismatch":
+        detail_bits.append("清单 " + str(result.get("message") or "").replace("清单频道为 ", "")
+                           .replace("，本机为 ", " / 本机 "))
+    elif result.get("message") and state not in ("up_to_date", "eligible"):
+        detail_bits.append(first_line(str(result["message"])))
+    if state == "not_eligible" and result.get("rollout_reason"):
+        detail_bits.append("桶 " + str(result.get("bucket")) + "%（"
+                           + str(result["rollout_reason"]) + "）")
+    if state == "eligible" and result.get("artifact", {}).get("size"):
+        size = result["artifact"]["size"]
+        detail_bits.append(str(round(float(size) / 1048576.0, 1)) + " MB")
+    url = ""
+    if action == "download":
+        base = str(web_console or facts.WEB_CONSOLE_URL or "").rstrip("/")
+        url = base + facts.UPDATE_DOWNLOAD_PATH if base else ""
+    return {"state": state, "title": title, "detail": " · ".join(detail_bits),
+            "next": row["next"], "action": action, "url": url,
+            "ok": state in GUIDANCE_OK_STATES}
+
+
+def open_manager(home: str | os.PathLike[str] | None = None, *,
+                 timeout: float = 20.0) -> "UpdateManager":
+    """按 ``home`` 装一个 :class:`UpdateManager`（与 ``djb update`` 同一套参数）。
+
+    桌面端用它做「检查更新」：**只在 worker 线程里调**（网络 + 签名校验）。
+    本机未初始化（没有库）时抛 :class:`NotInstalledError`——不要在 GUI 里凭空建库。
+    """
+    from .config import resolve_home
+    paths = Paths(resolve_home(home))
+    if not os.path.exists(paths.db_file):
+        raise NotInstalledError("本机未初始化：先执行 djb init")
+    store = Store(paths.db_file)
+    config = load_config(paths)
+    return UpdateManager(paths, store, source=config.update_source,
+                         channel=config.update_channel, edition=config.edition,
+                         http=HttpClient(timeout=timeout), config=config)
+
+
+def apply_exit_code(result: dict[str, Any]) -> int:
+    """apply() 结果 → 进程退出码（RC8：网络类失败不再算校验失败）。
+
+    * failed_verify → 7（EXIT_VERIFY）
+    * download_failed → 6（EXIT_NETWORK）
+    * 其它（installed / up_to_date / offline(清单拉不到) / not_eligible）→ 0
+    """
+    state = str((result or {}).get("state") or "")
+    if state == "failed_verify":
+        return facts.EXIT_VERIFY
+    if state == "download_failed":
+        return facts.EXIT_NETWORK
+    return 0
 
 
 def _version_tuple(text: str) -> tuple[int, int, int]:

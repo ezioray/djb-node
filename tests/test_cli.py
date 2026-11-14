@@ -12,7 +12,9 @@ from djb_node.cli import build_parser, main
 COMMANDS = ["init", "bootstrap", "env", "auth", "start", "stop", "status", "pause", "resume",
             "limits", "upstream", "token", "flags", "attest", "announce", "quotes",
             "update", "logs", "diagnose", "tray", "uninstall", "model-sync", "notify",
-            "proxy", "gui", "plan", "daemon", "reload", "machine"]
+            "proxy", "gui", "plan", "daemon", "reload", "machine",
+            # RC14 B：首启引导状态（--status / --reset；只读本机 desktop/onboarding.json）
+            "onboarding"]
 
 
 def test_every_command_has_help(capsys):

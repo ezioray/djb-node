@@ -15,7 +15,7 @@
 #
 # 用法：
 #   sudo ./install.sh --gateway https://gateway.example.com
-#   sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.2.5-py3-none-any.whl
+#   sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.6-py3-none-any.whl
 #   sudo ./install.sh --gateway https://gateway.example.com --start
 #   ./install.sh --dry-run                       # 只打印将执行的动作（不需要 root）
 #
@@ -35,6 +35,7 @@ PREFIX=/opt/djb-official-supply
 RUN_USER=djb-supply
 UNIT_PATH=/etc/systemd/system/djb-official-supply.service
 GATEWAY=""
+UPDATE_SOURCE="https://tkbank.ai/download/files/update-manifest.json"
 WHEEL=""
 DO_START=0
 DRY_RUN=0
@@ -55,6 +56,7 @@ run() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --gateway) GATEWAY=${2:?--gateway 需要 URL}; shift 2 ;;
+        --update-source) UPDATE_SOURCE=${2:?--update-source 需要 URL}; shift 2 ;;
         --home) HOME_DIR=${2:?--home 需要目录}; shift 2 ;;
         --prefix) PREFIX=${2:?--prefix 需要目录}; shift 2 ;;
         --user) RUN_USER=${2:?--user 需要用户名}; shift 2 ;;
@@ -95,17 +97,24 @@ run install -d -m 0700 -o "$RUN_USER" -g "$RUN_USER" "$HOME_DIR"
 if [ -f "$HOME_DIR/config.json" ]; then
     say "√ 已有配置，不覆盖：$HOME_DIR/config.json"
     say "  （要改服务端地址：djb init --gateway <URL> 或直接编辑后 djb daemon reload）"
+    say "  ⚠ 升级请确认档位：djb init --edition official-supply"
+    say "     （0.3.3 及以前的 config 没有 edition 字段；本脚本第 3 步会补；漏了则"
+    say "     update --status 的 edition/source_channel 为空，自动升级只剩 config 里的 URL）"
 else
     if [ "$DRY_RUN" -eq 1 ]; then
         say "[dry-run] 写 $HOME_DIR/config.json（gateway_url=$GATEWAY）"
     else
         # 原子写：临时文件 -> mv，并且先落成 0600 再改属主
         tmp=$(mktemp "$HOME_DIR/.config.json.XXXXXX")
-        sed "s#https://gateway.example.invalid#$GATEWAY#" "$HERE/config.json" > "$tmp"
+        # 两个字段都要落到正式环境：gateway_url 由 --gateway 决定；
+        # update_source 决定客户端能不能自动升级（沿用旧版占位/旧域会永远升不了）。
+        sed -e "s#\"gateway_url\": \"[^\"]*\"#\"gateway_url\": \"$GATEWAY\"#" \
+            -e "s#\"update_source\": \"[^\"]*\"#\"update_source\": \"$UPDATE_SOURCE\"#" \
+            "$HERE/config.json" > "$tmp"
         chmod 600 "$tmp"
         chown "$RUN_USER:$RUN_USER" "$tmp"
         mv -f "$tmp" "$HOME_DIR/config.json"
-        say "√ 已写配置：$HOME_DIR/config.json（gateway_url=$GATEWAY）"
+        say "√ 已写配置：$HOME_DIR/config.json（gateway_url=$GATEWAY，update_source=$UPDATE_SOURCE）"
     fi
 fi
 
@@ -123,10 +132,10 @@ fi
 
 # 首次初始化状态库（幂等；DJB_HOME 指到状态目录，凭据仍为空）
 if [ "$DRY_RUN" -eq 1 ]; then
-    say "[dry-run] 以 $RUN_USER 身份：DJB_HOME=$HOME_DIR djb init --no-env"
+    say "[dry-run] 以 $RUN_USER 身份：DJB_HOME=$HOME_DIR djb init --no-env --edition official-supply"
 else
     su -s /bin/sh "$RUN_USER" -c \
-        "DJB_HOME='$HOME_DIR' '$PREFIX/venv/bin/djb' init --no-env" >/dev/null
+        "DJB_HOME='$HOME_DIR' '$PREFIX/venv/bin/djb' init --no-env --edition official-supply" >/dev/null
     say "√ 状态库就绪：$HOME_DIR/state.db"
 fi
 
