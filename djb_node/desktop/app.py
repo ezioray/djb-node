@@ -296,6 +296,10 @@ class DesktopApp:
         self._ia_kickers = {key: nav_kicker(self._ia, key) for key in self._ia_order}
         self._nav_buttons: dict[str, Any] = {}
         self._fields: dict[str, Any] = {}
+        #: 密码框的「显示 / 隐藏」按钮（key → Button）：窗口级测试要点它验证真能切换
+        self._reveal_buttons: dict[str, Any] = {}
+        #: 可编辑字段的输入框（key → Entry）：窗口级测试要直接读 ``show`` 选项
+        self._entries: dict[str, Any] = {}
         self._row_notes: dict[str, str] = {}
         self._tree: Any = None
         self._detail: Any = None
@@ -1519,6 +1523,8 @@ class DesktopApp:
             child.destroy()
         self._fields.clear()
         self._vars.clear()
+        self._reveal_buttons.clear()         # 按钮随旧控件销毁，不能留悬空引用
+        self._entries.clear()
         self._row_notes.clear()
         self._tree = None
         self._detail = None
@@ -2281,6 +2287,12 @@ class DesktopApp:
             if field.secret:
                 entry.configure(show="•")
             entry.grid(row=0, column=1, sticky="ew")
+            # G7（RC14）：秘密字段右侧「显示 / 隐藏」。只切 Entry 的 show 选项——
+            # 不复制、不写日志、不进快照；输入框里的内容本来就只是客户刚粘的那串。
+            if getattr(field, "can_reveal", lambda: False)():
+                reveal = self._render_reveal_button(block, field, entry, surface)
+                if reveal is not None:
+                    self._reveal_buttons[field.key] = reveal
             hint = field.hint or ""
             if field.secret:
                 hint = ("当前 " + field.value + "｜" + hint).strip("｜")
@@ -2293,6 +2305,7 @@ class DesktopApp:
                                                         pady=(3, 0))
             self._fields[field.key] = field
             self._vars[field.key] = variable
+            self._entries[field.key] = entry
         else:
             # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
             # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
@@ -2310,6 +2323,34 @@ class DesktopApp:
                     anchor="w", justify="left",
                     wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
                                                         pady=(3, 0))
+
+    def _entry_for(self, key: str) -> Any:
+        """取某字段的输入框（没有该字段 → ``None``）；给窗口级测试与「显示密码」用。"""
+        return self._entries.get(str(key))
+
+    def _render_reveal_button(self, block: Any, field: Field, entry: Any,
+                              surface: str) -> Any:
+        """密码框的「显示 / 隐藏」（RC14 G7）：画在输入框**右侧**，点一下才看得见。
+
+        只做一件事：``entry.configure(show=""/"•")`` + 按钮文案切换。
+        **不**把值写进日志、不复制到剪贴板、不改 ``_vars``（保存路径读到的还是同一串）。
+        """
+        kit, tk = self._kit, self._tk
+        state = {"shown": False}
+        button = kit.Button(block, "显示", lambda: _toggle(), kind="ghost", ground=surface,
+                            px=kit.px("micro"), height=26, pad=8)
+        button.grid(row=0, column=2, sticky="w", padx=(6, 0))
+        del tk                                        # 只用 kit 的按钮，避免两套样式
+
+        def _toggle() -> None:
+            state["shown"] = not state["shown"]
+            try:
+                entry.configure(show="" if state["shown"] else "•")
+            except Exception:                          # pragma: no cover - 控件已销毁
+                return
+            button.set_text("隐藏" if state["shown"] else "显示")
+
+        return button
 
     # ── 动作
     def _on_action(self, key: str) -> None:

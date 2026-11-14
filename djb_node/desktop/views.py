@@ -211,6 +211,11 @@ class Field:
     * ``prefill``：可编辑框是否预填 ``value``。``False`` 时输入框留空、``value`` 进 hint——
       掩码值（如收款地址 ``TQn9Xa…7f3d``）若预填进输入框，客户直接点「保存并回读」就会把
       掩码当地址写回配置（真机上会被 ``validate_address`` 拒，等于保存永远失败）。
+    * ``revealable``：密码框右侧给不给「显示 / 隐藏」按钮。``None``（默认）= 跟着
+      ``secret`` 走（**秘密字段默认可显示**）；显式 ``False`` 才关掉。理由：客户粘贴
+      长密钥时打错一个字符，保存后只看到「401 / 密钥被拒」，而输入框里是一串黑点，
+      除了整段重粘没有任何补救手段（RC14 客户反馈「看不见就改不了」）。
+      显示**只改输入框的 ``show`` 选项**：不复制到剪贴板、不写日志、不进快照。
     """
 
     label: str
@@ -222,6 +227,13 @@ class Field:
     tone: str = "default"
     advanced: bool = False
     prefill: bool = True
+    revealable: bool | None = None
+
+    def can_reveal(self) -> bool:
+        """是否画「显示 / 隐藏」：只有**可编辑**的秘密字段才有意义（只读值本就是掩码）。"""
+        if not (self.editable and self.secret):
+            return False
+        return True if self.revealable is None else bool(self.revealable)
 
 
 @dataclass(frozen=True)
