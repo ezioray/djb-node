@@ -33,7 +33,10 @@ EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30",
                     facts.MACHINE_PROFILE_FLAG: "2027-06-30",
                     # ROUND3 / C-01b：批准窗口写到「日期时间 + 时区」（DECISIONS.md §D-R3-01），
                     # 登记表原样保留这个写法，求值只取该时区里的日期（config._parse_expire_at）
-                    facts.PROBE_FLAG_PERIODIC: "2027-06-30T00:00:00+08:00"}
+                    facts.PROBE_FLAG_PERIODIC: "2027-06-30T00:00:00+08:00",
+                    # RC14 B/I：设计 §5.4 给这两条定的是 2027-03-31（引导与竞价 UI 一起收敛）
+                    facts.ONBOARDING_FLAG: "2027-03-31",
+                    facts.UPSTREAM_BID_FLAG: "2027-03-31"}
 
 
 def test_every_flag_has_three_fields_and_default_off():

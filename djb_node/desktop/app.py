@@ -333,6 +333,12 @@ class DesktopApp:
         self._ensure_update_worker()
         self._ensure_probe_worker()
         self._ensure_discover_worker()
+        bind = getattr(self._root, "bind", None)
+        if callable(bind):
+            try:
+                bind("<Escape>", self._on_escape, add="+")
+            except Exception:                            # pragma: no cover - 无窗口
+                pass
         self.show_view(controller.view)
 
     # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
@@ -1579,6 +1585,46 @@ class DesktopApp:
         self._wrap_targets = []
 
     # ── 渲染入口
+    def _on_escape(self, event: Any = None) -> None:
+        """Esc = 跳过当前引导步骤（设计 §3.4）；引导不在时什么都不做。"""
+        try:
+            if self._controller.onboarding_visible():
+                self._on_action("onboarding.skip")
+        except Exception:                                # 状态读不到：不要拦 Esc
+            return None
+        return None
+
+    def _render_onboarding(self, body: Any) -> None:
+        """首启引导面板（应用内、非模态）。渲染失败绝不影响主界面。"""
+        try:
+            panel = self._controller.onboarding_panel()
+        except Exception:                                # 状态文件坏了：不画，别崩窗口
+            panel = None
+        if panel is None:
+            return
+        tk = self._tk
+        kit = self._kit
+        ground = dual.color("surface")
+        card = kit.RoundedCard(body, ground=dual.color("bg"), pad=(16, 12))
+        card.pack(fill="x", pady=(0, 10))
+        inner = card.body
+        tk.Label(inner, text=panel.title, font=self._fonts.sans(kit.px("h2"), bold=True),
+                 foreground=dual.color("ink"), background=ground, anchor="w").pack(anchor="w")
+        self._wrap(tk.Label(inner, text=panel.body, font=self._fonts.sans(kit.px("small")),
+                            foreground=dual.color("muted_text"), background=ground,
+                            anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
+                                anchor="w", pady=(4, 8))
+        row = tk.Frame(inner, background=ground)
+        row.pack(anchor="w")
+        for action in panel.actions:
+            button = kit.Button(row, action.label,
+                                (lambda key: (lambda: self._on_action(key)))(action.key),
+                                kind="primary" if action.primary else "ghost",
+                                ground=ground, px=kit.px("small"), height=30, pad=12,
+                                enabled=bool(action.enabled))
+            button.pack(side="left", padx=(0, 8))
+        self._onboarding_panel = card
+
     def _render(self, view: View) -> None:
         """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。"""
         tk = self._tk
@@ -1596,6 +1642,9 @@ class DesktopApp:
         body = tk.Frame(self._content, background=dual.color("bg"), bd=0, highlightthickness=0)
         body.pack(fill="both", expand=True, padx=pad[0], pady=pad[1])
         self._body = body
+        # RC14 B：首次引导面板 —— **不是模态**：画在正文最上方，不拦点击、不挡导航；
+        # 每步都有「跳过这一步」，第一步还有「跳过设置，直接进入」。开关关 → 不画。
+        self._render_onboarding(body)
         if view.subtitle:
             self._wrap(tk.Label(body, text=view.subtitle, font=self._fonts.sans(kit.px("small")),
                               foreground=dual.color("muted_text"), background=dual.color("bg"),

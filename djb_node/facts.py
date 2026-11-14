@@ -648,12 +648,24 @@ FEATURE_FLAGS["supply.attestation.enabled"] = {
     "default": False,
     "description": "模型身份证明（M17 §5 / C12 客户端侧线索采集），默认关闭",
 }
+# ── RC14 B 首启引导（默认关闭：关 → 不渲染引导视图，onboarding.json 保留但不读，
+# 零数据迁移；QA 截图基线不受影响）
+FEATURE_FLAGS["client.onboarding.enabled"] = {
+    "default": False,
+    "owner": "lead",                     # 设计 §5.4 原表：lead（待指定到人）
+    "expire_at": "2027-03-31",
+    "rollback_rule": "置 false 重启客户端 → 不渲染引导视图；desktop/onboarding.json 保留但"
+                     "不读，零数据迁移（可用 djb onboarding --reset 清状态）",
+    "description": "首启引导（3 步 + 完成页，每步可跳过；RC14 B）",
+}
+ONBOARDING_FLAG = "client.onboarding.enabled"
+
 # ── RC14 I/J 逐模型底价上报（默认关闭：云端 ask-settings / schedule-quotes.models[]
 # 还没有主线实现，见 CHG-2026-11-14-RC14-IMPL §3-B.9；三字段齐全、到期强制关）
 FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
     "default": False,
-    "owner": "client-seat",
-    "expire_at": "2027-06-30",
+    "owner": "lead",                     # 设计 §5.4：竞价/上报类开关统一 owner=lead
+    "expire_at": "2027-03-31",           # 与 §5.4 表的到期日一致
     "rollback_rule": "关闭 → 客户端不再上报逐模型底价（本地账本只读保留、报价回到原口径）；"
                      "djb flags --disable client.upstream.bid_report.enabled 即刻生效，"
                      "无需迁移、无残留（云端没有收到过任何底价）",

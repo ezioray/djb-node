@@ -120,7 +120,11 @@ class DesktopController:
     update_via: Callable[[str], Any] | None = None
     #: 探针异步通道（RC14 D）：返回 True = 已派给 worker（网络在 worker 线程里跑）
     probe_via: Callable[[], Any] | None = None
-    #: RC14 I：读取模型清单（``GET {base}/models``）的异步通道；返回 True = 已派给 worker。
+    #: RC14 B：首次引导状态（``djb_node.onboarding.OnboardingStore``；None = 未接本机目录）
+    onboarding: Any | None = None
+    #: 当前引导步骤（1..3；4 = 完成页；None = 不显示面板）
+    onboarding_step: int | None = None
+    #: RC14 B 读取模型清单（``GET {base}/models``）的异步通道；返回 True = 已派给 worker。
     #: 签名 ``(base_url, protocol, secret) -> bool``；没有通道时**同步**跑（单测/无 Tk）。
     discover_via: Callable[[str, str, str], Any] | None = None
     #: 最近一次「读取模型清单」的结果（``datasource.discover_upstream_models`` 原样）
@@ -151,6 +155,14 @@ class DesktopController:
             merged = dict(bench) if isinstance(bench, Mapping) else {}
             merged["benchmark"] = dict(self.benchmark)
             sections["bench"] = merged
+        # RC14 B：账户页的「重新运行首次引导」入口由**开关**决定（默认关 → 按钮隐藏）
+        onboarding_meta = {"enabled": self.onboarding_enabled(),
+                           "visible": self.onboarding_visible(),
+                           "step": self.onboarding_step}
+        access = sections.get("access")
+        merged_access = dict(access) if isinstance(access, Mapping) else {}
+        merged_access["onboarding"] = onboarding_meta
+        sections["access"] = merged_access
         # RC14 I：Token Plan 页的「选中行 + 该行已存底价」由本层注入（视图层不持有选中态）
         plan = sections.get("token_plan")
         if isinstance(plan, Mapping):
@@ -571,6 +583,157 @@ class DesktopController:
             except Exception:
                 return bids_mod.BidBook(None)
         return bids_mod.BidBook(None)
+
+    # ── RC14 B 首次引导（应用内面板，不是模态；每步都能跳）
+    def _onboarding_store(self):
+        from ..onboarding import OnboardingStore
+
+        if self.onboarding is not None:
+            return self.onboarding
+        home = getattr(self.source, "_home", None)
+        if not home:
+            return None
+        self.onboarding = OnboardingStore(str(home))
+        return self.onboarding
+
+    def onboarding_state(self):
+        store = self._onboarding_store()
+        return store.load() if store is not None else None
+
+    def onboarding_enabled(self) -> bool:
+        """开关（默认关）：关 → 不渲染面板，状态文件保留但不读。"""
+        from .. import facts as facts_mod
+        from ..config import Paths, feature_flag, load_config
+
+        home = getattr(self.source, "_home", None)
+        if not home:
+            return False
+        try:
+            return bool(feature_flag(load_config(Paths(str(home))),
+                                     facts_mod.ONBOARDING_FLAG))
+        except Exception:
+            return False
+
+    def onboarding_visible(self) -> bool:
+        if not self.onboarding_enabled():
+            return False
+        if self.onboarding_step is not None:
+            return True
+        state = self.onboarding_state()
+        return bool(state is not None and state.should_show())
+
+    def onboarding_panel(self):
+        """当前该显示的面板（不需要显示就返回 None）。"""
+        if not self.onboarding_visible():
+            return None
+        from .views import onboarding_panel
+
+        step = self.onboarding_step
+        if step is None:
+            state = self.onboarding_state()
+            step = (state.last_step if state is not None else 1) or 1
+        return onboarding_panel(step, bound=self._bound_flag(),
+                                upstream_count=self._upstream_count())
+
+    def _bound_flag(self) -> bool | None:
+        sections = self.snapshot.sections
+        account = sections.get("account") if isinstance(sections.get("account"), Mapping) else {}
+        access = sections.get("access") if isinstance(sections.get("access"), Mapping) else {}
+        from .views import _account_bound
+
+        profile = account.get("profile") if isinstance(account.get("profile"), Mapping) else {}
+        security = (account.get("security")
+                    if isinstance(account.get("security"), Mapping) else {})
+        binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
+        return _account_bound(profile, security, binding)
+
+    def _upstream_count(self) -> int:
+        sections = self.snapshot.sections
+        plan = sections.get("token_plan") if isinstance(sections.get("token_plan"), Mapping) else {}
+        rows = plan.get("upstreams")
+        return len(rows) if isinstance(rows, list) else 0
+
+    def _onboarding_move(self, step: int, *, skip: bool = False) -> ActionResult:
+        store = self._onboarding_store()
+        if store is None:
+            return ActionResult("引导状态不可用（没有本机配置目录）", ok=False)
+        state = store.load()
+        if skip:
+            state = store.skip_step(step, state)
+        state = store.touch_step(step, state)
+        self.onboarding_step = step
+        self.refresh(sections=("account", "overview"))
+        label = ("已跳过第 " + str(step) + " 步" if skip else "第 " + str(step) + " 步")
+        return ActionResult(label + "（进度只记在本机 desktop/onboarding.json，跳过不写凭据）",
+                            effect="refresh")
+
+    def _act_onboarding_next(self, *, confirm=None) -> ActionResult:
+        current = self.onboarding_step or 1
+        panel_total = 3
+        if current >= panel_total:
+            self.onboarding_step = panel_total + 1
+            store = self._onboarding_store()
+            if store is not None:
+                store.touch_step(panel_total + 1)
+            return ActionResult("引导最后一步了：下面是完成页", effect="refresh")
+        return self._onboarding_move(current + 1)
+
+    def _act_onboarding_back(self, *, confirm=None) -> ActionResult:
+        current = self.onboarding_step or 1
+        return self._onboarding_move(max(1, current - 1))
+
+    def _act_onboarding_skip(self, *, confirm=None) -> ActionResult:
+        """「跳过这一步」：**任意步都可用**；写盘失败不阻断，只把话说清楚。"""
+        current = self.onboarding_step or 1
+        store = self._onboarding_store()
+        saved = True
+        if store is not None:
+            saved = store.save(store.skip_step(current))
+        self.onboarding_step = current + 1
+        if saved and store is not None:
+            store.touch_step(min(self.onboarding_step, 3))   # 进度只记 1..3
+        self.refresh(sections=("account", "overview"))
+        if not saved:
+            return ActionResult("引导进度没存上（磁盘不可写），下次还会出现；本步已跳过",
+                                ok=True, effect="refresh")
+        return ActionResult("已跳过第 " + str(current) + " 步（进度只记在本机 "
+                            "desktop/onboarding.json，跳过不写凭据）", effect="refresh")
+
+    def _act_onboarding_skip_all(self, *, confirm=None) -> ActionResult:
+        store = self._onboarding_store()
+        if store is not None:
+            store.skip_all()
+        self.onboarding_step = None
+        return ActionResult("已跳过首次引导：主界面照常可用；要再跑一次，"
+                            "去「账户与安全 → 重新运行首次引导」（或 djb onboarding --reset）",
+                            effect="refresh")
+
+    def _act_onboarding_finish(self, *, confirm=None) -> ActionResult:
+        store = self._onboarding_store()
+        done = store.complete() if store is not None else None
+        self.onboarding_step = None
+        if done is None:
+            return ActionResult("引导结束（进度未能写盘，下次启动可能还会出现）", ok=True,
+                                effect="refresh")
+        return ActionResult("引导完成：随时可在「账户与安全」重新运行", effect="refresh")
+
+    def _act_onboarding_rerun(self, *, confirm=None) -> ActionResult:
+        """「重新运行首次引导」（完成页与账户页共用）：清 dismissed、保留 completed 历史。"""
+        store = self._onboarding_store()
+        if store is None:
+            return ActionResult("引导状态不可用（没有本机配置目录）", ok=False)
+        state = store.load()
+        state.dismissed_at = None
+        store.save(state)
+        self.onboarding_step = 1
+        self.refresh(sections=("account",))
+        return ActionResult("已重新开始首次引导（第 1 步，可随时跳过）", effect="refresh")
+
+    def _act_account_rerun_onboarding(self, *, confirm=None) -> ActionResult:
+        if not self.onboarding_enabled():
+            return ActionResult("首次引导开关关闭（client.onboarding.enabled）："
+                                "先 djb flags --enable client.onboarding.enabled 再重跑", ok=False)
+        return self._act_onboarding_rerun(confirm=confirm)
 
     def _act_token_plan_discover(self, *, confirm=None) -> ActionResult:
         """第 2 步：``GET {base}/models`` 拉清单（**网络在 worker 线程**，主线程不等）。"""

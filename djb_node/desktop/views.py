@@ -1956,6 +1956,10 @@ def _account(snapshot: Snapshot) -> View:
                            ("先填好 Polygon 收款地址再点这里提交"
                             if bound is True else
                             "节点还没绑定账户：先完成上面的绑定"))))
+    # RC14 B：引导重跑入口**永久**在本页（不是只在首次启动出现）；开关关 → 隐藏
+    onboarding = access.get("onboarding") if isinstance(access.get("onboarding"), Mapping) else {}
+    if onboarding.get("enabled"):
+        actions.append(Action("account.rerun_onboarding", "重新运行首次引导"))
     # 解绑 = 原来「接入配置」页那颗「粘贴绑定码绑定」的对偶：绑定与解绑都只在本页。
     # 键名保留 ``account.logout``（接口只加不改）：它就是「解绑 + 清本机密钥」那一个动作。
     actions.append(Action("account.logout", "解绑这台电脑（登出并清本机密钥）",
@@ -1993,6 +1997,58 @@ def _account(snapshot: Snapshot) -> View:
         unavailable=unavailable,
         notes=tuple(notes),
     )
+
+
+# ─────────────────────────────────────────────────────────── RC14 B 首次引导（应用内面板）
+@dataclass(frozen=True)
+class OnboardingPanel:
+    """首启引导的**投影**（无 Tk）：标题 / 正文 / 步骤序号 / 动作。
+
+    应用层把它画成主界面上方的一条面板（**不是模态**：不遮挡、不拦点击），并直接复用
+    同一套 :class:`Action`（键名与其它页一致，点下去仍走 controller.action）。
+    """
+
+    step: int                  # 1..3；4 = 完成页
+    total: int
+    title: str
+    body: str
+    actions: tuple[Action, ...] = ()
+
+    @property
+    def done(self) -> bool:
+        return self.step > self.total
+
+
+def onboarding_panel(step: int, *, total: int = 3, bound: bool | None = None,
+                     upstream_count: int = 0) -> OnboardingPanel:
+    """按步骤给面板（跳过按钮在**每一步**都有：这是 owner 的硬要求）。"""
+    step = max(1, min(total + 1, int(step)))
+    from .. import onboarding as onboarding_mod
+
+    if step > total:
+        marks = []
+        marks.append("✓ 已绑定" if bound is True else
+                     "· 还没绑定（随时可在「账户与安全」绑定）")
+        marks.append("✓ 已提供 " + str(upstream_count) + " 个接入"
+                     if upstream_count else "· 还没提供上游（随时可在「提供 Token Plan」添加）")
+        return OnboardingPanel(
+            step=step, total=total, title=onboarding_mod.DONE_TITLE,
+            body="  ".join(marks),
+            actions=(Action("onboarding.finish", "进入主界面", primary=True),
+                     Action("onboarding.rerun", "重新运行引导")))
+    actions = [Action("onboarding.next", "开始" if step == 1 else "下一步", primary=True)]
+    if step == 2:
+        actions.append(Action("account.bind", "在浏览器确认绑定"))
+    if step == 3:
+        actions.append(Action("token_plan.add_upstream", "去填接入"))
+    actions.append(Action("onboarding.skip", "跳过这一步"))
+    if step == 1:
+        actions.append(Action("onboarding.skip_all", "跳过设置，直接进入"))
+    if step > 1:
+        actions.append(Action("onboarding.back", "上一步"))
+    return OnboardingPanel(
+        step=step, total=total, title=onboarding_mod.step_title(step),
+        body=onboarding_mod.step_body(step), actions=tuple(actions))
 
 
 def _logs(snapshot: Snapshot) -> View:

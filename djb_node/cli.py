@@ -1682,6 +1682,42 @@ def cmd_flags(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_onboarding(args: argparse.Namespace) -> int:
+    """首启引导状态（RC14 B）：``--status`` 看进度 / ``--reset`` 清状态（下次启动重新引导）。
+
+    只读本机 ``desktop/onboarding.json``（**不含凭据**）；``--reset`` 只删这一个文件，
+    不动配置、不动凭据、不动账本。
+    """
+    from . import onboarding as onboarding_mod
+
+    # 引导状态是纯本机文件：**不要求 init 过**（未初始化的机器也该能看/清进度）
+    paths = Paths(resolve_home(getattr(args, "home", None)))
+    config = load_config(paths)
+    store = onboarding_mod.OnboardingStore(paths.home)
+    if getattr(args, "reset", False):
+        state = store.reset()
+        payload = {"reset": True, "state": state.as_dict(),
+                   "path": store.path, "flag": facts.ONBOARDING_FLAG}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: "已清除引导状态（下次启动会重新引导）：" + value["path"])
+        return 0
+    state = store.load()
+    payload = {"state": state.as_dict(), "show": state.should_show(),
+               "steps": [dict(item) for item in onboarding_mod.STEPS],
+               "path": store.path, "flag": facts.ONBOARDING_FLAG,
+               "enabled": bool(feature_flag(config, facts.ONBOARDING_FLAG))}
+    _emit(payload, as_json=_json_flag(args),
+          text=lambda value: (
+              ("引导" + ("已完成" if value["state"]["completed_at"] else
+                         "已跳过" if value["state"]["dismissed_at"] else "未完成"))
+              + ("，下次启动会显示" if value["show"] else "，不再自动显示")
+              + "（第 " + str(value["state"]["last_step"]) + " / "
+              + str(len(value["steps"])) + " 步）\n开关 " + value["flag"] + "："
+              + ("开" if value["enabled"] else "关（默认）")
+              + "｜状态文件：" + value["path"]))
+    return 0
+
+
 def cmd_attest(args: argparse.Namespace) -> int:
     """查看本地模型身份证明记录（客户端证据只作线索，不自我宣称 verified）。"""
     paths, config, store = _context(args)
@@ -2588,6 +2624,11 @@ def build_parser() -> argparse.ArgumentParser:
     flags = add_common(cmd_flags, "flags", "查看 / 设置本机特性开关（默认关闭）")
     flags.add_argument("--enable", metavar="NAME")
     flags.add_argument("--disable", metavar="NAME")
+
+    onboarding = add_common(cmd_onboarding, "onboarding",
+                            "首启引导状态：--status 看进度 / --reset 清状态（下次启动重新引导）")
+    onboarding.add_argument("--status", action="store_true", help="查看引导进度（默认动作）")
+    onboarding.add_argument("--reset", action="store_true", help="清除引导状态")
 
     attest_cmd = add_common(cmd_attest, "attest", "查看本地模型身份证明记录（客户端线索）")
     attest_cmd.add_argument("--id", help="上游 id")
