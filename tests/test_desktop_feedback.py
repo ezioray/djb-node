@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from djb_node.desktop import app as desktop_app
 from djb_node.desktop.controller import ActionResult
 from djb_node.desktop.datasource import FakeDataSource
@@ -153,3 +155,82 @@ def test_open_url_refuses_non_http_schemes(monkeypatch):
     app._open_url("https://tkbank.ai/console/security")            # noqa: SLF001
     assert status.text.startswith("✓") and "已在浏览器打开" in status.text
     assert opened == ["https://tkbank.ai/console/security"]
+
+
+# ────────────── RC15-039 #1：字段级错误走「字段下方红字 + 聚焦首错」，不落状态栏了事
+def _labels_starting_with(widget: Any, prefix: str) -> list[str]:
+    """递归收集文本以 ``prefix`` 开头的 Label 文本（真窗口里找红字用）。"""
+    found: list[str] = []
+    try:
+        children = widget.winfo_children()
+    except Exception:                                  # pragma: no cover - 已销毁
+        return found
+    for child in children:
+        try:
+            text = child.cget("text")
+        except Exception:
+            text = ""
+        if text and str(text).startswith(prefix):
+            found.append(str(text))
+        found.extend(_labels_starting_with(child, prefix))
+    return found
+
+
+def test_real_tk_inline_error_marks_the_field_and_takes_focus():
+    """点「保存并回读」失败后：红字在字段下方、键盘焦点在第一个错误字段、切页不留残留。
+
+    这一条钉的是走查原话「错误只在底部状态栏，不定位字段、跨页面残留」：状态栏仍然说一句
+    （失败必报），但**定位置**的活由字段自己干。
+    """
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    from djb_node.desktop import access as ac
+    from djb_node.desktop.app import DesktopApp, demo_snapshot
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    sections = dict(demo_snapshot().sections)
+    sections["access"] = {"config": {"price_mode": "auto", "node_secret": "••••1234",
+                                     "node_id": "nd_old"},
+                          "valid": True, "saved": True, "binding": None,
+                          "node_id": "nd_old", "node_id_source": "config",
+                          "note": "", "path": "~/.djb/desktop/access-config.json"}
+    store = ac.MemoryAccessStore(ac.AccessConfig(node_id="nd_old", price_mode="auto"))
+    controller = DesktopController(FakeDataSource(sections, source="demo"),
+                                   access=ac.AccessService(store, reloader=lambda: ac.RELOAD_OK))
+    app = DesktopApp(controller, root=root)
+    try:
+        app.show_view("access")
+        root.update()
+        app._advanced_toggle.command()                 # 节点凭证在折叠区里（要改就得先展开）
+        root.update()
+        app._vars["price_mode"].set("跟随平台建议价")
+        app._vars["node_id"].set("n" * 200)
+        app._vars["node_secret"].set("abc\ndef")
+        app._on_action("access.save")
+        root.update()
+
+        assert set(app._field_errors) == {"price_mode", "node_id", "node_secret"}
+        assert app._status.cget("text").startswith("!")      # 状态栏仍然报一次（失败必报）
+        view = app._last_view
+        assert view is not None and view.focus_field == "node_id"
+        assert root.focus_get() is app._entries["node_id"]   # 焦点落在**首个**错误字段
+        inline = _labels_starting_with(app._body, "！")
+        assert inline, "字段下方没有任何红字（错误还只活在状态栏里）"
+        assert sum(1 for text in inline if "节点标识" in text) == 1
+        # 折叠区里的错误也必须看得见：有错就自动展开
+        assert app._advanced_panel.winfo_ismapped() == 1
+
+        app.show_view("logs")                          # 切页：红字与错误态一起清掉
+        root.update()
+        assert app._field_errors == {}
+        assert "！" not in app._last_view.plain_text()
+    finally:
+        app.stop()
+        try:
+            root.destroy()
+        except Exception:                          # pragma: no cover
+            pass

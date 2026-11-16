@@ -59,6 +59,9 @@ class ActionResult:
     ok: bool = True
     effect: str = ""
     payload: str = ""
+    #: 字段级错误（配置字段名 → 一句话）：渲染层写在字段下方并聚焦第一个（RC15-039 #1）。
+    #: 默认空 = 没有字段错误（0.3.7 行为，只落状态栏）。只加不改。
+    fields: Mapping[str, str] = field(default_factory=dict)
 
 
 class ControlChannel(Protocol):
@@ -343,8 +346,11 @@ class DesktopController:
             self.drafts.clear()
             self.refresh(sections=("access", "agent"))
         prefix = ("；".join(warnings) + "。") if warnings else ""
+        # RC15-039 #1：校验失败时把**逐字段**原因一起回投，渲染层写在字段下方并聚焦第一个；
+        # 成功时 ``field_errors`` 为空 → 上一轮的红字随渲染一起清掉（不留残留）。
         return ActionResult(prefix + result.message, ok=result.effective,
-                            effect="access", payload=result.reload)
+                            effect="access", payload=result.reload,
+                            fields=dict(result.field_errors or {}))
 
     def save_agent(self) -> ActionResult:
         """Agent 上行地址编辑后保存（同一份本机配置，走同一保存+回读路径）。"""
@@ -506,14 +512,18 @@ class DesktopController:
 
         address = self.payout_address()
         if not address:
-            return ActionResult("暂不可用（先填 USDT 收款地址，再点「提交到云端」）", ok=False)
+            return ActionResult("暂不可用（先填 USDT 收款地址，再点「提交到云端」）", ok=False,
+                                fields={"usdt_address": "先填 USDT 收款地址（Polygon，0x 开头 42 位）"})
         try:
             address = validate_address(address)        # 格式（TRC20 / EVM 都认，老配置兼容）
         except ValueError as exc:
-            return ActionResult("提交失败：" + str(exc) + "（未发送到云端）", ok=False)
+            # RC15-039 #1：地址错误写在**地址字段下方**（本页内可见），不只落状态栏
+            return ActionResult("提交失败：" + str(exc) + "（未发送到云端）", ok=False,
+                                fields={"usdt_address": str(exc)})
         blocked = payout_mod.submit_blocker(address)   # 链闸：只放行 0x（Polygon）
         if blocked:
-            return ActionResult(blocked + "（未发送到云端）", ok=False)
+            return ActionResult(blocked + "（未发送到云端）", ok=False,
+                                fields={"usdt_address": blocked})
         if not callable(getattr(self.source, "submit_payout_address", None)):
             return ActionResult("暂不可用（当前数据源不支持提交收款地址）；地址未变更。", ok=False)
         return ActionResult("正在提交收款地址到云端…（可以继续操作）",

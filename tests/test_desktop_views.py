@@ -1196,3 +1196,69 @@ def test_access_copy_node_id_action_returns_clipboard_payload(tmp_path):
     assert missing.ok is False
     assert "接入配置" in missing.message            # 指向能看原因的地方
     assert "先启动一次" not in missing.message
+
+
+# ──────────────────────────── RC15-039 #1：表单校验内联化（字段下方红字 + 聚焦首错）
+def test_field_errors_collect_every_bad_field_at_once():
+    """一次给全部错误（老 ``validate`` 一次只报一条 → 客户改一步、点一次、再被打回）。"""
+    config = ac.AccessConfig(price_mode="跟随平台建议价", node_id="n" * 200,
+                             node_secret="abc\ndef")
+    errors = config.field_errors()
+    assert set(errors) == {"price_mode", "node_id", "node_secret"}
+    assert "价格模式" in errors["price_mode"]
+    # 红字直接显示在输入框下方，不许把内部字段名（node_secret）印到界面上
+    assert "node_secret" not in errors["node_secret"] and "节点凭证" in errors["node_secret"]
+
+
+def test_validate_still_raises_the_first_error_in_the_old_order():
+    """``validate`` 只是取第一条抛出：调用方（老的保存路径）看到的行为不变。"""
+    config = ac.AccessConfig(price_mode="跟随平台建议价", usdt_address="bogus")
+    with pytest.raises(ValueError) as info:
+        config.validate()
+    assert "价格模式" in str(info.value)          # 价格模式仍先于收款地址报
+    assert ac.AccessConfig(node_id="n").field_errors() == {}
+
+
+def test_with_field_errors_is_a_pure_projection():
+    """投影层不产生错误：只有贴错误这一个纯函数会改视图，且空错误 = 原对象。"""
+    base = vw.build_view("access", _access_snapshot(node_id="nd_1", source="config"))
+    assert base.focus_field == "" and all(not item.error for item in base.fields)
+    assert vw.with_field_errors(base, None) is base
+    assert vw.with_field_errors(base, {}) is base
+    # 键不在本页 → 什么都不贴（不许凭空造红字/造焦点）
+    assert vw.with_field_errors(base, {"api_key": "x"}) is base
+
+    marked = vw.with_field_errors(base, {"node_id": "节点标识必须是不超过 128 字符的文本"})
+    assert marked.focus_field == "node_id"
+    field = next(item for item in marked.fields if item.key == "node_id")
+    assert field.error.startswith("节点标识")
+    assert "！节点标识必须是不超过 128 字符的文本" in marked.plain_text()
+    # 其余字段一个字都没变
+    assert [item.value for item in marked.fields] == [item.value for item in base.fields]
+
+
+def test_save_access_returns_field_errors_and_keeps_the_store(tmp_path):
+    """保存失败：逐字段原因随结果回投，配置文件一个字节都不动。"""
+    store = ac.MemoryAccessStore(ac.AccessConfig(node_id="nd_old", price_mode="auto"))
+    controller = make_controller(tmp_path, sections=dict(
+        _access_snapshot(node_id="nd_old", source="config").sections))
+    controller.access = ac.AccessService(store, reloader=lambda: ac.RELOAD_OK)
+    controller.set_draft("price_mode", "跟随平台建议价")
+    controller.set_draft("node_id", "n" * 200)
+    result = controller.action("access.save")
+    assert result.ok is False
+    assert set(result.fields) == {"price_mode", "node_id"}
+    assert "价格模式" in result.message and "2" in result.message
+    assert store.load().price_mode == "auto" and store.load().node_id == "nd_old"
+
+
+def test_save_access_success_clears_field_errors(tmp_path):
+    """改好再存：``fields`` 为空（渲染层据此把红字清掉，不留残留）。"""
+    store = ac.MemoryAccessStore(ac.AccessConfig(node_id="nd_old", price_mode="auto"))
+    controller = make_controller(tmp_path, sections=dict(
+        _access_snapshot(node_id="nd_old", source="config").sections))
+    controller.access = ac.AccessService(store, reloader=lambda: ac.RELOAD_OK)
+    controller.set_draft("price_mode", "manual")
+    result = controller.action("access.save")
+    assert result.ok is True and result.fields == {}
+    assert store.load().price_mode == "manual"

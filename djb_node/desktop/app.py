@@ -34,7 +34,7 @@ from . import theme as dual          # 双主题：色板 + 偏好 + 动效助�
 from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
 from . import platform_ui
 from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
-                    Metric, RailCard, Row, Table, View, page_kicker)
+                    Metric, RailCard, Row, Table, View, page_kicker, with_field_errors)
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
            "demo_snapshot", "main", "make_controller"]
@@ -64,6 +64,12 @@ PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 #: 它们在 :meth:`DesktopApp._on_action` 的通用播报里要跳过，否则「已在浏览器打开」会被
 #: 动作自带的一句「网页端：https://…」覆盖掉——那正好抹掉了「打不开」这个关键差别。
 SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "update", "probe")
+
+#: 会回投**字段级错误**的 effect：这类动作的结果要覆盖本页红字状态（含「清空」）。
+#:
+#: 只有表单动作能改这份状态。其它动作（复制 / 打开目录 / 切页）无权把客户刚看到的红字抹掉，
+#: 也不该继承上一份错误——所以名单是**白名单**，不是「除黑名单外都清」。
+FORM_EFFECTS = ("access", "payout_submit")
 
 TOP_NAV_KEYS = VIEW_KEYS
 
@@ -313,6 +319,11 @@ class DesktopApp:
         self._detail: Any = None
         self._detail_columns: tuple[str, ...] = ()
         self._vars: dict[str, Any] = {}
+        #: RC15-039 #1：动作回投的字段级错误（key → 一句话）。切页/保存成功即清空——
+        #: 上一页的红字绝不能跟到下一页（走查原话「跨页面残留」）。
+        self._field_errors: dict[str, str] = {}
+        #: 当前已渲染视图（含贴上去的错误）；证据/测试读它判断「红字是否真的上屏」
+        self._last_view: View | None = None
         self._root.title(title)
         # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
         try:
@@ -849,6 +860,7 @@ class DesktopApp:
                 view = self._controller.show(key)
             except ValueError:                       # pragma: no cover - 与 route 双保险
                 return self._controller.current()
+        self._set_field_errors({})          # 切页清空上一页的字段红字（走查原话：跨页残留）
         self._render(view)
         self._sync_nav(key)
         self._update_status()
@@ -1681,9 +1693,14 @@ class DesktopApp:
         self._onboarding_panel = card
 
     def _render(self, view: View) -> None:
-        """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。"""
+        """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。
+
+        RC15-039 #1：渲染前把**本页**的字段级错误贴上去（纯函数 ``with_field_errors``），
+        渲染后把焦点送到第一个错误字段——客户点完「保存」不用自己找哪一行错了。
+        """
         tk = self._tk
         kit = self._kit
+        view = with_field_errors(view, self._field_errors)
         self._last_view = view
         self._in_render = True
         self._rendered_narrow = self._is_narrow()
@@ -1723,6 +1740,8 @@ class DesktopApp:
                                   anchor="w", pady=(2, 0))
         self._in_render = False
         self._sync_content_width()                   # B4：内容重排后把宽度钉回画布宽
+        if view.focus_field:
+            self._focus_field(view.focus_field)
 
     def _wrap(self, label: Any) -> Any:
         """登记一个「按窗口宽度换行」的文本控件（窗口变宽变窄时统一重算，只改 wraplength）。"""
@@ -2403,6 +2422,12 @@ class DesktopApp:
         self._advanced_panel = hidden
         self._advanced_toggle = toggle
         state = {"open": False}
+        if any(getattr(item, "error", "") for item in advanced):
+            # 错误落在折叠区里就等于没显示：有错就默认展开（客户改完再自己收起）
+            state["open"] = True
+            build(hidden, advanced)
+            hidden.pack(fill="x", pady=(6, 0), before=toggle)
+            toggle.set_text("收起高级")
 
         def _toggle() -> None:
             state["open"] = not state["open"]
@@ -2459,6 +2484,14 @@ class DesktopApp:
                     anchor="w", justify="left",
                     wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
                                                         pady=(3, 0))
+            if field.error:
+                # RC15-039 #1：红字就在**这个输入框**下面（不是状态栏、不是页脚）
+                self._wrap_to_column(tk.Label(
+                    block, text="！" + field.error, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("red_text"), background=surface,
+                    anchor="w", justify="left",
+                    wraplength=self._wrap_hint())).grid(row=2, column=1, sticky="we",
+                                                        pady=(2, 0))
             self._fields[field.key] = field
             self._vars[field.key] = variable
             self._entries[field.key] = entry
@@ -2479,6 +2512,13 @@ class DesktopApp:
                     anchor="w", justify="left",
                     wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
                                                         pady=(3, 0))
+            if field.error:
+                self._wrap_to_column(tk.Label(
+                    block, text="！" + field.error, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("red_text"), background=surface,
+                    anchor="w", justify="left",
+                    wraplength=self._wrap_hint())).grid(row=2, column=1, sticky="we",
+                                                        pady=(2, 0))
 
     def _entry_for(self, key: str) -> Any:
         """取某字段的输入框（没有该字段 → ``None``）；给窗口级测试与「显示密码」用。"""
@@ -2516,6 +2556,11 @@ class DesktopApp:
             except Exception:                            # 变量随旧视图销毁：跳过，不让动作静默不执行
                 continue
         result = self._controller.action(key, confirm=self._confirm)
+        # RC15-039 #1：动作带回**字段级错误**时，先落到本页再重画（保存成功后为空 = 清残留）。
+        # 只有「表单类」动作会改这份状态：复制/打开目录之类的动作不许把红字顺手抹掉。
+        fields = dict(getattr(result, "fields", {}) or {})
+        if fields or result.effect in FORM_EFFECTS:
+            self._set_field_errors(fields)
         copied = True
         if result.effect == "copy":
             copied = self.copy_text(result.payload)
@@ -2537,6 +2582,10 @@ class DesktopApp:
             # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
             self._start_payout_submit(str(result.payload), result.message)
         elif result.effect in ("refresh", "access", "bench", "control", "reload"):
+            self._render(self._controller.current())
+        elif fields:
+            # 表单错误回来了，但这个 effect 自己不重画（例如收款提交）：补一次，
+            # 否则「红字在数据里、屏幕上没有」——那还是 0.3.7 的「点了没反应」。
             self._render(self._controller.current())
         self._update_status()
         # "copy" 漏在名单外 = 复制成功/失败都零反馈（S4：客户说「点了没反应」）
@@ -2622,6 +2671,47 @@ class DesktopApp:
             opened = False
         self._toast(("已在浏览器打开：" if opened else "浏览器未能自动打开，请手动访问：") + str(url),
                     ok=opened)
+
+    # ── 字段级错误（RC15-039 #1：内联红字 + 聚焦首个错误 + 切页清残留）
+    def _set_field_errors(self, errors: Mapping[str, str] | None) -> None:
+        """换一份字段错误（只在表单动作回来时调用；重画由 ``_on_action`` 统一负责）。
+
+        重画是必须的（错误来自一次动作、视图是数据的投影），但只画**一次**：
+        ``access`` 这类 effect 自己就会重画，这里再画一次会让焦点闪一下再被抢走。
+        """
+
+        fresh = {str(key): str(value) for key, value in (errors or {}).items() if value}
+        if fresh == getattr(self, "_field_errors", None):
+            return
+        self._field_errors = fresh
+
+    def _focus_field(self, key: str) -> None:
+        """把键盘焦点送到某个字段的输入框，并把它滚进可视区（「本页内可见」）。"""
+        entry = getattr(self, "_entries", {}).get(str(key))
+        if entry is None:
+            return
+        try:
+            entry.focus_set()
+        except Exception:                              # pragma: no cover - 控件已销毁
+            return
+        self._scroll_into_view(entry)
+
+    def _scroll_into_view(self, widget: Any) -> None:
+        """把控件滚进内容区可视范围（只改滚动位置，不动布局）。"""
+        canvas = getattr(self, "_canvas", None)
+        content = getattr(self, "_content", None)
+        if canvas is None or content is None:
+            return
+        try:
+            canvas.update_idletasks()
+            total = max(1, int(content.winfo_height()))
+            offset = int(widget.winfo_rooty()) - int(content.winfo_rooty())
+            visible = int(canvas.winfo_height())
+            top = int(canvas.canvasy(0))
+            if offset < top or offset + int(widget.winfo_height()) > top + visible:
+                canvas.yview_moveto(max(0.0, min(1.0, offset / float(total))))
+        except Exception:                              # pragma: no cover - 无显示/已销毁
+            return
 
     def _toast(self, message: str, *, ok: bool = True) -> None:
         self._status.configure(text=("✓ " if ok else "! ") + message)

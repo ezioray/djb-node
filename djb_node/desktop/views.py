@@ -14,7 +14,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
@@ -28,6 +28,7 @@ __all__ = [
     "Action", "Card", "Chart", "Field", "GaugeData", "Hero", "Mark", "Metric", "NAV_SECTIONS",
     "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "VIEWS",
     "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
+    "with_field_errors",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -231,6 +232,10 @@ class Field:
     #: 非空 ⇒ 渲染成**只读下拉**（``ttk.Combobox`` + ``state="readonly"``）。
     #: 只影响渲染；校验仍在动作侧（下拉选不出非法值，但手改配置/老快照可能带别的值）。
     choices: tuple[str, ...] = ()
+    #: 字段级错误（一句话）。非空 ⇒ 红字渲染在**该字段下方**并参与「聚焦首个错误」
+    #: （RC15-039 #1）。默认空 = 0.3.7 行为；错误不由投影层产生，由动作层回投
+    #: （见 :func:`with_field_errors`），所以 13 个视图的既有快照一字不变。
+    error: str = ""
 
     def can_reveal(self) -> bool:
         """是否画「显示 / 隐藏」：只有**可编辑**的秘密字段才有意义（只读值本就是掩码）。"""
@@ -353,6 +358,9 @@ class View:
     hero: Hero | None = None
     chart: Chart | None = None
     rail: tuple[RailCard, ...] = ()
+    #: 渲染后要**获得键盘焦点**的字段 key（RC15-039 #1：校验失败聚焦首个错误字段）。
+    #: 空 = 不动焦点（0.3.7 行为）。由 :func:`with_field_errors` 填，投影层自己不产生。
+    focus_field: str = ""
 
     def plain_text(self) -> str:
         """文本快照（证据 / 无显示环境验收）：稳定顺序，无时间戳抖动。
@@ -390,8 +398,13 @@ class View:
         if self.fields:
             lines.append("")
             for item in self.fields:
-                lines.append(item.label + "：" + item.value
-                             + (("   " + item.hint) if item.hint else ""))
+                line = item.label + "：" + item.value
+                if item.hint:
+                    line += "   " + item.hint
+                if item.error:
+                    # 红字的文本形态：与屏幕上同一条文案（证据/读屏都靠它）
+                    line += "   ！" + item.error
+                lines.append(line)
         if self.actions:
             lines.append("")
             for action in self.actions:
@@ -400,6 +413,32 @@ class View:
         for note in self.notes:
             lines.append("· " + note)
         return "\n".join(lines)
+
+
+def with_field_errors(view: View, errors: Mapping[str, str] | None) -> View:
+    """把动作层回投的**字段级错误**贴到视图上（RC15-039 #1）。
+
+    为什么在这里而不是在 ``View`` 的构造里：错误是**一次动作的结果**，不是数据的投影。
+    投影层保持纯函数（13 个视图的快照不因错误而变），渲染层只在渲染前调用这一个纯函数。
+    ``errors`` 为空时原样返回同一个对象（``is`` 相等），老路径零开销、零行为变化。
+
+    只贴到**同名的可编辑字段**上：键不在本页的字段（例如在别的页保存）不许凭空造出红字。
+    """
+    if not errors:
+        return view
+    applied: list[Field] = []
+    focus = ""
+    for item in view.fields:
+        message = str(errors.get(item.key) or "") if item.key else ""
+        if not message:
+            applied.append(item)
+            continue
+        applied.append(replace(item, error=message))
+        if not focus:
+            focus = item.key
+    if not focus:                      # 本页没有这些字段：什么都没贴，别造空焦点
+        return view
+    return replace(view, fields=tuple(applied), focus_field=focus)
 
 
 def _hero_text(hero: Hero) -> list[str]:
