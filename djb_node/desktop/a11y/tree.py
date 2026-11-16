@@ -53,6 +53,7 @@ __all__ = [
     "Node",
     "build_tree",
     "flatten",
+    "flatten_for_provider",
     "ids_by_key",
 ]
 
@@ -327,6 +328,44 @@ def _assign_ids(node: Node, prefix: str = "", index: int = 0) -> Node:
     if children == node.children and absolute == node.node_id:
         return node
     return replace(node, node_id=absolute, children=children)
+
+
+def flatten_for_provider(root: Node) -> tuple[Node, ...]:
+    """把树压成**一层**子元素——MSAA 跨进程只能可靠地传 childId。
+
+    为什么必须压平：``get_accChild`` 交出去的是活的对象指针，跨进程要靠 COM 编组；
+    自定义 COM 对象没有 ``IMarshal`` / 代理-桩，客户端拿到的是 NULL（2026-11-16 真机实测：
+    服务端指针有效、客户端 ``get_accChild`` 返回 hr=0 但指针为空）。所以 0.3.9 的提供方
+    只暴露「根 + 一层简单子元素」：每个子元素只有 childId，没有子对象。
+
+    压平后仍保证读屏读到的东西**一字不少**：
+
+    * 表格行 → ``ROLE_ROW``，名字 = 各单元格用 `` | `` 拼起来（单元格不再单独建节点）；
+    * 表头 → ``ROLE_ROW`` 改名「表头：…」；
+    * 其余节点（卡片/分组/按钮/字段/静态文本）原角色保留，只是不再嵌套。
+    """
+    flat: list[Node] = []
+
+    def visit(node: Node) -> None:
+        if node.role == ROLE_CELL:
+            return                                   # 单元格文本已并进行名
+        if node.role == ROLE_ROW:
+            cells = [child.name for child in node.children]
+            name = (" | ".join(cells)) if cells else node.name
+            if node.name == "表头":
+                name = "表头：" + name
+            flat.append(replace(node, name=name, children=()))
+            return
+        if node.role in (ROLE_TABLE, ROLE_CARD):
+            flat.append(replace(node, children=()))
+        else:
+            flat.append(replace(node, children=()))
+        for child in node.children:
+            visit(child)
+
+    for child in root.children:
+        visit(child)
+    return tuple(flat)
 
 
 def flatten(root: Node) -> list[tuple[int, Node]]:

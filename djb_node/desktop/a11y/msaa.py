@@ -35,10 +35,11 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import replace
 from typing import Any
 
 from ..views import View
-from .tree import Node, build_tree
+from .tree import Node, build_tree, flatten_for_provider
 
 __all__ = ["ENV_DISABLE", "ENV_TRACE", "Provider", "attach", "available"]
 
@@ -178,6 +179,35 @@ class _Runtime:
         target[0].value = int(value)
 
 
+def _pointer_keys(obj: Any) -> list[str]:
+    """诊断用：COMObject 里已经 QI 出来的接口名（不打印指针值）。"""
+    try:
+        return [getattr(iface, "__name__", str(iface))
+                for iface in getattr(obj, "_com_pointers_", {})]
+    except Exception:
+        return []
+
+
+def _dispatch_pointer(obj: Any) -> Any:
+    """取这个小对象的 ``IDispatch*``。
+
+    ``IAccessible`` 是 **dual interface**：同一个 vtable 既能当 IAccessible 也能当 IDispatch 用，
+    所以拿 IAccessible 的指针当 IDispatch 交出去是合法的。**不要**在这里
+    ``QueryInterface(IDispatch)``：comtypes 的 Python 侧 COM 对象对自身 IDispatch 的 QI
+    会回 ``E_NOINTERFACE``，客户端就只能看到「有名字、点不进去」的平树。
+    """
+    pointers = getattr(obj, "_com_pointers_", {}) or {}
+    fallback = None
+    for iface, pointer in pointers.items():
+        if pointer is None:
+            continue
+        if getattr(iface, "__name__", "") == "IDispatch":
+            return pointer
+        if fallback is None:
+            fallback = pointer
+    return fallback
+
+
 def _child_index(var: Any) -> int:
     """``CHILDID_SELF`` 是 0；其余取整数（comtypes 的 VARIANT 有时给对象、有时给值）。"""
     try:
@@ -206,6 +236,7 @@ class Provider:
         self._children_by_path: dict[str, tuple[str, ...]] = {}
         self._parent_by_path: dict[str, str] = {}
         self._focused_path = ""
+        self._root_path = ""
         self._tree: Node | None = None
         self._error_count = 0
         self._trace_path = (os.environ.get(ENV_TRACE) or "").strip()
@@ -280,19 +311,42 @@ class Provider:
 
     # ── 数据 ──────────────────────────────────────────────────────────────────
     def refresh(self, view: View, *, max_rows: int | None = None) -> None:
-        """换一页/一版数据。**不发任何焦点事件**（自动刷新不能把读屏的焦点顶走）。"""
-        if self.rt is None:
-            return
+        """换一页/一版数据。**不发任何焦点事件**（自动刷新不能把读屏的焦点顶走）。
+
+        没有 COM 运行时也照常建树（纯数据），这样 Linux 上能单测节点解析。
+        """
         try:
             tree = build_tree(view) if max_rows is None else build_tree(view, max_rows=max_rows)
         except Exception as exc:                      # pragma: no cover - 防御
             self._error("build_tree", exc)
             return
         self._tree = tree
+        self._root_path = tree.node_id
         self._node_by_path = {}
         self._children_by_path = {}
         self._parent_by_path = {}
-        self._index(tree, "")
+        # provider 只暴露「根 + 一层简单子元素」：跨进程没有编组，子对象回不来（见 tree 里的说明）
+        flat = flatten_for_provider(tree)
+        paths: list[str] = []
+        seen: dict[str, int] = {}
+        for node in flat:
+            path = node.node_id
+            if path in seen:
+                seen[path] += 1
+                path = "%s#%d" % (path, seen[path])
+                node = replace(node, node_id=path)
+            else:
+                seen[path] = 0
+            paths.append(path)
+            self._node_by_path[path] = node
+            self._parent_by_path[path] = ""
+            self._children_by_path[path] = ()
+        self._children_by_path[""] = tuple(paths)
+        self._children_by_path[self._root_path] = tuple(paths)
+        self._node_by_path[""] = tree
+        self._node_by_path[self._root_path] = tree
+        self._parent_by_path[""] = ""
+        self._root_children = tuple(paths)
         # 焦点所在节点可能被筛掉了：掉了就回根，并记一条（不发事件）
         if self._focused_path and self._focused_path not in self._node_by_path:
             self._focused_path = ""
@@ -306,10 +360,10 @@ class Provider:
             self._index(child, path)
 
     def node(self, path: str) -> Node | None:
-        return self._node_by_path.get(path)
+        return self._node_by_path.get(path or self._root_path)
 
     def children(self, path: str) -> tuple[str, ...]:
-        return self._children_by_path.get(path, ())
+        return self._children_by_path.get(path or self._root_path, ())
 
     # ── 事件 / 日志 ───────────────────────────────────────────────────────────
     def notify_focus(self, path: str) -> None:
@@ -349,7 +403,14 @@ class Provider:
     def _error(self, method: str, exc: BaseException) -> None:
         self._error_count += 1
         if self._error_count <= _MAX_ERROR_LOGS:
-            log.warning("desktop.a11y.error method=%s error=%r", method, exc)
+            where = ""
+            tb = getattr(exc, "__traceback__", None)
+            if tb is not None:
+                frames = __import__("traceback").extract_tb(tb)
+                if frames:
+                    last = frames[-1]
+                    where = " at %s:%s" % (last.filename.rsplit("\\", 1)[-1], last.lineno)
+            log.warning("desktop.a11y.error method=%s error=%r%s", method, exc, where)
 
 
 def attach(root: Any) -> Provider | None:
@@ -374,6 +435,16 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
             super().__init__()
             self._provider = provider
             self._path = path
+            # IAccessible 是 dual interface：同一个指针既是 IAccessible 也是 IDispatch。
+            # comtypes 按 **IID** 记接口指针，这里把 IAccessible 的指针也登记到 IDispatch 的
+            # IID 下——否则 ``QueryInterface(IDispatch)`` 会回 E_NOINTERFACE（_com_pointers_
+            # 里根本没有那个 IID），``get_accChild`` 就交不出子对象。
+            try:
+                pointer = self._com_pointers_.get(rt.IAccessibleV._iid_)
+                if pointer is not None:
+                    self._com_pointers_[rt.IDispatch._iid_] = pointer
+            except Exception:
+                pass
 
         # ── 内部 ──
         def _node(self):
@@ -425,7 +496,16 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                 if _child_index(varChild) == 0:
                     return 0
                 child = self._child_object(self._child_path(varChild))
-                ppdispChild[0] = child.QueryInterface(rt.IDispatch)
+                try:
+                    ppdispChild[0] = child.QueryInterface(rt.IDispatch)
+                except Exception:
+                    pointer = _dispatch_pointer(child)
+                    if pointer is None:
+                        self._provider._trace(
+                            "accChild.no_pointer", _child_index(varChild),
+                            "keys=" + ",".join(sorted(_pointer_keys(child))))
+                        return E_FAIL
+                    ppdispChild[0] = rt.ctypes.cast(pointer, rt.POINTER(rt.IDispatch))
                 return 0
             except Exception as exc:
                 self._provider._error("accChild", exc)

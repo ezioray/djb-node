@@ -3240,9 +3240,16 @@ class DesktopApp:
     def _install_a11y(self) -> Any:
         """装 MSAA 提供方；任何失败都返回 ``None``（Linux、无 comtypes、钩窗口失败都走这里）。"""
         try:
-            return install_a11y(self._root)
+            provider = install_a11y(self._root)
         except Exception:                      # pragma: no cover - 防御
             return None
+        if provider is not None and getattr(self, "_last_view", None) is not None:
+            # 构造时先渲染了一页、后装的 provider：补一次刷新，否则首屏读屏是空的
+            try:
+                provider.refresh(self._last_view)
+            except Exception:                  # pragma: no cover - 防御
+                pass
+        return provider
 
     def _refresh_a11y(self, view: View) -> None:
         """把这一版 ``View`` 推给读屏树。**自动刷新也走这里，但 provider 不发焦点事件**。"""

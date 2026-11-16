@@ -188,6 +188,21 @@ def test_escape_hatch_disables_provider(monkeypatch):
     assert msaa.available() is False
 
 
+def test_provider_resolves_the_root_after_refresh():
+    """根对象是 attach 时用空路径建的；refresh 后 ``""`` 必须解析成树根。
+
+    真机现场：provider 装上了、AccessibleObjectFromWindow 也成功，但 accChildCount=0
+    （根对象拿空路径查不到节点）——读屏看到一棵空树。
+    """
+    provider = msaa.Provider(root=None)
+    view = vw.build_view("overview", demo_snapshot())
+    provider.refresh(view)
+    root = provider.node("")
+    assert root is not None and root.node_id == "view:overview"
+    kids = provider.children("")
+    assert kids and kids[0].startswith("view:overview/")
+
+
 def test_trace_is_off_unless_env_points_to_a_file(monkeypatch, tmp_path):
     monkeypatch.delenv(msaa.ENV_TRACE, raising=False)
     provider = msaa.Provider(root=None)
