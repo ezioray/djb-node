@@ -2757,7 +2757,34 @@ class DesktopApp:
                 target.focus_set()
             except Exception:                            # pragma: no cover - 控件已销毁
                 pass
+            self._notify_a11y_focus(target)
         return "break"                                   # 吃掉按键：不再走 Tk 的默认遍历
+
+    def _notify_a11y_focus(self, widget: Any) -> None:
+        """键盘焦点动了 → 给读屏发 ``EVENT_OBJECT_FOCUS``（S3）。
+
+        Tab 顺序（``_tab_order``）与 a11y 树的可聚焦顺序都由同一个 ``View`` 的视觉顺序生成，
+        所以按**位置**对应。任何异常都咽掉：读屏事件不许影响键盘路径。
+        """
+        provider = getattr(self, "_a11y", None)
+        if provider is None:
+            return
+        try:
+            order = self._tab_order()
+            if widget in order:
+                provider.notify_focus_at(order.index(widget))
+        except Exception:                                # pragma: no cover - 防御
+            pass
+
+    def _notify_a11y_selection(self, index: int) -> None:
+        """表格行选中动了 → ``EVENT_OBJECT_SELECTION``。只发事件，不改界面。"""
+        provider = getattr(self, "_a11y", None)
+        if provider is None:
+            return
+        try:
+            provider.notify_selection_at(index)
+        except Exception:                                # pragma: no cover - 防御
+            pass
 
     def _select_row_at(self, index: int) -> str:
         """把选中行移到第 ``index`` 条（``-1`` = 最后一条）；返回 ``"break"`` 吃掉按键。"""
@@ -2777,6 +2804,7 @@ class DesktopApp:
             tree.see(target)
         except Exception:                                # pragma: no cover
             pass
+        self._notify_a11y_selection(children.index(target))
         return "break"
 
     def _move_selection(self, delta: int) -> str:

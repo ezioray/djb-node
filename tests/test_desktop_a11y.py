@@ -68,7 +68,8 @@ def root_text(view):
 def test_overview_table_exposes_header_and_rows():
     view = vw.build_view("overview", demo_snapshot())
     table = _find(view, role=ROLE_TABLE)
-    assert table.name.startswith("表格：共 ")
+    # 压平后行是「单元格用 | 拼接」，所以表节点自己必须先说清列序 + 总行数
+    assert table.name == "表格：最近收据（列：收据号 | 时间 | Tokens | 状态 | 本机校验），共 5 行"
     headers = [child.name for child in table.children[0].children]
     assert headers == ["收据号", "时间", "Tokens", "状态", "本机校验"]
     rows = [child for child in table.children[1:]]
@@ -100,6 +101,20 @@ def test_big_table_is_capped_and_says_so_twice():
     # 顺序遍历也会读到同一句话
     assert any(n.role == ROLE_STATIC and "显示前 %d 行" % TABLE_MAX_ROWS in n.name
                for _id, n in nodes)
+
+
+def test_table_name_carries_column_order_and_total():
+    """压平唯一能补回列语义的地方：表名里的「（列：…）」+「共 N 行」。
+
+    lead 的真机验收原话：行读出来是 `a | b | c`，用户不知道哪列是哪列，所以进表格第一句
+    必须把列序念出来。
+    """
+    rows = tuple(vw.Row(("r%03d" % i, "12:00", "4096", "✓", "·"), key="r%03d" % i)
+                 for i in range(3))
+    table = vw.Table(("收据号", "时间", "Tokens", "状态", "本机校验"), rows, title="收据明细")
+    view = vw.View(key="receipts", title="收据", subtitle="", cards=(), table=table)
+    node = _find(view, role=ROLE_TABLE)
+    assert node.name == "表格：收据明细（列：收据号 | 时间 | Tokens | 状态 | 本机校验），共 3 行"
 
 
 def test_empty_table_says_empty_instead_of_fake_rows():
@@ -201,6 +216,39 @@ def test_provider_resolves_the_root_after_refresh():
     assert root is not None and root.node_id == "view:overview"
     kids = provider.children("")
     assert kids and kids[0].startswith("view:overview/")
+
+
+def test_focus_and_selection_events_use_stable_child_ids():
+    """S3：焦点/选中事件的 childId 必须跟着**行**走，不能跟着位置漂（自动刷新 10s 一次）。
+
+    做法：先 refresh 一次记住第 2 行的 childId，再换一版数据（行顺序不变）refresh，
+    同一个 ``node_id`` 的 childId 必须一样；同时焦点/选中只记录、不因为 refresh 被清掉或重发。
+    """
+    provider = msaa.Provider(root=None)
+    provider.refresh(vw.build_view("overview", demo_snapshot()))
+    rows = provider.selectable_paths()
+    assert len(rows) >= 3, rows
+    target = rows[1]
+    before = provider.child_id(target)
+    provider.notify_focus(target)
+    provider.select(target)
+    assert provider._focused_path == target
+    assert provider._selection_path == target
+
+    provider.refresh(vw.build_view("overview", demo_snapshot()))   # 自动刷新
+    assert provider.child_id(target) == before                     # childId 稳定
+    assert provider._focused_path == target                        # 刷新不清焦点
+    assert provider._selection_path == target
+
+
+def test_notify_focus_at_clamps_instead_of_raising():
+    """越界的焦点位置就地夹住——焦点事件是锦上添花，不许把键盘路径带崩。"""
+    provider = msaa.Provider(root=None)
+    provider.refresh(vw.build_view("overview", demo_snapshot()))
+    provider.notify_focus_at(10 ** 6)
+    assert provider._focused_path == provider.focusable_paths()[-1]
+    provider.notify_focus_at(-5)
+    assert provider._focused_path == provider.focusable_paths()[0]
 
 
 def test_trace_is_off_unless_env_points_to_a_file(monkeypatch, tmp_path):

@@ -39,7 +39,8 @@ from dataclasses import replace
 from typing import Any
 
 from ..views import View
-from .tree import Node, build_tree, flatten_for_provider
+from .tree import (STATE_FOCUSABLE, STATE_SELECTABLE, STATE_SELECTED, Node, build_tree,
+                   flatten_for_provider)
 
 __all__ = ["ENV_DISABLE", "ENV_TRACE", "Provider", "attach", "available"]
 
@@ -51,12 +52,16 @@ ENV_DISABLE = "DJB_DESKTOP_A11Y"
 ENV_TRACE = "DJB_DESKTOP_A11Y_TRACE"
 
 _E_FAIL = -2147467259
-S_FALSE = 1            # 0x80004005
+S_FALSE = 1
+E_INVALIDARG = -2147024809            # 0x80004005
 _E_NOTIMPL = -2147467263         # 0x80004001
 _DISP_E_BADINDEX = -2147352572   # 0x80020004
 _OBJID_CLIENT = -4
 _WM_GETOBJECT = 0x003D
 _EVENT_OBJECT_FOCUS = 0x8005
+_EVENT_OBJECT_SELECTION = 0x8006
+_SELFLAG_TAKEFOCUS = 0x1
+_SELFLAG_TAKESELECTION = 0x2
 
 #: 一次刷新里最多报几条异常（防止读屏狂刷把日志撑爆）
 _MAX_ERROR_LOGS = 20
@@ -268,6 +273,7 @@ class Provider:
         self._children_by_path: dict[str, tuple[str, ...]] = {}
         self._parent_by_path: dict[str, str] = {}
         self._focused_path = ""
+        self._selection_path = ""
         self._root_path = ""
         self._tree: Node | None = None
         self._error_count = 0
@@ -398,14 +404,54 @@ class Provider:
         return self._children_by_path.get(path or self._root_path, ())
 
     # ── 事件 / 日志 ───────────────────────────────────────────────────────────
+    def focusable_paths(self) -> tuple[str, ...]:
+        """可以拿焦点的节点（按读屏遍历顺序）——app 用 Tab 走位时按位置映射。"""
+        return tuple(path for path in self._root_children
+                     if self._node_by_path[path].state & (STATE_FOCUSABLE | STATE_SELECTABLE))
+
     def notify_focus(self, path: str) -> None:
-        """S3 用：把焦点挪到某个节点并**发** ``EVENT_OBJECT_FOCUS``。S2 不调用。"""
-        if self.rt is None or path not in self._node_by_path:
+        """把焦点挪到某个节点并**发** ``EVENT_OBJECT_FOCUS``（键盘路径 / 客户端 accSelect）。"""
+        self._focus(path, _EVENT_OBJECT_FOCUS)
+
+    def notify_focus_at(self, index: int) -> None:
+        """按**可聚焦节点的顺序**给第 ``index`` 个发焦点事件。
+
+        app 的 Tab 顺序（``_tab_order``）与 a11y 树的可聚焦顺序都由同一个 ``View`` 的视觉顺序
+        生成，所以这里用位置对应；越界就夹到边界，不抛——焦点事件是「锦上添花」，不许影响界面。
+        """
+        paths = self.focusable_paths()
+        if not paths:
             return
-        self._focused_path = path
+        self.notify_focus(paths[max(0, min(int(index), len(paths) - 1))])
+
+    def selectable_paths(self) -> tuple[str, ...]:
+        """可被选中的行（表格行/列表项），按读屏遍历顺序。"""
+        return tuple(path for path in self._root_children
+                     if self._node_by_path[path].state & STATE_SELECTABLE)
+
+    def notify_selection_at(self, index: int) -> None:
+        """按**可选中节点的顺序**给第 ``index`` 个发选中事件（↑↓ 换行时调）。"""
+        paths = self.selectable_paths()
+        if not paths:
+            return
+        self.select(paths[max(0, min(int(index), len(paths) - 1))])
+
+    def select(self, path: str) -> None:
+        """选中某行（表格行/列表项）并发 ``EVENT_OBJECT_SELECTION``。"""
+        self._selection_path = path
+        self._focus(path, _EVENT_OBJECT_SELECTION, keep_focus=False)
+
+    def _focus(self, path: str, event: int, *, keep_focus: bool = True) -> None:
+        if path not in self._node_by_path:
+            return
+        if keep_focus:
+            self._focused_path = path
+        else:
+            self._selection_path = path
+        if self.rt is None:                 # 没有 COM 也要记账：Linux 上可单测，语义也一致
+            return
         try:
-            self.rt.user32.NotifyWinEvent(_EVENT_OBJECT_FOCUS,
-                                          self.rt.wt.HWND(self.outer or self.hwnd),
+            self.rt.user32.NotifyWinEvent(event, self.rt.wt.HWND(self.outer or self.hwnd),
                                           _OBJID_CLIENT, self.child_id(path))
         except Exception as exc:                      # pragma: no cover
             self._error("NotifyWinEvent", exc)
@@ -586,7 +632,12 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
             try:
                 index = _child_index(varChild)
                 node = self._node() if index == 0 else self._child_node(varChild)
-                rt.int_variant(pvarState, node.state if node else 0)
+                bits = node.state if node else 0
+                if node is not None and node.node_id == self._provider._selection_path:
+                    bits |= STATE_SELECTED
+                elif bits & STATE_SELECTABLE:
+                    bits &= ~STATE_SELECTED            # 只报「这一个」被选中，不虚报
+                rt.int_variant(pvarState, bits)
                 return 0 if node else BADINDEX
             except Exception as exc:
                 self._provider._error("accState", exc)
@@ -655,8 +706,28 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                 return E_FAIL
 
         def accSelect(self, flagsSelect, varChild):
-            # S3 实现 SELFLAG_TAKEFOCUS | SELFLAG_TAKESELECTION；S2 明确不支持
-            return E_NOTIMPL
+            """``SELFLAG_TAKEFOCUS`` / ``SELFLAG_TAKESELECTION``：客户端（读屏）要求把焦点/选中
+            挪到某个子元素。只改**记录 + 发事件**，不动 Tk 控件——本版 a11y 是只读镜像，
+            真正搬 Tk 焦点由键盘路径负责（边界见票面 §6.4）。"""
+            try:
+                provider = self._provider
+                index = _child_index(varChild)
+                if index == 0:
+                    return S_FALSE
+                path = self._child_path(varChild)
+                node = provider.node(path) if path else None
+                if node is None:
+                    return E_INVALIDARG
+                if not flagsSelect & (_SELFLAG_TAKEFOCUS | _SELFLAG_TAKESELECTION):
+                    return S_FALSE
+                if flagsSelect & _SELFLAG_TAKEFOCUS:
+                    provider.notify_focus(path)
+                if flagsSelect & _SELFLAG_TAKESELECTION:
+                    provider.select(path)
+                return 0
+            except Exception as exc:
+                self._provider._error("accSelect", exc)
+                return E_FAIL
 
         def accLocation(self, pxLeft, pyTop, pcxWidth, pcyHeight, varChild):
             """**要么给对，要么不给**：暂时只有页根能给出真实矩形，其余一律 E_NOTIMPL。"""

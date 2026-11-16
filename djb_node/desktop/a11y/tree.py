@@ -245,9 +245,14 @@ def _table(table: Table, ordinal: int = 0, *, max_rows: int = TABLE_MAX_ROWS
     truncated = total > len(shown)
 
     base = _seg("table" + ((":" + str(ordinal + 1)) if ordinal else ""))
-    name = "表格" + ((" " + str(ordinal + 1)) if ordinal else "")
+    # 压平后每一行是「单元格用 | 拼起来」，用户听不出哪列是哪列——所以表节点自己的名字里
+    # 必须带**列序 + 总行数**：读屏进表格先念这一句，后面每行才能对号入座。
+    label = table.title or ("表格" + ((" " + str(ordinal + 1)) if ordinal else ""))
+    name = label if label.startswith("表格") else ("表格：" + label)
+    if table.columns and total:
+        name += "（列：" + " | ".join(table.columns) + "）"
     if total:
-        name += "：共 " + str(total) + " 行" + ("，显示前 " + str(len(shown)) + " 行" if truncated else "")
+        name += "，共 " + str(total) + " 行" + ("，显示前 " + str(len(shown)) + " 行" if truncated else "")
 
     head = Node(ROLE_ROW, "表头",
                 children=tuple(Node(ROLE_COLUMNHEADER, column, node_id=_seg("col:" + column))

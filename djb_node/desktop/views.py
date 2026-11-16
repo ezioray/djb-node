@@ -195,6 +195,9 @@ class Row:
 class Table:
     columns: tuple[str, ...]
     rows: tuple[Row, ...] = ()
+    #: 表格自称的名字（读屏进表格时念的第一句）。空 = 用「表格」兜底。
+    #: 压平后行是 ` | ` 拼接，这个名字 + 列序 + 总行数是唯一能补回列语义的地方。
+    title: str = ""
     note: str = ""
     empty: str = "暂无数据"
     #: 窄窗（E10 口径 390）下先让位的列；数据不丢，详情抽屉里仍是全字段
@@ -970,7 +973,7 @@ def _overview(snapshot: Snapshot) -> View:
                     narrow_hide=("时间", "Tokens"),
                     narrow_headers=(("本机校验", "校验"),),
                     note=str(receipts.get("note") or ""),
-                    empty="还没有收据（完成后自动生成）"),
+                    empty="还没有收据（完成后自动生成）", title="最近收据"),
         # 设计样新增：左栏主卡 + 节奏图，右栏三卡（数据仍全部来自上面这些既有数据域）
         hero=_hero(snapshot),
         chart=_hourly_chart(snapshot),
@@ -1099,7 +1102,7 @@ def _bench(snapshot: Snapshot) -> View:
         subtitle="环境检测 + CPU/内存/磁盘 + 可选 GPU",
         cards=cards,
         table=Table(("检查项", "结论", "下一步"), tuple(rows),
-                    note="检查项来自本机只读探测", empty="环境检测暂不可用"),
+                    note="检查项来自本机只读探测", empty="环境检测暂不可用", title="环境检测"),
         actions=(Action("bench.run", "开始跑分（≤10 秒）", primary=True),
                  Action("bench.copy", "复制结果")),
         unavailable=_missing(snapshot, ("bench",)),
@@ -1212,7 +1215,7 @@ def _models(snapshot: Snapshot) -> View:
     probe_table = Table(("模型", "上游", "最近探测", "L2", "L3", "用量", "状态", "原因"),
                         tuple(rows),
                         note=str(probe.get("unavailable") or ""),
-                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论")
+                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论", title="模型探测")
 
     # ── 云端目录（原 4 列，保留为附加表：它是「云端认为该有哪些模型」，与探针事实互补）
     catalog = models.get("catalog") if isinstance(models.get("catalog"), list) else []
@@ -1243,7 +1246,7 @@ def _models(snapshot: Snapshot) -> View:
                     "model-sync 状态", "default")),
         table=probe_table,
         tables=(Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(catalog_rows),
-                      note=str(models.get("note") or ""), empty="云端目录暂不可用"),),
+                      note=str(models.get("note") or ""), empty="云端目录暂不可用", title="模型目录"),),
         # G1-1（RC14 P0）：**摘掉**「保存并上报意向」这颗按钮（键名见 commit / NODE.md）。
         # 表里根本没有开关控件，副标题却写「逐模型开关」，按钮点了又永远无声
         # （云端意向上报接口未接线）——虚假承诺比缺按钮更伤。
@@ -1278,7 +1281,7 @@ def _gpu(snapshot: Snapshot) -> View:
                     str(gpu.get("note") or "—"), "mint" if present else "muted"),),
         table=Table(("型号", "厂商", "显存 已用/总", "温度", "利用率"), tuple(rows),
                     note=str(gpu.get("note") or ""),
-                    empty="本机无可用 GPU（nvidia-smi / rocm-smi 都没有输出）"),
+                    empty="本机无可用 GPU（nvidia-smi / rocm-smi 都没有输出）", title="显卡"),
         actions=(Action("gpu.refresh", "刷新"),),
         unavailable=_missing(snapshot, ("gpu",)),
         notes=("没有 GPU 不隐藏本页；显存/温度/利用率只在真读到时展示。",),
@@ -1320,7 +1323,7 @@ def _tasks(snapshot: Snapshot) -> View:
         table=Table(("任务", "状态", "耗时", "Tokens", "收据号"), tuple(rows),
                     narrow_hide=("耗时", "收据号"),
                     note=str(tasks.get("note") or ""),
-                    empty=_empty_text(snapshot, "tasks", "当前没有任务")),
+                    empty=_empty_text(snapshot, "tasks", "当前没有任务"), title="任务"),
         actions=(Action("tasks.refresh", "刷新"),),
         unavailable=_missing(snapshot, ("tasks",)),
         notes=("状态列给云端原词（recorded/settled/…）+ 中文；「进行中」来自 inflight 字段。",
@@ -1353,7 +1356,7 @@ def _receipts(snapshot: Snapshot) -> View:
                     note=str(receipts.get("note") or ""),
                     empty=_empty_text(snapshot, "receipts", "还没有收据"),
                     narrow_hide=("时间", "Tokens"),
-                    narrow_headers=(("本机校验", "校验"),)),
+                    narrow_headers=(("本机校验", "校验"),), title="收据明细"),
         actions=(Action("receipts.verify", "校验选中收据", enabled=bool(rows),
                         reason="没有可校验的收据"),),
         unavailable=_missing(snapshot, ("receipts",)),
@@ -1400,7 +1403,7 @@ def _earnings(snapshot: Snapshot) -> View:
         table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
                     narrow_hide=("币种", "时间"),
                     note=str(earnings.get("note") or ""),
-                    empty=(UNAVAILABLE if not available else "暂无计费明细")),
+                    empty=(UNAVAILABLE if not available else "暂无计费明细"), title="计费明细"),
         actions=(Action("earnings.export", "导出明细", enabled=bool(rows),
                         reason=("暂不可用" if not available else "没有可导出的记录")),),
         unavailable=_missing(snapshot, ("earnings",)),
@@ -1721,11 +1724,11 @@ def _token_plan(snapshot: Snapshot) -> View:
                     narrow_hide=("目录",),
                     note=planned + ("｜" + discover_note if discover_note else ""),
                     empty=("还没有模型行：填「请求链接」与「密钥」，再点「读取模型清单」。"
-                           if snapshot.ok("token_plan") else UNAVAILABLE)),
+                           if snapshot.ok("token_plan") else UNAVAILABLE), title="上游报价"),
         tables=(Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
                       narrow_hide=("最近验证",),
                       note="验证通过且新鲜的模型才会进入共享容量",
-                      empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE)),),
+                      empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE), title="上游接入"),),
         fields=fields,
         actions=tuple(plan_actions),
         unavailable=_missing(snapshot, ("token_plan",)),
@@ -1965,7 +1968,7 @@ def _yield(snapshot: Snapshot) -> View:
                Card("接单", _flag(data.get("accepting"), "允许", "禁止"), "", "default"),
                Card("档位", now_text, now_meta, now_tone)),
         table=Table(("档位", "键", "当前"), rows, empty="档位暂不可用",
-                    activate="yield.apply_mode"),
+                    activate="yield.apply_mode", title="档位"),
         actions=(Action("yield.apply_mode", "切到选中的档位", enabled=bool(rows),
                         reason="当前没有可切换的档位", primary=True),
                  Action("yield.pause", "暂停接单", enabled=not paused,
@@ -2292,7 +2295,7 @@ def _logs(snapshot: Snapshot) -> View:
                     note=str(logs.get("note") or ""),
                     empty=empty_text,
                     narrow_hide=("时间", "原因", "下一步"),
-                    narrow_headers=(("下一步", "下一步"),)),
+                    narrow_headers=(("下一步", "下一步"),), title="日志"),
         filters=(Filter("log_level", "级别", options=options, value=level,
                         action="logs.filter",
                         hint="只改本页显示；日志文件不动。"),) if levels else (),
