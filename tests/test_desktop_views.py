@@ -1337,3 +1337,54 @@ def test_controller_log_filter_refuses_an_unknown_level(tmp_path):
     result = controller.action("logs.filter")
     assert result.ok is False and "alert" in result.message
     assert len(controller.current().table.rows) == 3
+
+
+# ───────────────── RC15-039 #4：自动刷新（可见 10s / 最小化或空闲 60s；可关；不叠请求）
+def test_auto_refresh_defaults_on_and_the_toggle_is_on_the_settings_page():
+    """默认开 + 开关就在「本机设置」（不是藏在配置文件里）。"""
+    controller = DesktopController(ds.FakeDataSource(dict(demo_snapshot().sections)))
+    assert controller.auto_refresh is True
+    view = controller.show("access")
+    toggle = view.switches[0]
+    assert toggle.key == "auto_refresh" and toggle.value is True
+    assert toggle.action == "access.toggle_auto_refresh"
+    assert "[自动刷新：开]" in view.plain_text()
+
+    controller.set_draft("auto_refresh", "off")
+    result = controller.action("access.toggle_auto_refresh")
+    assert result.ok and "已关闭" in result.message
+    assert controller.auto_refresh is False
+    assert "[自动刷新：关]" in controller.current().plain_text()
+    assert controller.drafts == {}                 # 开关值不进配置草稿
+
+
+def test_auto_refresh_switch_refuses_an_unknown_state():
+    controller = DesktopController(ds.FakeDataSource(dict(demo_snapshot().sections)))
+    controller.set_draft("auto_refresh", "maybe")
+    result = controller.action("access.toggle_auto_refresh")
+    assert result.ok is False and controller.auto_refresh is True
+
+
+def test_quiet_refresh_never_clobbers_the_message_but_reports_failures(tmp_path):
+    """自动刷新是后台动作：成功不许顶掉客户正在读的那句；失败必须留一句。"""
+    controller = make_controller(tmp_path)
+    controller.message = "未保存：价格模式必须是 auto / manual"
+    controller.apply_refresh(controller.snapshot, sections=("status",), quiet=True)
+    assert controller.message == "未保存：价格模式必须是 auto / manual"
+
+    controller.apply_refresh(None, sections=("status",), error=RuntimeError("boom"), quiet=True)
+    assert "刷新失败" in controller.message         # 失败不静默
+
+
+def test_theme_save_keeps_the_auto_refresh_flag(tmp_path):
+    """切主题是读改写：不许把「自动刷新已关闭」顺手重置成默认。"""
+    from djb_node.desktop import theme as dual
+
+    dual.save_flag("auto_refresh", False, tmp_path)
+    dual.save("night", tmp_path)
+    payload = dual.load_prefs(tmp_path)
+    assert payload == {"auto_refresh": False, "theme": "night"}
+    assert dual.load_flag("auto_refresh", tmp_path, default=True) is False
+    dual.save("day", tmp_path)
+    assert dual.load_flag("auto_refresh", tmp_path, default=True) is False
+    assert dual.load(tmp_path) == "day"

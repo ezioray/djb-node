@@ -113,6 +113,9 @@ class DesktopController:
     save_path: Callable[[str], str | None] | None = None
     selected: dict[str, str] = field(default_factory=dict)
     log_level: str = "all"
+    #: RC15-039 #4：自动刷新开关（**本机界面状态**，不是服务端配置）。默认开；
+    #: GUI 侧负责按 10s/60s 落一次刷新，并把偏好存进 desktop-prefs.json。
+    auto_refresh: bool = True
     message: str = DEFAULT_MESSAGE
     view: str = "overview"
     drafts: dict[str, str] = field(default_factory=dict)
@@ -200,6 +203,9 @@ class DesktopController:
                     (self.last_discover or {}).get("protocol") or
                     merged_plan.get("protocol") or "")
             sections["token_plan"] = merged_plan
+        access_sec = sections.get("access")
+        if isinstance(access_sec, Mapping):
+            sections["access"] = {**access_sec, "auto_refresh": bool(self.auto_refresh)}
         logs = sections.get("logs")
         if isinstance(logs, Mapping):
             # RC15-039 #5：级别筛选是**真的**筛（旧实现只有一句页脚承诺，页面照旧全量）。
@@ -256,7 +262,7 @@ class DesktopController:
         return False
 
     def apply_refresh(self, fresh: Any = None, *, sections: Sequence[str] | None = None,
-                      error: BaseException | None = None) -> View:
+                      error: BaseException | None = None, quiet: bool = False) -> View:
         """把一次取数结果落到快照上（**必须在主线程调用**）。
 
         * ``error``：取数整体失败 → 只把这次点名的域标成「刷新失败（类型）」，
@@ -266,6 +272,7 @@ class DesktopController:
         * ``fresh is None`` 且无 error：按「没取到数据」处理，同样保留旧结果。
         """
         names = tuple(sections) if sections else SECTIONS
+        kept = self.message if quiet else None
         if error is not None:
             merged = dict(self._snapshot.sections) if self._snapshot is not None else {}
             merged.update({name: Unavailable("刷新失败（" + type(error).__name__ + "）")
@@ -284,6 +291,12 @@ class DesktopController:
             else:
                 self._snapshot = fresh
             self.message = "已刷新：" + (self._snapshot.fetched_at or "刚刚")
+        if quiet:
+            # RC15-039 #4：自动刷新是后台动作。**成功**时保留客户正在读的那句（例如
+            # 「未保存：…」），失败时保留上面刚写的失败说明——两种都不进托盘广播。
+            if error is None and fresh is not None and kept is not None:
+                self.message = str(kept)
+            return self.current()
         self._publish()
         return self.current()
 
@@ -1259,6 +1272,19 @@ class DesktopController:
     def set_log_level(self, level: str) -> View:
         self.log_level = str(level or "all")
         return self.current()
+
+    def _act_access_toggle_auto_refresh(self, *, confirm=None) -> ActionResult:
+        """自动刷新开关：真关（不是画个开关）。``effect="access"`` 让本页重画回读新状态。"""
+        raw = str(self.drafts.pop("auto_refresh", "") or "").strip().lower()
+        if raw not in ("on", "off", "true", "false", "1", "0"):
+            return ActionResult("开关没生效：没拿到目标状态（" + (raw or "空") + "）", ok=False)
+        self.auto_refresh = raw in ("on", "true", "1")
+        if not self.auto_refresh:
+            return ActionResult("自动刷新已关闭：数据只在你点「刷新」时更新"
+                                "（并记在 desktop-prefs.json，下次启动仍然关闭）",
+                                effect="access")
+        return ActionResult("自动刷新已打开：页面可见时每 10 秒、最小化或空闲 60 秒"
+                            "自动取一次本机数据", effect="access")
 
     def _act_logs_filter(self, *, confirm=None) -> ActionResult:
         """日志级别筛选（``Filter`` 选中即生效）：只改本页显示，**不碰日志文件**。

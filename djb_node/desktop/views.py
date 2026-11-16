@@ -26,7 +26,8 @@ from .. import facts
 
 __all__ = [
     "Action", "Card", "Chart", "Field", "GaugeData", "Hero", "Mark", "Metric", "NAV_SECTIONS",
-    "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "VIEWS",
+    "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "Toggle",
+    "VIEWS",
     "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
     "with_field_errors",
 ]
@@ -271,6 +272,24 @@ class Filter:
 
 
 @dataclass(frozen=True)
+class Toggle:
+    """一条开关（RC15-039 #4：自动刷新在「本机设置」里可以关掉）。
+
+    值来自 controller 的**本机界面状态**（不是服务端配置），投影层只负责说明它是什么。
+    """
+
+    key: str
+    label: str
+    value: bool = True
+    hint: str = ""
+    #: 选中后派发的动作 key（把值写成草稿再派发，与 ``Filter`` 同一条路）
+    action: str = ""
+
+    def text(self) -> str:
+        return "开" if self.value else "关"
+
+
+@dataclass(frozen=True)
 class Action:
     """可点动作；``enabled=False`` 时按钮置灰并显示 ``reason``（不隐藏）。
 
@@ -386,6 +405,8 @@ class View:
     rail: tuple[RailCard, ...] = ()
     #: 表格上方的下拉筛选（RC15-039 #5）。默认空 = 0.3.7 行为（没有筛选控件）。
     filters: tuple[Filter, ...] = ()
+    #: 开关（RC15-039 #4）。默认空 = 0.3.7 行为（页面上没有开关）。
+    switches: tuple[Toggle, ...] = ()
     #: 渲染后要**获得键盘焦点**的字段 key（RC15-039 #1：校验失败聚焦首个错误字段）。
     #: 空 = 不动焦点（0.3.7 行为）。由 :func:`with_field_errors` 填，投影层自己不产生。
     focus_field: str = ""
@@ -410,6 +431,9 @@ class View:
             lines.extend(_chart_text(self.chart))
         if self.rail:
             lines.extend(_rail_text(self.rail))
+        for item in self.switches:
+            lines.append("[" + item.label + "：" + item.text() + "]"
+                         + (("   " + item.hint) if item.hint else ""))
         for item in self.filters:
             lines.append("")
             lines.append("筛选 " + item.label + "：" + item.current_text()
@@ -1801,6 +1825,12 @@ def _access(snapshot: Snapshot) -> View:
                   editable=True, secret=True, advanced=True,
                   hint="掩码显示；粘贴新值才会覆盖"),
         ),
+        # RC15-039 #4：自动刷新是**本机界面**设置（不是服务端配置），所以单独一条开关，
+        # 不进表单、不参与「保存并回读」（那会把界面偏好写进接入配置）。
+        switches=(Toggle("auto_refresh", "自动刷新",
+                         value=bool(access.get("auto_refresh", True)),
+                         action="access.toggle_auto_refresh",
+                         hint="页面可见时每 10 秒；最小化或空闲 60 秒；只读本机数据"),),
         actions=(Action("access.save", "保存并回读", primary=True),
                  Action("access.copy_node_id", "复制节点 ID", enabled=bool(node_id),
                         reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："

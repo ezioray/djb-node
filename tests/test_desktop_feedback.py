@@ -282,3 +282,178 @@ def test_real_tk_log_level_dropdown_filters_the_table():
             root.destroy()
         except Exception:                          # pragma: no cover
             pass
+
+
+# ────── RC15-039 #4：自动刷新（可见 10s / 最小化或空闲 60s / 不叠请求 / 能在设置里关）
+def _auto_app(root, tmp_path, source=None):
+    from djb_node.desktop.app import DesktopApp, demo_snapshot
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    class _Counting(FakeDataSource):
+        def __init__(self, sections, **kwargs):
+            super().__init__(sections, **kwargs)
+            self.rounds: list[tuple[str, ...]] = []
+
+        def snapshot(self, *, sections=None):       # noqa: ANN001 - 与基类同形
+            self.rounds.append(tuple(sections or ()))
+            return super().snapshot(sections=sections)
+
+    data = source or _Counting(dict(demo_snapshot().sections), source="demo")
+    controller = DesktopController(data)
+    return DesktopApp(controller, root=root, prefs_home=tmp_path), controller, data
+
+
+def test_real_tk_auto_refresh_interval_follows_visibility():
+    """可见 10 秒、最小化 60 秒、空闲 60 秒后降到 60 秒（不做 0 秒轮询）。"""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, _data = _auto_app(root, Path(home))
+        try:
+            root.update()
+            assert app._auto_interval_s() == desktop_app.AUTO_REFRESH_VISIBLE_S == 10
+            app._last_input -= desktop_app.AUTO_IDLE_S + 1      # 模拟长时间没操作
+            assert app._auto_interval_s() == desktop_app.AUTO_REFRESH_HIDDEN_S == 60
+            app._note_activity()                        # 一按键就回到 10 秒
+            assert app._auto_interval_s() == 10
+            # 最小化（iconic）= 不可见 → 60 秒
+            app._root.state = lambda: "iconic"          # type: ignore[assignment]
+            assert app._auto_visible() is False
+            assert app._auto_interval_s() == 60
+        finally:
+            app.stop()
+
+
+def test_real_tk_auto_refresh_refreshes_only_the_current_page_and_never_stacks():
+    """一次 tick 只取本页那一域；上一次还没回来就**跳过**（不派第二个请求、不刷提示）。"""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, data = _auto_app(root, Path(home))
+        try:
+            app.show_view("logs")
+            root.update()
+            before = len(data.rounds)
+            app._auto_refresh_tick()
+            root.update()
+            assert data.rounds[before:] == [("logs",)]   # 只取 logs，不整库重拉
+            assert app._auto_timer is not None           # 排了下一次
+            # 忙：跳过，且状态栏不许刷「已忽略这次点击」
+            # 用真 worker 造忙态（不换替身：换掉会让真 worker 的 after 轮询漏收尾）
+            app._status.configure(text="")
+            app._refresh_worker.start(("logs",))
+            assert app._refresh_worker.busy is True
+            before = len(data.rounds)
+            app._auto_refresh_tick()
+            assert len(data.rounds) == before              # 没有派第二个请求
+            assert app._status.cget("text") == ""          # 也没刷「已忽略这次点击」
+            # 收尾：让这次刷新正常跑完（**不**用 poll_once：它会绕过已排的 after 轮询，
+            # 留下一个没人取消的任务，销毁窗口时 Tk 会打一行「invalid command name」）
+            import time
+            for _ in range(100):
+                root.update()
+                if not app._refresh_worker.busy:
+                    break
+                time.sleep(0.02)               # 轮询间隔 50ms：得让 after 真的到点
+            assert app._refresh_worker.busy is False
+        finally:
+            app.stop()
+
+
+def test_real_tk_auto_refresh_off_leaves_no_timer_and_persists():
+    """设置里关掉 → 定时器清空、立刻停刷；偏好写进 desktop-prefs.json。"""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    import json
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, controller, data = _auto_app(root, Path(home))
+        try:
+            app.show_view("access")
+            root.update()
+            assert app._switch_widgets["auto_refresh"].on is True
+            app._on_toggle(app._last_view.switches[0], False)
+            root.update()
+            assert controller.auto_refresh is False
+            assert app._auto_timer is None                   # 一个定时器都不留
+            assert app._switch_widgets["auto_refresh"].on is False
+            before = len(data.rounds)
+            app._auto_refresh_tick()                         # 关掉后即使被叫到也不刷
+            root.update()
+            assert len(data.rounds) == before
+            prefs = json.loads((Path(home) / "desktop-prefs.json").read_text(encoding="utf-8"))
+            assert prefs["auto_refresh"] is False
+        finally:
+            app.stop()
+
+
+def test_real_tk_auto_refresh_reads_the_saved_preference_at_startup():
+    """默认是「开」，所以这条真的在读文件（否则从关到开不会发生）。"""
+    tk = pytest.importorskip("tkinter")
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        from djb_node.desktop import theme as dual
+        dual.save_flag("auto_refresh", False, home)
+        try:
+            root = tk.Tk()
+        except Exception:                              # pragma: no cover - 无显示
+            pytest.skip("没有可用的 Tk 显示")
+        app, controller, _data = _auto_app(root, Path(home))
+        try:
+            app.show_view("access")
+            root.update()
+            assert controller.auto_refresh is False
+            assert app._auto_timer is None
+            assert app._switch_widgets["auto_refresh"].on is False
+        finally:
+            app.stop()
+
+
+def test_real_tk_auto_refresh_yields_while_the_form_has_unsaved_edits():
+    """客户正在填表：自动刷新让路（重画会把没保存的输入冲掉）。"""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, data = _auto_app(root, Path(home))
+        try:
+            app.show_view("access")
+            root.update()
+            assert app._has_unsaved_edits() is False
+            app._vars["price_mode"].set("manual")        # 改了但没点保存
+            root.update()
+            assert app._has_unsaved_edits() is True
+            before = len(data.rounds)
+            app._auto_refresh_tick()
+            root.update()
+            assert len(data.rounds) == before
+            app._vars["price_mode"].set("auto")          # 改回去 → 恢复自动刷新
+            root.update()
+            assert app._has_unsaved_edits() is False
+        finally:
+            app.stop()

@@ -22,13 +22,14 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 from .access import ACCESS_FILE, RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED
 from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
-from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
+from .datasource import SECTIONS, FakeDataSource, LocalDataSource, ProviderError, Snapshot
 from ..platform.no_window import subprocess_window_kwargs
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
 from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
@@ -64,6 +65,15 @@ PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 #: 它们在 :meth:`DesktopApp._on_action` 的通用播报里要跳过，否则「已在浏览器打开」会被
 #: 动作自带的一句「网页端：https://…」覆盖掉——那正好抹掉了「打不开」这个关键差别。
 SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "update", "probe")
+
+#: RC15-039 #4：自动刷新的两档间隔（秒）与「空闲」阈值。
+#:
+#: 走查原话：「要么不刷新，要么一直在后台刷」——所以不是开关二选一，而是**按可见性降频**：
+#: 页面可见 10 秒；最小化（或超过 ``AUTO_IDLE_S`` 没有任何输入）降到 60 秒。
+#: 不做 0 秒轮询：本机数据源一轮要跑一次 ``djb status``，10 秒已经够实时。
+AUTO_REFRESH_VISIBLE_S = 10
+AUTO_REFRESH_HIDDEN_S = 60
+AUTO_IDLE_S = 60
 
 #: 会回投**字段级错误**的 effect：这类动作的结果要覆盖本页红字状态（含「清空」）。
 #:
@@ -340,6 +350,15 @@ class DesktopApp:
             getattr(controller, "source", None), "_home", None)
         self._fade_job = None
         self._theme_name = dual.load(self._prefs_home)
+        #: RC15-039 #4：自动刷新（本机偏好，默认开）。关掉之后**一个定时器都不留**。
+        self._auto_timer: Any = None
+        self._refresh_quiet = False          # 自动刷新：不弹 toast、不抢状态栏
+        self._last_input = time.monotonic()
+        try:
+            controller.auto_refresh = dual.load_flag("auto_refresh", self._prefs_home,
+                                                     default=bool(controller.auto_refresh))
+        except Exception:                    # pragma: no cover - 偏好文件坏了：用默认（开）
+            pass
         dual.apply(self._root, ttk, self._theme_name)
         self._build_shell()
         self._bind_keys()
@@ -360,6 +379,102 @@ class DesktopApp:
             except Exception:                            # pragma: no cover - 无窗口
                 pass
         self.show_view(controller.view)
+        self._bind_activity()                # 记录最后一次输入（判「空闲 60 秒」）
+        self._schedule_auto_refresh()
+
+    # ── RC15-039 #4：自动刷新（可见 10s / 最小化或空闲 60s；可关；不叠请求）
+    def _bind_activity(self) -> None:
+        """记录最后一次键盘/鼠标动作：只用于「空闲就降频」，不拦截任何事件。"""
+        for sequence in ("<KeyPress>", "<ButtonPress>", "<Motion>", "<MouseWheel>"):
+            try:
+                self._root.bind(sequence, self._note_activity, add="+")
+            except Exception:                        # pragma: no cover - 无窗口
+                pass
+
+    def _note_activity(self, _event: Any = None) -> None:
+        self._last_input = time.monotonic()
+
+    def _idle_seconds(self) -> float:
+        return max(0.0, time.monotonic() - float(getattr(self, "_last_input", 0.0)))
+
+    def _auto_visible(self) -> bool:
+        """窗口是否「在眼前」：最小化（iconic/withdrawn）或长时间无输入都算不可见。"""
+        try:
+            if str(self._root.state()) != "normal":
+                return False
+        except Exception:                            # pragma: no cover - 无窗口
+            pass
+        return self._idle_seconds() < AUTO_IDLE_S
+
+    def _auto_interval_s(self) -> int:
+        return AUTO_REFRESH_VISIBLE_S if self._auto_visible() else AUTO_REFRESH_HIDDEN_S
+
+    def _auto_sections(self) -> tuple[str, ...]:
+        """自动刷新只取**本页要用的那一域**（外加总览要的 status）：不整库重拉。"""
+        key = str(getattr(self._controller, "view", "") or "")
+        if key in ("", "overview"):
+            return ("status",)
+        return (key,) if key in SECTIONS else ()
+
+    def _schedule_auto_refresh(self, delay_s: float | None = None) -> None:
+        """排下一次自动刷新（单一定时器：``after`` 只留一个，关掉即取消）。"""
+        if not bool(getattr(self._controller, "auto_refresh", True)):
+            self._cancel_auto_refresh()
+            return
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return
+        self._cancel_auto_refresh()
+        delay = int((self._auto_interval_s() if delay_s is None else delay_s) * 1000)
+        try:
+            self._auto_timer = root.after(max(250, delay), self._auto_refresh_tick)
+        except Exception:                            # pragma: no cover - 窗口已销毁
+            self._auto_timer = None
+
+    def _cancel_auto_refresh(self) -> None:
+        if self._auto_timer is None:
+            return
+        try:
+            self._root.after_cancel(self._auto_timer)
+        except Exception:                            # pragma: no cover - 已触发/已销毁
+            pass
+        self._auto_timer = None
+
+    def _auto_refresh_tick(self) -> None:
+        """到点了：能刷就刷一次，然后**无论如何**排下一次（不叠请求、不刷提示）。"""
+        self._auto_timer = None
+        if not bool(getattr(self._controller, "auto_refresh", True)):
+            return
+        worker = getattr(self, "_refresh_worker", None)
+        busy = bool(getattr(worker, "busy", False))
+        # 三个「不刷」：上一次还没回来（不叠请求）/ 正在改表单（别把输入冲掉）/ 页面没画出来
+        if not busy and not self._has_unsaved_edits() and getattr(self, "_last_view", None):
+            self._start_quiet_refresh(self._auto_sections())
+        self._schedule_auto_refresh()
+
+    def _has_unsaved_edits(self) -> bool:
+        """本页有没有**改过但没保存**的输入。有 → 自动刷新让路（重画会把输入冲掉）。
+
+        拿「输入框现在的内容」跟「渲染时填进去的内容」比：不碰「有没有焦点」这种不可靠信号，
+        也不用 ``edit_modified``（ttk.Entry 没有这个命令）。
+        """
+        for key, entry in (getattr(self, "_entries", {}) or {}).items():
+            try:
+                if str(entry.get()) != str(self._entry_initial.get(key, "")):
+                    return True
+            except Exception:                        # pragma: no cover - 控件已销毁
+                continue
+        return False
+
+    def _start_quiet_refresh(self, sections: Sequence[str] | None = None) -> None:
+        """自动刷新用的**安静**刷新：不 toast、成功不抢状态栏；失败仍然留一句。"""
+        self._refresh_quiet = True
+        try:
+            self._request_refresh_async(sections)
+        finally:
+            # 同步回落（无事件循环）时不会有回调来清这个标记
+            if getattr(self, "_refresh_worker", None) is None:
+                self._refresh_quiet = False
 
     # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
     #: 三段壳的高度（设计值；窗口总高会多出 Windows 原生标题栏 ~31px，见 R6）
@@ -933,16 +1048,20 @@ class DesktopApp:
 
     def _refresh_started(self) -> None:
         """(a) 立即反馈：按钮文案 + 状态栏，在取数**开始之前**就变。"""
+        quiet = bool(getattr(self, "_refresh_quiet", False))
         button = getattr(self, "_refresh_button", None)
         if button is not None:
             try:
-                button.set_text("刷新中…")
+                button.set_text("刷新中…" if not quiet else button.text)
             except Exception:                      # pragma: no cover - 控件已销毁
                 pass
-        self._toast("正在刷新…（可以继续拖动/切页）", ok=True)
+        if not quiet:
+            self._toast("正在刷新…（可以继续拖动/切页）", ok=True)
 
     def _refresh_busy(self) -> None:
         """(c) 并发闸门：重复点击只提示，不再派发第二个取数。"""
+        if getattr(self, "_refresh_quiet", False):
+            return                                 # 自动刷新不刷「已忽略这次点击」
         self._toast("正在刷新…上一次还没结束，已忽略这次点击", ok=True)
 
     def _refresh_finished(self) -> None:
@@ -955,13 +1074,22 @@ class DesktopApp:
 
     def _apply_refresh(self, fresh: Any, error: BaseException | None,
                        sections: Any = None) -> None:
-        """(d) 结果落地：合并快照 → 渲染 → 状态栏。异常已经在这里变成「刷新失败」。"""
-        view = self._controller.apply_refresh(fresh, sections=sections, error=error)
+        """(d) 结果落地：合并快照 → 渲染 → 状态栏。异常已经在这里变成「刷新失败」。
+
+        自动刷新（``_refresh_quiet``）走**安静**路径：成功不 toast、不覆盖状态栏最后一条消息
+        （那条常常是「未保存：…」这种客户还没读完的话），但**失败照旧留一句**在上面。
+        """
+        quiet = bool(getattr(self, "_refresh_quiet", False))
+        view = self._controller.apply_refresh(fresh, sections=sections, error=error,
+                                             quiet=quiet)
         self._render(view)
         self._update_status()
         worker = getattr(self, "_refresh_worker", None)
         duration = getattr(worker, "last_duration_s", 0.0) or 0.0
         message = str(self._controller.message or "")
+        if quiet:
+            self._refresh_quiet = False
+            return
         if duration and message.startswith("已刷新"):
             message += "（用时 %.1f s）" % duration
         self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
@@ -1644,6 +1772,10 @@ class DesktopApp:
         self._vars.clear()
         self._reveal_buttons.clear()         # 按钮随旧控件销毁，不能留悬空引用
         self._entries.clear()
+        #: 渲染时输入框里的初始文本（判「改过但没保存」用；自动刷新要给编辑让路）
+        self._entry_initial = {}
+        self._filter_widgets = []
+        self._switch_widgets = {}
         self._row_notes.clear()
         self._tree = None
         self._detail = None
@@ -2094,6 +2226,8 @@ class DesktopApp:
                 self._render_card(grid, card, index, per_row=per_row)
             for column in range(per_row):
                 grid.columnconfigure(column, weight=1, uniform="card")
+        for item in view.switches:                   # RC15-039 #4：本机界面开关
+            self._render_switch(item)
         # 有表单的页：卡片 → 字段 → 动作（保存）→ 表格；没有表单的页：卡片 → 动作 → 表格
         if view.fields:
             self._render_fields(view.fields, view.key)
@@ -2178,6 +2312,39 @@ class DesktopApp:
         except Exception:                            # pragma: no cover - 控件已销毁
             pass
         return widget
+
+    def _render_switch(self, item: Any) -> None:
+        """一条开关：真 Switch（28×15，Tab 可达、空格/回车可切）+ 标签 + 说明。"""
+        tk, kit = self._tk, self._kit
+        base = dual.color("bg")
+        bar = tk.Frame(self._body, background=base, bd=0, highlightthickness=0)
+        bar.pack(fill="x", pady=(0, 8))
+        switch = kit.Switch(bar, on=bool(item.value), ground=base,
+                            command=lambda on, target=item: self._on_toggle(target, bool(on)))
+        switch.pack(side="left", padx=(2, 8))
+        tk.Label(bar, text=item.label, font=self._fonts.sans(kit.px("small")),
+                 foreground=dual.color("ink"), background=base).pack(side="left")
+        if item.hint:
+            tk.Label(bar, text=item.hint, font=self._fonts.sans(kit.px("micro")),
+                     foreground=dual.color("muted_text"), background=base).pack(
+                         side="left", padx=(10, 0))
+        self._switch_widgets[item.key] = switch
+        self._a11y_name(switch, item.label + "（开关键）")
+
+    def _on_toggle(self, item: Any, on: bool) -> None:
+        """开关切换 → 动作层 → 立即落偏好 → 重画（状态以重画后的视图为准，不猜）。"""
+        self._controller.set_draft(item.key, "on" if on else "off")
+        self._on_action(item.action or ("toggle." + item.key))
+        if item.key == "auto_refresh":
+            try:
+                dual.save_flag("auto_refresh", bool(on), self._prefs_home)
+            except Exception as exc:                 # noqa: BLE001 - 偏好写不进去也要能用
+                self._toast("自动刷新已改，但偏好没写进 desktop-prefs.json（"
+                            + type(exc).__name__ + "）：下次启动会回到默认", ok=False)
+            if on:
+                self._schedule_auto_refresh()
+            else:
+                self._cancel_auto_refresh()          # 关掉 = 一个定时器都不留
 
     def _render_filter(self, item: Any) -> None:
         """下拉筛选：一条标签 + 只读 Combobox（键盘可达：Tab 到、↑↓ 选、回车生效）。"""
@@ -2545,6 +2712,10 @@ class DesktopApp:
             self._fields[field.key] = field
             self._vars[field.key] = variable
             self._entries[field.key] = entry
+            try:                                   # 初始文本（自动刷新判「有没有在改」）
+                self._entry_initial[field.key] = str(entry.get())
+            except Exception:                      # pragma: no cover - 控件已销毁
+                self._entry_initial[field.key] = str(field.value or "")
         else:
             # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
             # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
@@ -2809,6 +2980,10 @@ class DesktopApp:
         self._root.mainloop()
 
     def stop(self) -> None:
+        self._cancel_auto_refresh()          # 自动刷新不许在关窗后继续排下一次
+        self._cancel_fade()                  # 淡入/主题渐变的 after 也要取消：
+        # 不然销毁窗口时 Tk 会对着已消失的 lambda 打一行「invalid command name」
+        # （只是 stderr 噪音，但会把真实测试输出搞脏——0.3.7 起就有的收场缺口）
         for name in ("_refresh_worker", "_payout_worker", "_update_worker", "_probe_worker",
                      "_discover_worker"):
             worker = getattr(self, name, None)
