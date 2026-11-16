@@ -625,6 +625,24 @@ PROBE_BACKLOG_RETRY_S = 5.0
 不按常规周期（half-fresh）等，而是很快续跑，几轮内把 backlog 清空；
 清空后自动回到 ``periodic_interval_s``。"""
 
+PROBE_REUSE_OK_S = _float_env("DJB_NODE_PROBE_REUSE_OK_S", 20.0, minimum=0.0)
+"""**预算受限的轮次**里，刚探过且 ok 的模型可以直接复用结论、不必重探的时间窗（秒）。
+
+0.3.9 / D-RCA P1-b：5s backlog 续跑是为了**补缺口**（``not_probed`` / 未覆盖 / 已知失败），
+不是把 5 秒前刚验过的模型再跑一遍。没有这个复用窗，一轮 20s 预算里 4 个刚 ok 的模型
+会把预算重新吃光，缺口（例如排最后的 qwen）依旧轮不到 —— 与 0.3.4 的 635s 逐模型 stale
+是同一类「没轮到」的累积。
+
+窗口必须**远小于** ``PROBE_FRESH_AFTER_S``(600)：复用期间的 ok 行仍然进报价，
+窗口一旦接近新鲜度窗口，就会把模型拖成逐模型 ``stale_probe``（0.3.4 事故模式 5 行→1 行）。
+默认 20s（= 一个 ``PROBE_PASS_BUDGET_S``）：跨过一轮预算就没有复用价值了。
+
+* 只在**有 deadline** 的轮次生效（周期/启动/预算受限）；手动 ``djb upstream probe``
+  （``deadline=None``）永远实探，不拿旧结论糊弄人；
+* 被复用的模型**不刷新** ``last_probe_at``（不伪造新鲜度），也不进 ``not_probed[]``。
+回滚：``DJB_NODE_PROBE_REUSE_OK_S=0`` 即关闭复用（每轮所有模型都实探），无需改代码。
+"""
+
 # ─────────────────────────────────────────────────────────── 报价发布（CR-20261106-OFFICIAL-SUPPLY-01）
 # 口径：`design/17-官方供给与价格配置-设计方案-v1.md` §15 + CR 第 3 节 P1/P2/P4/P6。
 # 只加不改：本段不修改任何既有常量；`DEFAULT_MIN_PRICE_UNIT`（价格单位）语义不变。
