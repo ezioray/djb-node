@@ -751,8 +751,13 @@ class Switch(tk.Canvas):
         self.on = bool(on)
         self.command = command
         self.ground = ground or theme.color("surface")
+        # RC15-039 #31②：开关也要有**看得见**的焦点环。28×15 画布内再画一圈会糊成一团，
+        # 所以用 Tk 原生 highlight 环（1px，聚焦时换成 theme 的 focus 令牌）。
         super().__init__(master, width=28, height=15, background=self.ground, bd=0,
-                         highlightthickness=0, takefocus=1 if command else 0, **kwargs)
+                         highlightthickness=1 if command else 0,
+                         highlightbackground=(ground or theme.color("surface")),
+                         highlightcolor=theme.color("focus"),
+                         takefocus=1 if command else 0, **kwargs)
         self.bind("<Button-1>", self._toggle)
         self.bind("<Return>", self._toggle)
         self.bind("<space>", self._toggle)

@@ -552,3 +552,184 @@ def test_real_tk_enter_on_a_non_action_table_opens_the_detail_instead():
             assert "详情：" in getattr(app._detail, app.A11Y_NAME_ATTR)
         finally:
             app.stop()
+
+
+# ────── RC15-039 #31/#32：无障碍最小切片（名字 / Tab 视觉顺序 / 表格键盘 / 文字导出）
+def _close(app, root):
+    """关窗口：``app.stop()`` 已经销毁了 root，再 destroy 一次会抛 TclError。"""
+    app.stop()
+    try:
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _tk_root_or_skip():
+    tk = pytest.importorskip("tkinter")
+    try:
+        return tk, tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+
+
+def test_real_tk_every_focusable_control_has_an_accessible_name():
+    """#31①：Tab 能停的每个控件都要有名字——读屏念不出名字的控件等于不存在。"""
+    import tempfile
+    from pathlib import Path
+
+    from djb_node.desktop.views import VIEW_KEYS
+
+    tk, root = _tk_root_or_skip()
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, _data = _auto_app(root, Path(home))
+        try:
+            root.update()
+            missing = []
+            for key in VIEW_KEYS:
+                app.show_view(key)
+                root.update()
+                for widget in app._tab_order():
+                    if not getattr(widget, app.A11Y_NAME_ATTR, ""):
+                        missing.append((key, widget.winfo_class(), str(widget)))
+            assert missing == []
+        finally:
+            _close(app, root)
+
+
+def test_real_tk_tab_order_follows_visual_order():
+    """#31②：顶部按钮（左→右）→ 侧栏（上→下）→ 内容区（上→下、左→右）。"""
+    import tempfile
+    from pathlib import Path
+
+    tk, root = _tk_root_or_skip()
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, _data = _auto_app(root, Path(home))
+        try:
+            app.show_view("access")
+            root.update()
+            order = app._tab_order()
+            assert order, "Tab 链空 = 键盘用户进不了界面"
+
+            def place(widget):
+                return (widget.winfo_rooty(), widget.winfo_rootx())
+
+            # 三个区：顶部一条 → 左侧栏（一整列）→ 内容区；区之间不许穿插
+            header_end = app._px(app.HEADER_H)
+            header = [w for w in order if w.winfo_rooty() <= header_end]
+            nav_set = set(app._nav_buttons.values())
+            nav = [w for w in order if w in nav_set]
+            content = [w for w in order if w not in header and w not in nav_set]
+            assert header and nav and content
+            assert order == header + nav + content
+            # 区**内部**按视觉顺序（上→下、左→右）
+            assert sorted(header, key=place) == header
+            assert sorted(nav, key=place) == nav
+            assert sorted(content, key=place) == content
+            # 区**之间**也是视觉顺序：顶部在最上，侧栏从更上面起（一整列），内容在它们的下方
+            assert max(w.winfo_rooty() for w in header) < min(w.winfo_rooty() for w in nav)
+            assert min(w.winfo_rooty() for w in nav) < min(w.winfo_rooty() for w in content)
+            # 顶部第一格是最左边那个（不是最右的「刷新」）
+            assert place(header[0])[1] < place(header[-1])[1]
+        finally:
+            _close(app, root)
+
+
+def test_real_tk_tab_and_shift_tab_walk_the_same_order():
+    """#31②：Tab 往后、Shift-Tab 往前，走的是同一条链（不是 Tk 的创建顺序）。"""
+    import tempfile
+    from pathlib import Path
+
+    tk, root = _tk_root_or_skip()
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, _data = _auto_app(root, Path(home))
+        try:
+            app.show_view("logs")
+            root.update()
+            order = app._tab_order()
+            # 焦点不在链上（比如刚启动）时，按 Tab 从**第一格**开始（不是跳到第二格）
+            assert app._focus_next(1) == order[0]
+            root.focus_force()
+            order[0].focus_set()
+            root.update()
+            assert app._focus_next(1) == order[1]
+            assert app._focus_next(-1) == order[-1]        # 回绕到最后一个
+        finally:
+            _close(app, root)
+
+
+def test_real_tk_table_keys_move_selection_and_home_end_reach_the_edges():
+    """#31③/#32：↑↓ 逐行、Home/End 到首尾——提示语这么写就必须这么动。"""
+    import tempfile
+    from pathlib import Path
+
+    tk, root = _tk_root_or_skip()
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, _data = _auto_app(root, Path(home))
+        try:
+            app.show_view("receipts")
+            root.update()
+            rows = list(app._tree.get_children())
+            assert len(rows) >= 3
+            app._tree.focus_set()
+            root.update()
+            app._tree.selection_set(rows[0])
+            root.update()
+            app._tree.event_generate("<Down>", when="now")
+            root.update()
+            assert app._tree.selection() == (rows[1],)
+            app._tree.event_generate("<End>", when="now")
+            root.update()
+            assert app._tree.selection() == (rows[-1],)
+            app._tree.event_generate("<Up>", when="now")
+            root.update()
+            assert app._tree.selection() == (rows[-2],)
+            app._tree.event_generate("<Home>", when="now")
+            root.update()
+            assert app._tree.selection() == (rows[0],)
+            # 到顶再按 ↑ 停在原地（不绕回，否则「最后一条」永远按不到）
+            app._tree.event_generate("<Up>", when="now")
+            root.update()
+            assert app._tree.selection() == (rows[0],)
+        finally:
+            _close(app, root)
+
+
+def test_real_tk_export_text_prints_and_copies_the_current_page():
+    """#31④：``--export-text`` 是读屏兜底——整页文字既能打印也能进剪贴板。"""
+    import tempfile
+    from pathlib import Path
+
+    tk, root = _tk_root_or_skip()
+    with tempfile.TemporaryDirectory() as home:
+        app, controller, _data = _auto_app(root, Path(home))
+        try:
+            app.show_view("logs")
+            root.update()
+            code = desktop_app._export_text(app, "logs")
+            assert code == desktop_app.EXIT_OK
+            text = controller.show("logs").plain_text()
+            assert text.strip()
+            assert root.clipboard_get() == text        # 剪贴板拿到的是**整页**文字
+        finally:
+            _close(app, root)
+
+
+def test_real_tk_switch_focus_ring_uses_the_focus_token():
+    """#31②：开关聚焦时要有看得见的环（1px 原生 highlight，颜色跟主题 focus 走）。"""
+    import tempfile
+    from pathlib import Path
+
+    from djb_node.desktop import theme as desktop_theme
+
+    tk, root = _tk_root_or_skip()
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, _data = _auto_app(root, Path(home))
+        try:
+            app.show_view("access")
+            root.update()
+            switch = app._switch_widgets["auto_refresh"]
+            assert int(str(switch.cget("highlightthickness"))) == 1
+            assert str(switch.cget("highlightcolor")) == desktop_theme.color("focus")
+            assert int(str(switch.cget("takefocus"))) == 1
+        finally:
+            _close(app, root)
