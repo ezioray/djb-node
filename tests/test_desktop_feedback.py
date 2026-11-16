@@ -813,4 +813,34 @@ def test_auto_refresh_counts_a_maximized_window_as_visible():
             app._root.state = real_state
         finally:
             _close(app, root)
+def test_real_tk_auto_refresh_on_the_default_page_updates_its_numbers():
+    """复核 M3：总览页自动刷新只取 `status` 时，主卡数字永不更新而页头时间照走 = 谎报。"""
+    import time
 
+    tk, root = _tk_root_or_skip()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, controller, data = _auto_app(root, Path(home))
+        try:
+            app.show_view("overview")
+            root.update()
+            sections = app._auto_sections()
+            for needed in ("status", "earnings", "bench", "yield", "receipts", "tasks"):
+                assert needed in sections, needed          # 页面用到的域都要取
+
+            # 数据变了：自动刷新落地后，总览页上的数字要跟着变
+            data._sections["earnings"] = dict(data._sections["earnings"] or {})   # noqa: SLF001
+            data._sections["earnings"]["today"] = 999.99                          # noqa: SLF001
+            app._auto_refresh_tick()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                root.update()
+                if not app._refresh_worker.busy:
+                    break
+                time.sleep(0.02)
+            root.update()
+            assert "999.99" in app._last_view.plain_text()
+        finally:
+            _close(app, root)

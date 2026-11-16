@@ -413,11 +413,18 @@ class DesktopApp:
     def _auto_interval_s(self) -> int:
         return AUTO_REFRESH_VISIBLE_S if self._auto_visible() else AUTO_REFRESH_HIDDEN_S
 
+    #: 总览页**真正**用到的域（复核 M3/S11：以前这里只给 `status`，主卡数字永不更新，
+    #: 而页头的「数据截至」照走 = 谎报新鲜度）。改 Overview 版面时这张清单要一起改。
+    OVERVIEW_SECTIONS = ("status", "earnings", "bench", "yield", "receipts", "tasks")
+
     def _auto_sections(self) -> tuple[str, ...]:
-        """自动刷新只取**本页要用的那一域**（外加总览要的 status）：不整库重拉。"""
+        """自动刷新取的域：**本页真正要用的那几个**（总览有 6 个域，不能只取 status）。
+
+        宁可多取几个已缓存的小域，也不要出现「时间在走、数字不动」的假新鲜。
+        """
         key = str(getattr(self._controller, "view", "") or "")
         if key in ("", "overview"):
-            return ("status",)
+            return self.OVERVIEW_SECTIONS
         return (key,) if key in SECTIONS else ()
 
     def _schedule_auto_refresh(self, delay_s: float | None = None) -> None:
