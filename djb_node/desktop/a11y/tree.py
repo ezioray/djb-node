@@ -15,8 +15,8 @@
   （能 Tab 进去、能读当前值）；否则 ``TEXT + READONLY``；``Field.secret`` 另加
   ``STATE_SYSTEM_PROTECTED``。本模块不提供任何写回路径，输入仍走真正的 Tk 输入框。
 * **id 是路径键**：每个节点带 :attr:`Node.node_id`（``view/table:1/row:2026-11-16-003/cell:金额``
-  这种），**不随筛选或刷新改变**；数字 childId 由 :func:`flatten` 按前序给，只用于本次遍历。
-  提供方按 ``node_id`` 保留 id，刷新前后同一行仍是同一个 id。
+  这种），**不随筛选或刷新改变**；数字 childId 是**位置**（``children`` 顺序 + 1，密集 1..N），
+  每次刷新都可能变——所以焦点/选中按 ``node_id`` 记，位置一变由 provider 用新 childId 重发事件。
 * **行名用内容，不用位置**：「第 3 行」筛完会变成「第 1 行」，读屏念出来就是错的。
   行名取首列内容；位置信息放 :attr:`Node.description`（或不写）。
 * **规模上限**：单表最多 :data:`TABLE_MAX_ROWS` 行（读屏逐条遍历会卡），超出时表节点名字里

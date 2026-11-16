@@ -392,4 +392,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # 复核要求：日志里要能直接看到退出码，别让复核人去猜（PowerShell 的 $LASTEXITCODE
+    # 常被管道/Select-Object 吃掉，脚本自己回显一行最省事）
+    print("EXIT=%d" % code, flush=True)
+    sys.exit(code)

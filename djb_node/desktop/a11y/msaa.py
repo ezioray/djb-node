@@ -15,8 +15,10 @@
    ``DJB_DESKTOP_A11Y=0`` 是**故障逃生阀**（不是特性开关）：设了就不装 provider。
 3. **默认不落盘**：只有 ``DJB_DESKTOP_A11Y_TRACE=<路径>`` 时才写调用日志；日志里
    ``accValue`` 只写长度（**不写原文**，避免金额/地址/节点 ID 进磁盘）。
-4. **刷新不发事件**：:meth:`Provider.refresh` 只换数据，**不发** ``EVENT_OBJECT_FOCUS/SELECTION``；
-   只有用户操作（S3）才发。节点对象按 ``node_id`` 复用，刷新前后同一行还是同一个 IAccessible。
+4. **刷新一般不发事件，但焦点/选中移位要补发**：:meth:`Provider.refresh` 只换数据；唯一的例外是
+   被聚焦/被选中的业务行位置变了——那时用它的**新 childId 重发** ``EVENT_OBJECT_FOCUS`` /
+   ``EVENT_OBJECT_SELECTION``，否则读屏手里那个号会指向另一行。childId 是**位置**
+   （``children`` 下标 + 1，密集 1..N），身份由 ``node_id`` 路径承担，两者别混。
 
 实现要点（都是踩过的坑，别删）
 ==============================

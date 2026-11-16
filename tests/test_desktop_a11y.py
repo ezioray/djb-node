@@ -150,7 +150,7 @@ def test_editable_field_is_focusable_not_readonly():
     assert not (readonly.state & STATE_FOCUSABLE)
 
 
-# ── id 稳定：刷新前后同一行还是同一个 id ───────────────────────────────────────
+# ── 身份与位置：路径稳定，childId 是位置（密集），移位要重发事件 ─────────────
 def _logs_snapshot(entries):
     """走**真实**产品路径：`views._logs` 生成 Row.key，不在用例里手写 key。"""
     return ds.Snapshot({"logs": {"rows": [
