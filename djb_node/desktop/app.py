@@ -32,6 +32,7 @@ from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
 from .datasource import SECTIONS, FakeDataSource, LocalDataSource, ProviderError, Snapshot
 from ..platform.no_window import subprocess_window_kwargs
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
+from .a11y import install as install_a11y   # 读屏（MSAA）；**静态 import**，别改成 import_module
 from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
 from . import platform_ui
 from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
@@ -379,6 +380,7 @@ class DesktopApp:
             except Exception:                            # pragma: no cover - 无窗口
                 pass
         self.show_view(controller.view)
+        self._a11y = self._install_a11y()    # 读屏：装不上就 None，界面照跑
         self._bind_activity()                # 记录最后一次输入（判「空闲 60 秒」）
         self._bind_window_state()            # 最大化/恢复后立刻按新状态重排（S4）
         self._schedule_auto_refresh()
@@ -1939,6 +1941,7 @@ class DesktopApp:
                                   anchor="w", pady=(2, 0))
         self._in_render = False
         self._sync_content_width()                   # B4：内容重排后把宽度钉回画布宽
+        self._refresh_a11y(view)                     # 读屏树跟着这一版数据走（不发焦点事件）
         if view.focus_field:
             self._focus_field(view.focus_field)
 
@@ -3233,11 +3236,36 @@ class DesktopApp:
         except Exception:
             pass
 
+    # ── 读屏（RC15-039 #31）：只读镜像，装不上就静默降级
+    def _install_a11y(self) -> Any:
+        """装 MSAA 提供方；任何失败都返回 ``None``（Linux、无 comtypes、钩窗口失败都走这里）。"""
+        try:
+            return install_a11y(self._root)
+        except Exception:                      # pragma: no cover - 防御
+            return None
+
+    def _refresh_a11y(self, view: View) -> None:
+        """把这一版 ``View`` 推给读屏树。**自动刷新也走这里，但 provider 不发焦点事件**。"""
+        provider = getattr(self, "_a11y", None)
+        if provider is None:
+            return
+        try:
+            provider.refresh(view)
+        except Exception:                      # pragma: no cover - 防御
+            pass
+
     # ── 生命周期
     def run(self) -> None:
         self._root.mainloop()
 
     def stop(self) -> None:
+        provider = getattr(self, "_a11y", None)
+        if provider is not None:
+            try:
+                provider.detach()            # 先摘窗口过程钩子，再销毁窗口
+            except Exception:
+                pass
+            self._a11y = None
         self._cancel_auto_refresh()          # 自动刷新不许在关窗后继续排下一次
         self._cancel_fade()                  # 淡入/主题渐变的 after 也要取消：
         # 不然销毁窗口时 Tk 会对着已消失的 lambda 打一行「invalid command name」
