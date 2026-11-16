@@ -380,6 +380,7 @@ class DesktopApp:
                 pass
         self.show_view(controller.view)
         self._bind_activity()                # 记录最后一次输入（判「空闲 60 秒」）
+        self._bind_window_state()            # 最大化/恢复后立刻按新状态重排（S4）
         self._schedule_auto_refresh()
 
     # ── RC15-039 #4：自动刷新（可见 10s / 最小化或空闲 60s；可关；不叠请求）
@@ -389,6 +390,25 @@ class DesktopApp:
             try:
                 self._root.bind(sequence, self._note_activity, add="+")
             except Exception:                        # pragma: no cover - 无窗口
+                pass
+
+    def _bind_window_state(self) -> None:
+        """窗口 `<Map>`/`<Unmap>` 后**立刻**按新的可见状态重排定时器（复核 S4）。
+
+        没有这一条：最小化 → 定时器还在 10s 那档；恢复可见后，最坏要等 60s 才刷一次，
+        走查原话「页面不会自己更新」会在这个窗口里复现。``<Unmap>`` 之后 ``state()``
+        可能还没更新，所以延到下一轮事件循环再排（``after(0, …)``）。
+        """
+        def reschedule(_event: Any = None) -> None:
+            try:
+                self._root.after_idle(self._schedule_auto_refresh)
+            except Exception:                    # pragma: no cover - 窗口已销毁
+                pass
+
+        for sequence in ("<Map>", "<Unmap>"):
+            try:
+                self._root.bind(sequence, reschedule, add="+")
+            except Exception:                    # pragma: no cover - 无窗口
                 pass
 
     def _note_activity(self, _event: Any = None) -> None:

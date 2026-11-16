@@ -161,6 +161,9 @@ FIRST_RUN_BUDGET_S = 180
 
 # ─────────────────────────────────────────────────────────── client.* 默认值（§8.1）
 PRESETS: tuple[str, ...] = ("省心", "均衡", "全力以赴")
+# TODO(preset-effect): 目前**没有任何消费方**（定义 1 处、消费 0 处），且「省心=2」与
+# `DEFAULT_CONCURRENT = 3` 本就不一致——切档不会改并发/让路。等 daemon 侧开票接上
+# （RC15-039 #17 复核 M7/S12），在那之前界面不许宣称"切档会改算力"。
 PRESET_CONCURRENCY: dict[str, int] = {"省心": 2, "均衡": 3, "全力以赴": 8}
 DEFAULT_PRESET = "省心"
 DEFAULT_DAILY_TOKENS = 500_000

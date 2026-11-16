@@ -848,3 +848,27 @@ def test_real_tk_auto_refresh_on_the_default_page_updates_its_numbers():
             assert "999.99" in app._last_view.plain_text()
         finally:
             _close(app, root)
+
+
+def test_window_map_and_unmap_rearm_the_auto_refresh_timer():
+    """复核 S4：最大化/最小化/恢复后要**立刻**按新状态重排定时器，不能等满 60s。"""
+    tk, root = _tk_root_or_skip()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, _data = _auto_app(root, Path(home))
+        try:
+            root.update()
+            app._schedule_auto_refresh()
+            before = app._auto_timer
+            assert before is not None
+            root.event_generate("<Unmap>")          # 只投递事件，不真的把窗口藏起来
+            root.update()
+            assert app._auto_timer is not None and app._auto_timer != before
+            again = app._auto_timer
+            root.event_generate("<Map>")
+            root.update()
+            assert app._auto_timer is not None and app._auto_timer != again
+        finally:
+            _close(app, root)
