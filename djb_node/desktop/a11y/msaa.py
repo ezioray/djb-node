@@ -50,7 +50,8 @@ ENV_DISABLE = "DJB_DESKTOP_A11Y"
 #: 调试调用日志路径；不设就**一行都不写**
 ENV_TRACE = "DJB_DESKTOP_A11Y_TRACE"
 
-_E_FAIL = -2147467259            # 0x80004005
+_E_FAIL = -2147467259
+S_FALSE = 1            # 0x80004005
 _E_NOTIMPL = -2147467263         # 0x80004001
 _DISP_E_BADINDEX = -2147352572   # 0x80020004
 _OBJID_CLIENT = -4
@@ -177,6 +178,37 @@ class _Runtime:
     def int_variant(self, target: Any, value: int) -> None:
         target[0].vt = 3                      # VT_I4
         target[0].value = int(value)
+
+
+def _foreground_exe() -> str:
+    """trace 里记「调用发生时前台进程的可执行文件名」。
+
+    注意口径：这是**前台窗口**的进程，不是发起 COM 调用的进程。读屏软件调 acc* 时它自己是
+    前台，所以这一列才会是 ``nvda.exe``；反过来不能拿它当「谁调用的」证据。
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return "-"
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = kernel32.OpenProcess(0x1000, False, pid)     # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return "-"
+        try:
+            buffer = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buffer))
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return "-"
+            return buffer.value.replace("/", "\\").rsplit("\\", 1)[-1] or "-"
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return "-"
 
 
 def _pointer_keys(obj: Any) -> list[str]:
@@ -394,9 +426,9 @@ class Provider:
             return
         try:
             with open(self._trace_path, "a", encoding="utf-8") as fh:
-                fh.write("%s pid=%d method=%s child=%s %s\n"
-                         % (__import__("time").strftime("%H:%M:%S"), os.getpid(), method,
-                            child, extra))
+                fh.write("%s pid=%d fg_exe=%s method=%s child=%s %s\n"
+                         % (__import__("time").strftime("%H:%M:%S"), os.getpid(),
+                            _foreground_exe(), method, child, extra))
         except Exception:
             pass
 
@@ -488,25 +520,21 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                 return E_FAIL
 
         def get_accChild(self, varChild, ppdispChild):
+            """本版全是**简单子元素**：交回 NULL + ``S_FALSE``，客户端用 childId 取属性。
+
+            ``S_FALSE``（不是 E_FAIL！）是 MSAA 的约定：E_FAIL 会让客户端以为这个子元素坏了，
+            NVDA 真机实测就**直接跳过整棵树**（trace 里只有 51 次 accChild、一条 accName 都没有）。
+            跨进程交不出子对象的原因见 ``tree.flatten_for_provider`` 的说明。
+            """
             try:
-                node = self._child_node(varChild)
                 ppdispChild[0] = None
-                if node is None:
-                    return 0 if _child_index(varChild) == 0 else E_FAIL
-                if _child_index(varChild) == 0:
-                    return 0
-                child = self._child_object(self._child_path(varChild))
-                try:
-                    ppdispChild[0] = child.QueryInterface(rt.IDispatch)
-                except Exception:
-                    pointer = _dispatch_pointer(child)
-                    if pointer is None:
-                        self._provider._trace(
-                            "accChild.no_pointer", _child_index(varChild),
-                            "keys=" + ",".join(sorted(_pointer_keys(child))))
-                        return E_FAIL
-                    ppdispChild[0] = rt.ctypes.cast(pointer, rt.POINTER(rt.IDispatch))
-                return 0
+                index = _child_index(varChild)
+                if index == 0:
+                    return S_FALSE
+                return S_FALSE if self._child_path(varChild) is not None else E_FAIL
+            except Exception as exc:
+                self._provider._error("accChild", exc)
+                return E_FAIL
             except Exception as exc:
                 self._provider._error("accChild", exc)
                 return E_FAIL
