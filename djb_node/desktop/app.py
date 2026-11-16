@@ -989,7 +989,13 @@ class DesktopApp:
         # 右对齐按钮上是从右往左，客户按第一下 Tab 就发现焦点跑到最右边去了）
         self._root.bind("<Tab>", lambda _e: self._focus_step(1))
         self._root.bind("<Shift-Tab>", lambda _e: self._focus_step(-1))
-        self._root.bind("<ISO_Left_Tab>", lambda _e: self._focus_step(-1))   # X11 的 Shift+Tab
+        # X11 把 Shift+Tab 报成 ISO_Left_Tab；Windows 的 Tcl/Tk **没有这个 keysym**，
+        # 直接 bind 会抛 TclError，把整个 __init__ 炸掉（0.3.9 真机验证抓到：Windows 上
+        # 客户端根本起不来）。Shift+Tab 已由上一行覆盖，这条纯属可选别名，绑不上就跳过。
+        try:
+            self._root.bind("<ISO_Left_Tab>", lambda _e: self._focus_step(-1))
+        except Exception:
+            pass
         self._root.bind("<Escape>", lambda _e: self._canvas.yview_moveto(0))
 
     def _step_view(self, step: int) -> None:
