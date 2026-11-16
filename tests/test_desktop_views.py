@@ -29,7 +29,9 @@ SPEC_SECTIONS = [
     ("connect", "接入", "CONNECT", ["agent", "access"]),
     ("system", "系统", "SYSTEM", ["yield", "account", "logs"]),
 ]
-#: 合规红线：不许出现「许愿式」金融承诺；「不可提现」这类否定式免责声明是允许的
+#: 合规红线：不许出现「许愿式」金融承诺。**唯一例外**是 owner 2026-11-16 D-2 那句结算口径
+#: （`views.SETTLE_NOTE`，原话里含「提现」）；除它之外任何地方出现「提现」都算违规——
+#: 旧注释写的「『不可提现』这类否定式免责声明是允许的」已作废，别再照它写文案。
 FORBIDDEN_PROMISES = ("充值", "APY", "保本", "固定收益", "储值账户", "稳赚", "保证收益")
 
 
@@ -115,10 +117,11 @@ def test_copy_has_no_forbidden_promises():
         text = vw.build_view(key, snapshot).plain_text()
         for word in FORBIDDEN_PROMISES:
             assert word not in text, (key, word)
-        # 「提现」只允许以否定形式出现（额度不可提现）
-        for index in range(len(text)):
-            if text.startswith("提现", index):
-                assert text[max(0, index - 2):index] == "不可", (key, text[index - 12:index + 6])
+        # 「提现」只允许出现在 SETTLE_NOTE 这一句里（RC15-039 #34：唯一出处）；其余地方
+        # 一律不许提，更不许承诺可提现——这句是 owner D-2 的原话，本身就是否定式
+        # 「收益不等于可提现余额」，所以旧规则「必须以『不可』开头」改成「必须在常量内」。
+        masked = text.replace(vw.SETTLE_NOTE, "")
+        assert "提现" not in masked, (key, masked[max(0, masked.find("提现") - 12):][:24])
 
 
 def test_never_leaks_secrets():
@@ -1196,3 +1199,435 @@ def test_access_copy_node_id_action_returns_clipboard_payload(tmp_path):
     assert missing.ok is False
     assert "接入配置" in missing.message            # 指向能看原因的地方
     assert "先启动一次" not in missing.message
+
+
+# ──────────────────────────── RC15-039 #1：表单校验内联化（字段下方红字 + 聚焦首错）
+def test_field_errors_collect_every_bad_field_at_once():
+    """一次给全部错误（老 ``validate`` 一次只报一条 → 客户改一步、点一次、再被打回）。"""
+    config = ac.AccessConfig(price_mode="跟随平台建议价", node_id="n" * 200,
+                             node_secret="abc\ndef")
+    errors = config.field_errors()
+    assert set(errors) == {"price_mode", "node_id", "node_secret"}
+    assert "价格模式" in errors["price_mode"]
+    # 红字直接显示在输入框下方，不许把内部字段名（node_secret）印到界面上
+    assert "node_secret" not in errors["node_secret"] and "节点凭证" in errors["node_secret"]
+
+
+def test_validate_still_raises_the_first_error_in_the_old_order():
+    """``validate`` 只是取第一条抛出：调用方（老的保存路径）看到的行为不变。"""
+    config = ac.AccessConfig(price_mode="跟随平台建议价", usdt_address="bogus")
+    with pytest.raises(ValueError) as info:
+        config.validate()
+    assert "价格模式" in str(info.value)          # 价格模式仍先于收款地址报
+    assert ac.AccessConfig(node_id="n").field_errors() == {}
+
+
+def test_with_field_errors_is_a_pure_projection():
+    """投影层不产生错误：只有贴错误这一个纯函数会改视图，且空错误 = 原对象。"""
+    base = vw.build_view("access", _access_snapshot(node_id="nd_1", source="config"))
+    assert base.focus_field == "" and all(not item.error for item in base.fields)
+    assert vw.with_field_errors(base, None) is base
+    assert vw.with_field_errors(base, {}) is base
+    # 键不在本页 → 什么都不贴（不许凭空造红字/造焦点）
+    assert vw.with_field_errors(base, {"api_key": "x"}) is base
+
+    marked = vw.with_field_errors(base, {"node_id": "节点标识必须是不超过 128 字符的文本"})
+    assert marked.focus_field == "node_id"
+    field = next(item for item in marked.fields if item.key == "node_id")
+    assert field.error.startswith("节点标识")
+    assert "！节点标识必须是不超过 128 字符的文本" in marked.plain_text()
+    # 其余字段一个字都没变
+    assert [item.value for item in marked.fields] == [item.value for item in base.fields]
+
+
+def test_save_access_returns_field_errors_and_keeps_the_store(tmp_path):
+    """保存失败：逐字段原因随结果回投，配置文件一个字节都不动。"""
+    store = ac.MemoryAccessStore(ac.AccessConfig(node_id="nd_old", price_mode="auto"))
+    controller = make_controller(tmp_path, sections=dict(
+        _access_snapshot(node_id="nd_old", source="config").sections))
+    controller.access = ac.AccessService(store, reloader=lambda: ac.RELOAD_OK)
+    controller.set_draft("price_mode", "跟随平台建议价")
+    controller.set_draft("node_id", "n" * 200)
+    result = controller.action("access.save")
+    assert result.ok is False
+    assert set(result.fields) == {"price_mode", "node_id"}
+    assert "价格模式" in result.message and "2" in result.message
+    assert store.load().price_mode == "auto" and store.load().node_id == "nd_old"
+
+
+def test_save_access_success_clears_field_errors(tmp_path):
+    """改好再存：``fields`` 为空（渲染层据此把红字清掉，不留残留）。"""
+    store = ac.MemoryAccessStore(ac.AccessConfig(node_id="nd_old", price_mode="auto"))
+    controller = make_controller(tmp_path, sections=dict(
+        _access_snapshot(node_id="nd_old", source="config").sections))
+    controller.access = ac.AccessService(store, reloader=lambda: ac.RELOAD_OK)
+    controller.set_draft("price_mode", "manual")
+    result = controller.action("access.save")
+    assert result.ok is True and result.fields == {}
+    assert store.load().price_mode == "manual"
+
+
+# ──────────────────── RC15-039 #5：日志的「原因 / 下一步」真上屏 + 级别筛选真能筛
+def _logs_snapshot(rows):
+    sections = dict(demo_snapshot().sections)
+    sections["logs"] = {"rows": rows, "levels": list(ds.LOG_LEVELS), "total": len(rows),
+                        "note": "", "path": "/tmp/djb-test/logs/desktop.jsonl"}
+    return ds.Snapshot(sections)
+
+
+_LOG_ROWS = [
+    {"ts": "2026-11-16T10:00:01Z", "level": "info", "event": "daemon.started", "fields": {}},
+    {"ts": "2026-11-16T10:00:05Z", "level": "error", "event": "upstream.probe_failed",
+     "fields": {"reason": "上游返回 401", "next_step": "在接入配置里更新密钥"}},
+    {"ts": "2026-11-16T10:00:09Z", "level": "warning", "event": "yield.detected",
+     "fields": {"reason": "全屏游戏在前台"}},
+]
+
+
+def test_logs_table_shows_reason_and_next_step_verbatim():
+    """错误行自带的 reason / next_step **原样**上屏；没有就写「—」，绝不编一句原因。"""
+    view = vw.build_view("logs", _logs_snapshot(_LOG_ROWS))
+    assert view.table.columns == ("级别", "时间", "事件", "原因", "下一步")
+    error_row = view.table.rows[1]
+    assert error_row.cells[3] == "上游返回 401"
+    assert error_row.cells[4] == "在接入配置里更新密钥"
+    # 行里没有这两个字段 → 两个「—」（不是空字符串，也不是「成功」）
+    assert view.table.rows[0].cells[3:] == ("—", "—")
+    assert "在接入配置里更新密钥" in view.plain_text()
+
+
+def test_logs_has_a_real_level_filter_and_no_phantom_promise():
+    """页脚旧文案承诺「all / debug / info / …」却没有控件（走查原话）。
+
+    现在：筛选项是真的（每个级别一个 option）、页脚只说它真做了什么。
+    """
+    view = vw.build_view("logs", _logs_snapshot(_LOG_ROWS))
+    item = view.filters[0]
+    assert item.key == "log_level" and item.action == "logs.filter"
+    values = [value for value, _text in item.options]
+    assert values == ["all"] + list(ds.LOG_LEVELS)
+    assert item.current_text() == "全部级别"
+    assert "只改本页显示" in view.plain_text()
+    assert "筛选只改本页显示；日志文件本身一个字都不动。" in view.notes
+
+
+def test_controller_log_filter_really_filters_and_leaves_the_file_alone(tmp_path):
+    """级别筛选是**真筛**（filter 之前只有一句页脚）：行数、卡片、复制内容一起变。"""
+    controller = make_controller(tmp_path, sections=dict(_logs_snapshot(_LOG_ROWS).sections))
+    controller.show("logs")
+    controller.set_draft("log_level", "error")
+    result = controller.action("logs.filter")
+    assert result.ok and result.effect == "filter"
+    assert "1 行" in result.message and "未改动" in result.message
+    view = controller.current()
+    assert len(view.table.rows) == 1 and "error" in view.table.rows[0].cells[0]
+    assert view.filters[0].current_text() == "error（错误）"
+    assert "共 3 行 · 已筛选" in view.plain_text()          # 卡片说清「1 是筛出来的」
+    assert controller.drafts == {}                          # 筛选不写进配置草稿
+    # 复制跟随筛选：只剩筛出来的那一行
+    copied = controller.action("logs.copy")
+    assert "upstream.probe_failed" in copied.payload and "daemon.started" not in copied.payload
+    controller.set_draft("log_level", "all")
+    controller.action("logs.filter")
+    assert len(controller.current().table.rows) == 3
+
+
+def test_controller_log_filter_refuses_an_unknown_level(tmp_path):
+    """不认识的级别：明确拒绝，**不许**静默退回「全部」（那会让客户以为筛过了）。"""
+    controller = make_controller(tmp_path, sections=dict(_logs_snapshot(_LOG_ROWS).sections))
+    controller.show("logs")
+    controller.set_draft("log_level", "alert")
+    result = controller.action("logs.filter")
+    assert result.ok is False and "alert" in result.message
+    assert len(controller.current().table.rows) == 3
+
+
+# ───────────────── RC15-039 #4：自动刷新（可见 10s / 最小化或空闲 60s；可关；不叠请求）
+def test_auto_refresh_defaults_on_and_the_toggle_is_on_the_settings_page():
+    """默认开 + 开关就在「本机设置」（不是藏在配置文件里）。"""
+    controller = DesktopController(ds.FakeDataSource(dict(demo_snapshot().sections)))
+    assert controller.auto_refresh is True
+    view = controller.show("access")
+    toggle = view.switches[0]
+    assert toggle.key == "auto_refresh" and toggle.value is True
+    assert toggle.action == "access.toggle_auto_refresh"
+    assert "[自动刷新：开]" in view.plain_text()
+
+    controller.set_draft("auto_refresh", "off")
+    result = controller.action("access.toggle_auto_refresh")
+    assert result.ok and "已关闭" in result.message
+    assert controller.auto_refresh is False
+    assert "[自动刷新：关]" in controller.current().plain_text()
+    assert controller.drafts == {}                 # 开关值不进配置草稿
+
+
+def test_auto_refresh_switch_refuses_an_unknown_state():
+    controller = DesktopController(ds.FakeDataSource(dict(demo_snapshot().sections)))
+    controller.set_draft("auto_refresh", "maybe")
+    result = controller.action("access.toggle_auto_refresh")
+    assert result.ok is False and controller.auto_refresh is True
+
+
+def test_quiet_refresh_never_clobbers_the_message_but_reports_failures(tmp_path):
+    """自动刷新是后台动作：成功不许顶掉客户正在读的那句；失败必须留一句。"""
+    controller = make_controller(tmp_path)
+    controller.message = "未保存：价格模式必须是 auto / manual"
+    controller.apply_refresh(controller.snapshot, sections=("status",), quiet=True)
+    assert controller.message == "未保存：价格模式必须是 auto / manual"
+
+    controller.apply_refresh(None, sections=("status",), error=RuntimeError("boom"), quiet=True)
+    assert "刷新失败" in controller.message         # 失败不静默
+
+
+def test_theme_save_keeps_the_auto_refresh_flag(tmp_path):
+    """切主题是读改写：不许把「自动刷新已关闭」顺手重置成默认。"""
+    from djb_node.desktop import theme as dual
+
+    dual.save_flag("auto_refresh", False, tmp_path)
+    dual.save("night", tmp_path)
+    payload = dual.load_prefs(tmp_path)
+    assert payload == {"auto_refresh": False, "theme": "night"}
+    assert dual.load_flag("auto_refresh", tmp_path, default=True) is False
+    dual.save("day", tmp_path)
+    assert dual.load_flag("auto_refresh", tmp_path, default=True) is False
+    assert dual.load(tmp_path) == "day"
+
+
+# ───────────────── RC15-039 #17：档位三档（全速/均衡/省心）、二次确认、回读 daemon
+def _yield_sections(preset: str, state: str = "online") -> dict:
+    sections = dict(demo_snapshot().sections)
+    sections["yield"] = {"state": state, "reason": None, "reason_label": None,
+                         "accepting": state != "paused", "mode": "balanced",
+                         "preset": preset, "yield_enabled": True}
+    return sections
+
+
+def test_yield_table_has_exactly_three_tiers_and_paused_is_not_one_of_them(tmp_path):
+    """owner D-1：档位只有三个；``paused`` 是状态，不许占一行。"""
+    text = make_controller(tmp_path, sections=_yield_sections("均衡")).show("yield").plain_text()
+    assert "三档模式" in text and "四档" not in text
+    for label in ("全速", "均衡", "省心"):
+        assert label in text
+    assert "暂停 |" not in text                      # 表里没有「暂停」这一行
+    assert "| paused" not in text
+    # 暂停时：表还是三行，当前档位照旧显示（暂停不吞掉档位）
+    paused = make_controller(tmp_path, sections=_yield_sections("省心", "paused")).show("yield")
+    assert [row.key for row in paused.table.rows] == ["full", "balanced", "saver"]
+    assert "✓ 当前" in paused.plain_text()
+    assert any("已暂停" in card.value for card in paused.cards)
+
+
+def test_yield_current_tier_comes_from_the_preset_and_degrades_honestly(tmp_path):
+    view = make_controller(tmp_path, sections=_yield_sections("全力以赴")).show("yield")
+    # RC15-039 复核 M7：说明列已删（列 = 档位 / 键 / 当前）
+    assert view.table.columns == ("档位", "键", "当前")
+    current = [row.cells[0] for row in view.table.rows if "当前" in row.cells[2]]
+    assert current == ["全速"]                        # 「全速」在本机命令里叫「全力以赴」
+    assert view.table.activate == "yield.apply_mode"  # 回车/双击能切
+    unknown = make_controller(tmp_path, sections=_yield_sections("")).show("yield")
+    assert not any("当前" in row.cells[2] for row in unknown.table.rows)
+    assert "未知（没有回读到）" in unknown.plain_text()
+
+
+class _PresetCli:
+    """假 CLI：记下每次调用；``limits --preset`` 写进 ``preset``，``status`` 回报它。"""
+
+    def __init__(self, preset: str, *, readback: str | None = None, boom: bool = False,
+                 disk: str | None = None) -> None:
+        self.preset = preset
+        self.readback = readback                # None = 回读就是写入值
+        self.boom = boom
+        # `disk` = 本机配置里的**真**档位（可与快照不同：造"快照落后"用）
+        self.disk = preset if disk is None else disk
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, argv):
+        argv = tuple(argv)
+        self.calls.append(argv)
+        if self.boom and argv[:1] == ("limits",):
+            raise RuntimeError("boom")
+        if argv[:1] == ("limits",) and "--json" in argv and "--preset" not in argv:
+            # 复核 M6：`djb limits --json` 只读本机 profile（离线可用），不写任何东西
+            return {"profile": {"preset": self.disk}}
+        if argv[:1] == ("limits",) and "--preset" in argv:
+            self.preset = argv[argv.index("--preset") + 1]
+            self.disk = self.preset                 # 写也写在本机配置上
+            return {"profile": {"preset": self.preset}}
+        if argv[:1] == ("status",):
+            seen = self.preset if self.readback is None else self.readback
+            return {"state": "online", "profile": {"preset": seen}}
+        return {}
+
+
+def test_switch_tier_needs_a_selection_a_tier_and_a_second_confirmation(tmp_path):
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    cli = _PresetCli("均衡")
+    controller.cli = cli
+    assert controller.action("yield.apply_mode").ok is False      # 没选行
+    assert cli.calls == []
+
+    controller.select_row("yield", "暂停")                          # 选中不是档位的行
+    assert "不是档位" in controller.action("yield.apply_mode").message
+
+    controller.select_row("yield", "省心")                          # 选了，但确认框被取消
+    asked: list[str] = []
+    result = controller.action("yield.apply_mode", confirm=lambda text: asked.append(text) or False)
+    assert result.effect == "cancelled" and result.ok is False
+    assert "已取消切换" in result.message
+    # 取消就一个字节都不写（`limits --json` 是**只读**读原档，不算写；复核 M6）
+    assert [call for call in cli.calls if "--preset" in call] == []
+    assert ("limits", "--json") in cli.calls
+    assert "在跑的任务不会被打断" in asked[0] and "回读" in asked[0]
+
+
+def test_switch_tier_writes_the_preset_and_verifies_the_daemon_readback(tmp_path):
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    cli = _PresetCli("均衡")
+    controller.cli = cli
+    controller.select_row("yield", "省心")
+    result = controller.action("yield.apply_mode", confirm=lambda _text: True)
+    assert result.ok is True and result.effect == "refresh"
+    assert ("limits", "--preset", "省心") in cli.calls               # 写的是命令的取值
+    assert ("status",) in cli.calls                                 # 独立回读
+    assert "已切到「省心」" in result.message and "回读" in result.message
+
+
+def test_switch_tier_mismatch_writes_the_old_tier_back_and_says_so(tmp_path):
+    """回读不一致 = 失败（owner D-1）：写回原档 + 出声，界面不许装作切成功了。"""
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    cli = _PresetCli("均衡", readback="全力以赴")                    # daemon 回报的却是全速
+    controller.cli = cli
+    controller.select_row("yield", "省心")
+    result = controller.action("yield.apply_mode", confirm=lambda _text: True)
+    assert result.ok is False
+    assert ("limits", "--preset", "均衡") in cli.calls               # 写回原档
+    assert "回读" in result.message and "「均衡」档" in result.message
+
+
+def test_switch_tier_without_a_readback_is_not_success(tmp_path):
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    controller.cli = _PresetCli("均衡", readback="")                 # daemon 没跑：没有 profile
+    controller.select_row("yield", "省心")
+    result = controller.action("yield.apply_mode", confirm=lambda _text: True)
+    assert result.ok is False
+    assert "回读不到" in result.message and "不是" not in result.message
+
+
+def test_switch_tier_reports_an_already_current_tier_and_a_write_failure(tmp_path):
+    controller = make_controller(tmp_path, sections=_yield_sections("省心"))
+    controller.cli = _PresetCli("省心")
+    controller.select_row("yield", "省心")
+    assert "已经" in controller.action("yield.apply_mode", confirm=lambda _t: True).message
+
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    controller.cli = _PresetCli("均衡", boom=True)
+    controller.select_row("yield", "全速")
+    result = controller.action("yield.apply_mode", confirm=lambda _t: True)
+    assert result.ok is False and "档位未切换" in result.message
+
+
+# ───────────────── RC15-039 #34：结算口径只剩一个常量（owner D-2 原文，逐字）
+def test_settlement_wording_is_one_constant_used_verbatim(tmp_path):
+    from djb_node.desktop.views import SETTLE_NOTE
+
+    assert SETTLE_NOTE == "结算币种：USDT（按 1 USDT = 1 USD 展示）；收益不等于可提现余额。"
+    text = make_controller(tmp_path).show("earnings").plain_text()
+    assert text.count(SETTLE_NOTE) == 1
+    # 四张卡的去向都要能对上这一句：余额卡不许暗示可提现
+    for card in ("[今日]", "[待结算]", "[已结算]", "[余额（可用）]"):
+        assert card in text
+    assert "余额（可用）" in text and "可提现" not in text.split("[余额（可用）]")[1].splitlines()[0]
+
+
+def test_no_view_promises_settlement_with_the_old_conflicting_lines(tmp_path):
+    """全客户端（13 页）不许再出现互相打脸的那两句手写文案。"""
+    controller = make_controller(tmp_path)
+    for key in vw.VIEW_KEYS:
+        text = controller.show(key).plain_text()
+        assert "不可提现" not in text, key
+        assert "直接结算" not in text, key
+
+
+def test_rollback_uses_the_real_local_tier_not_the_stale_snapshot(tmp_path):
+    """复核 M6：快照落后 + 回读失败 —— 写回必须是**本机配置里的真原档**。
+
+    旧实现 `before = current_preset()` 读快照：真原档「省心」、快照「均衡」时，
+    失败消息会说"已写回原来的「均衡」档"，落盘变成谁也没选过的值。
+    """
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))   # 快照说「均衡」
+    cli = _PresetCli("均衡", readback="", disk="省心")                          # 真原档是「省心」
+    controller.cli = cli
+    controller.select_row("yield", "均衡")                       # 客户要切到「均衡」
+    result = controller.action("yield.apply_mode", confirm=lambda _t: True)
+
+    assert result.ok is False
+    # 写「均衡」（用户选的）→ 回读不到 → 写回**真原档「省心」**（不是快照里的「均衡」）
+    written = [call[2] for call in cli.calls
+               if call[:1] == ("limits",) and "--preset" in call]
+    assert written == ["均衡", "省心"]
+    assert cli.disk == "省心"                                    # 落盘还是真原档
+    assert "写回原来的「省心」" in result.message
+
+
+def test_rollback_refuses_to_guess_when_the_local_tier_is_unreadable(tmp_path):
+    """复核 M6：读不到真原档 → **不回写**，并明说「原档未知，请手动选一次」。"""
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    cli = _PresetCli("均衡", readback="", disk="")
+    controller.cli = cli
+    controller.select_row("yield", "省心")
+    asked: list[str] = []
+    result = controller.action("yield.apply_mode", confirm=lambda text: asked.append(text) or True)
+
+    assert result.ok is False
+    written = [call for call in cli.calls if call[:1] == ("limits",) and "--preset" in call]
+    assert written == [("limits", "--preset", "省心")]           # 只写了用户选的那一次
+    assert "原档位未知" in result.message and "手动选一次" in result.message
+    assert cli.disk == "省心"                                    # 只写了用户选的那一次
+    # 确认框里就要先讲清楚：读不到原档 → 失败时不回写
+    assert "不会" in asked[0] and "回写" in asked[0]
+
+
+def test_log_empty_text_does_not_claim_the_file_is_missing_when_it_is_only_filtered(tmp_path):
+    """复核 M4：筛到 0 行 ≠「日志文件尚未生成」（同屏卡片写着「共 4 行」）。
+
+    三种「表体为空」必须分开说：筛空 / 有行但解析不出 / 真没有日志。
+    """
+    controller = make_controller(tmp_path)
+    controller.show("logs")
+    view = controller.set_log_level("debug")            # demo 数据里没有 debug 行
+    text = view.plain_text()
+    assert view.table.rows == ()
+    assert "当前筛选（debug）下没有日志行" in text
+    assert "日志文件尚未生成" not in text
+    assert "共 4 行" in text                            # 卡片仍说真话：文件里有 4 行
+
+    # 真没有日志（域可用、total=0）时才说「尚未生成」
+    sections = dict(demo_snapshot().sections)
+    sections["logs"] = {"rows": [], "total": 0, "levels": ["info"], "level": "all",
+                        "path": "~/.djb/logs/daemon.log"}
+    empty = make_controller(tmp_path, sections=sections).show("logs").plain_text()
+    assert "日志文件尚未生成" in empty
+
+
+def test_yield_copy_only_claims_what_this_version_actually_does(tmp_path):
+    """复核 M7（owner a′）：说明列三句删掉；「已回读」只在切档成功后才出现。
+
+    验收原话：这一页 `plain_text()` 里不许同时出现「满载/实时算力/不使用电脑时」
+    与「不生效」这类互斥说法。
+    """
+    sections = _yield_sections("均衡")
+    controller = make_controller(tmp_path, sections=sections)
+    text = controller.show("yield").plain_text()
+    for phrase in ("满载", "实时算力", "不使用电脑时"):
+        assert phrase not in text, phrase
+    assert "本版只记录档位偏好" in text and "后续版本生效" in text
+    assert "不生效" not in text
+    assert "已回读" not in text                    # 首屏没有任何回读动作
+
+    # 切档成功（回读一致）之后：「已回读」才出现
+    sections["yield"]["preset"] = "省心"           # 落盘后数据源读到的就是新档
+    controller.cli = _PresetCli("均衡")
+    controller.select_row("yield", "省心")
+    result = controller.action("yield.apply_mode", confirm=lambda _t: True)
+    assert result.ok is True, result.message
+    assert "已回读" in controller.show("yield").plain_text()

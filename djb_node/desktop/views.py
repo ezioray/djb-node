@@ -14,7 +14,9 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
@@ -26,8 +28,11 @@ from .. import facts
 
 __all__ = [
     "Action", "Card", "Chart", "Field", "GaugeData", "Hero", "Mark", "Metric", "NAV_SECTIONS",
-    "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "VIEWS",
+    "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "Toggle",
+    "VIEWS",
     "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
+    "YIELD_PRESET_BY_KEY", "YIELD_PRESET_BY_LABEL", "YIELD_TIERS",
+    "Filter", "with_field_errors",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -192,12 +197,19 @@ class Row:
 class Table:
     columns: tuple[str, ...]
     rows: tuple[Row, ...] = ()
+    #: 表格自称的名字（读屏进表格时念的第一句）。空 = 用「表格」兜底。
+    #: 压平后行是 ` | ` 拼接，这个名字 + 列序 + 总行数是唯一能补回列语义的地方。
+    title: str = ""
     note: str = ""
     empty: str = "暂无数据"
     #: 窄窗（E10 口径 390）下先让位的列；数据不丢，详情抽屉里仍是全字段
     narrow_hide: tuple[str, ...] = ()
     #: 窄窗下的表头短名（只改表头，不改数据）
     narrow_headers: tuple[tuple[str, str], ...] = ()
+    #: RC15-039 #17：回车/双击**激活**这一行时派发的动作（``""`` = 老行为：只看详情）。
+    #: 只给「行本身就是一个可执行选择」的表用（让路页的三档就是）；收据/日志这类
+    #: 行不是动作，保持默认空，回车仍然只是打开详情。
+    activate: str = ""
 
 
 @dataclass(frozen=True)
@@ -231,12 +243,60 @@ class Field:
     #: 非空 ⇒ 渲染成**只读下拉**（``ttk.Combobox`` + ``state="readonly"``）。
     #: 只影响渲染；校验仍在动作侧（下拉选不出非法值，但手改配置/老快照可能带别的值）。
     choices: tuple[str, ...] = ()
+    #: 字段级错误（一句话）。非空 ⇒ 红字渲染在**该字段下方**并参与「聚焦首个错误」
+    #: （RC15-039 #1）。默认空 = 0.3.7 行为；错误不由投影层产生，由动作层回投
+    #: （见 :func:`with_field_errors`），所以 13 个视图的既有快照一字不变。
+    error: str = ""
 
     def can_reveal(self) -> bool:
         """是否画「显示 / 隐藏」：只有**可编辑**的秘密字段才有意义（只读值本就是掩码）。"""
         if not (self.editable and self.secret):
             return False
         return True if self.revealable is None else bool(self.revealable)
+
+
+@dataclass(frozen=True)
+class Filter:
+    """表格上方的一条下拉筛选（RC15-039 #5：日志级别筛选的**真**入口）。
+
+    为什么单独一个类型而不是复用 ``Field``：``Field`` 会被 ``app._on_action`` 收成草稿
+    交给「保存配置」，而日志筛选是**本机只读视图状态**——混进草稿会写出「草稿字段不被支持」
+    的告警，甚至把 `log_level` 写进接入配置。筛选有自己的动作 key（``action``）。
+    """
+
+    key: str
+    label: str
+    #: (值, 显示文案)：值是内部契约（``all`` / ``debug`` …），文案是客户看到的
+    options: tuple[tuple[str, str], ...] = ()
+    value: str = ""
+    #: 选中后派发的动作 key；动作侧从草稿 ``key`` 读新值
+    action: str = ""
+    #: 一句话说明「筛选影响什么、不影响什么」
+    hint: str = ""
+
+    def current_text(self) -> str:
+        for value, text in self.options:
+            if value == self.value:
+                return text
+        return self.value or "—"
+
+
+@dataclass(frozen=True)
+class Toggle:
+    """一条开关（RC15-039 #4：自动刷新在「本机设置」里可以关掉）。
+
+    值来自 controller 的**本机界面状态**（不是服务端配置），投影层只负责说明它是什么。
+    """
+
+    key: str
+    label: str
+    value: bool = True
+    hint: str = ""
+    #: 选中后派发的动作 key（把值写成草稿再派发，与 ``Filter`` 同一条路）
+    action: str = ""
+
+    def text(self) -> str:
+        return "开" if self.value else "关"
 
 
 @dataclass(frozen=True)
@@ -353,6 +413,13 @@ class View:
     hero: Hero | None = None
     chart: Chart | None = None
     rail: tuple[RailCard, ...] = ()
+    #: 表格上方的下拉筛选（RC15-039 #5）。默认空 = 0.3.7 行为（没有筛选控件）。
+    filters: tuple[Filter, ...] = ()
+    #: 开关（RC15-039 #4）。默认空 = 0.3.7 行为（页面上没有开关）。
+    switches: tuple[Toggle, ...] = ()
+    #: 渲染后要**获得键盘焦点**的字段 key（RC15-039 #1：校验失败聚焦首个错误字段）。
+    #: 空 = 不动焦点（0.3.7 行为）。由 :func:`with_field_errors` 填，投影层自己不产生。
+    focus_field: str = ""
 
     def plain_text(self) -> str:
         """文本快照（证据 / 无显示环境验收）：稳定顺序，无时间戳抖动。
@@ -374,6 +441,13 @@ class View:
             lines.extend(_chart_text(self.chart))
         if self.rail:
             lines.extend(_rail_text(self.rail))
+        for item in self.switches:
+            lines.append("[" + item.label + "：" + item.text() + "]"
+                         + (("   " + item.hint) if item.hint else ""))
+        for item in self.filters:
+            lines.append("")
+            lines.append("筛选 " + item.label + "：" + item.current_text()
+                         + (("   " + item.hint) if item.hint else ""))
         for table in ((self.table,) + self.tables if self.table is not None else self.tables):
             lines.append("")
             lines.append(" | ".join(table.columns))
@@ -390,8 +464,13 @@ class View:
         if self.fields:
             lines.append("")
             for item in self.fields:
-                lines.append(item.label + "：" + item.value
-                             + (("   " + item.hint) if item.hint else ""))
+                line = item.label + "：" + item.value
+                if item.hint:
+                    line += "   " + item.hint
+                if item.error:
+                    # 红字的文本形态：与屏幕上同一条文案（证据/读屏都靠它）
+                    line += "   ！" + item.error
+                lines.append(line)
         if self.actions:
             lines.append("")
             for action in self.actions:
@@ -400,6 +479,32 @@ class View:
         for note in self.notes:
             lines.append("· " + note)
         return "\n".join(lines)
+
+
+def with_field_errors(view: View, errors: Mapping[str, str] | None) -> View:
+    """把动作层回投的**字段级错误**贴到视图上（RC15-039 #1）。
+
+    为什么在这里而不是在 ``View`` 的构造里：错误是**一次动作的结果**，不是数据的投影。
+    投影层保持纯函数（13 个视图的快照不因错误而变），渲染层只在渲染前调用这一个纯函数。
+    ``errors`` 为空时原样返回同一个对象（``is`` 相等），老路径零开销、零行为变化。
+
+    只贴到**同名的可编辑字段**上：键不在本页的字段（例如在别的页保存）不许凭空造出红字。
+    """
+    if not errors:
+        return view
+    applied: list[Field] = []
+    focus = ""
+    for item in view.fields:
+        message = str(errors.get(item.key) or "") if item.key else ""
+        if not message:
+            applied.append(item)
+            continue
+        applied.append(replace(item, error=message))
+        if not focus:
+            focus = item.key
+    if not focus:                      # 本页没有这些字段：什么都没贴，别造空焦点
+        return view
+    return replace(view, fields=tuple(applied), focus_field=focus)
 
 
 def _hero_text(hero: Hero) -> list[str]:
@@ -521,6 +626,13 @@ def _empty_text(snapshot: Snapshot, name: str, text: str) -> str:
     return text if snapshot.ok(name) else UNAVAILABLE
 
 
+#: RC15-039 #34：结算口径的**唯一出处**（owner 2026-11-16 D-2 原文，逐字照抄，不许改写）。
+#: 全客户端只许引用这个名字，别处不许再手写同类句子（验收口径见票面 §0.1 D-2）。
+#: 为什么合成一句：走查里那两句（一句说「完成就结算」，一句说「不能提」）同屏出现，
+#: 客户读成两个互相打脸的承诺。现在只剩这一句，收益页四卡的去向都对得上它。
+SETTLE_NOTE = "结算币种：USDT（按 1 USDT = 1 USD 展示）；收益不等于可提现余额。"
+
+
 def _section(snapshot: Snapshot, name: str) -> Mapping[str, Any]:
     value = snapshot.get(name)
     return value if isinstance(value, Mapping) else {}
@@ -531,11 +643,14 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 
 # ─────────────────────────────────────────────── 总览：主卡 / 节奏图 / 右栏（设计样 v2.1）
-#: 让路模式的短说明（与 :func:`_yield` 的模式表同源，改文案只改这里）
+#: 让路模式的短说明（总览主卡/右栏用；改文案只改这里）。
+#: RC15-039 复核 M7（owner a′）：原来这三档写的是"只要接单就满载 / 工作时段实时算力 /
+#: 只在我不使用电脑时工作"——本版 daemon 不按档位改并发（`facts.PRESET_CONCURRENCY` 零消费），
+#: 这三句就是假承诺；统一改成"只记录偏好"。``paused`` 是**真**行为（停止接新任务），保留。
 YIELD_MODE_SUMMARY = {
-    "full": "只要接单就满载",
-    "balanced": "工作时段实时算力，其余慢任务",
-    "saver": "只在我不使用电脑时工作",
+    "full": "本版仅记录档位偏好",
+    "balanced": "本版仅记录档位偏好",
+    "saver": "本版仅记录档位偏好",
     "paused": "不接新任务；在途任务按护栏处理",
 }
 
@@ -840,13 +955,15 @@ def _overview(snapshot: Snapshot) -> View:
         Card("余额（可用）",
              ("暂不可用" if earnings.get("balance_note") and earnings.get("balance") is None
               else _num(earnings.get("balance") or status.get("balance"))),
-             ("账户预付款 · 不可提现" if earnings.get("balance") is not None
-              else str(earnings.get("balance_note") or "额度不可提现，仅抵扣推理")),
+             ("账户预付款 · 结算口径见「收益」页" if earnings.get("balance") is not None
+              else str(earnings.get("balance_note") or "余额暂不可用；结算口径见「收益」页")),
              "default"),
         Card("接单状态", state_text, str(reason or "无让路原因"), tone),
         Card("资源", _bytes(_section(snapshot, "bench").get("mem_available_bytes")) + " 可用内存",
              "CPU " + str(_section(snapshot, "bench").get("cpu_count") or "—") + " 核", "default"),
-        Card("让路 / 节能", str(yield_state.get("mode") or "未设置"),
+        Card("让路 / 节能",
+             YIELD_LABEL_BY_KEY.get(str(yield_state.get("mode") or ""),
+                                    str(yield_state.get("mode") or "未设置")),
              "暂停后与托盘一致", "muted"),
     )
     rows = _receipt_rows(receipts.get("rows"))
@@ -860,7 +977,7 @@ def _overview(snapshot: Snapshot) -> View:
                     narrow_hide=("时间", "Tokens"),
                     narrow_headers=(("本机校验", "校验"),),
                     note=str(receipts.get("note") or ""),
-                    empty="还没有收据（完成后自动生成）"),
+                    empty="还没有收据（完成后自动生成）", title="最近收据"),
         # 设计样新增：左栏主卡 + 节奏图，右栏三卡（数据仍全部来自上面这些既有数据域）
         hero=_hero(snapshot),
         chart=_hourly_chart(snapshot),
@@ -989,7 +1106,7 @@ def _bench(snapshot: Snapshot) -> View:
         subtitle="环境检测 + CPU/内存/磁盘 + 可选 GPU",
         cards=cards,
         table=Table(("检查项", "结论", "下一步"), tuple(rows),
-                    note="检查项来自本机只读探测", empty="环境检测暂不可用"),
+                    note="检查项来自本机只读探测", empty="环境检测暂不可用", title="环境检测"),
         actions=(Action("bench.run", "开始跑分（≤10 秒）", primary=True),
                  Action("bench.copy", "复制结果")),
         unavailable=_missing(snapshot, ("bench",)),
@@ -1102,7 +1219,7 @@ def _models(snapshot: Snapshot) -> View:
     probe_table = Table(("模型", "上游", "最近探测", "L2", "L3", "用量", "状态", "原因"),
                         tuple(rows),
                         note=str(probe.get("unavailable") or ""),
-                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论")
+                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论", title="模型探测")
 
     # ── 云端目录（原 4 列，保留为附加表：它是「云端认为该有哪些模型」，与探针事实互补）
     catalog = models.get("catalog") if isinstance(models.get("catalog"), list) else []
@@ -1133,7 +1250,7 @@ def _models(snapshot: Snapshot) -> View:
                     "model-sync 状态", "default")),
         table=probe_table,
         tables=(Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(catalog_rows),
-                      note=str(models.get("note") or ""), empty="云端目录暂不可用"),),
+                      note=str(models.get("note") or ""), empty="云端目录暂不可用", title="模型目录"),),
         # G1-1（RC14 P0）：**摘掉**「保存并上报意向」这颗按钮（键名见 commit / NODE.md）。
         # 表里根本没有开关控件，副标题却写「逐模型开关」，按钮点了又永远无声
         # （云端意向上报接口未接线）——虚假承诺比缺按钮更伤。
@@ -1168,7 +1285,7 @@ def _gpu(snapshot: Snapshot) -> View:
                     str(gpu.get("note") or "—"), "mint" if present else "muted"),),
         table=Table(("型号", "厂商", "显存 已用/总", "温度", "利用率"), tuple(rows),
                     note=str(gpu.get("note") or ""),
-                    empty="本机无可用 GPU（nvidia-smi / rocm-smi 都没有输出）"),
+                    empty="本机无可用 GPU（nvidia-smi / rocm-smi 都没有输出）", title="显卡"),
         actions=(Action("gpu.refresh", "刷新"),),
         unavailable=_missing(snapshot, ("gpu",)),
         notes=("没有 GPU 不隐藏本页；显存/温度/利用率只在真读到时展示。",),
@@ -1210,7 +1327,7 @@ def _tasks(snapshot: Snapshot) -> View:
         table=Table(("任务", "状态", "耗时", "Tokens", "收据号"), tuple(rows),
                     narrow_hide=("耗时", "收据号"),
                     note=str(tasks.get("note") or ""),
-                    empty=_empty_text(snapshot, "tasks", "当前没有任务")),
+                    empty=_empty_text(snapshot, "tasks", "当前没有任务"), title="任务"),
         actions=(Action("tasks.refresh", "刷新"),),
         unavailable=_missing(snapshot, ("tasks",)),
         notes=("状态列给云端原词（recorded/settled/…）+ 中文；「进行中」来自 inflight 字段。",
@@ -1243,12 +1360,12 @@ def _receipts(snapshot: Snapshot) -> View:
                     note=str(receipts.get("note") or ""),
                     empty=_empty_text(snapshot, "receipts", "还没有收据"),
                     narrow_hide=("时间", "Tokens"),
-                    narrow_headers=(("本机校验", "校验"),)),
+                    narrow_headers=(("本机校验", "校验"),), title="收据明细"),
         actions=(Action("receipts.verify", "校验选中收据", enabled=bool(rows),
                         reason="没有可校验的收据"),),
         unavailable=_missing(snapshot, ("receipts",)),
         notes=("状态列是云端受理结果（accepted/rejected/expired）；「本机校验」列才是本机比对结论。",
-               "哈希 / seq 用等宽字体 + 弱化颜色；证据常驻但不发光。"),
+               "哈希与 seq 可以原样复制给对方核对；颜色只用来弱化，不承载信息。"),
     )
 
 
@@ -1272,9 +1389,11 @@ def _earnings(snapshot: Snapshot) -> View:
     currency = str(earnings.get("currency") or "USDT")
     return View(
         key="earnings", title="收益",
-        subtitle="按完成任务直接结算 " + currency,
+        # 副标题只做「这是哪一页」；结算口径统一引用常量（不再各处手写一句）
+        subtitle="收益明细 · " + SETTLE_NOTE,
         cards=(Card("今日", _money(snapshot, "earnings", earnings.get("today"), currency),
-                    _today_note(earnings.get("today")) or "完成即结算", "mint"),
+                    # 「完成即结算」会和「待结算」自相矛盾：今日只说「已经进了结算流程」
+                    _today_note(earnings.get("today")) or "今天完成，已进入结算流程", "mint"),
                Card("待结算", _money(snapshot, "earnings", earnings.get("pending")),
                     "结算中不代表到账", "amber"),
                Card("已结算", _money(snapshot, "earnings", earnings.get("settled")),
@@ -1283,11 +1402,12 @@ def _earnings(snapshot: Snapshot) -> View:
                     ("暂不可用" if earnings.get("balance_note") and
                      earnings.get("balance") is None
                      else _money(snapshot, "earnings", earnings.get("balance"))),
-                    "账户预付款 · 不可提现", "muted")),
+                    # 余额卡**不许**暗示可提现（owner D-2）：meta 只留「这一列是余额」
+                    "可用余额 · 口径见本页副标题", "muted")),
         table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
                     narrow_hide=("币种", "时间"),
                     note=str(earnings.get("note") or ""),
-                    empty=(UNAVAILABLE if not available else "暂无计费明细")),
+                    empty=(UNAVAILABLE if not available else "暂无计费明细"), title="计费明细"),
         actions=(Action("earnings.export", "导出明细", enabled=bool(rows),
                         reason=("暂不可用" if not available else "没有可导出的记录")),),
         unavailable=_missing(snapshot, ("earnings",)),
@@ -1608,11 +1728,11 @@ def _token_plan(snapshot: Snapshot) -> View:
                     narrow_hide=("目录",),
                     note=planned + ("｜" + discover_note if discover_note else ""),
                     empty=("还没有模型行：填「请求链接」与「密钥」，再点「读取模型清单」。"
-                           if snapshot.ok("token_plan") else UNAVAILABLE)),
+                           if snapshot.ok("token_plan") else UNAVAILABLE), title="上游报价"),
         tables=(Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
                       narrow_hide=("最近验证",),
                       note="验证通过且新鲜的模型才会进入共享容量",
-                      empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE)),),
+                      empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE), title="上游接入"),),
         fields=fields,
         actions=tuple(plan_actions),
         unavailable=_missing(snapshot, ("token_plan",)),
@@ -1730,6 +1850,12 @@ def _access(snapshot: Snapshot) -> View:
                   editable=True, secret=True, advanced=True,
                   hint="掩码显示；粘贴新值才会覆盖"),
         ),
+        # RC15-039 #4：自动刷新是**本机界面**设置（不是服务端配置），所以单独一条开关，
+        # 不进表单、不参与「保存并回读」（那会把界面偏好写进接入配置）。
+        switches=(Toggle("auto_refresh", "自动刷新",
+                         value=bool(access.get("auto_refresh", True)),
+                         action="access.toggle_auto_refresh",
+                         hint="页面可见时每 10 秒；最小化或空闲 60 秒；只读本机数据"),),
         actions=(Action("access.save", "保存并回读", primary=True),
                  Action("access.copy_node_id", "复制节点 ID", enabled=bool(node_id),
                         reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
@@ -1774,8 +1900,28 @@ def _diag_hint(diag: Sequence[Mapping[str, Any]]) -> str:
 def _today_note(today: Any) -> str:
     """「今日」按 UTC 日界（服务端口径）；本地时区跨日时数字会看起来对不上，得写明。"""
     if today in (None, ""):
-        return "服务端未下发今日字段；不拿总计冒充今日"
+        return "服务端没有下发今天的数字（不是 0）"
     return "服务端下发值（UTC 日界）；本机不换算"
+
+
+#: RC15-039 #17：档位**只有三个**（owner 2026-11-16 D-1：``paused`` 是状态，不是第四档）。
+#: 每项 = (表内键, 档位文案, ``djb limits --preset`` 的取值)。
+#: 第三列是**写命令**的取值（「全速」在本机命令里叫「全力以赴」），必须一一对上，
+#: 否则切完回读永远不一致。前两列之外的地方不许再手写档位名。
+#:
+#: RC15-039 复核 M7（owner a′）：原来的第四列「一句话说明」写的是"只要接单就满载 /
+#: 工作时段实时算力 / 只在我不使用电脑时工作"——这三句描述的是**本版 daemon 不做**的事
+#: （`facts.PRESET_CONCURRENCY` 零消费），与页脚"本版不按档位调整"同屏矛盾，整列删掉。
+YIELD_TIERS: tuple[tuple[str, str, str], ...] = (
+    ("full", "全速", "全力以赴"),
+    ("balanced", "均衡", "均衡"),
+    ("saver", "省心", "省心"),
+)
+#: 表内键 → 写命令取值 / 档位文案 → 写命令取值（动作层按选中的**标签**查）
+YIELD_PRESET_BY_KEY: dict[str, str] = {key: preset for key, _l, preset in YIELD_TIERS}
+#: 键 → 中文档位名（复核 SHOULD-FIX 7：总览卡以前直接印原始键 `balanced`，中文界面里冒英文）
+YIELD_LABEL_BY_KEY: dict[str, str] = {key: label for key, label, _p in YIELD_TIERS}
+YIELD_PRESET_BY_LABEL: dict[str, str] = {label: preset for _k, label, preset in YIELD_TIERS}
 
 
 def _yield_state_text(state: str) -> str:
@@ -1802,30 +1948,47 @@ def _yield(snapshot: Snapshot) -> View:
     state = str(data.get("state") or "unknown")
     paused = state == "paused"
     reason = data.get("reason_label") or data.get("reason")
-    mode = str(data.get("mode") or "unknown")
-    modes = (("full", "全速", "只要接单就满载"),
-             ("balanced", "均衡", "工作时段实时算力，其余慢任务"),
-             ("saver", "省心", "只在我不使用电脑时工作"),
-             ("paused", "暂停", "不接新任务；在途任务按护栏处理"))
-    active = mode if mode != "unknown" else ("paused" if paused else "")
-    rows = tuple(Row((label, key, summary,
-                      (MARK_DONE + " 当前") if key == active else MARK_IDLE), key=key)
-                 for key, label, summary in modes)
+    # RC15-039 #17：当前档位以**本机配置里的 preset** 为准（``djb limits --preset`` 写的就是它），
+    # 不从 yield_mode 猜：以前那行「模式」读的是另一个键，跟切档根本不是一个东西。
+    preset = str(data.get("preset") or "")
+    # RC15-039 复核 M7：首屏**没有**任何回读动作（数据来自本机配置），所以只说「本机配置」；
+    # 「已回读」只在切档动作成功后出现（控制器注入 `readback_ok`）。
+    verified = bool(data.get("readback_ok"))
+    active_key = next((key for key, _l, value in YIELD_TIERS if value == preset), "")
+    rows = tuple(Row((label, key, (MARK_DONE + " 当前") if key == active_key else MARK_IDLE),
+                     key=key)
+                 for key, label, _value in YIELD_TIERS)
+    if active_key:
+        now_text = next(label for key, label, _v in YIELD_TIERS if key == active_key)
+        now_meta, now_tone = ("本机配置 · 已回读" if verified else "本机配置"), "mint"
+    else:
+        now_text = "未知（没有回读到）"
+        now_meta, now_tone = "读不到就不猜；点下面三档之一可重新写一次", "amber"
     return View(
         key="yield", title="让路 / 节能",
-        subtitle="四档模式 · 暂停后与托盘状态一致",
+        # 「暂停」是**状态**不是档位（owner D-1）：它只由下面两个按钮进出
+        subtitle="三档模式 · 暂停是状态，不占档位",
         cards=(Card("当前状态", _yield_state_text(state),
                     str(reason or data.get("reason_label") or "无让路原因"),
                     _yield_state_tone(state)),
                Card("接单", _flag(data.get("accepting"), "允许", "禁止"), "", "default"),
-               Card("模式", mode, "本机配置", "muted")),
-        table=Table(("模式", "键", "说明", "当前"), rows, empty="模式暂不可用"),
-        actions=(Action("yield.pause", "暂停接单", enabled=not paused,
+               Card("档位", now_text, now_meta, now_tone)),
+        table=Table(("档位", "键", "当前"), rows, empty="档位暂不可用",
+                    activate="yield.apply_mode", title="档位"),
+        actions=(Action("yield.apply_mode", "切到选中的档位", enabled=bool(rows),
+                        reason="当前没有可切换的档位", primary=True),
+                 Action("yield.pause", "暂停接单", enabled=not paused,
                         reason="已经是暂停状态"),
                  Action("yield.resume", "恢复接单", enabled=paused,
-                        reason="当前不是暂停状态", primary=True)),
+                        reason="当前不是暂停状态")),
         unavailable=_missing(snapshot, ("yield",)),
-        notes=("暂停只停止接新任务，不停止服务；托盘与窗口读同一份状态。",),
+        notes=("先选中一档（↑↓ 或点击），再点「切到选中的档位」或按回车："
+               "会先问一次，确认后写本机配置并回读 daemon。",
+               "切档不打断在跑的任务、不重启服务；暂停/恢复是另一个动作，"
+               "与托盘读同一份状态。",
+               # RC15-039 复核 M7（owner a′）：用**正面**口径说同一件事，别和上面的档位
+               # 描述互相打脸——"只记录偏好"是这版真实做的事，"后续版本生效"是真实计划。
+               "本版只记录档位偏好；并发与让路在后续版本生效。"),
     )
 
 
@@ -2078,9 +2241,32 @@ def onboarding_panel(step: int, *, total: int = 3, bound: bool | None = None,
         body=onboarding_mod.step_body(step), actions=tuple(actions))
 
 
+#: 日志级别 → 客户看到的筛选文案（值仍是契约里的 ``debug``/``info``/…）
+LOG_LEVEL_TEXT = {"all": "全部级别", "debug": "debug（调试）", "info": "info（信息）",
+                  "warning": "warning（警告）", "error": "error（错误）",
+                  "critical": "critical（严重）"}
+
+
+def _content_key(prefix: str, parts: Any, seen: dict[str, int]) -> str:
+    """列表项的内容身份：``<prefix>-<内容哈希>``；**逐字相同**的行才补 ``#2``。
+
+    用途：Treeview 的 iid 必须唯一（撞了会 TclError 打死窗口），但 id 又不能用序号，
+    否则上面插一行、下面全变。两行内容逐字相同时它们本来不可区分，计数器是唯一选择。
+    """
+    digest = hashlib.sha1("\x1f".join(str(part) for part in parts).encode("utf-8")).hexdigest()[:10]
+    key = prefix + "-" + digest
+    if key in seen:
+        seen[key] += 1
+        return "%s#%d" % (key, seen[key])
+    seen[key] = 0
+    return key
+
+
 def _logs(snapshot: Snapshot) -> View:
     logs = _section(snapshot, "logs")
+    total = logs.get("total")
     rows = []
+    seen: dict[str, int] = {}
     for index, row in enumerate(logs.get("rows") if isinstance(logs.get("rows"), list) else []):
         if not isinstance(row, Mapping):
             continue
@@ -2091,23 +2277,61 @@ def _logs(snapshot: Snapshot) -> View:
         tone = ("red" if level in ("error", "critical") else
                 "amber" if level == "warning" else
                 "muted" if level == "unknown" else "default")
-        # key 必须唯一：日志里同一微秒可能被写两次（init 与 daemon 各写一遍同一事件），
-        # 用 ts 当 iid 会让 Treeview 抛 TclError「Item ... already exists」把整个窗口打死。
+        # RC15-039 #5：错误行自带的原因/下一步**原样上屏**（`_parse_log_line` 已把它们
+        # 摊在 row["fields"] 里）。没有就写「—」，绝不拿别的东西冒充一句原因。
+        payload = row.get("fields") if isinstance(row.get("fields"), Mapping) else {}
+        reason = str(payload.get("reason") or "").strip()
+        next_step = str(payload.get("next_step") or "").strip()
+        # key = **内容身份**，不许带序号（复核 MF-1：`logs-%04d-<ts>` 里的序号会让
+        # 顶部插一行时下面每行的 a11y 路径全变，读屏焦点跟着跳到别人身上）。
+        # 仍然必须唯一：同一微秒可能被写两遍（init 与 daemon 各写一遍同一事件），
+        # 完全相同的两行只能用「同内容计数器」区分——那是这类行唯一的不稳定点，已写进
+        # `a11y/tree._row_id` 的文档。
         rows.append(Row((mark + " " + level, str(row.get("ts") or "—"),
-                         str(row.get("event") or "—")),
-                        key="logs-%04d-%s" % (index, row.get("ts") or ""),
+                         str(row.get("event") or "—"),
+                         reason or "—", next_step or "—"),
+                        key=_content_key("logs", (level, str(row.get("ts") or ""),
+                                                  str(row.get("event") or ""),
+                                                  reason, next_step), seen),
                         tone=tone))
+    level = str(logs.get("level") or "all")
+    levels = [str(item) for item in (logs.get("levels") or []) if str(item)]
+    options = (("all", LOG_LEVEL_TEXT["all"]),) + tuple(
+        (item, LOG_LEVEL_TEXT.get(item, item)) for item in levels)
+    filtered = level != "all"
+    count_meta = ("共 " + str(total) + " 行 · 已筛选" if filtered and _is_number(total)
+                  else "共 " + str(total) + " 行" if _is_number(total) else "尾部 200 行")
+    # RC15-039 复核 M4：筛到 0 行时旧文案写「日志文件尚未生成」——同屏卡片却写着「共 N 行」，
+    # 屏幕上的事实性错误。行的有无有三种原因，文案必须分开说，不许拿「文件没生成」兜一切。
+    if rows:
+        empty_text = _empty_text(snapshot, "logs", "日志文件尚未生成")
+    elif filtered:
+        # 级别名用**裸名**（`LOG_LEVEL_TEXT` 里是「debug（调试）」，套进括号会变成套娃）
+        empty_text = ("当前筛选（" + level + "）下没有日志行；换一个级别，或选「"
+                      + LOG_LEVEL_TEXT["all"] + "」。")
+    elif _is_number(total) and int(total) > 0:
+        empty_text = "日志里有 " + str(total) + " 行，但没能解析出可显示的行（详情见日志文件）。"
+    else:
+        empty_text = "日志文件尚未生成（本机还没有任何日志行）。"
     return View(
         key="logs", title="日志",
-        subtitle="本地 ring buffer（最近 2000 行，按需筛选）",
-        cards=(Card("行数", _count(snapshot, "logs", str(len(rows))), "尾部 200 行", "default"),),
-        table=Table(("级别", "时间", "事件"), tuple(rows),
+        subtitle="本机日志 · 本页显示最近 200 行（级别筛选只改显示）",
+        cards=(Card("行数", _count(snapshot, "logs", str(len(rows))), count_meta, "default"),),
+        # 窄窗先让出「原因/下一步」（正文在下面详情抽屉里，点一行就能看全）
+        table=Table(("级别", "时间", "事件", "原因", "下一步"), tuple(rows),
                     note=str(logs.get("note") or ""),
-                    empty=_empty_text(snapshot, "logs", "日志文件尚未生成")),
+                    empty=empty_text,
+                    narrow_hide=("时间", "原因", "下一步"),
+                    narrow_headers=(("下一步", "下一步"),), title="日志"),
+        filters=(Filter("log_level", "级别", options=options, value=level,
+                        action="logs.filter",
+                        hint="只改本页显示；日志文件不动。"),) if levels else (),
         actions=(Action("logs.copy", "复制当前筛选", enabled=bool(rows), reason="没有日志行"),
                  Action("logs.open_dir", "打开日志目录")),
         unavailable=_missing(snapshot, ("logs",)),
-        notes=("级别筛选：all / debug / info / warning / error；不改日志文件。",),
+        # 旧页脚许诺「级别筛选：all / debug / …」却**没有**任何筛选控件（走查原话：
+        # 「页脚承诺的功能根本不存在」）。现在筛选是真的，页脚只说它真做了什么。
+        notes=("筛选只改本页显示；日志文件本身一个字都不动。",),
     )
 
 

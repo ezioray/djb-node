@@ -249,3 +249,15 @@ def test_recorded_receipts_read_as_in_flight_not_unknown():
     row = overview(patched(receipts=receipts(*rows))).table.rows[0]
     assert row.cells[3].startswith(vw.MARK_WAIT)
     assert "未知" not in row.cells[3]
+
+
+def test_overview_does_not_promise_tier_effects_this_version_does_not_have():
+    """复核 M7 残留（owner a′）：总览页也不许出现档位假承诺。
+
+    同一个常量 ``YIELD_MODE_SUMMARY`` 之前还写着「只要接单就满载 / 工作时段实时算力 /
+    只在我不使用电脑时工作」；总览是首屏，留着等于把假承诺搬到客户第一眼。
+    """
+    text = overview().plain_text()
+    for phrase in ("满载", "实时算力", "不使用电脑时"):
+        assert phrase not in text, phrase
+    assert "本版仅记录档位偏好" in text

@@ -42,7 +42,8 @@ from typing import Any
 __all__ = [
     "CHART_TOKENS", "DEFAULT_THEME", "GUI_CONSTANTS", "PALETTES", "PREFS_FILE", "THEME_LABELS",
     "apply", "available", "blend", "chart", "color", "current", "gui_tokens", "load",
-    "mix_step", "palette", "prefs_path", "save", "set_active", "toggle",
+    "load_flag", "load_prefs", "mix_step", "palette", "prefs_path", "save", "save_flag",
+    "set_active", "toggle",
 ]
 
 #: 没有偏好文件时的主题（白天，与既有验收截图一致）
@@ -382,6 +383,36 @@ def prefs_path(home: str | os.PathLike[str] | None = None) -> Path:
     return base / PREFS_FILE
 
 
+def load_prefs(home: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    """整份偏好（**非主题项也能存**：``auto_refresh`` 等界面开关）。
+
+    文件缺失 / 损坏 / 不是对象 → 空字典（界面照常起，不因为偏好文件坏了打不开）。
+    这里只放**界面偏好**，绝不放凭据（与 ``PREFS_FILE`` 的既有红线一致）。
+    """
+    try:
+        payload = json.loads(prefs_path(home).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def load_flag(name: str, home: str | os.PathLike[str] | None = None, *,
+              default: bool = True) -> bool:
+    """读一个布尔界面偏好；没有/类型不对 → ``default``（默认开，与 0.3.7 行为一致）。"""
+    value = load_prefs(home).get(str(name))
+    if isinstance(value, bool):
+        return value
+    return bool(default)
+
+
+def save_flag(name: str, value: bool, home: str | os.PathLike[str] | None = None) -> Path:
+    """写一个布尔界面偏好（0600，原子替换，**保留已有键**——不会把 theme 冲掉）。"""
+    path = prefs_path(home)
+    payload = load_prefs(home)
+    payload[str(name)] = bool(value)
+    return _write_prefs(path, payload)
+
+
 def load(home: str | os.PathLike[str] | None = None) -> str:
     """读主题偏好；文件缺失/损坏/值不认识 → 默认日间（界面照常起）。"""
     try:
@@ -393,20 +424,31 @@ def load(home: str | os.PathLike[str] | None = None) -> str:
 
 
 def save(name: str, home: str | os.PathLike[str] | None = None) -> Path:
-    """写主题偏好（0600，原子替换）。只写主题名，绝不写凭据。"""
+    """写主题偏好（0600，原子替换）。只写界面偏好，绝不写凭据。
+
+    **读改写**：文件里已有的其它界面偏好（``auto_refresh``）必须保留——否则每次切主题
+    都会把「自动刷新已关闭」悄悄重置成默认。
+    """
     if name not in PALETTES:
         raise ValueError("未知主题：" + str(name))
     path = prefs_path(home)
+    payload = load_prefs(home)
+    payload["theme"] = name
+    return _write_prefs(path, payload)
+
+
+def _write_prefs(path: Path, payload: dict[str, Any]) -> Path:
+    """0600 + 原子替换地写整份偏好（唯一写入口：所有键走同一条路）。"""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:                          # pragma: no cover - 只读 home
         raise OSError("无法创建偏好目录：" + str(exc)) from None
-    payload = json.dumps({"theme": name}, ensure_ascii=False, sort_keys=True) + "\n"
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
     temporary = path.with_name(path.name + ".tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(payload)
+            handle.write(text)
     finally:
         try:
             os.chmod(temporary, 0o600)

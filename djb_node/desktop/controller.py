@@ -26,9 +26,10 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED,
                      AccessConfig, AccessService, FileAccessStore, SaveResult, mask_secret,
                      validate_address)
-from .datasource import (SECTIONS, DataSource, LocalDataSource, ProviderError, Snapshot,
-                         Unavailable, benchmark)
-from .views import VIEW_KEYS, VIEW_TITLES, View, build_view
+from .datasource import (LOG_LEVELS, SECTIONS, DataSource, LocalDataSource, ProviderError,
+                         Snapshot, Unavailable, benchmark)
+from .views import (VIEW_KEYS, VIEW_TITLES, YIELD_PRESET_BY_KEY, YIELD_PRESET_BY_LABEL,
+                    View, build_view)
 from .. import facts
 
 __all__ = ["ActionResult", "ControlOutcome", "DesktopController", "LocalControlChannel",
@@ -39,7 +40,9 @@ SUB_TASKS = "tasks"
 SUB_RECEIPTS = "receipts"
 SUB_CONTROL = "control"
 
-DEFAULT_MESSAGE = "就绪：F5 刷新 · Ctrl+1…9 切换视图 · 关闭窗口不会停止 daemon"
+# RC15-039 #32：状态条是键盘用户第一眼看到的一行，新加的 Tab 路径要在这里露面
+# （↑↓/Home/End/Enter 是表格内的键，写在表格下面；Tab 是全窗的，写在这里）
+DEFAULT_MESSAGE = "就绪：F5 刷新 · Tab 走焦点 · Ctrl+1…9 切换视图 · 关闭窗口不会停止 daemon"
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,9 @@ class ActionResult:
     ok: bool = True
     effect: str = ""
     payload: str = ""
+    #: 字段级错误（配置字段名 → 一句话）：渲染层写在字段下方并聚焦第一个（RC15-039 #1）。
+    #: 默认空 = 没有字段错误（0.3.7 行为，只落状态栏）。只加不改。
+    fields: Mapping[str, str] = field(default_factory=dict)
 
 
 class ControlChannel(Protocol):
@@ -110,6 +116,12 @@ class DesktopController:
     save_path: Callable[[str], str | None] | None = None
     selected: dict[str, str] = field(default_factory=dict)
     log_level: str = "all"
+    #: RC15-039 #4：自动刷新开关（**本机界面状态**，不是服务端配置）。默认开；
+    #: GUI 侧负责按 10s/60s 落一次刷新，并把偏好存进 desktop-prefs.json。
+    auto_refresh: bool = True
+    #: RC15-039 #17/M7：最近一次**切档成功且回读一致**的档位；空 = 从来没回读过。
+    #: 只决定「已回读」四个字出不出现，不参与任何判断。
+    preset_readback: str = ""
     message: str = DEFAULT_MESSAGE
     view: str = "overview"
     drafts: dict[str, str] = field(default_factory=dict)
@@ -197,13 +209,27 @@ class DesktopController:
                     (self.last_discover or {}).get("protocol") or
                     merged_plan.get("protocol") or "")
             sections["token_plan"] = merged_plan
-        if self.log_level and self.log_level != "all":
-            logs = sections.get("logs")
-            if isinstance(logs, Mapping):
-                rows = [row for row in (logs.get("rows") or [])
-                        if isinstance(row, Mapping)
-                        and str(row.get("level")) == self.log_level]
-                sections["logs"] = {**logs, "rows": rows}
+        access_sec = sections.get("access")
+        if isinstance(access_sec, Mapping):
+            sections["access"] = {**access_sec, "auto_refresh": bool(self.auto_refresh)}
+        yield_sec = sections.get("yield")
+        if isinstance(yield_sec, Mapping):
+            # RC15-039 复核 M7：首屏只说「本机配置」，「已回读」只在切档成功且回读一致后出现
+            sections["yield"] = {
+                **yield_sec,
+                "readback_ok": bool(self.preset_readback)
+                and str(self.preset_readback) == str(yield_sec.get("preset") or ""),
+            }
+        logs = sections.get("logs")
+        if isinstance(logs, Mapping):
+            # RC15-039 #5：级别筛选是**真的**筛（旧实现只有一句页脚承诺，页面照旧全量）。
+            # ``total`` 保留筛选前的行数：卡片要能说清「这 3 行是筛出来的」。
+            level = str(self.log_level or "all")
+            all_rows = [row for row in (logs.get("rows") or []) if isinstance(row, Mapping)]
+            rows = ([row for row in all_rows if str(row.get("level")) == level]
+                    if level != "all" else all_rows)
+            sections["logs"] = {**logs, "rows": rows, "level": level,
+                                "total": logs.get("total", len(all_rows))}
         return Snapshot(sections=sections, fetched_at=base.fetched_at, source=base.source,
                         notes=base.notes)
 
@@ -250,7 +276,7 @@ class DesktopController:
         return False
 
     def apply_refresh(self, fresh: Any = None, *, sections: Sequence[str] | None = None,
-                      error: BaseException | None = None) -> View:
+                      error: BaseException | None = None, quiet: bool = False) -> View:
         """把一次取数结果落到快照上（**必须在主线程调用**）。
 
         * ``error``：取数整体失败 → 只把这次点名的域标成「刷新失败（类型）」，
@@ -260,6 +286,7 @@ class DesktopController:
         * ``fresh is None`` 且无 error：按「没取到数据」处理，同样保留旧结果。
         """
         names = tuple(sections) if sections else SECTIONS
+        kept = self.message if quiet else None
         if error is not None:
             merged = dict(self._snapshot.sections) if self._snapshot is not None else {}
             merged.update({name: Unavailable("刷新失败（" + type(error).__name__ + "）")
@@ -278,6 +305,12 @@ class DesktopController:
             else:
                 self._snapshot = fresh
             self.message = "已刷新：" + (self._snapshot.fetched_at or "刚刚")
+        if quiet:
+            # RC15-039 #4：自动刷新是后台动作。**成功**时保留客户正在读的那句（例如
+            # 「未保存：…」），失败时保留上面刚写的失败说明——两种都不进托盘广播。
+            if error is None and fresh is not None and kept is not None:
+                self.message = str(kept)
+            return self.current()
         self._publish()
         return self.current()
 
@@ -343,8 +376,11 @@ class DesktopController:
             self.drafts.clear()
             self.refresh(sections=("access", "agent"))
         prefix = ("；".join(warnings) + "。") if warnings else ""
+        # RC15-039 #1：校验失败时把**逐字段**原因一起回投，渲染层写在字段下方并聚焦第一个；
+        # 成功时 ``field_errors`` 为空 → 上一轮的红字随渲染一起清掉（不留残留）。
         return ActionResult(prefix + result.message, ok=result.effective,
-                            effect="access", payload=result.reload)
+                            effect="access", payload=result.reload,
+                            fields=dict(result.field_errors or {}))
 
     def save_agent(self) -> ActionResult:
         """Agent 上行地址编辑后保存（同一份本机配置，走同一保存+回读路径）。"""
@@ -506,14 +542,18 @@ class DesktopController:
 
         address = self.payout_address()
         if not address:
-            return ActionResult("暂不可用（先填 USDT 收款地址，再点「提交到云端」）", ok=False)
+            return ActionResult("暂不可用（先填 USDT 收款地址，再点「提交到云端」）", ok=False,
+                                fields={"usdt_address": "先填 USDT 收款地址（Polygon，0x 开头 42 位）"})
         try:
             address = validate_address(address)        # 格式（TRC20 / EVM 都认，老配置兼容）
         except ValueError as exc:
-            return ActionResult("提交失败：" + str(exc) + "（未发送到云端）", ok=False)
+            # RC15-039 #1：地址错误写在**地址字段下方**（本页内可见），不只落状态栏
+            return ActionResult("提交失败：" + str(exc) + "（未发送到云端）", ok=False,
+                                fields={"usdt_address": str(exc)})
         blocked = payout_mod.submit_blocker(address)   # 链闸：只放行 0x（Polygon）
         if blocked:
-            return ActionResult(blocked + "（未发送到云端）", ok=False)
+            return ActionResult(blocked + "（未发送到云端）", ok=False,
+                                fields={"usdt_address": blocked})
         if not callable(getattr(self.source, "submit_payout_address", None)):
             return ActionResult("暂不可用（当前数据源不支持提交收款地址）；地址未变更。", ok=False)
         return ActionResult("正在提交收款地址到云端…（可以继续操作）",
@@ -965,6 +1005,106 @@ class DesktopController:
                                 effect="refresh")
         return ActionResult(self.message, effect="refresh")
 
+    def _act_yield_apply_mode(self, *, confirm=None) -> ActionResult:
+        """RC15-039 #17：切档 = 二次确认 → 写本机配置 → **回读 daemon** → 不一致就写回原档。
+
+        口径（owner 2026-11-16 D-1）：档位只有全速/均衡/省心；``paused`` 是状态不是档位；
+        回读不一致 = 失败（要出声），并回到原档。
+        """
+        label = str(self.selected.get("yield") or "").strip()
+        if not label:
+            return ActionResult("先在表格里选中一档（全速 / 均衡 / 省心），再点「切到选中的档位」。",
+                                ok=False)
+        preset = YIELD_PRESET_BY_LABEL.get(label)
+        if preset is None:
+            return ActionResult("选中的行不是档位（" + label + "）；档位未改动。", ok=False)
+        # 复核 M6：**确认框之前**先读真原档（本机配置），不能拿快照当"原来的档"——
+        # 回读失败要写回的就是这个值，快照落后一格就会把客户档位静默改成第三个值。
+        before = self.profile_preset()
+        if before and before == preset:
+            return ActionResult("已经是「" + label + "」档，不用切换。", ok=False)
+        if self.cli is None:
+            return ActionResult("暂不可用（本机命令通道未接通）；档位未改动。", ok=False)
+        # 「全速」在本机命令里叫「全力以赴」：只有两者不同名时才补这一句，否则读着像口吃
+        target = ("「" + label + "」" if label == preset
+                  else "「" + label + "」（" + preset + "）")
+        rollback = ("切完会回读 daemon 确认，回读不一致就退回原来的档位。"
+                    if before else
+                    "切完会回读 daemon 确认；现在读不到原来的档位，回读不一致时**不会**替你"
+                    "回写（需要你手动再选一次）。")
+        if not confirm("把档位切到" + target + "？\n\n"
+                       "写的是本机配置里的档位；在跑的任务不会被打断、daemon 不会重启。"
+                       + rollback):
+            return ActionResult("已取消切换（档位未改动）。", ok=False, effect="cancelled")
+        try:
+            self.cli(["limits", "--preset", preset])
+        except ProviderError as exc:
+            return ActionResult("档位未切换：" + exc.reason + "（本机配置未改动）", ok=False)
+        except Exception as exc:
+            return ActionResult("档位未切换（" + type(exc).__name__ + "）；本机配置未改动。",
+                                ok=False)
+        readback = self.current_preset(fresh=True)
+        if readback == preset:
+            self.preset_readback = preset
+            self.refresh(sections=("status", "yield"))
+            return ActionResult("已切到「" + label + "」：写的是 " + preset
+                                + "，daemon 回读也是 " + preset + "。", effect="refresh")
+        # 回读不到（daemon 没跑 / 没给 profile）**不是**成功；不一致则回到原档
+        self.preset_readback = ""                 # 没回读成功 → 别处不许出现「已回读」
+        restored, note = self._restore_preset(before)
+        if readback:
+            head = ("切档未生效：写入的是 " + preset + "，daemon 回读却是 " + readback
+                    + "。界面按回读显示，")
+        else:
+            head = "已写入 " + preset + "，但回读不到 daemon 的档位（daemon 可能没在运行），"
+        self.refresh(sections=("status", "yield"))
+        return ActionResult(head + note, ok=False, effect="refresh")
+
+    def profile_preset(self) -> str:
+        """本机配置里**当前**的档位：`djb limits --json`（离线可读本机 profile，不依赖 daemon）。
+
+        为什么不能拿快照当"原来的档"：快照是上一次取数的结果，可能落后几十秒甚至更久；
+        回写原档时用它，会把客户从「省心」静默改成快照里的「均衡」（复核 M6 实测）。
+        读不到就给空字符串——调用方据此**不回写**并明说，绝不猜一个值写下去。
+        """
+        if self.cli is None:
+            return ""
+        try:
+            payload = self.cli(["limits", "--json"])
+        except Exception:                            # noqa: BLE001 - 读不到就返回空，不冒充
+            return ""
+        profile = payload.get("profile") if isinstance(payload, Mapping) else None
+        preset = profile.get("preset") if isinstance(profile, Mapping) else ""
+        return str(preset or "")
+
+    def current_preset(self, *, fresh: bool = False) -> str:
+        """当前档位：默认读快照；``fresh=True`` 时**重新问一次 daemon**（回读用）。
+
+        读不到就给空字符串——绝不拿上一次的值冒充回读结果。
+        """
+        if fresh:
+            if self.cli is None:
+                return ""
+            try:
+                payload = self.cli(["status"])
+            except Exception:
+                return ""
+            profile = payload.get("profile") if isinstance(payload, Mapping) else None
+            return str((profile or {}).get("preset") or "")
+        section = self.snapshot.get("yield")
+        return str(section.get("preset") or "") if isinstance(section, Mapping) else ""
+
+    def _restore_preset(self, before: str) -> tuple[bool, str]:
+        """回读不一致时写回原档（原档未知就不猜着写）。返回（是否写回，给人看的一句话）。"""
+        if before not in set(YIELD_PRESET_BY_KEY.values()):
+            return False, "原档位未知，没有替你回写；请手动选一次正确的档位。"
+        try:
+            self.cli(["limits", "--preset", before])
+        except Exception as exc:                    # noqa: BLE001 - 回写失败也要说清楚
+            return False, ("写回原档「" + before + "」也失败了（" + type(exc).__name__
+                           + "）；请手动选一次。")
+        return True, "已写回原来的「" + before + "」档。"
+
     def _act_yield_pause(self, *, confirm=None) -> ActionResult:
         return self._control("pause", confirm)
 
@@ -1246,6 +1386,37 @@ class DesktopController:
     def set_log_level(self, level: str) -> View:
         self.log_level = str(level or "all")
         return self.current()
+
+    def _act_access_toggle_auto_refresh(self, *, confirm=None) -> ActionResult:
+        """自动刷新开关：真关（不是画个开关）。``effect="access"`` 让本页重画回读新状态。"""
+        raw = str(self.drafts.pop("auto_refresh", "") or "").strip().lower()
+        if raw not in ("on", "off", "true", "false", "1", "0"):
+            return ActionResult("开关没生效：没拿到目标状态（" + (raw or "空") + "）", ok=False)
+        self.auto_refresh = raw in ("on", "true", "1")
+        if not self.auto_refresh:
+            return ActionResult("自动刷新已关闭：数据只在你点「刷新」时更新"
+                                "（并记在 desktop-prefs.json，下次启动仍然关闭）",
+                                effect="access")
+        return ActionResult("自动刷新已打开：页面可见时每 10 秒、最小化或空闲 60 秒"
+                            "自动取一次本机数据", effect="access")
+
+    def _act_logs_filter(self, *, confirm=None) -> ActionResult:
+        """日志级别筛选（``Filter`` 选中即生效）：只改本页显示，**不碰日志文件**。
+
+        级别不在白名单 → 明确拒绝（不静默退回「全部」：那会让客户以为筛选生效了）。
+        """
+        level = str(self.drafts.get("log_level") or "").strip()
+        if level not in ("all",) + tuple(LOG_LEVELS):
+            return ActionResult("筛选没生效：不认识的日志级别「" + (level or "（空）") + "」",
+                                ok=False)
+        self.drafts.pop("log_level", None)          # 视图状态，不是要写进配置的草稿
+        view = self.set_log_level(level)
+        rows = len(view.table.rows) if view.table is not None else 0
+        if level == "all":
+            return ActionResult("已显示全部级别：本页 " + str(rows)
+                                + " 行（日志文件未改动）", effect="filter")
+        return ActionResult("筛选只看 " + level + "：本页 " + str(rows)
+                            + " 行（日志文件未改动）", effect="filter")
 
     def status_line(self) -> str:
         """状态栏文案：daemon 状态 + 让路 + 最近一次消息。"""

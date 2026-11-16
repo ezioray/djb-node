@@ -22,19 +22,21 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 from .access import ACCESS_FILE, RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED
 from .access import AccessService, FileAccessStore
 from .controller import DEFAULT_MESSAGE, DesktopController, LocalControlChannel
-from .datasource import FakeDataSource, LocalDataSource, ProviderError, Snapshot
+from .datasource import SECTIONS, FakeDataSource, LocalDataSource, ProviderError, Snapshot
 from ..platform.no_window import subprocess_window_kwargs
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
+from .a11y import install as install_a11y   # 读屏（MSAA）；**静态 import**，别改成 import_module
 from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
 from . import platform_ui
 from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
-                    Metric, RailCard, Row, Table, View, page_kicker)
+                    Metric, RailCard, Row, Table, View, page_kicker, with_field_errors)
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
            "demo_snapshot", "main", "make_controller"]
@@ -64,6 +66,21 @@ PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 #: 它们在 :meth:`DesktopApp._on_action` 的通用播报里要跳过，否则「已在浏览器打开」会被
 #: 动作自带的一句「网页端：https://…」覆盖掉——那正好抹掉了「打不开」这个关键差别。
 SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "update", "probe")
+
+#: RC15-039 #4：自动刷新的两档间隔（秒）与「空闲」阈值。
+#:
+#: 走查原话：「要么不刷新，要么一直在后台刷」——所以不是开关二选一，而是**按可见性降频**：
+#: 页面可见 10 秒；最小化（或超过 ``AUTO_IDLE_S`` 没有任何输入）降到 60 秒。
+#: 不做 0 秒轮询：本机数据源一轮要跑一次 ``djb status``，10 秒已经够实时。
+AUTO_REFRESH_VISIBLE_S = 10
+AUTO_REFRESH_HIDDEN_S = 60
+AUTO_IDLE_S = 60
+
+#: 会回投**字段级错误**的 effect：这类动作的结果要覆盖本页红字状态（含「清空」）。
+#:
+#: 只有表单动作能改这份状态。其它动作（复制 / 打开目录 / 切页）无权把客户刚看到的红字抹掉，
+#: 也不该继承上一份错误——所以名单是**白名单**，不是「除黑名单外都清」。
+FORM_EFFECTS = ("access", "payout_submit")
 
 TOP_NAV_KEYS = VIEW_KEYS
 
@@ -313,6 +330,11 @@ class DesktopApp:
         self._detail: Any = None
         self._detail_columns: tuple[str, ...] = ()
         self._vars: dict[str, Any] = {}
+        #: RC15-039 #1：动作回投的字段级错误（key → 一句话）。切页/保存成功即清空——
+        #: 上一页的红字绝不能跟到下一页（走查原话「跨页面残留」）。
+        self._field_errors: dict[str, str] = {}
+        #: 当前已渲染视图（含贴上去的错误）；证据/测试读它判断「红字是否真的上屏」
+        self._last_view: View | None = None
         self._root.title(title)
         # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
         try:
@@ -329,6 +351,15 @@ class DesktopApp:
             getattr(controller, "source", None), "_home", None)
         self._fade_job = None
         self._theme_name = dual.load(self._prefs_home)
+        #: RC15-039 #4：自动刷新（本机偏好，默认开）。关掉之后**一个定时器都不留**。
+        self._auto_timer: Any = None
+        self._refresh_quiet = False          # 自动刷新：不弹 toast、不抢状态栏
+        self._last_input = time.monotonic()
+        try:
+            controller.auto_refresh = dual.load_flag("auto_refresh", self._prefs_home,
+                                                     default=bool(controller.auto_refresh))
+        except Exception:                    # pragma: no cover - 偏好文件坏了：用默认（开）
+            pass
         dual.apply(self._root, ttk, self._theme_name)
         self._build_shell()
         self._bind_keys()
@@ -349,6 +380,141 @@ class DesktopApp:
             except Exception:                            # pragma: no cover - 无窗口
                 pass
         self.show_view(controller.view)
+        self._a11y = self._install_a11y()    # 读屏：装不上就 None，界面照跑
+        self._bind_activity()                # 记录最后一次输入（判「空闲 60 秒」）
+        self._bind_window_state()            # 最大化/恢复后立刻按新状态重排（S4）
+        self._schedule_auto_refresh()
+
+    # ── RC15-039 #4：自动刷新（可见 10s / 最小化或空闲 60s；可关；不叠请求）
+    def _bind_activity(self) -> None:
+        """记录最后一次键盘/鼠标动作：只用于「空闲就降频」，不拦截任何事件。"""
+        for sequence in ("<KeyPress>", "<ButtonPress>", "<Motion>", "<MouseWheel>"):
+            try:
+                self._root.bind(sequence, self._note_activity, add="+")
+            except Exception:                        # pragma: no cover - 无窗口
+                pass
+
+    def _bind_window_state(self) -> None:
+        """窗口 `<Map>`/`<Unmap>` 后**立刻**按新的可见状态重排定时器（复核 S4）。
+
+        没有这一条：最小化 → 定时器还在 10s 那档；恢复可见后，最坏要等 60s 才刷一次，
+        走查原话「页面不会自己更新」会在这个窗口里复现。``<Unmap>`` 之后 ``state()``
+        可能还没更新，所以延到下一轮事件循环再排（``after(0, …)``）。
+        """
+        def reschedule(_event: Any = None) -> None:
+            try:
+                self._root.after_idle(self._schedule_auto_refresh)
+            except Exception:                    # pragma: no cover - 窗口已销毁
+                pass
+
+        for sequence in ("<Map>", "<Unmap>"):
+            try:
+                self._root.bind(sequence, reschedule, add="+")
+            except Exception:                    # pragma: no cover - 无窗口
+                pass
+
+    def _note_activity(self, _event: Any = None) -> None:
+        self._last_input = time.monotonic()
+
+    def _idle_seconds(self) -> float:
+        return max(0.0, time.monotonic() - float(getattr(self, "_last_input", 0.0)))
+
+    #: 「窗口在眼前」的 wm state。**Windows/macOS 最大化是 ``zoomed``**，不是 ``normal``：
+    #: 旧实现只认 ``normal``，把最常见的最大化当成不可见，刷新悄悄降到 60s（复核 M2）。
+    VISIBLE_WM_STATES = ("normal", "zoomed")
+
+    def _auto_visible(self) -> bool:
+        """窗口是否「在眼前」：最小化（iconic/withdrawn）或长时间无输入都算不可见。"""
+        try:
+            if str(self._root.state()) not in self.VISIBLE_WM_STATES:
+                return False
+        except Exception:                            # pragma: no cover - 无窗口
+            pass
+        return self._idle_seconds() < AUTO_IDLE_S
+
+    def _auto_interval_s(self) -> int:
+        return AUTO_REFRESH_VISIBLE_S if self._auto_visible() else AUTO_REFRESH_HIDDEN_S
+
+    #: 总览页**真正**用到的域（复核 M3/S11：以前这里只给 `status`，主卡数字永不更新，
+    #: 而页头的「数据截至」照走 = 谎报新鲜度）。
+    #:
+    #: 2026-11-16 复核 MUST-FIX #4：上一版只补了 6 个域，``_hero``/``_rail`` 还在读
+    #: ``gpu``/``account``/``token_plan``/``access``——于是出现「今日贡献在涨、GPU 仪表钉在
+    #: 62%、页头时间在跑」的半截假新鲜。现在**首屏每一块用到的域都在这里**：
+    #: ``_hero``（gpu/account/token_plan/access/yield/receipts）+ ``_rail``（access/receipts）
+    #: + 卡片与表格（status/earnings/bench/tasks）。改版面必须同步改这张清单。
+    OVERVIEW_SECTIONS = ("status", "earnings", "bench", "yield", "receipts", "tasks",
+                         "gpu", "account", "token_plan", "access")
+
+    def _auto_sections(self) -> tuple[str, ...]:
+        """自动刷新取的域：**本页真正要用的那几个**（总览有 6 个域，不能只取 status）。
+
+        宁可多取几个已缓存的小域，也不要出现「时间在走、数字不动」的假新鲜。
+        """
+        key = str(getattr(self._controller, "view", "") or "")
+        if key in ("", "overview"):
+            return self.OVERVIEW_SECTIONS
+        return (key,) if key in SECTIONS else ()
+
+    def _schedule_auto_refresh(self, delay_s: float | None = None) -> None:
+        """排下一次自动刷新（单一定时器：``after`` 只留一个，关掉即取消）。"""
+        if not bool(getattr(self._controller, "auto_refresh", True)):
+            self._cancel_auto_refresh()
+            return
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return
+        self._cancel_auto_refresh()
+        delay = int((self._auto_interval_s() if delay_s is None else delay_s) * 1000)
+        try:
+            self._auto_timer = root.after(max(250, delay), self._auto_refresh_tick)
+        except Exception:                            # pragma: no cover - 窗口已销毁
+            self._auto_timer = None
+
+    def _cancel_auto_refresh(self) -> None:
+        if self._auto_timer is None:
+            return
+        try:
+            self._root.after_cancel(self._auto_timer)
+        except Exception:                            # pragma: no cover - 已触发/已销毁
+            pass
+        self._auto_timer = None
+
+    def _auto_refresh_tick(self) -> None:
+        """到点了：能刷就刷一次，然后**无论如何**排下一次（不叠请求、不刷提示）。"""
+        self._auto_timer = None
+        if not bool(getattr(self._controller, "auto_refresh", True)):
+            return
+        worker = getattr(self, "_refresh_worker", None)
+        busy = bool(getattr(worker, "busy", False))
+        # 三个「不刷」：上一次还没回来（不叠请求）/ 正在改表单（别把输入冲掉）/ 页面没画出来
+        if not busy and not self._has_unsaved_edits() and getattr(self, "_last_view", None):
+            self._start_quiet_refresh(self._auto_sections())
+        self._schedule_auto_refresh()
+
+    def _has_unsaved_edits(self) -> bool:
+        """本页有没有**改过但没保存**的输入。有 → 自动刷新让路（重画会把输入冲掉）。
+
+        拿「输入框现在的内容」跟「渲染时填进去的内容」比：不碰「有没有焦点」这种不可靠信号，
+        也不用 ``edit_modified``（ttk.Entry 没有这个命令）。
+        """
+        for key, entry in (getattr(self, "_entries", {}) or {}).items():
+            try:
+                if str(entry.get()) != str(self._entry_initial.get(key, "")):
+                    return True
+            except Exception:                        # pragma: no cover - 控件已销毁
+                continue
+        return False
+
+    def _start_quiet_refresh(self, sections: Sequence[str] | None = None) -> None:
+        """自动刷新用的**安静**刷新：不 toast、成功不抢状态栏；失败仍然留一句。"""
+        self._refresh_quiet = True
+        try:
+            self._request_refresh_async(sections)
+        finally:
+            # 同步回落（无事件循环）时不会有回调来清这个标记
+            if getattr(self, "_refresh_worker", None) is None:
+                self._refresh_quiet = False
 
     # ── 骨架（设计 01 §1.1：43 应用头 / 208 侧栏 / 68 页头 / 30 状态条）
     #: 三段壳的高度（设计值；窗口总高会多出 Windows 原生标题栏 ~31px，见 R6）
@@ -486,6 +652,12 @@ class DesktopApp:
         self._tune_button = kit.Button(right, "调整贡献", lambda: self.show_view("yield"),
                                        kind="primary", ground=dual.color("surface"),
                                        px=kit.px("small"), height=self._px(26), pad=self._px(12))
+        # 头里的固定按钮：读屏要念得出「这是什么按钮」（#31①）
+        for widget, name in ((self._refresh_button, "刷新本页数据（也可按 F5）"),
+                             (self._theme_button, self._theme_button_text()),
+                             (self._log_button, "打开日志"),
+                             (self._tune_button, "调整贡献（去让路/节能页）")):
+            self._a11y_name(widget, name)
         self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.px("micro")),
                                     foreground=dual.color("muted_text"),
                                     background=dual.color("surface"))
@@ -613,6 +785,7 @@ class DesktopApp:
             item = kit.NavItem(self._nav_inner, text=label, icon=icon, count=badge,
                                ground=ground,
                                command=lambda name=key: self.show_view(name))
+            self._a11y_name(item, label + ("（当前页）" if key == self._controller.view else ""))
             item.pack(fill="x", pady=1)
             self._nav_buttons[key] = item
 
@@ -821,6 +994,17 @@ class DesktopApp:
         self._root.bind("<Control-Prior>", lambda _e: self._step_view(-1))
         self._root.bind("<Control-Next>", lambda _e: self._step_view(1))
         self._root.bind("<Control-r>", lambda _e: self.refresh())
+        # RC15-039 #31②：Tab / Shift-Tab 按**视觉顺序**走（Tk 默认的创建顺序在顶部那排
+        # 右对齐按钮上是从右往左，客户按第一下 Tab 就发现焦点跑到最右边去了）
+        self._root.bind("<Tab>", lambda _e: self._focus_step(1))
+        self._root.bind("<Shift-Tab>", lambda _e: self._focus_step(-1))
+        # X11 把 Shift+Tab 报成 ISO_Left_Tab；Windows 的 Tcl/Tk **没有这个 keysym**，
+        # 直接 bind 会抛 TclError，把整个 __init__ 炸掉（0.3.9 真机验证抓到：Windows 上
+        # 客户端根本起不来）。Shift+Tab 已由上一行覆盖，这条纯属可选别名，绑不上就跳过。
+        try:
+            self._root.bind("<ISO_Left_Tab>", lambda _e: self._focus_step(-1))
+        except Exception:
+            pass
         self._root.bind("<Escape>", lambda _e: self._canvas.yview_moveto(0))
 
     def _step_view(self, step: int) -> None:
@@ -849,6 +1033,7 @@ class DesktopApp:
                 view = self._controller.show(key)
             except ValueError:                       # pragma: no cover - 与 route 双保险
                 return self._controller.current()
+        self._set_field_errors({})          # 切页清空上一页的字段红字（走查原话：跨页残留）
         self._render(view)
         self._sync_nav(key)
         self._update_status()
@@ -921,16 +1106,20 @@ class DesktopApp:
 
     def _refresh_started(self) -> None:
         """(a) 立即反馈：按钮文案 + 状态栏，在取数**开始之前**就变。"""
+        quiet = bool(getattr(self, "_refresh_quiet", False))
         button = getattr(self, "_refresh_button", None)
         if button is not None:
             try:
-                button.set_text("刷新中…")
+                button.set_text("刷新中…" if not quiet else button.text)
             except Exception:                      # pragma: no cover - 控件已销毁
                 pass
-        self._toast("正在刷新…（可以继续拖动/切页）", ok=True)
+        if not quiet:
+            self._toast("正在刷新…（可以继续拖动/切页）", ok=True)
 
     def _refresh_busy(self) -> None:
         """(c) 并发闸门：重复点击只提示，不再派发第二个取数。"""
+        if getattr(self, "_refresh_quiet", False):
+            return                                 # 自动刷新不刷「已忽略这次点击」
         self._toast("正在刷新…上一次还没结束，已忽略这次点击", ok=True)
 
     def _refresh_finished(self) -> None:
@@ -943,16 +1132,42 @@ class DesktopApp:
 
     def _apply_refresh(self, fresh: Any, error: BaseException | None,
                        sections: Any = None) -> None:
-        """(d) 结果落地：合并快照 → 渲染 → 状态栏。异常已经在这里变成「刷新失败」。"""
-        view = self._controller.apply_refresh(fresh, sections=sections, error=error)
+        """(d) 结果落地：合并快照 → 渲染 → 状态栏。异常已经在这里变成「刷新失败」。
+
+        自动刷新（``_refresh_quiet``）走**安静**路径：成功不 toast、不覆盖状态栏最后一条消息
+        （那条常常是「未保存：…」这种客户还没读完的话），但**失败照旧留一句**在上面。
+        """
+        quiet = bool(getattr(self, "_refresh_quiet", False))
+        view = self._controller.apply_refresh(fresh, sections=sections, error=error,
+                                             quiet=quiet)
+        # RC15-039 复核 M1：**派发时判过，落地时还要再判一次**。
+        # 派发到落地之间的几百毫秒里客户可能刚开始打字；这时重画会把输入框刷回旧值，
+        # 还会顺手把 `_entry_initial` 一起刷新——"有改动"的证据被抹掉，下一轮继续冲。
+        # 所以落地发现新输入：数据留在快照里，**本页不重画、页头时间也不动**（时间写的是
+        # 屏幕上这份数据的截至时刻，重画没发生就不能往前推，否则又是一种谎报）。
+        if quiet and error is None and self._has_unsaved_edits():
+            self._refresh_quiet = False
+            self._note_skipped_render()
+            return
+        self._skip_notice_on = False
         self._render(view)
         self._update_status()
         worker = getattr(self, "_refresh_worker", None)
         duration = getattr(worker, "last_duration_s", 0.0) or 0.0
         message = str(self._controller.message or "")
+        if quiet:
+            self._refresh_quiet = False
+            return
         if duration and message.startswith("已刷新"):
             message += "（用时 %.1f s）" % duration
         self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
+
+    def _note_skipped_render(self) -> None:
+        """落地时发现新输入 → 只留一句话，不重画（同一次跳过只念一遍，别每 10 秒吵一次）。"""
+        if bool(getattr(self, "_skip_notice_on", False)):
+            return
+        self._skip_notice_on = True
+        self._announce("有未保存的输入，已跳过自动刷新（这一页没重画，保存后自动恢复）")
 
     # ── 检查更新 / 安装更新（G4 / RC14 P0）：网络 + 签名校验，绝不在主线程
     def _ensure_update_worker(self) -> Any:
@@ -1632,6 +1847,10 @@ class DesktopApp:
         self._vars.clear()
         self._reveal_buttons.clear()         # 按钮随旧控件销毁，不能留悬空引用
         self._entries.clear()
+        #: 渲染时输入框里的初始文本（判「改过但没保存」用；自动刷新要给编辑让路）
+        self._entry_initial = {}
+        self._filter_widgets = []
+        self._switch_widgets = {}
         self._row_notes.clear()
         self._tree = None
         self._detail = None
@@ -1677,13 +1896,19 @@ class DesktopApp:
                                 kind="primary" if action.primary else "ghost",
                                 ground=ground, px=kit.px("small"), height=30, pad=12,
                                 enabled=bool(action.enabled))
+            self._a11y_name(button, action.label)      # 引导卡的动作按钮同样要能念出来
             button.pack(side="left", padx=(0, 8))
         self._onboarding_panel = card
 
     def _render(self, view: View) -> None:
-        """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。"""
+        """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。
+
+        RC15-039 #1：渲染前把**本页**的字段级错误贴上去（纯函数 ``with_field_errors``），
+        渲染后把焦点送到第一个错误字段——客户点完「保存」不用自己找哪一行错了。
+        """
         tk = self._tk
         kit = self._kit
+        view = with_field_errors(view, self._field_errors)
         self._last_view = view
         self._in_render = True
         self._rendered_narrow = self._is_narrow()
@@ -1723,6 +1948,9 @@ class DesktopApp:
                                   anchor="w", pady=(2, 0))
         self._in_render = False
         self._sync_content_width()                   # B4：内容重排后把宽度钉回画布宽
+        self._refresh_a11y(view)                     # 读屏树跟着这一版数据走（不发焦点事件）
+        if view.focus_field:
+            self._focus_field(view.focus_field)
 
     def _wrap(self, label: Any) -> Any:
         """登记一个「按窗口宽度换行」的文本控件（窗口变宽变窄时统一重算，只改 wraplength）。"""
@@ -2025,9 +2253,10 @@ class DesktopApp:
                 tk.Label(line, text=card.toggle[0], font=fonts.sans(kit.px("micro")),
                          foreground=dual.color("muted_text"), background=surface).pack(side="left")
                 # 开关只读：点它等于「去让路页改」，这里不假装能改（无对应后端动作）
-                kit.Switch(line, on=bool(card.toggle[1]), ground=surface,
-                           command=lambda _on: self.show_view("yield")).pack(
-                               side="right")
+                toggle = kit.Switch(line, on=bool(card.toggle[1]), ground=surface,
+                                    command=lambda _on: self.show_view("yield"))
+                self._a11y_name(toggle, str(card.toggle[0]) + "（只读，点一下去让路页改）")
+                toggle.pack(side="right")
         if card.progress is not None:
             # 进度轨（设计 G-05）：一行标签 + 6px 圆角轨，比例直接来自服务端用量
             label, ratio, value_text = card.progress
@@ -2075,6 +2304,8 @@ class DesktopApp:
                 self._render_card(grid, card, index, per_row=per_row)
             for column in range(per_row):
                 grid.columnconfigure(column, weight=1, uniform="card")
+        for item in view.switches:                   # RC15-039 #4：本机界面开关
+            self._render_switch(item)
         # 有表单的页：卡片 → 字段 → 动作（保存）→ 表格；没有表单的页：卡片 → 动作 → 表格
         if view.fields:
             self._render_fields(view.fields, view.key)
@@ -2083,6 +2314,8 @@ class DesktopApp:
             bar.pack(fill="x", pady=(0, 12))
             for action in view.actions:
                 self._render_action(bar, action)
+        for item in view.filters:                    # RC15-039 #5：表格上方的下拉筛选
+            self._render_filter(item)
         if view.table is not None:
             self._render_table(view.table)
         for extra in view.tables:                     # RC14 D：模型与探针页的第二张表
@@ -2146,6 +2379,87 @@ class DesktopApp:
         from ..gui.theme import FONT
         return FONT[0]
 
+    #: 可读名称的属性名（读屏软件读不到 Tk 子控件，但导出/证据/测试能读到；
+    #: 真 UIA 命名需要 provider，见 RC15-039 #31 的边界说明）
+    A11Y_NAME_ATTR = "djb_accessible_name"
+
+    def _a11y_name(self, widget: Any, text: str) -> Any:
+        """给控件挂一个**人类可读的名称**（#31 最小切片的底座，也供本条筛选控件用）。"""
+        try:
+            setattr(widget, self.A11Y_NAME_ATTR, str(text))
+        except Exception:                            # pragma: no cover - 控件已销毁
+            pass
+        return widget
+
+    def _render_switch(self, item: Any) -> None:
+        """一条开关：真 Switch（28×15，Tab 可达、空格/回车可切）+ 标签 + 说明。"""
+        tk, kit = self._tk, self._kit
+        base = dual.color("bg")
+        bar = tk.Frame(self._body, background=base, bd=0, highlightthickness=0)
+        bar.pack(fill="x", pady=(0, 8))
+        switch = kit.Switch(bar, on=bool(item.value), ground=base,
+                            command=lambda on, target=item: self._on_toggle(target, bool(on)))
+        switch.pack(side="left", padx=(2, 8))
+        tk.Label(bar, text=item.label, font=self._fonts.sans(kit.px("small")),
+                 foreground=dual.color("ink"), background=base).pack(side="left")
+        if item.hint:
+            tk.Label(bar, text=item.hint, font=self._fonts.sans(kit.px("micro")),
+                     foreground=dual.color("muted_text"), background=base).pack(
+                         side="left", padx=(10, 0))
+        self._switch_widgets[item.key] = switch
+        self._a11y_name(switch, item.label + "（开关键）")
+
+    def _on_toggle(self, item: Any, on: bool) -> None:
+        """开关切换 → 动作层 → 立即落偏好 → 重画（状态以重画后的视图为准，不猜）。"""
+        self._controller.set_draft(item.key, "on" if on else "off")
+        self._on_action(item.action or ("toggle." + item.key))
+        if item.key == "auto_refresh":
+            try:
+                dual.save_flag("auto_refresh", bool(on), self._prefs_home)
+            except Exception as exc:                 # noqa: BLE001 - 偏好写不进去也要能用
+                self._toast("自动刷新已改，但偏好没写进 desktop-prefs.json（"
+                            + type(exc).__name__ + "）：下次启动会回到默认", ok=False)
+            if on:
+                self._schedule_auto_refresh()
+            else:
+                self._cancel_auto_refresh()          # 关掉 = 一个定时器都不留
+
+    def _render_filter(self, item: Any) -> None:
+        """下拉筛选：一条标签 + 只读 Combobox（键盘可达：Tab 到、↑↓ 选、回车生效）。"""
+        tk, ttk, kit = self._tk, self._ttk, self._kit
+        base = dual.color("bg")
+        bar = tk.Frame(self._body, background=base, bd=0, highlightthickness=0)
+        bar.pack(fill="x", pady=(0, 8))
+        tk.Label(bar, text=item.label, font=self._fonts.sans(kit.px("small")),
+                 foreground=dual.color("muted_text"), background=base).pack(
+                     side="left", padx=(2, 8))
+        values = [text for _value, text in item.options]
+        box = ttk.Combobox(bar, state="readonly", values=values, width=16, takefocus=True,
+                           font=self._fonts.sans(kit.px("small")))
+        box.set(item.current_text())
+        box.pack(side="left")
+        # 选中即生效（下拉本身就是「确认」动作，不再要一次点击）
+        box.bind("<<ComboboxSelected>>",
+                 lambda _event, target=item, widget=box: self._on_filter(target, widget))
+        if item.hint:
+            tk.Label(bar, text=item.hint, font=self._fonts.sans(kit.px("micro")),
+                     foreground=dual.color("muted_text"), background=base).pack(
+                         side="left", padx=(10, 0))
+        try:
+            self._filter_widgets.append(box)
+        except AttributeError:                     # pragma: no cover - 还没渲染过
+            self._filter_widgets = [box]
+        self._a11y_name(box, item.label + "筛选")
+
+    def _on_filter(self, item: Any, widget: Any) -> None:
+        """把下拉的选择值交给动作层（草稿 → 动作 → 重画 + 播报）。"""
+        index = int(widget.current())
+        if index < 0 or index >= len(item.options):
+            return
+        value = item.options[index][0]
+        self._controller.set_draft(item.key, value)
+        self._on_action(item.action or ("filter." + item.key))
+
     def _render_action(self, parent: Any, action: Action, *,
                        ground: str | None = None) -> None:
         """动作按钮：主/次两档；置灰时旁边写原因（不隐藏，C9 既有行为）。"""
@@ -2156,6 +2470,8 @@ class DesktopApp:
         button = kit.Button(parent, action.label, target,
                             kind="primary" if action.primary else "ghost", ground=base,
                             px=kit.px("small"), height=29, pad=12, enabled=action.enabled)
+        self._a11y_name(button, action.label if action.enabled
+                        else action.label + "（不可用：" + (action.reason or "条件不满足") + "）")
         button.pack(side="left", padx=(0, 8))
         if not action.enabled and action.reason:
             tk.Label(parent, text=action.reason, font=self._fonts.sans(kit.px("micro")),
@@ -2186,6 +2502,11 @@ class DesktopApp:
         for column in table.columns:
             tree.heading(column, text=column, anchor="w")
             tree.column(column, anchor="w", width=120, stretch=True)
+        # 每一张表（含附加表）都要有名字：读屏靠它知道「这是哪张表、有哪些列」（#31①）。
+        # 附加表**没有**详情抽屉，名字里就不许承诺 Enter 能开详情（#32：提示语跟着真实路径写）
+        self._a11y_name(tree, "表格：" + "、".join(table.columns)
+                        + ("（↑↓ 选择，Home/End 到首尾，Enter 打开详情）" if primary
+                           else "（附加表：↑↓ 可以看行，没有详情抽屉）"))
         tree.tag_configure("disabled", foreground=dual.color("muted_text"))
         tag_colors = {"mint": dual.color("mint_text"), "amber": dual.color("amber_text"),
                       "red": dual.color("red_text"), "muted": dual.color("muted_text"),
@@ -2237,7 +2558,20 @@ class DesktopApp:
         self._tables = list(getattr(self, "_tables", ()) or ()) + [(table, tree)]
         if table.rows:
             tree.bind("<<TreeviewSelect>>", self._on_row_select)
-            tk.Label(body, text="选中一行看详情（↑↓ 或点击）",
+            for sequence, step in (("<Up>", -1), ("<Down>", 1)):
+                tree.bind(sequence, lambda _e, delta=step: self._move_selection(delta))
+            tree.bind("<Home>", lambda _e: self._select_row_at(0))
+            tree.bind("<End>", lambda _e: self._select_row_at(-1))
+            # RC15-039 #31③/#32：↑↓/Home/End 真绑上，提示语才敢这么写
+            for sequence, handler in (("<Return>", lambda _e: self._activate_row()),
+                                      ("<KP_Enter>", lambda _e: self._activate_row()),
+                                      ("<Double-1>", self._on_double_click),
+                                      ("<space>", lambda _e: self._activate_row())):
+                tree.bind(sequence, handler)
+            hint = ("选中一行看详情（↑↓ 选择，Home/End 到首尾，Enter 打开详情）"
+                    if not table.activate else
+                    "选中一档再按 Enter（或双击这一行）＝切到它，会先问一次")
+            tk.Label(body, text=hint,
                      font=self._fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"),
                      background=dual.color("surface")).pack(anchor="w", pady=(6, 0))
@@ -2357,6 +2691,197 @@ class DesktopApp:
                                     anchor="w", justify="left",
                                     wraplength=self._wrap_hint())).pack(anchor="w", padx=10, pady=(4, 6))
 
+    # ── RC15-039 #31②：Tab 顺序 = 视觉顺序（顶部按钮 → 侧栏 → 内容区），焦点环可见
+    def _is_focusable(self, widget: Any) -> bool:
+        """这个控件进不进 Tab 链（Tk 的 ``takefocus`` 有三种写法：0/1/""/类默认）。"""
+        try:
+            raw = widget.cget("takefocus")
+        except Exception:
+            return False
+        if raw is None or raw == "":
+            # 空值 = 走控件类默认：ttk 输入类默认进链，Canvas 默认不进（我们的 Canvas 都显式写了 1）
+            return widget.winfo_class() in ("TEntry", "TCombobox", "Treeview", "Text")
+        text = str(raw).strip()
+        if text.lstrip("-").isdigit():
+            return int(text) != 0
+        return text.lower() not in ("false", "no", "0")
+
+    def _collect_focusable(self, root_widget: Any) -> list[Any]:
+        """递归收出「看得见且能聚焦」的控件，按（上→下、左→右）排。"""
+        found: list[Any] = []
+        stack = [root_widget]
+        while stack:
+            widget = stack.pop()
+            try:
+                stack.extend(widget.winfo_children())
+            except Exception:                            # pragma: no cover - 已销毁
+                continue
+            if not self._is_focusable(widget):
+                continue
+            try:
+                if not widget.winfo_ismapped():
+                    continue
+                found.append((widget.winfo_rooty(), widget.winfo_rootx(), widget))
+            except Exception:                            # pragma: no cover
+                continue
+        return [item[2] for item in sorted(found, key=lambda item: (item[0], item[1]))]
+
+    def _tab_order(self) -> list[Any]:
+        """整窗的 Tab 链：**顶部按钮**（左→右）→ **侧栏**（上→下）→ **内容区**（上→下、左→右）。
+
+        为什么自己算一次：Tk 默认按**创建顺序**遍历，而顶部那排按钮是右对齐打包的
+        （创建顺序 = 刷新/主题/日志/调整贡献 = 从右往左），客户按 Tab 会先从右端跳。
+        """
+        header = self._collect_focusable(getattr(self, "_header_right", None)) \
+            if getattr(self, "_header_right", None) is not None else []
+        nav = [self._nav_buttons[key] for key in self._ia_order
+               if key in getattr(self, "_nav_buttons", {}) and self._is_focusable(
+                   self._nav_buttons[key])]
+        content = self._collect_focusable(getattr(self, "_content", None)) \
+            if getattr(self, "_content", None) is not None else []
+        ordered: list[Any] = []
+        for widget in (*(header or ()), *(nav or ()), *(content or ())):
+            if widget not in ordered:
+                ordered.append(widget)
+        return ordered
+
+    def _focus_next(self, delta: int) -> Any:
+        """按 :meth:`_tab_order` 前后移动一格（到头绕回）；返回目标控件（没有则 None）。"""
+        order = self._tab_order()
+        if not order:
+            return None
+        try:
+            current = self._root.focus_get()
+        except Exception:                                # pragma: no cover
+            current = None
+        index = order.index(current) if current in order else (-1 if delta > 0 else 0)
+        return order[(index + int(delta)) % len(order)]
+
+    def _focus_step(self, delta: int) -> str:
+        target = self._focus_next(delta)
+        if target is not None:
+            try:
+                target.focus_set()
+            except Exception:                            # pragma: no cover - 控件已销毁
+                pass
+            self._notify_a11y_focus(target)
+        return "break"                                   # 吃掉按键：不再走 Tk 的默认遍历
+
+    def _notify_a11y_focus(self, widget: Any) -> None:
+        """键盘焦点动了 → 给读屏发 ``EVENT_OBJECT_FOCUS``（S3）。
+
+        Tab 顺序（``_tab_order``）与 a11y 树的可聚焦顺序都由同一个 ``View`` 的视觉顺序生成，
+        所以按**位置**对应。任何异常都咽掉：读屏事件不许影响键盘路径。
+        """
+        provider = getattr(self, "_a11y", None)
+        if provider is None:
+            return
+        try:
+            order = self._tab_order()
+            if widget in order:
+                provider.notify_focus_at(order.index(widget))
+        except Exception:                                # pragma: no cover - 防御
+            pass
+
+    def _notify_a11y_selection(self, index: int) -> None:
+        """表格行选中动了 → ``EVENT_OBJECT_SELECTION``。只发事件，不改界面。"""
+        provider = getattr(self, "_a11y", None)
+        if provider is None:
+            return
+        try:
+            provider.notify_selection_at(index)
+        except Exception:                                # pragma: no cover - 防御
+            pass
+
+    def _select_row_at(self, index: int) -> str:
+        """把选中行移到第 ``index`` 条（``-1`` = 最后一条）；返回 ``"break"`` 吃掉按键。"""
+        tree = getattr(self, "_tree", None)
+        if tree is None:
+            return "break"
+        try:
+            children = list(tree.get_children())
+        except Exception:                                # pragma: no cover - 控件已销毁
+            return "break"
+        if not children:
+            return "break"
+        target = children[index] if -len(children) <= index < len(children) else children[-1]
+        try:
+            tree.selection_set(target)
+            tree.focus(target)
+            tree.see(target)
+        except Exception:                                # pragma: no cover
+            pass
+        self._notify_a11y_selection(children.index(target))
+        return "break"
+
+    def _move_selection(self, delta: int) -> str:
+        """↑↓ 逐行移动；到边界就停住（不绕回：绕回会让「最后一条」按不到）。"""
+        tree = getattr(self, "_tree", None)
+        if tree is None:
+            return "break"
+        try:
+            children = list(tree.get_children())
+            current = tree.selection()
+            index = children.index(current[0]) if current and current[0] in children else -1
+        except Exception:                                # pragma: no cover
+            return "break"
+        if not children:
+            return "break"
+        nxt = max(0, min(len(children) - 1, index + int(delta)))
+        return self._select_row_at(nxt)
+
+    def _announce(self, text: str) -> None:
+        """把一句话放到状态条：读屏用户靠它「听见」焦点与详情的当前值。
+
+        （RC15-039 #31④ 的配套：Tk 没有可用的 UIA 通知，状态条就是唯一的播报面。）
+        """
+        try:
+            self._status.configure(text=str(text or ""))
+        except Exception:                            # pragma: no cover - 控件已销毁
+            pass
+
+    def _on_double_click(self, event: Any = None) -> None:
+        row = ""
+        tree = getattr(self, "_tree", None)
+        try:
+            row = str(tree.identify_row(getattr(event, "y", 0))) if tree is not None else ""
+        except Exception:                                # pragma: no cover - 控件已销毁
+            row = ""
+        if row:
+            try:
+                tree.selection_set(row)
+            except Exception:                            # pragma: no cover
+                pass
+        self._activate_row()
+
+    def _activate_row(self) -> None:
+        """回车 / 双击：表自己声明了 ``activate`` 就派发它，否则**播报**这一行的详情（#31③）。
+
+        复核 M5：旧实现把焦点搬到详情框上，可那个 Frame ``highlightthickness=0``——
+        客户看不见焦点在哪，而 ↑↓/Home/End 绑在表格上，焦点一走键位立刻失效（实测选中不再变）。
+        现在焦点**留在表格**里，详情用状态条念一句；键盘路径不断，也不需要"看得见的焦点环"。
+        """
+        table = getattr(self, "_table", None)
+        action = str(getattr(table, "activate", "") or "")
+        if action:
+            self._on_action(action)
+            return
+        selection = ()
+        tree = getattr(self, "_tree", None)
+        try:
+            selection = tree.selection() if tree is not None else ()
+        except Exception:                                # pragma: no cover
+            selection = ()
+        if not selection:
+            self._toast("先用 ↑↓ 选中一行，再按 Enter 打开详情。", ok=False)
+            return
+        cells = self._row_cells.get(str(selection[0]), ()) or ()
+        head = " · ".join(str(item) for item in cells)
+        # 只播报，不搬焦点：焦点留在表格上，↑↓/Home/End/Enter 继续可用。
+        # 不宣称读屏会念出来——Tk 没有 UIA/MSAA provider，`djb_accessible_name` 只是
+        # Python 属性；真读屏要整段文字时用 `--export-text`（票面 #31④ 的兜底）。
+        self._announce("详情：" + head)
+
     def _render_fields(self, fields: Sequence[Field], view_key: str,
                        parent: Any = None) -> None:
         """字段区：宽窗两列、窄窗一列；可编辑的进输入框，只读的用等宽值。
@@ -2398,11 +2923,18 @@ class DesktopApp:
         toggle = kit.Button(body, "高级（排障用）", lambda: _toggle(),
                             kind="ghost", ground=surface, px=kit.px("small"),
                             height=26, pad=10)
+        self._a11y_name(toggle, "展开高级（排障用）字段")
         toggle.pack(anchor="w", pady=(2, 0))
         # 留给真窗口取证（tests/test_desktop_payout.py）：折叠区/按钮不在首屏，也得能被点开
         self._advanced_panel = hidden
         self._advanced_toggle = toggle
         state = {"open": False}
+        if any(getattr(item, "error", "") for item in advanced):
+            # 错误落在折叠区里就等于没显示：有错就默认展开（客户改完再自己收起）
+            state["open"] = True
+            build(hidden, advanced)
+            hidden.pack(fill="x", pady=(6, 0), before=toggle)
+            toggle.set_text("收起高级")
 
         def _toggle() -> None:
             state["open"] = not state["open"]
@@ -2410,9 +2942,11 @@ class DesktopApp:
                 build(hidden, advanced)
                 hidden.pack(fill="x", pady=(6, 0), before=toggle)
                 toggle.set_text("收起高级")
+                self._a11y_name(toggle, "收起高级（排障用）字段")
             else:
                 hidden.pack_forget()
                 toggle.set_text("高级（排障用）")
+                self._a11y_name(toggle, "展开高级（排障用）字段")
 
     def _render_field(self, container: Any, row: int, column: int, field: Field,
                       per_row: int) -> None:
@@ -2459,9 +2993,23 @@ class DesktopApp:
                     anchor="w", justify="left",
                     wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
                                                         pady=(3, 0))
+            if field.error:
+                # RC15-039 #1：红字就在**这个输入框**下面（不是状态栏、不是页脚）
+                self._wrap_to_column(tk.Label(
+                    block, text="！" + field.error, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("red_text"), background=surface,
+                    anchor="w", justify="left",
+                    wraplength=self._wrap_hint())).grid(row=2, column=1, sticky="we",
+                                                        pady=(2, 0))
             self._fields[field.key] = field
             self._vars[field.key] = variable
             self._entries[field.key] = entry
+            self._a11y_name(entry, field.label + ("（已掩码，粘贴新值才会覆盖）"
+                                                 if field.secret else ""))
+            try:                                   # 初始文本（自动刷新判「有没有在改」）
+                self._entry_initial[field.key] = str(entry.get())
+            except Exception:                      # pragma: no cover - 控件已销毁
+                self._entry_initial[field.key] = str(field.value or "")
         else:
             # 只读值也要能换行：900 宽单列时端点 URL（http://…/agent）比列宽长，
             # 不换行就被切掉尾部（audit text-clip-w）。短值不受影响。
@@ -2479,6 +3027,13 @@ class DesktopApp:
                     anchor="w", justify="left",
                     wraplength=self._wrap_hint())).grid(row=1, column=1, sticky="we",
                                                         pady=(3, 0))
+            if field.error:
+                self._wrap_to_column(tk.Label(
+                    block, text="！" + field.error, font=fonts.sans(kit.px("micro")),
+                    foreground=dual.color("red_text"), background=surface,
+                    anchor="w", justify="left",
+                    wraplength=self._wrap_hint())).grid(row=2, column=1, sticky="we",
+                                                        pady=(2, 0))
 
     def _entry_for(self, key: str) -> Any:
         """取某字段的输入框（没有该字段 → ``None``）；给窗口级测试与「显示密码」用。"""
@@ -2495,6 +3050,7 @@ class DesktopApp:
         state = {"shown": False}
         button = kit.Button(block, "显示", lambda: _toggle(), kind="ghost", ground=surface,
                             px=kit.px("micro"), height=26, pad=8)
+        self._a11y_name(button, "显示" + field.label + "的明文")
         button.grid(row=0, column=2, sticky="w", padx=(6, 0))
         del tk                                        # 只用 kit 的按钮，避免两套样式
 
@@ -2505,6 +3061,7 @@ class DesktopApp:
             except Exception:                          # pragma: no cover - 控件已销毁
                 return
             button.set_text("隐藏" if state["shown"] else "显示")
+            self._a11y_name(button, ("隐藏" if state["shown"] else "显示") + field.label + "的明文")
 
         return button
 
@@ -2516,6 +3073,11 @@ class DesktopApp:
             except Exception:                            # 变量随旧视图销毁：跳过，不让动作静默不执行
                 continue
         result = self._controller.action(key, confirm=self._confirm)
+        # RC15-039 #1：动作带回**字段级错误**时，先落到本页再重画（保存成功后为空 = 清残留）。
+        # 只有「表单类」动作会改这份状态：复制/打开目录之类的动作不许把红字顺手抹掉。
+        fields = dict(getattr(result, "fields", {}) or {})
+        if fields or result.effect in FORM_EFFECTS:
+            self._set_field_errors(fields)
         copied = True
         if result.effect == "copy":
             copied = self.copy_text(result.payload)
@@ -2536,7 +3098,11 @@ class DesktopApp:
         elif result.effect == "payout_submit":
             # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
             self._start_payout_submit(str(result.payload), result.message)
-        elif result.effect in ("refresh", "access", "bench", "control", "reload"):
+        elif result.effect in ("refresh", "access", "bench", "control", "reload", "filter"):
+            self._render(self._controller.current())
+        elif fields:
+            # 表单错误回来了，但这个 effect 自己不重画（例如收款提交）：补一次，
+            # 否则「红字在数据里、屏幕上没有」——那还是 0.3.7 的「点了没反应」。
             self._render(self._controller.current())
         self._update_status()
         # "copy" 漏在名单外 = 复制成功/失败都零反馈（S4：客户说「点了没反应」）
@@ -2623,6 +3189,47 @@ class DesktopApp:
         self._toast(("已在浏览器打开：" if opened else "浏览器未能自动打开，请手动访问：") + str(url),
                     ok=opened)
 
+    # ── 字段级错误（RC15-039 #1：内联红字 + 聚焦首个错误 + 切页清残留）
+    def _set_field_errors(self, errors: Mapping[str, str] | None) -> None:
+        """换一份字段错误（只在表单动作回来时调用；重画由 ``_on_action`` 统一负责）。
+
+        重画是必须的（错误来自一次动作、视图是数据的投影），但只画**一次**：
+        ``access`` 这类 effect 自己就会重画，这里再画一次会让焦点闪一下再被抢走。
+        """
+
+        fresh = {str(key): str(value) for key, value in (errors or {}).items() if value}
+        if fresh == getattr(self, "_field_errors", None):
+            return
+        self._field_errors = fresh
+
+    def _focus_field(self, key: str) -> None:
+        """把键盘焦点送到某个字段的输入框，并把它滚进可视区（「本页内可见」）。"""
+        entry = getattr(self, "_entries", {}).get(str(key))
+        if entry is None:
+            return
+        try:
+            entry.focus_set()
+        except Exception:                              # pragma: no cover - 控件已销毁
+            return
+        self._scroll_into_view(entry)
+
+    def _scroll_into_view(self, widget: Any) -> None:
+        """把控件滚进内容区可视范围（只改滚动位置，不动布局）。"""
+        canvas = getattr(self, "_canvas", None)
+        content = getattr(self, "_content", None)
+        if canvas is None or content is None:
+            return
+        try:
+            canvas.update_idletasks()
+            total = max(1, int(content.winfo_height()))
+            offset = int(widget.winfo_rooty()) - int(content.winfo_rooty())
+            visible = int(canvas.winfo_height())
+            top = int(canvas.canvasy(0))
+            if offset < top or offset + int(widget.winfo_height()) > top + visible:
+                canvas.yview_moveto(max(0.0, min(1.0, offset / float(total))))
+        except Exception:                              # pragma: no cover - 无显示/已销毁
+            return
+
     def _toast(self, message: str, *, ok: bool = True) -> None:
         self._status.configure(text=("✓ " if ok else "! ") + message)
 
@@ -2664,11 +3271,47 @@ class DesktopApp:
         except Exception:
             pass
 
+    # ── 读屏（RC15-039 #31）：只读镜像，装不上就静默降级
+    def _install_a11y(self) -> Any:
+        """装 MSAA 提供方；任何失败都返回 ``None``（Linux、无 comtypes、钩窗口失败都走这里）。"""
+        try:
+            provider = install_a11y(self._root)
+        except Exception:                      # pragma: no cover - 防御
+            return None
+        if provider is not None and getattr(self, "_last_view", None) is not None:
+            # 构造时先渲染了一页、后装的 provider：补一次刷新，否则首屏读屏是空的
+            try:
+                provider.refresh(self._last_view)
+            except Exception:                  # pragma: no cover - 防御
+                pass
+        return provider
+
+    def _refresh_a11y(self, view: View) -> None:
+        """把这一版 ``View`` 推给读屏树。**自动刷新也走这里，但 provider 不发焦点事件**。"""
+        provider = getattr(self, "_a11y", None)
+        if provider is None:
+            return
+        try:
+            provider.refresh(view)
+        except Exception:                      # pragma: no cover - 防御
+            pass
+
     # ── 生命周期
     def run(self) -> None:
         self._root.mainloop()
 
     def stop(self) -> None:
+        provider = getattr(self, "_a11y", None)
+        if provider is not None:
+            try:
+                provider.detach()            # 先摘窗口过程钩子，再销毁窗口
+            except Exception:
+                pass
+            self._a11y = None
+        self._cancel_auto_refresh()          # 自动刷新不许在关窗后继续排下一次
+        self._cancel_fade()                  # 淡入/主题渐变的 after 也要取消：
+        # 不然销毁窗口时 Tk 会对着已消失的 lambda 打一行「invalid command name」
+        # （只是 stderr 噪音，但会把真实测试输出搞脏——0.3.7 起就有的收场缺口）
         for name in ("_refresh_worker", "_payout_worker", "_update_worker", "_probe_worker",
                      "_discover_worker"):
             worker = getattr(self, name, None)
@@ -2885,7 +3528,7 @@ _DEMO_SECTIONS = {
             "node": {"node_id": "node-7c31", "bound": True},
             "note": ""},
         "yield": {"state": "online", "reason": None, "reason_label": None, "accepting": True,
-                  "mode": "balanced", "yield_enabled": True},
+                  "mode": "balanced", "preset": "均衡", "yield_enabled": True},
         "account": {"profile": {"email": "node@example.com", "role": "共享方",
                                 "twofa_enabled": True},
                     "security": {"node_id": "node-7c31", "storage": "file"},
@@ -3072,6 +3715,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="启动时打开的视图")
     parser.add_argument("--demo", action="store_true", help="用确定性演示数据（截图/培训用）")
     parser.add_argument("--shot", metavar="DIR", help="构造后逐视图截图到目录（需要 ImageMagick import）")
+    parser.add_argument("--export-text", action="store_true",
+                        help="把当前页的文字版打印出来并复制到剪贴板（读屏/排障兜底）")
     parser.add_argument("--no-auto", action="store_true",
                         help="关闭首启自举（测试/离线环境：不建目录、不起节点）")
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -3103,11 +3748,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             app._toast(boot_line)                         # noqa: SLF001 - 同模块私有状态栏
         except Exception:                                # pragma: no cover - 纯展示
             pass
+    if args.export_text:
+        code = _export_text(app, args.view)
+        app.stop()
+        return code
     if args.shot:
         _shoot(app, args.shot)
         app.stop()
         return EXIT_OK
     app.run()
+    return EXIT_OK
+
+
+def _export_text(app: DesktopApp, view: str = "") -> int:
+    """RC15-039 #31④：把当前页的 ``View.plain_text()`` 打印出来并放进剪贴板。
+
+    为什么要有：Tk 没有 UIA provider，读屏软件读不到画布上的字（见票面 #31 的完整方案
+    另立评估票）。``--export-text`` 是**兜底**——客户按一次就能把这一页的**全部**文字
+    （含被折叠的、被表格截断的）拿到手，粘贴到记事本或让读屏去念。
+
+    只读：只看 ``View``，不碰数据源、不写任何文件、不改配置。
+    """
+    try:
+        page = app._controller.show(view or app._controller.view)   # noqa: SLF001 - 同一模块
+    except Exception as exc:                                        # pragma: no cover
+        print("取这一页失败（" + type(exc).__name__ + "）；没有导出任何内容。")
+        return EXIT_HEADLESS
+    text = page.plain_text()
+    print(text)
+    copied = app.copy_text(text)
+    print()
+    print(("已复制到剪贴板（" if copied else "剪贴板不可用（")
+          + page.title + " · " + str(len(text)) + " 字符）"
+          + ("" if copied else "；上面的文字可直接从终端复制"))
     return EXIT_OK
 
 

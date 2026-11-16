@@ -124,24 +124,47 @@ class AccessConfig:
     scoped_token: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
-    def validate(self) -> None:
+    def field_errors(self) -> dict[str, str]:
+        """逐字段收集错误（键 = 配置字段名，值 = 客户能看懂的一句话）。
+
+        **一次给全部**：界面要把每条错误写在对应字段下方（RC15-039 #1 内联校验），
+        一次只报一条会让客户改一步、点一次「保存」、再被打回来。
+
+        规则与文案与 :meth:`validate` **完全同源**（validate 只是取这里的第一条抛出），
+        所以「哪个先报」的老行为不变：字典的插入顺序就是老 ``validate`` 的检查顺序。
+        """
+        errors: dict[str, str] = {}
         if self.price_mode not in PRICE_MODES:
-            raise ValueError("价格模式必须是 " + " / ".join(PRICE_MODES))
+            errors["price_mode"] = "价格模式必须是 " + " / ".join(PRICE_MODES)
         if not isinstance(self.node_id, str) or len(self.node_id) > 128:
-            raise ValueError("节点标识必须是不超过 128 字符的文本")
+            errors["node_id"] = "节点标识必须是不超过 128 字符的文本"
         for name, label in (("openai_base_url", "OpenAI 请求地址"),
                             ("anthropic_base_url", "Anthropic 请求地址"),
                             ("agent_downlink_url", "Agent 下行地址")):
-            validate_url(getattr(self, name), label=label)
-        validate_address(self.usdt_address)
-        for name in ("node_secret", "api_key", "scoped_token"):
+            try:
+                validate_url(getattr(self, name), label=label)
+            except ValueError as exc:
+                errors[name] = str(exc)
+        try:
+            validate_address(self.usdt_address)
+        except ValueError as exc:
+            errors["usdt_address"] = str(exc)
+        # 这三条会**直接显示在输入框下方**，所以用界面上的称谓，不把内部字段名印上去
+        for name, label in (("node_secret", "节点凭证"), ("api_key", "接入密钥"),
+                            ("scoped_token", "受限令牌")):
             value = getattr(self, name)
             if not isinstance(value, str):
-                raise ValueError(name + " 必须是文本")
-            if "\n" in value or "\r" in value:
-                raise ValueError(name + " 不能含换行")
+                errors[name] = label + "必须是文本"
+            elif "\n" in value or "\r" in value:
+                errors[name] = label + "不能含换行（粘贴时可能带进了回车）"
         if not isinstance(self.extra, dict):
-            raise ValueError("extra 必须是对象")
+            errors["extra"] = "extra 必须是对象"
+        return errors
+
+    def validate(self) -> None:
+        errors = self.field_errors()
+        if errors:
+            raise ValueError(next(iter(errors.values())))
 
     def display(self) -> dict[str, str]:
         """可上屏投影：秘密只给掩码，地址给半掩码，其余原样（已校验）。"""
@@ -285,6 +308,9 @@ class SaveResult:
     display: Mapping[str, str] = field(default_factory=dict)
     #: 重载失败的**可读原因**（daemon 回的原文，例如「log_level 必须是 …」）
     detail: str = ""
+    #: 校验失败的**逐字段**原因（字段名 → 一句话）。默认空 = 没有字段级错误；
+    #: 渲染层据此把红字写在字段下方并聚焦第一个（RC15-039 #1）。只加不改：老调用方不看这个字段。
+    field_errors: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def effective(self) -> bool:
@@ -309,8 +335,11 @@ class AccessService:
         try:
             config.validate()
         except ValueError as exc:
-            return SaveResult(False, False, RELOAD_FAILED, "未保存：" + str(exc),
-                              config.display())
+            errors = config.field_errors()
+            extra = ("（共 " + str(len(errors)) + " 个字段需修正，已标在字段下方）"
+                     if len(errors) > 1 else "")
+            return SaveResult(False, False, RELOAD_FAILED, "未保存：" + str(exc) + extra,
+                              config.display(), field_errors=errors)
         try:
             self._store.save(config)
         except (OSError, ValueError):

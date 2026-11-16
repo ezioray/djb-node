@@ -151,6 +151,29 @@ def _window_app(tmp_path, width: int):
     return app, root
 
 
+def test_iso_left_tab_binding_is_optional(tmp_path):
+    """Windows 的 Tk 没有 ``ISO_Left_Tab`` keysym：绑不上必须**跳过**，不许把窗口炸掉。
+
+    真机现场（2026-11-16，Windows 11 + Python 3.11.9 / Tk 8.6）：
+    ``bind("<ISO_Left_Tab>")`` → ``TclError: bad event type or keysym``，
+    ``DesktopApp.__init__`` 直接抛异常 = 客户端起不来。X11 有这 keysym，所以 Linux CI 一直是绿的。
+    """
+    tk = pytest.importorskip("tkinter")
+    app, root = _window_app(tmp_path, 1200)
+    real_bind = root.bind
+
+    def bind(sequence, *args, **kwargs):
+        if sequence == "<ISO_Left_Tab>":
+            raise tk.TclError('bad event type or keysym "ISO_Left_Tab"')
+        return real_bind(sequence, *args, **kwargs)
+
+    try:
+        root.bind = bind                            # noqa: SLF001 - 模拟 Windows 的 Tk
+        app._bind_keys()                            # noqa: SLF001 - 不许抛
+    finally:
+        root.destroy()
+
+
 def test_narrow_window_shows_every_receipt_column_without_horizontal_scroll(tmp_path):
     """390 宽：5 列里的「本机校验」不许被挤出可视区（Treeview 没有横向滚动条）。"""
     app, root = _window_app(tmp_path, 390)
