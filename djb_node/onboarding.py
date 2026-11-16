@@ -35,7 +35,7 @@ STEPS: tuple[dict[str, str], ...] = (
     {"step": "2", "title": "绑定这台电脑",
      "body": "在网页端确认后，这台电脑的收益才能结算到你的账户。"},
     {"step": "3", "title": "提供 Token Plan（可选）",
-     "body": "填一个请求链接与密钥，就能把上游模型挂到平台报价。"},
+     "body": "填一个请求地址与密钥，就能把上游模型挂到平台报价。"},
 )
 TOTAL_STEPS = len(STEPS)
 DONE_TITLE = "完成"

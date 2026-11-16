@@ -488,7 +488,12 @@ class LocalDataSource:
             lines = [line.strip() for line in (stderr or stdout or "").splitlines()
                      if line.strip() and not line.strip().startswith("details=")]
             detail = lines[0].removeprefix("djb: ") if lines else ""
-            raise ProviderError(detail[:160] or "本地命令退出码 " + str(returncode))
+            # RC15-039 #11：CLI 的「先执行 djb init」被原样搬到界面上，客户却没有终端入口。
+            # 客户端的规矩：**要么做成界面内动作，要么明说这条要去终端跑并给完整命令**。
+            if "djb init" in detail:
+                detail = (detail[:160] + "（这条要在终端里跑：djb init；"
+                          "桌面端没有初始化入口，界面里点不到）")
+            raise ProviderError(detail[:260] or "本地命令退出码 " + str(returncode))
         try:
             payload = json.loads(stdout or "{}")
         except ValueError:

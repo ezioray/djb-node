@@ -449,7 +449,7 @@ class DesktopController:
         ids = [str(item.get("id")) for item in (rows or [])
                if isinstance(item, Mapping) and item.get("id")]
         if not ids:
-            return ActionResult("还没有接入任何上游：先去「提供 Token Plan」填请求链接与密钥。",
+            return ActionResult("还没有接入任何上游：先去「提供 Token Plan」填请求地址与密钥。",
                                 ok=False)
         verified = failed = 0
         reasons: list[str] = []
@@ -700,8 +700,11 @@ class DesktopController:
         from .. import device_flow as flow_mod
 
         if not self.device_flow_enabled():
+            # RC15-039 #11：以前甩半条 CLI（`djb auth --bind`）当解决方案——客户没有终端
+            # 在手边，也没有「绑定码」参数。界面内本来就有这条动作，直接指过去。
             return ActionResult("设备码绑定开关关闭（client.binding.device_flow.enabled）："
-                                "改用高级→手输绑定码（djb auth --bind）", ok=False)
+                                "改用界面里的「手输绑定码」：在网页端生成绑定码，"
+                                "回到这一页点「手输绑定码」把码粘进去。", ok=False)
         hook = self.device_via
         if hook is not None:
             try:
@@ -888,7 +891,7 @@ class DesktopController:
         protocol = str(self.drafts.get("protocol") or "").strip()
         secret = str(self.drafts.get("upstream_secret") or "").strip()
         if not base_url:
-            return ActionResult("先填「请求链接」（例如 https://api.openai.com/v1）", ok=False)
+            return ActionResult("先填「请求地址」（例如 https://api.openai.com/v1）", ok=False)
         hook = self.discover_via
         if hook is not None:
             try:
@@ -979,9 +982,9 @@ class DesktopController:
     def _act_token_plan_add_upstream(self, *, confirm=None) -> ActionResult:
         """E（RC14 IA 拆分）：「添加上游」不再跳到「本机设置」（那里根本不能加）。
 
-        第 1 步就在本页下方「添加接入」（协议 / 请求链接 / 密钥 → 读取模型清单）。
+        第 1 步就在本页下方「添加接入」（协议 / 请求地址 / 密钥 → 读取模型清单）。
         """
-        return ActionResult("在下方「添加接入」填：协议 → 请求链接 → 密钥，再点「读取模型清单」。",
+        return ActionResult("在下方「添加接入」填：协议 → 请求地址 → 密钥，再点「读取模型清单」。",
                             effect="goto", payload="token_plan")
 
     def _act_token_plan_bind_node(self, *, confirm=None) -> ActionResult:

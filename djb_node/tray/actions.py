@@ -40,7 +40,15 @@ def apply_control(action: TrayAction, *, call: Callable[..., Mapping[str, Any]],
     if action not in (TrayAction.PAUSE, TrayAction.RESUME):
         return ControlResult(False, "不支持的控制动作；未执行。")
     if not enabled():
-        return ControlResult(False, "控制开关关闭或已到期；命令指南，未执行。")
+        # RC15-039 #3：上一版文案是「开关…；命令指南，未执行。」——客户读不懂
+        # （「命令指南」是什么？没执行的是哪个命令？）。人话版必须说清**为什么没成**
+        # 与**下一步做什么**，并且明确「服务状态没变」——托盘动作最容易让人以为已经生效。
+        return ControlResult(
+            False,
+            "没有执行：这台机器的接单控制开关现在是关闭状态（或已过期），"
+            "所以暂停/恢复发不出去，服务状态一个字都没改。"
+            "下一步：去网页端「设备 · 本机节点」把控制开关打开或续期，"
+            "再回到托盘点一次；开关没打开之前点多少次都不会生效。")
     message = ("暂停接收新任务；在途任务按现有护栏处理。不停止服务。" if action is TrayAction.PAUSE
                else "恢复用户暂停；现有护栏仍可阻止接单。不启动服务。")
     if not confirm(message):

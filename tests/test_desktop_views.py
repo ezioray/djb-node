@@ -1018,7 +1018,9 @@ def test_unbound_account_shows_bind_entry_with_code_hint_and_web_url():
 
     text = view.plain_text()
     assert "绑定：在网页端 → 账户/节点 → 生成绑定码" in text
-    assert "djb auth --bind <码>" in text
+    # RC15-039 #11：绑定是界面内动作，提示里**不许**再甩半条 CLI 命令（客户手边没终端）
+    assert "手输绑定码" in text
+    assert "djb auth --bind" not in text, "CLI 不许再当解决方案出现在界面上"
     assert facts.WEB_CONSOLE_URL in text
     assert "account.open_web" in keys                 # 地址在界面上可点开
 

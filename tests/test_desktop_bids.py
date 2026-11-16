@@ -277,7 +277,8 @@ def test_discover_without_a_link_asks_for_it_first():
     source = _Source(_Store())
     controller = _controller(source)
     result = controller.action("token_plan.discover")
-    assert not result.ok and "请求链接" in result.message
+    # RC15-039 #37：界面上统一叫「请求地址」（以前一处叫「请求链接」，客户以为是两个字段）
+    assert not result.ok and "请求地址" in result.message
     assert source.calls == 0                              # 不发半个请求
 
 

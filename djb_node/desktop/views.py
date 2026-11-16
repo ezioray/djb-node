@@ -654,6 +654,11 @@ YIELD_MODE_SUMMARY = {
     "paused": "不接新任务；在途任务按护栏处理",
 }
 
+#: 「请求地址」统一口径（RC15-039 #37）：标签只叫「…请求地址」，填法提示**逐字一致**。
+#: 以前一页叫「请求链接」、一页叫「上行 OpenAI」、还有一页叫「OpenAI 请求地址」，
+#: 同一件事三种名字，客户以为是三个不同的字段。
+BASE_URL_HINT = "填到 /v1 就行（例如 https://api.openai.com/v1）；不要带 key 参数"
+
 #: 贡献节奏图的时间窗（小时）
 CHART_HOURS = 24
 
@@ -857,7 +862,10 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
     limits = _mapping(plan.get("limits"))
     receipts = _section(snapshot, "receipts")
     yield_state = _section(snapshot, "yield")
-    steps = (bool(config.get("node_secret") or config.get("node_id")), bool(config.get("price_mode")),
+    # RC15-039 #9：第一步「绑定」用**账户页同一个判定源**（服务端 binding），
+    # 不再拿「本机有没有节点凭据」冒充绑定——那正是「3 / 3 接入完成」与「未绑定」同屏的根因。
+    bound_ok, _bound_node_id = binding_state(snapshot)
+    steps = (bound_ok is True, bool(config.get("price_mode")),
              bool(config.get("usdt_address")))
     done = sum(1 for step in steps if step)
     # E（RC14 IA 拆分）：总览右栏只做**只读摘要**，且把「去哪改」指到唯一入口——
@@ -1430,10 +1438,10 @@ def _agent(snapshot: Snapshot) -> View:
                Card("下行", "已下发" if downlink.get("url") else "未设置",
                     "只读地址 + scoped token（掩码）", "muted")),
         fields=(
-            Field("上行 OpenAI", str(upstream.get("openai") or "未设置"),
-                  key="openai_base_url", editable=True, hint="Agent 把请求发到这里"),
-            Field("上行 Anthropic", str(upstream.get("anthropic") or "未设置"),
-                  key="anthropic_base_url", editable=True, hint="Anthropic 兼容协议"),
+            Field("OpenAI 请求地址", str(upstream.get("openai") or "未设置"),
+                  key="openai_base_url", editable=True, hint=BASE_URL_HINT),
+            Field("Anthropic 请求地址", str(upstream.get("anthropic") or "未设置"),
+                  key="anthropic_base_url", editable=True, hint=BASE_URL_HINT),
             Field("下行 本机入口", str(downlink.get("url") or "未设置"), key="agent_downlink_url",
                   hint="只读：由服务端下发"),
             Field("下行 scoped token", str(downlink.get("token") or "—"), key="scoped_token",
@@ -1584,8 +1592,8 @@ def _token_plan(snapshot: Snapshot) -> View:
     status = _section(snapshot, "status")
     receipts = _section(snapshot, "receipts")
     receipt_rows = [row for row in (receipts.get("rows") or []) if isinstance(row, Mapping)]
-    # 绑定态直接复用账户/接入页的判定（服务端 binding → profile.bound → 本机凭据）
-    bound = _account_bound(profile, security, binding)
+    # 绑定态走**唯一判定源**（#9）：总览 / 账户页 / 这里三处必须同一个答案
+    bound, _plan_node_id = binding_state(snapshot)
     online = str(status.get("state") or "") == "online"
     state = str(status.get("state") or "")
     state_text, state_tone = (
@@ -1644,7 +1652,7 @@ def _token_plan(snapshot: Snapshot) -> View:
     # 现在拆成两颗，各自跳到真正能做这件事的地方：
     #   * 添加上游 → 本页「添加接入」（第 1 步就在下方，item 11 落地表单）
     #   * 绑定节点 → 账户与安全（绑定的唯一位）
-    plan_actions = [Action("token_plan.add_upstream", "添加上游（填请求链接与密钥）",
+    plan_actions = [Action("token_plan.add_upstream", "添加上游（填请求地址与密钥）",
                            primary=True)]
     if bound is True:
         plan_actions.append(Action("token_plan.bind_node", "已绑定这台电脑", enabled=False,
@@ -1674,9 +1682,8 @@ def _token_plan(snapshot: Snapshot) -> View:
               hint="默认 " + facts.UPSTREAM_PROTOCOL_LABELS.get(
                   facts.DEFAULT_UPSTREAM_PROTOCOL, facts.DEFAULT_UPSTREAM_PROTOCOL)
               + "；切换不会改已填的链接"),
-        Field("请求链接", str(plan.get("base_url") or ""), key="base_url", editable=True,
-              prefill=False,
-              hint="填到 /v1 就行（例如 https://api.openai.com/v1）；不要带 key 参数"),
+        Field("请求地址", str(plan.get("base_url") or ""), key="base_url", editable=True,
+              prefill=False, hint=BASE_URL_HINT),
         # 密钥只存本机 0600；显示按钮由 Field.can_reveal 自动给（G7）
         Field("密钥", str(plan.get("secret_seen") or "未保存"), key="upstream_secret",
               editable=True, secret=True, prefill=False,
@@ -1719,7 +1726,7 @@ def _token_plan(snapshot: Snapshot) -> View:
             Card("我的 Token Plan（上游）",
                  _count(snapshot, "token_plan", str(len(rows)) + " 条上游"),
                  (("已验证 " + str(verified_upstreams) + " 条 · 详见下表") if rows
-                  else "点下面「添加上游」填请求链接") if snapshot.ok("token_plan") else "",
+                  else "点下面「添加上游」填请求地址") if snapshot.ok("token_plan") else "",
                  "mint" if rows else "amber"),
             Card("共享预算", budget, budget_meta + "（本机限额设置）", "default"),
             Card("今日已共享", shared_value, shared_meta, "mint" if used else "muted"),
@@ -1727,7 +1734,7 @@ def _token_plan(snapshot: Snapshot) -> View:
         table=Table(("模型", "上游", "目录", "探针", "本机底价", "生效来源"), tuple(bid_rows),
                     narrow_hide=("目录",),
                     note=planned + ("｜" + discover_note if discover_note else ""),
-                    empty=("还没有模型行：填「请求链接」与「密钥」，再点「读取模型清单」。"
+                    empty=("还没有模型行：填「请求地址」与「密钥」，再点「读取模型清单」。"
                            if snapshot.ok("token_plan") else UNAVAILABLE), title="上游报价"),
         tables=(Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
                       narrow_hide=("最近验证",),
@@ -1992,6 +1999,23 @@ def _yield(snapshot: Snapshot) -> View:
     )
 
 
+def binding_state(snapshot: Snapshot) -> tuple[bool | None, str]:
+    """**绑定态的唯一判定源**（RC15-039 #9）：返回 ``(是否已绑定, 节点 ID)``。
+
+    总览「三步接上」与账户页「节点绑定」都从这里取，不许各算各的——以前总览看「本机有没有
+    节点凭据」、账户页看「服务端 binding」，于是同一屏同时出现「3 / 3 接入完成」和「未绑定」（#9），
+    还把「节点 ID 存在」读成「没注册」（#33）。
+    """
+    account = _section(snapshot, "account")
+    access = _section(snapshot, "access")
+    profile = _mapping(account.get("profile"))
+    security = _mapping(account.get("security"))
+    binding = _mapping(access.get("binding"))
+    bound = _account_bound(profile, security, binding)
+    node_id = str(profile.get("node_id") or security.get("node_id") or "")
+    return bound, node_id
+
+
 def _account_bound(profile: Mapping[str, Any], security: Mapping[str, Any],
                    binding: Mapping[str, Any]) -> bool | None:
     """账户页的绑定态：服务端 binding 优先，其次 profile.bound，最后看本机有没有节点凭据。
@@ -2023,7 +2047,7 @@ def _account(snapshot: Snapshot) -> View:
     email = profile.get("email")
     identity = str(node_id or email or "—")
     identity_meta = str(profile.get("state") or profile.get("role") or "—")
-    bound = _account_bound(profile, security, binding)
+    bound, bound_node_id = binding_state(snapshot)
     # 绑定入口**不能**被「本域暂不可用」挡掉：未登录时账户域本来就取不到云端数据，
     # 而那正是最需要「绑定网页端」的时刻（2026-11-11 正式环境实测：账户页只剩一行
     # 「账户资料暂不可用」，按钮全被隐藏，用户没有任何可点的下一步）。
@@ -2036,8 +2060,13 @@ def _account(snapshot: Snapshot) -> View:
             for index, item in enumerate(unavailable))
     twofa = profile.get("twofa_enabled", profile.get("mfa_enabled"))
     if bound is not None:
+        # RC15-039 #33：「未绑定」只说**网页端账号**没绑到这个节点，不等于节点没注册。
+        binding_meta = ("服务端视图（只读）" if bound is True else
+                        ("本机已有节点凭据，只是网页端账号还没绑到它"
+                         if (bound_node_id or security.get("node_id")) else
+                         "服务端视图（只读）"))
         second = Card("节点绑定", _flag(bound, "已绑定", "未绑定"),
-                      "服务端视图（只读）", "mint" if bound is True else "amber")
+                      binding_meta, "mint" if bound is True else "amber")
     else:
         second = Card("双因素验证", _flag(twofa, "已开启", "未开启", "暂不可用"),
                       "登录保护的第二步", "mint" if twofa is True else "amber")
@@ -2171,9 +2200,17 @@ def _account(snapshot: Snapshot) -> View:
                      + "%），本轮不更新；下一波会自动再检查。")
     if can_bind:
         notes = [
-            "绑定：在网页端 → 账户/节点 → 生成绑定码，然后点「绑定网页端」粘贴到这里"
-            "（或 djb auth --bind <码>）",
+            # RC15-039 #11：绑定是**界面内动作**（「手输绑定码」按钮弹输入框，界面自己调本机命令），
+            # 不再甩半条 CLI 命令当解决方案。
+            "绑定：在网页端 → 账户/节点 → 生成绑定码，回到这一页点「手输绑定码」"
+            "（或「绑定网页端」）把码粘进去。",
             "网页端：" + facts.WEB_CONSOLE_URL,
+        ] + notes
+    if bound is False and (bound_node_id or security.get("node_id")):
+        # RC15-039 #33：一句话说清三个状态的关系，别让「未绑定 / 在线 / 有凭据」互相打脸。
+        notes = [
+            "「未绑定」只说网页端账号还没绑到这个节点；节点本身是存在的"
+            "（节点 ID 见「账户」卡，本机凭据见「本机凭据」卡）。"
         ] + notes
     return View(
         key="account", title="账户与安全",
