@@ -621,6 +621,13 @@ def _empty_text(snapshot: Snapshot, name: str, text: str) -> str:
     return text if snapshot.ok(name) else UNAVAILABLE
 
 
+#: RC15-039 #34：结算口径的**唯一出处**（owner 2026-11-16 D-2 原文，逐字照抄，不许改写）。
+#: 全客户端只许引用这个名字，别处不许再手写同类句子（验收口径见票面 §0.1 D-2）。
+#: 为什么合成一句：走查里那两句（一句说「完成就结算」，一句说「不能提」）同屏出现，
+#: 客户读成两个互相打脸的承诺。现在只剩这一句，收益页四卡的去向都对得上它。
+SETTLE_NOTE = "结算币种：USDT（按 1 USDT = 1 USD 展示）；收益不等于可提现余额。"
+
+
 def _section(snapshot: Snapshot, name: str) -> Mapping[str, Any]:
     value = snapshot.get(name)
     return value if isinstance(value, Mapping) else {}
@@ -940,8 +947,8 @@ def _overview(snapshot: Snapshot) -> View:
         Card("余额（可用）",
              ("暂不可用" if earnings.get("balance_note") and earnings.get("balance") is None
               else _num(earnings.get("balance") or status.get("balance"))),
-             ("账户预付款 · 不可提现" if earnings.get("balance") is not None
-              else str(earnings.get("balance_note") or "额度不可提现，仅抵扣推理")),
+             ("账户预付款 · 结算口径见「收益」页" if earnings.get("balance") is not None
+              else str(earnings.get("balance_note") or "余额暂不可用；结算口径见「收益」页")),
              "default"),
         Card("接单状态", state_text, str(reason or "无让路原因"), tone),
         Card("资源", _bytes(_section(snapshot, "bench").get("mem_available_bytes")) + " 可用内存",
@@ -1372,9 +1379,11 @@ def _earnings(snapshot: Snapshot) -> View:
     currency = str(earnings.get("currency") or "USDT")
     return View(
         key="earnings", title="收益",
-        subtitle="按完成任务直接结算 " + currency,
+        # 副标题只做「这是哪一页」；结算口径统一引用常量（不再各处手写一句）
+        subtitle="收益明细 · " + SETTLE_NOTE,
         cards=(Card("今日", _money(snapshot, "earnings", earnings.get("today"), currency),
-                    _today_note(earnings.get("today")) or "完成即结算", "mint"),
+                    # 「完成即结算」会和「待结算」自相矛盾：今日只说「已经进了结算流程」
+                    _today_note(earnings.get("today")) or "今天完成，已进入结算流程", "mint"),
                Card("待结算", _money(snapshot, "earnings", earnings.get("pending")),
                     "结算中不代表到账", "amber"),
                Card("已结算", _money(snapshot, "earnings", earnings.get("settled")),
@@ -1383,7 +1392,8 @@ def _earnings(snapshot: Snapshot) -> View:
                     ("暂不可用" if earnings.get("balance_note") and
                      earnings.get("balance") is None
                      else _money(snapshot, "earnings", earnings.get("balance"))),
-                    "账户预付款 · 不可提现", "muted")),
+                    # 余额卡**不许**暗示可提现（owner D-2）：meta 只留「这一列是余额」
+                    "可用余额 · 口径见本页副标题", "muted")),
         table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
                     narrow_hide=("币种", "时间"),
                     note=str(earnings.get("note") or ""),

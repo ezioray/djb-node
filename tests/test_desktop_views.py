@@ -115,10 +115,11 @@ def test_copy_has_no_forbidden_promises():
         text = vw.build_view(key, snapshot).plain_text()
         for word in FORBIDDEN_PROMISES:
             assert word not in text, (key, word)
-        # 「提现」只允许以否定形式出现（额度不可提现）
-        for index in range(len(text)):
-            if text.startswith("提现", index):
-                assert text[max(0, index - 2):index] == "不可", (key, text[index - 12:index + 6])
+        # 「提现」只允许出现在 SETTLE_NOTE 这一句里（RC15-039 #34：唯一出处）；其余地方
+        # 一律不许提，更不许承诺可提现——这句是 owner D-2 的原话，本身就是否定式
+        # 「收益不等于可提现余额」，所以旧规则「必须以『不可』开头」改成「必须在常量内」。
+        masked = text.replace(vw.SETTLE_NOTE, "")
+        assert "提现" not in masked, (key, masked[max(0, masked.find("提现") - 12):][:24])
 
 
 def test_never_leaks_secrets():
@@ -1510,3 +1511,25 @@ def test_switch_tier_reports_an_already_current_tier_and_a_write_failure(tmp_pat
     controller.select_row("yield", "全速")
     result = controller.action("yield.apply_mode", confirm=lambda _t: True)
     assert result.ok is False and "档位未切换" in result.message
+
+
+# ───────────────── RC15-039 #34：结算口径只剩一个常量（owner D-2 原文，逐字）
+def test_settlement_wording_is_one_constant_used_verbatim(tmp_path):
+    from djb_node.desktop.views import SETTLE_NOTE
+
+    assert SETTLE_NOTE == "结算币种：USDT（按 1 USDT = 1 USD 展示）；收益不等于可提现余额。"
+    text = make_controller(tmp_path).show("earnings").plain_text()
+    assert text.count(SETTLE_NOTE) == 1
+    # 四张卡的去向都要能对上这一句：余额卡不许暗示可提现
+    for card in ("[今日]", "[待结算]", "[已结算]", "[余额（可用）]"):
+        assert card in text
+    assert "余额（可用）" in text and "可提现" not in text.split("[余额（可用）]")[1].splitlines()[0]
+
+
+def test_no_view_promises_settlement_with_the_old_conflicting_lines(tmp_path):
+    """全客户端（13 页）不许再出现互相打脸的那两句手写文案。"""
+    controller = make_controller(tmp_path)
+    for key in vw.VIEW_KEYS:
+        text = controller.show(key).plain_text()
+        assert "不可提现" not in text, key
+        assert "直接结算" not in text, key
