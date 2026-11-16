@@ -1094,6 +1094,16 @@ class DesktopApp:
         quiet = bool(getattr(self, "_refresh_quiet", False))
         view = self._controller.apply_refresh(fresh, sections=sections, error=error,
                                              quiet=quiet)
+        # RC15-039 复核 M1：**派发时判过，落地时还要再判一次**。
+        # 派发到落地之间的几百毫秒里客户可能刚开始打字；这时重画会把输入框刷回旧值，
+        # 还会顺手把 `_entry_initial` 一起刷新——"有改动"的证据被抹掉，下一轮继续冲。
+        # 所以落地发现新输入：数据留在快照里，**本页不重画、页头时间也不动**（时间写的是
+        # 屏幕上这份数据的截至时刻，重画没发生就不能往前推，否则又是一种谎报）。
+        if quiet and error is None and self._has_unsaved_edits():
+            self._refresh_quiet = False
+            self._note_skipped_render()
+            return
+        self._skip_notice_on = False
         self._render(view)
         self._update_status()
         worker = getattr(self, "_refresh_worker", None)
@@ -1105,6 +1115,13 @@ class DesktopApp:
         if duration and message.startswith("已刷新"):
             message += "（用时 %.1f s）" % duration
         self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
+
+    def _note_skipped_render(self) -> None:
+        """落地时发现新输入 → 只留一句话，不重画（同一次跳过只念一遍，别每 10 秒吵一次）。"""
+        if bool(getattr(self, "_skip_notice_on", False)):
+            return
+        self._skip_notice_on = True
+        self._announce("有未保存的输入，已跳过自动刷新（这一页没重画，保存后自动恢复）")
 
     # ── 检查更新 / 安装更新（G4 / RC14 P0）：网络 + 签名校验，绝不在主线程
     def _ensure_update_worker(self) -> Any:

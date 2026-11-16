@@ -733,3 +733,58 @@ def test_real_tk_switch_focus_ring_uses_the_focus_token():
             assert int(str(switch.cget("takefocus"))) == 1
         finally:
             _close(app, root)
+
+
+def test_real_tk_auto_refresh_landing_keeps_input_typed_while_the_request_was_in_flight():
+    """复核 M1：派发时没改动、落地前开始输入 —— 落地**不许**重画，输入必须保住。
+
+    旧实现的坑：只在派发前判一次，落地无条件 ``_render``，连 ``_entry_initial`` 一起刷，
+    于是"有改动"的证据被抹掉，下一轮继续冲。这里直接驱动落地路径复现。
+    """
+    import time
+
+    tk, root = _tk_root_or_skip()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, controller, _data = _auto_app(root, Path(home))
+        try:
+            app.show_view("access")
+            root.update()
+            initial = app._entries["price_mode"].get()
+            assert app._has_unsaved_edits() is False
+
+            # 派发：此刻没有改动 → 允许刷新
+            app._start_quiet_refresh(("access",))
+            # 飞在路上的这几百毫秒里，客户开始打字
+            app._vars["price_mode"].set("manual")
+            root.update()
+            assert app._has_unsaved_edits() is True
+
+            # 落地
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                root.update()
+                if not app._refresh_worker.busy:
+                    break
+                time.sleep(0.02)
+            root.update()
+
+            assert app._entries["price_mode"].get() == "manual"      # 输入没被回滚
+            assert app._has_unsaved_edits() is True                  # 「有改动」的证据还在
+            assert "跳过自动刷新" in app._status.cget("text")         # 有话说，不是静默
+
+            # 下一轮 tick 仍然让路（不覆盖、不叠请求）
+            rounds = len(_data.rounds)
+            app._auto_refresh_tick()
+            root.update()
+            assert len(_data.rounds) == rounds
+            assert app._entries["price_mode"].get() == "manual"
+
+            # 改回去 → 恢复自动刷新（不是永久停摆）
+            app._vars["price_mode"].set(initial)
+            root.update()
+            assert app._has_unsaved_edits() is False
+        finally:
+            _close(app, root)
