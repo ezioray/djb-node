@@ -185,6 +185,40 @@ class _Runtime:
         target[0].value = int(value)
 
 
+def _process_by_exe(name: str) -> int:
+    """按可执行文件名找进程（给 trace 用：证明读屏软件当时在跑）。找不到就 0。"""
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        count = 4096
+        while True:
+            buffer = (wintypes.DWORD * count)()
+            needed = wintypes.DWORD()
+            if not psapi.EnumProcesses(buffer, ctypes.sizeof(buffer), ctypes.byref(needed)):
+                return 0
+            got = needed.value // ctypes.sizeof(wintypes.DWORD)
+            if got < count:
+                break
+            count *= 2
+        for index in range(got):
+            handle = kernel32.OpenProcess(0x1000, False, buffer[index])
+            if not handle:
+                continue
+            try:
+                path = ctypes.create_unicode_buffer(1024)
+                size = wintypes.DWORD(len(path))
+                if kernel32.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
+                    if path.value.replace("/", "\\").rsplit("\\", 1)[-1].lower() == name.lower():
+                        return int(buffer[index])
+            finally:
+                kernel32.CloseHandle(handle)
+    except Exception:
+        return 0
+    return 0
+
+
 def _foreground_exe() -> str:
     """trace 里记「调用发生时前台进程的可执行文件名」。
 
@@ -467,14 +501,22 @@ class Provider:
         except ValueError:
             return 0
 
+    def _nvda_pid(self) -> int:
+        """NVDA 进程号（5 秒缓存）——trace 里用它证明「读屏软件当时在跑」。"""
+        now = __import__("time").time()
+        if now - getattr(self, "_nvda_checked_at", 0.0) > 5.0:
+            self._nvda_checked_at = now
+            self._nvda_cached = _process_by_exe("nvda.exe")
+        return getattr(self, "_nvda_cached", 0)
+
     def _trace(self, method: str, child: Any, extra: str = "") -> None:
         if not self._trace_path:
             return
         try:
             with open(self._trace_path, "a", encoding="utf-8") as fh:
-                fh.write("%s pid=%d fg_exe=%s method=%s child=%s %s\n"
+                fh.write("%s pid=%d fg_exe=%s nvda=%d method=%s child=%s %s\n"
                          % (__import__("time").strftime("%H:%M:%S"), os.getpid(),
-                            _foreground_exe(), method, child, extra))
+                            _foreground_exe(), self._nvda_pid(), method, child, extra))
         except Exception:
             pass
 
@@ -559,7 +601,9 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
 
         def get_accChildCount(self, pcount):
             try:
-                pcount[0] = len(self._provider.children(self._path))
+                count = len(self._provider.children(self._path))
+                pcount[0] = count
+                self._provider._trace("accChildCount", 0, "count=%d" % count)
                 return 0
             except Exception as exc:
                 self._provider._error("accChildCount", exc)
@@ -581,15 +625,14 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
             except Exception as exc:
                 self._provider._error("accChild", exc)
                 return E_FAIL
-            except Exception as exc:
-                self._provider._error("accChild", exc)
-                return E_FAIL
 
         def get_accName(self, varChild, pszName):
             try:
                 index = _child_index(varChild)
                 node = self._node() if index == 0 else self._child_node(varChild)
-                pszName[0] = rt.bstr(node.name if node else "")
+                name = node.name if node else ""
+                pszName[0] = rt.bstr(name)
+                self._provider._trace("accName", index, "len=%d" % len(name))
                 return 0 if node else BADINDEX
             except Exception as exc:
                 self._provider._error("accName", exc)
@@ -623,6 +666,7 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                 index = _child_index(varChild)
                 node = self._node() if index == 0 else self._child_node(varChild)
                 rt.int_variant(pvarRole, node.role if node else 0)
+                self._provider._trace("accRole", index, "ok")
                 return 0 if node else BADINDEX
             except Exception as exc:
                 self._provider._error("accRole", exc)
@@ -638,6 +682,7 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                 elif bits & STATE_SELECTABLE:
                     bits &= ~STATE_SELECTED            # 只报「这一个」被选中，不虚报
                 rt.int_variant(pvarState, bits)
+                self._provider._trace("accState", index, "state=%d" % bits)
                 return 0 if node else BADINDEX
             except Exception as exc:
                 self._provider._error("accState", exc)
@@ -674,11 +719,13 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                     return 0
                 if focused == self._path:
                     rt.int_variant(pvarChild, 0)          # CHILDID_SELF
+                    self._provider._trace("accFocus", 0, "self")
                     return 0
                 # 焦点不在自己身上：只有当它是自己的直接子节点时才报给客户端
                 kids = provider.children(self._path)
                 if focused in kids:
                     rt.int_variant(pvarChild, kids.index(focused) + 1)
+                    self._provider._trace("accFocus", kids.index(focused) + 1, "")
                 else:
                     rt.empty_variant(pvarChild)
                 return 0
@@ -720,6 +767,7 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                     return E_INVALIDARG
                 if not flagsSelect & (_SELFLAG_TAKEFOCUS | _SELFLAG_TAKESELECTION):
                     return S_FALSE
+                self._provider._trace("accSelect", index, "flags=%d" % int(flagsSelect))
                 if flagsSelect & _SELFLAG_TAKEFOCUS:
                     provider.notify_focus(path)
                 if flagsSelect & _SELFLAG_TAKESELECTION:
