@@ -32,7 +32,7 @@ BIND = re.compile(r'bind(?:_all)?\(\s*"<([^">]+)>"')
 def _bound_sequences() -> dict[str, set[str]]:
     found: dict[str, set[str]] = {}
     root = pathlib.Path(__file__).resolve().parent.parent / "djb_node" / "desktop"
-    for path in root.glob("*.py"):
+    for path in root.rglob("*.py"):            # 递归：子目录（a11y/ 等）也不许漏
         for seq in BIND.findall(path.read_text(encoding="utf-8")):
             found.setdefault(seq, set()).add(path.name)
     return found
@@ -57,6 +57,23 @@ def test_every_bound_sequence_is_valid_on_windows():
     finally:
         window.destroy()
     assert not bad, "Windows Tk 不认这些绑定：" + "; ".join(bad)
+
+
+def test_allowlist_has_at_most_one_entry():
+    """复核 SHOULD-FIX 5：白名单是要人肉解释的债，只准 1 条。
+
+    想加第二条 = 又引入一个 Windows 绑不上的序列；要么改代码，要么在这里写清楚
+    为什么非它不可，并把数字改大——改这个常数会被复核看到。
+    """
+    assert len(ALLOWED) == 1, "白名单只准 1 条（当前：%s）" % ", ".join(sorted(ALLOWED))
+
+
+def test_scan_actually_finds_the_bindings():
+    """扫描的自我证明：至少扫到 `_bind_keys` 里那批绑定，且支持子目录（rglob）。"""
+    sequences = _bound_sequences()
+    files = {name for names in sequences.values() for name in names}
+    assert "app.py" in files, "连 app.py 的绑定都没扫到，扫描等于没写"
+    assert len(sequences) >= 10, "只扫到 %d 条绑定，肯定漏了" % len(sequences)
 
 
 def test_allowlist_entries_still_exist():

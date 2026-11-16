@@ -67,9 +67,21 @@ _SELFLAG_TAKESELECTION = 0x2
 _MAX_ERROR_LOGS = 20
 
 
+#: 逃生阀的「关」取值。以前只认 ``"0"``，客户写 ``false``/``off`` 关不掉（复核 SHOULD-FIX 1）。
+_DISABLE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
+
+
+def _disabled_by_env() -> bool:
+    """``DJB_DESKTOP_A11Y`` 是否要求关掉 provider（大小写/空白都不敏感）。"""
+    raw = os.environ.get(ENV_DISABLE)
+    if raw is None:
+        return False                                  # 没设 = 默认开（默认值即「开」）
+    return str(raw).strip().lower() in _DISABLE_VALUES
+
+
 def available() -> bool:
     """当前环境能不能装 provider（不 import comtypes，只看平台与逃生阀）。"""
-    if os.environ.get(ENV_DISABLE, "1").strip() == "0":
+    if _disabled_by_env():
         return False
     return sys.platform == "win32"
 
@@ -309,12 +321,13 @@ class Provider:
         self._focused_path = ""
         self._selection_path = ""
         self._root_path = ""
-        # childId 是**身份**不是位置：路径一经分配就不再变，行插入/删除都不动老行。
-        # 读屏按 childId 升序遍历；代价见 refresh() 文档（新行排在读序末尾）。
-        self._id_by_path: dict[str, int] = {}
-        self._path_by_id: dict[int, str] = {}
-        self._next_child_id = 1
-        self._free_ids: list[int] = []
+        # childId 必须是**密集**的 1..N（MSAA 客户端按 1..accChildCount 遍历，稀疏 id 必撞空，
+        # 复核 MF-2）。所以 id = 当前 children 顺序里的位置 + 1；**身份稳定性由 path 承担**：
+        # 焦点/选中记住的是 path，刷新后位置变了就用新 childId **重发**焦点/选中事件。
+        self._focus_event_id = 0
+        self._selection_event_id = 0
+        # 发过的事件（event, childId, path）：真机取证与单测都用它，不发事件也给记账
+        self._event_log: list[tuple[int, int, str]] = []
         self._tree: Node | None = None
         self._error_count = 0
         self._trace_path = (os.environ.get(ENV_TRACE) or "").strip()
@@ -398,6 +411,8 @@ class Provider:
         except Exception as exc:                      # pragma: no cover - 防御
             self._error("build_tree", exc)
             return
+        old_focus_id = self.child_id(self._focused_path) if self._focused_path else 0
+        old_selection_id = self.child_id(self._selection_path) if self._selection_path else 0
         self._tree = tree
         self._root_path = tree.node_id
         self._node_by_path = {}
@@ -419,30 +434,27 @@ class Provider:
             self._node_by_path[path] = node
             self._parent_by_path[path] = ""
             self._children_by_path[path] = ()
-        # 回收消失的路径（这些 id 可能被新行复用；客户端手里的旧 id 只对旧行有意义）
-        live = set(paths)
-        for path, child_id in list(self._id_by_path.items()):
-            if path not in live:
-                del self._id_by_path[path]
-                self._path_by_id.pop(child_id, None)
-                self._free_ids.append(child_id)
-        for path in paths:
-            if path in self._id_by_path:
-                continue
-            child_id = self._free_ids.pop(0) if self._free_ids else self._next_child_id
-            if child_id >= self._next_child_id:
-                self._next_child_id = child_id + 1
-            self._id_by_path[path] = child_id
-            self._path_by_id[child_id] = path
         self._children_by_path[""] = tuple(paths)
         self._children_by_path[self._root_path] = tuple(paths)
         self._node_by_path[""] = tree
         self._node_by_path[self._root_path] = tree
         self._parent_by_path[""] = ""
         self._root_children = tuple(paths)
-        # 焦点所在节点可能被筛掉了：掉了就回根，并记一条（不发事件）
+        # 焦点/选中可能被筛掉了：掉了就清空
         if self._focused_path and self._focused_path not in self._node_by_path:
             self._focused_path = ""
+        if self._selection_path and self._selection_path not in self._node_by_path:
+            self._selection_path = ""
+        # **位置变了就重发**（复核 MF-2 契约）：读屏手里记的是 childId，
+        # 行往上/往下挪了必须让它知道「同一个业务行现在叫几号」，否则它会读成另一行。
+        if self._focused_path:
+            new_id = self.child_id(self._focused_path)
+            if old_focus_id and new_id and new_id != old_focus_id:
+                self._refire(_EVENT_OBJECT_FOCUS, self._focused_path, new_id)
+        if self._selection_path:
+            new_id = self.child_id(self._selection_path)
+            if old_selection_id and new_id and new_id != old_selection_id:
+                self._refire(_EVENT_OBJECT_SELECTION, self._selection_path, new_id)
 
     def _index(self, node: Node, parent_path: str) -> None:
         path = node.node_id
@@ -456,15 +468,34 @@ class Provider:
         return self._node_by_path.get(path or self._root_path)
 
     def children(self, path: str) -> tuple[str, ...]:
-        """直接子元素，**按 childId 升序**（= 读屏的遍历顺序）。
-
-        压平后只有根有孩子；根的子元素顺序由 id 决定，因此不会因为数据顺序变化而「串位」。
-        """
+        """直接子元素，**按界面顺序**；childId 就是这里的下标 + 1（密集，1..N）。"""
         if path not in ("", self._root_path):
             return ()
-        return tuple(self._path_by_id[child_id] for child_id in sorted(self._path_by_id))
+        return self._root_children
 
     # ── 事件 / 日志 ───────────────────────────────────────────────────────────
+    def _window_rect(self) -> "tuple[int, int, int, int] | None":
+        """窗口屏幕矩形 ``(left, top, right, bottom)``；没有真窗口（Linux/单测）给 None。"""
+        rt = self.rt
+        if rt is None:
+            return None
+        try:
+            rect = rt.wt.RECT()
+            if not rt.user32.GetWindowRect(rt.wt.HWND(self.outer or self.hwnd),
+                                           ctypes.byref(rect)):
+                return None
+            return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+        except Exception:                              # pragma: no cover - 句柄失效
+            return None
+
+    def contains_point(self, x: int, y: int) -> bool:
+        """这个屏幕坐标是否落在本窗口矩形内（``accHitTest`` 用；拿不到矩形就保守放行）。"""
+        rect = self._window_rect()
+        if rect is None:
+            return True
+        left, top, right, bottom = rect
+        return left <= x < right and top <= y < bottom
+
     def focusable_paths(self) -> tuple[str, ...]:
         """可以拿焦点的节点（按读屏遍历顺序）——app 用 Tab 走位时按位置映射。"""
         return tuple(path for path in self._root_children
@@ -497,10 +528,31 @@ class Provider:
             return
         self.select(paths[max(0, min(int(index), len(paths) - 1))])
 
+    def _refire(self, event: int, path: str, child_id: int) -> None:
+        """位置变了以后**重发**事件（只发事件，不改任何状态、不动 Tk 焦点）。"""
+        self._record_event(event, child_id, path)
+        if self.rt is None:
+            self._focus_event_id = child_id
+            return
+        try:
+            self.rt.user32.NotifyWinEvent(event, self.rt.wt.HWND(self.outer or self.hwnd),
+                                          _OBJID_CLIENT, int(child_id))
+        except Exception as exc:                      # pragma: no cover
+            self._error("NotifyWinEvent", exc)
+        if event == _EVENT_OBJECT_FOCUS:
+            self._focus_event_id = child_id
+        else:
+            self._selection_event_id = child_id
+
     def select(self, path: str) -> None:
         """选中某行（表格行/列表项）并发 ``EVENT_OBJECT_SELECTION``。"""
         self._selection_path = path
         self._focus(path, _EVENT_OBJECT_SELECTION, keep_focus=False)
+
+    def _record_event(self, event: int, child_id: int, path: str) -> None:
+        self._event_log.append((int(event), int(child_id), path))
+        del self._event_log[:-200]
+        self._trace("NotifyWinEvent", child_id, "event=0x%04X path=%s" % (int(event), path))
 
     def _focus(self, path: str, event: int, *, keep_focus: bool = True) -> None:
         if path not in self._node_by_path:
@@ -509,6 +561,7 @@ class Provider:
             self._focused_path = path
         else:
             self._selection_path = path
+        self._record_event(event, self.child_id(path), path)
         if self.rt is None:                 # 没有 COM 也要记账：Linux 上可单测，语义也一致
             return
         try:
@@ -518,16 +571,25 @@ class Provider:
             self._error("NotifyWinEvent", exc)
 
     def child_id(self, path: str) -> int:
-        """路径 → childId（1 起；根 0 = CHILDID_SELF）。
+        """路径 → childId = 当前 children 顺序里的位置 + 1（根给 0 = CHILDID_SELF）。
 
-        走注册表而不是 ``index(path)+1``：**位置会漂，身份不会**。顶部插一行时老行 id 不动，
-        新行拿新 id（读序排在末尾——顺序语义由行名里的时间/收据号表达）。
+        **密集编号**：1..N 一个不空。位置会变，所以「同一行还是同一个号」不是契约——
+        契约是「焦点/选中跟着 **path** 走，位置变了就用新号重发事件」（见 ``refresh``）。
         """
-        return self._id_by_path.get(path, 0)
+        try:
+            return self._root_children.index(path) + 1
+        except ValueError:
+            return 0
 
     def path_for_id(self, child_id: int) -> str:
-        """childId → 路径；无效/已回收给空串。"""
-        return self._path_by_id.get(int(child_id), "")
+        """childId → 路径；越界/非正给空串（与 ``get_accChild`` 的 S_FALSE 一致）。"""
+        try:
+            index = int(child_id)
+        except (TypeError, ValueError):
+            return ""
+        if 1 <= index <= len(self._root_children):
+            return self._root_children[index - 1]
+        return ""
 
     def _nvda_pid(self) -> int:
         """NVDA 进程号（5 秒缓存）——trace 里用它证明「读屏软件当时在跑」。"""
@@ -626,8 +688,7 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
 
         def get_accChildCount(self, pcount):
             try:
-                ids = self._provider._path_by_id
-                count = max(ids) if ids else 0
+                count = len(self._provider.children(self._path))    # 密集：1..count 一个不空
                 pcount[0] = count
                 self._provider._trace("accChildCount", 0, "count=%d" % count)
                 return 0
@@ -836,10 +897,20 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                 return E_FAIL
 
         def accHitTest(self, xLeft, yTop, pvarChild):
+            """坐标落在窗口外 → ``E_INVALIDARG``；窗内 → 报根（``CHILDID_SELF``）。
+
+            以前无条件回 SELF：读屏点窗口外一屏空白也得到「这是本窗口」，坐标定位等于没用
+            （复核 SHOULD-FIX 2）。窗内不编造子节点——本版是压平模型，命中具体行需要嵌套，
+            见 `CHG-20261116-CLIENT-A11Y-NESTED-P2.md`。
+            """
             try:
-                rt.int_variant(pvarChild, 0)     # 保守：报「就是我自己」，绝不编造子节点
+                if self._provider.rt is not None and not self._provider.contains_point(
+                        int(xLeft), int(yTop)):
+                    return E_INVALIDARG
+                rt.int_variant(pvarChild, 0)
                 return 0
-            except Exception:
+            except Exception as exc:
+                self._provider._error("accHitTest", exc)
                 return E_FAIL
 
         def accDoDefaultAction(self, varChild):

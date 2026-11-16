@@ -18,8 +18,9 @@ Linux CI 有 xvfb，能跑投影和窗口测试，但**抓不到 Windows Tk 的�
 * ``--mode inproc``（默认，venv 里跑）：进程内建窗口 → 断言主窗口存在且标题对 → 断言 a11y
   provider 真的挂上且 ``accChildCount>0`` → 依次切 13 个视图 → 逐个开/关弹窗 → 写 JSON。
 * ``--mode exe --exe <djb-desktop.exe>``（冻结包）：起进程 → **按标题找窗口**（Tk 窗口属于
-  python 子进程，按启动 pid 找不到）→ ``SetForegroundWindow`` 抢前台 → 发 Ctrl+1..9 →
-  结束断言「进程活着 **且** 窗口还在」。
+  python 子进程，按启动 pid 找不到）→ ``SetForegroundWindow`` 抢前台 → **13 个视图快捷键**
+  （Ctrl+1..9 + Ctrl+Shift+1..4）逐个按 → 每按一次都**跨进程读 oleacc**，断言根节点第一个
+  孩子的名字真的跟着变（只听按键发出去不算切页）→ 结束断言「进程活着 **且** 窗口还在」。
 
 自测（证明脚本会红）
 ====================
@@ -95,6 +96,53 @@ def _widget_count(widget) -> int:
     return total
 
 
+# ── 跨进程探针（oleacc）：断言「界面真的变了」，而不是「按键发出去了」 ──────────────
+_PROBE_SRC = r"""
+import ctypes, sys
+from ctypes import POINTER, byref, c_void_p
+import ctypes.wintypes as wt
+import comtypes, comtypes.client, comtypes.automation
+from comtypes.automation import VARIANT
+
+hwnd = int(sys.argv[1])
+comtypes.CoInitialize()
+IAccessible = comtypes.client.GetModule("oleacc.dll").IAccessible
+oleacc = ctypes.WinDLL("oleacc", use_last_error=True)
+ptr = c_void_p()
+hres = oleacc.AccessibleObjectFromWindow(wt.HWND(hwnd), wt.DWORD(-4),
+                                         byref(IAccessible._iid_), byref(ptr))
+if hres != 0 or not ptr:
+    print("0\t")
+    raise SystemExit(3)
+acc = ctypes.cast(ptr, POINTER(IAccessible))
+count = int(acc.accChildCount)
+names = []
+for index in range(1, min(count, 6) + 1):
+    try:
+        names.append((acc.accName(VARIANT(index)) or "")[:40])
+    except Exception:
+        names.append("?")
+print("%d\t%s" % (count, " | ".join(names).replace("\t", " ").replace("\r", " ").replace("\n", " ")))
+"""
+
+
+def _acc_probe(hwnd: int) -> tuple[int, str]:
+    """**另一个进程**读这个窗口的 IAccessible 根：返回 (childCount, 前 6 个孩子的名字拼串)。
+
+    为什么非要跨进程：进程内读自己永远是通的，只有跨进程才证明「oleacc 能拿到树」。
+    名字拼串当**页面指纹**：13 个视图的卡片不同，切页成功指纹必变。
+    """
+    import subprocess
+    import sys as _sys
+    out = subprocess.run([_sys.executable, "-c", _PROBE_SRC, str(int(hwnd))],
+                         capture_output=True, text=True, timeout=60)
+    if out.returncode != 0:
+        raise AssertionError("跨进程探针失败 rc=%s err=%s" % (out.returncode, out.stderr[-200:]))
+    line = (out.stdout or "").strip().splitlines()[-1] if out.stdout.strip() else "0\t"
+    count_text, _, signature = line.partition("\t")
+    return int(count_text or 0), signature
+
+
 # ── inproc 模式 ───────────────────────────────────────────────────────────────
 def smoke_inproc(out: Path, views: list[str], self_test_fail: bool = False) -> int:
     import tkinter as tk
@@ -132,6 +180,10 @@ def smoke_inproc(out: Path, views: list[str], self_test_fail: bool = False) -> i
         return True, "childCount=%d" % len(kids)
 
     ok_all &= run_step("a11y-provider", a11y_provider)
+
+    # 注：跨进程断言放在 exe 模式（那才是真跨进程）。进程内建窗口再跨进程读自己，
+    # 读到的是 Tk 外壳窗口的默认对象（空壳、无名字），会得出「读屏读不到」的假结论
+    # ——真机已验证两次，故不在 inproc 里做这件事。
 
     wanted = VIEW_KEYS if (not views or views == ["all"]) else views
     for key in wanted:
@@ -199,10 +251,11 @@ def _window_present(hwnd: int) -> bool:
     return bool(hwnd) and bool(_user32().IsWindow(hwnd))
 
 
-def smoke_exe(exe: Path, out: Path, timeout: float = 40.0, self_test_fail: bool = False) -> int:
+def smoke_exe(exe: Path, out: Path, timeout: float = 40.0, self_test_fail: bool = False,
+              exe_args: list[str] | None = None) -> int:
     title = BAD_TITLE if self_test_fail else os.environ.get("DJB_SMOKE_TITLE", TITLE)
     user32 = _user32()
-    proc = subprocess.Popen([str(exe)], cwd=str(exe.parent))
+    proc = subprocess.Popen([str(exe), *(exe_args or [])], cwd=str(exe.parent))
     step("launch", True, "pid=%d" % proc.pid)
     ok_all = True
     state: dict[str, int] = {"hwnd": 0}
@@ -233,18 +286,51 @@ def smoke_exe(exe: Path, out: Path, timeout: float = 40.0, self_test_fail: bool 
     if hwnd:
         ok_all &= run_step("foreground", focus_window)
 
+    #: 13 个视图快捷键：Ctrl+1..9 + Ctrl+Shift+1..4（与 app.view_shortcut_bindings 一致）
+    SHORTCUTS = [(str(digit), False) for digit in "123456789"] + \
+                [(str(digit), True) for digit in "1234"]
+
+    def _send_shortcut(digit: str, shift: bool) -> None:
+        VK_SHIFT, VK_CONTROL, KEYEVENTF_KEYUP = 0x10, 0x11, 2
+        if shift:
+            user32.keybd_event(VK_SHIFT, 0, 0, 0)
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(ord(digit), 0, 0, 0)
+        user32.keybd_event(ord(digit), 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        if shift:
+            user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+
     def switch_views():
+        """13 个快捷键逐个按，**每按一次跨进程读一次树**：指纹没变就算没切过去。
+
+        先按 Ctrl+9 离开首视图再开始：否则第一下 Ctrl+1 正好是当前页，指纹不变会被
+        误判成「没切过去」（第一轮就是这么红的）。
+        """
         if not _window_present(hwnd):
             return False, "窗口不在了，没法切页"
-        for key in "123456789":
-            user32.keybd_event(0x11, 0, 0, 0)                  # Ctrl down
-            user32.keybd_event(ord(key), 0, 0, 0)
-            user32.keybd_event(ord(key), 0, 2, 0)
-            user32.keybd_event(0x11, 0, 2, 0)
-            time.sleep(0.2)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.3)
+        _send_shortcut("9", False)
+        time.sleep(0.45)
+        count, signature = _acc_probe(hwnd)
+        if count <= 0 or not signature.strip():
+            return False, "跨进程读不到树（childCount=%d）" % count
+        seen: list[str] = []
+        for digit, shift in SHORTCUTS:
+            label = "Ctrl+" + ("Shift+" if shift else "") + digit
+            _send_shortcut(digit, shift)
+            time.sleep(0.45)
             if proc.poll() is not None:
-                return False, "发到 Ctrl+%s 时进程死了，退出码 %s" % (key, proc.returncode)
-        return True, "已发 Ctrl+1..9，进程存活"
+                return False, "发到 %s 时进程死了，退出码 %s" % (label, proc.returncode)
+            count, fresh = _acc_probe(hwnd)
+            if count <= 0 or not fresh.strip():
+                return False, "%s 之后跨进程读不到树" % label
+            if fresh == signature:
+                return False, "%s 之后界面没变（指纹仍是 %r）" % (label, fresh[:60])
+            seen.append(fresh.split("|")[0].strip())
+            signature = fresh
+        return True, "13 个快捷键各切一次，首孩子依次：%s" % " → ".join(seen)
 
     ok_all &= run_step("switch-views", switch_views)
 
@@ -286,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exe", type=Path, help="冻结包里的 djb-desktop.exe")
     parser.add_argument("--out", type=Path, help="结果 JSON（默认 win_smoke_<版本>.json）")
     parser.add_argument("--views", nargs="*", help="只跑这些视图（默认 13 个全跑）")
+    parser.add_argument("--exe-args", nargs="*", default=[],
+                        help="传给 --exe 的参数（自测用：指向 venv python + 演示脚本）")
     parser.add_argument("--self-test-fail", action="store_true",
                         help="自测：故意让 window-exists 失败（标题写错），退出码必须是 1")
     args = parser.parse_args(argv)
@@ -298,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "exe":
         if not args.exe:
             parser.error("--mode exe 需要 --exe")
-        return smoke_exe(args.exe, out, self_test_fail=args.self_test_fail)
+        return smoke_exe(args.exe, out, self_test_fail=args.self_test_fail,
+                         exe_args=list(args.exe_args or []))
     return smoke_inproc(out, args.views or [], self_test_fail=args.self_test_fail)
 
 

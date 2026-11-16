@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
@@ -959,7 +961,9 @@ def _overview(snapshot: Snapshot) -> View:
         Card("接单状态", state_text, str(reason or "无让路原因"), tone),
         Card("资源", _bytes(_section(snapshot, "bench").get("mem_available_bytes")) + " 可用内存",
              "CPU " + str(_section(snapshot, "bench").get("cpu_count") or "—") + " 核", "default"),
-        Card("让路 / 节能", str(yield_state.get("mode") or "未设置"),
+        Card("让路 / 节能",
+             YIELD_LABEL_BY_KEY.get(str(yield_state.get("mode") or ""),
+                                    str(yield_state.get("mode") or "未设置")),
              "暂停后与托盘一致", "muted"),
     )
     rows = _receipt_rows(receipts.get("rows"))
@@ -1915,6 +1919,8 @@ YIELD_TIERS: tuple[tuple[str, str, str], ...] = (
 )
 #: 表内键 → 写命令取值 / 档位文案 → 写命令取值（动作层按选中的**标签**查）
 YIELD_PRESET_BY_KEY: dict[str, str] = {key: preset for key, _l, preset in YIELD_TIERS}
+#: 键 → 中文档位名（复核 SHOULD-FIX 7：总览卡以前直接印原始键 `balanced`，中文界面里冒英文）
+YIELD_LABEL_BY_KEY: dict[str, str] = {key: label for key, label, _p in YIELD_TIERS}
 YIELD_PRESET_BY_LABEL: dict[str, str] = {label: preset for _k, label, preset in YIELD_TIERS}
 
 
@@ -2241,10 +2247,26 @@ LOG_LEVEL_TEXT = {"all": "全部级别", "debug": "debug（调试）", "info": "
                   "critical": "critical（严重）"}
 
 
+def _content_key(prefix: str, parts: Any, seen: dict[str, int]) -> str:
+    """列表项的内容身份：``<prefix>-<内容哈希>``；**逐字相同**的行才补 ``#2``。
+
+    用途：Treeview 的 iid 必须唯一（撞了会 TclError 打死窗口），但 id 又不能用序号，
+    否则上面插一行、下面全变。两行内容逐字相同时它们本来不可区分，计数器是唯一选择。
+    """
+    digest = hashlib.sha1("\x1f".join(str(part) for part in parts).encode("utf-8")).hexdigest()[:10]
+    key = prefix + "-" + digest
+    if key in seen:
+        seen[key] += 1
+        return "%s#%d" % (key, seen[key])
+    seen[key] = 0
+    return key
+
+
 def _logs(snapshot: Snapshot) -> View:
     logs = _section(snapshot, "logs")
     total = logs.get("total")
     rows = []
+    seen: dict[str, int] = {}
     for index, row in enumerate(logs.get("rows") if isinstance(logs.get("rows"), list) else []):
         if not isinstance(row, Mapping):
             continue
@@ -2260,12 +2282,17 @@ def _logs(snapshot: Snapshot) -> View:
         payload = row.get("fields") if isinstance(row.get("fields"), Mapping) else {}
         reason = str(payload.get("reason") or "").strip()
         next_step = str(payload.get("next_step") or "").strip()
-        # key 必须唯一：日志里同一微秒可能被写两次（init 与 daemon 各写一遍同一事件），
-        # 用 ts 当 iid 会让 Treeview 抛 TclError「Item ... already exists」把整个窗口打死。
+        # key = **内容身份**，不许带序号（复核 MF-1：`logs-%04d-<ts>` 里的序号会让
+        # 顶部插一行时下面每行的 a11y 路径全变，读屏焦点跟着跳到别人身上）。
+        # 仍然必须唯一：同一微秒可能被写两遍（init 与 daemon 各写一遍同一事件），
+        # 完全相同的两行只能用「同内容计数器」区分——那是这类行唯一的不稳定点，已写进
+        # `a11y/tree._row_id` 的文档。
         rows.append(Row((mark + " " + level, str(row.get("ts") or "—"),
                          str(row.get("event") or "—"),
                          reason or "—", next_step or "—"),
-                        key="logs-%04d-%s" % (index, row.get("ts") or ""),
+                        key=_content_key("logs", (level, str(row.get("ts") or ""),
+                                                  str(row.get("event") or ""),
+                                                  reason, next_step), seen),
                         tone=tone))
     level = str(logs.get("level") or "all")
     levels = [str(item) for item in (logs.get("levels") or []) if str(item)]

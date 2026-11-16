@@ -151,26 +151,27 @@ def test_editable_field_is_focusable_not_readonly():
 
 
 # ── id 稳定：刷新前后同一行还是同一个 id ───────────────────────────────────────
-def test_row_ids_survive_a_refresh_with_different_rows():
-    def snapshot(rows):
-        return ds.Snapshot({"logs": {"rows": rows}})
+def _logs_snapshot(entries):
+    """走**真实**产品路径：`views._logs` 生成 Row.key，不在用例里手写 key。"""
+    return ds.Snapshot({"logs": {"rows": [
+        {"ts": ts, "level": level, "event": event, "reason": "", "next": ""}
+        for event, ts, level in entries]}})
 
-    def logs_rows(*events):
-        return [{"ts": "2026-11-16T10:0%d:00Z" % i, "level": "info", "event": e,
-                 "reason": "", "next": ""} for i, e in enumerate(events)]
 
-    first = vw.build_view("logs", snapshot(logs_rows("a", "b", "c")))
-    second = vw.build_view("logs", snapshot(logs_rows("b", "c")))
-    ids_first = ids_by_key(build_tree(first))
-    ids_second = ids_by_key(build_tree(second))
-    shared = set(ids_first) & set(ids_second)
-    rows_shared = {key for key in shared if "/row:" in key}
-    assert rows_shared, "两版之间应至少共有一行"
-    # 计数从 1 起并且唯一（客户端按 childId 逐个取，不能重号）
-    for mapping in (ids_first, ids_second):
-        values = list(mapping.values())
-        assert len(values) == len(set(values))
-        assert sorted(values) == list(range(len(values)))
+def _log_entries(*events):
+    return [(event, "2026-11-16T10:%02d:00Z" % index, "info")
+            for index, event in enumerate(events)]
+
+
+def test_row_paths_survive_a_refresh_with_different_rows():
+    """真实日志页：换一版数据（少一行）后，还在的行路径必须原样。"""
+    first = vw.build_view("logs", _logs_snapshot(_log_entries("a", "b", "c")))
+    second = vw.build_view("logs", _logs_snapshot(
+        _log_entries("a", "b", "c")[:1] + _log_entries("a", "b", "c")[2:]))
+    rows_first = {row.key for row in first.table.rows}
+    rows_second = {row.key for row in second.table.rows}
+    assert rows_first & rows_second, "两版之间应至少共有一行"
+    assert len(rows_first) == len(first.table.rows), "key 必须唯一（Treeview iid 会撞）"
 
 
 def test_flatten_is_preorder_and_ids_by_key_matches():
@@ -233,48 +234,61 @@ def test_a11y_is_imported_statically_for_pyinstaller():
         "别把 a11y 改成 import_module（PyInstaller 看不见）"
 
 
-def test_child_ids_survive_a_row_inserted_at_the_top():
-    """**数据变了，id 不变**（复核 MUST-FIX #1 的原话）。
+def test_child_ids_are_dense_so_screen_readers_never_hit_a_hole():
+    """MF-2：childId 必须密集 1..N，且 ``accChildCount == len(children)``。
 
-    真机事故现场：logs 顶部多一行 → 同一行 childId 5→6。这里按**业务键**跟踪每一行，
-    在顶部插一行后，每个业务键的 childId 必须一个都不动；新行拿一个没被占用的 id。
+    稀疏 id 的后果（真机实测）：日志筛 5→3 行后 `accChildCount=12` 而孩子只有 10 个，
+    读屏按 1..count 遍历必撞空号（`accChild` 回 S_FALSE、`accName` 回 BADINDEX）。
     """
-    def log_view(rows):
-        return vw.View(key="logs", title="日志", subtitle="",
-                       cards=(), table=vw.Table(("级别", "时间", "事件", "原因", "下一步"),
-                                                tuple(rows), title="日志"))
-
-    def row(stamp):
-        return vw.Row(("WARN", stamp, "上游超时", "重试中", "等待"), key="log-" + stamp)
-
-    def ids_by_key(provider):
-        return {provider._node_by_path[path].key: provider.child_id(path)
-                for path in provider.children("") if provider._node_by_path[path].key}
-
-    base = [row("12:00"), row("11:59"), row("11:58")]
+    view = vw.build_view("logs", _logs_snapshot(_log_entries("a", "b", "c", "d", "e")))
     provider = msaa.Provider(root=None)
-    provider.refresh(log_view(base))
-    before = ids_by_key(provider)
-    assert len(before) == 3, before
+    provider.refresh(view)
+    kids = provider.children("")
+    assert kids, "日志页应有子元素"
+    assert [provider.child_id(path) for path in kids] == list(range(1, len(kids) + 1))
+    for child_id in range(1, len(kids) + 1):
+        assert provider.path_for_id(child_id) == kids[child_id - 1]
+    assert provider.path_for_id(len(kids) + 1) == ""      # 越界不撞已有元素
+    assert provider.path_for_id(0) == ""
 
-    provider.refresh(log_view([row("12:01")] + base))        # 顶部插一行
-    after = ids_by_key(provider)
-    for key, child_id in before.items():
-        assert after[key] == child_id, (key, child_id, after[key])
-    assert set(after) - set(before) == {"log-12:01"}
-    assert after["log-12:01"] not in set(before.values())
+    # 筛掉两行：孩子变少，但编号仍然 1..N 连续
+    filtered = vw.build_view("logs", _logs_snapshot(_log_entries("a", "c", "e")))
+    provider.refresh(filtered)
+    kids = provider.children("")
+    assert [provider.child_id(path) for path in kids] == list(range(1, len(kids) + 1))
 
 
-def test_rows_without_key_get_content_ids_not_ordinals():
-    """没有 ``Row.key`` 的行：id 取内容哈希，**不许带序号**——顶部插一行不许牵连别人。"""
-    table = vw.Table(("级别", "时间", "事件", "原因", "下一步"),
-                     (vw.Row(("WARN", "12:00", "超时", "重试", "等待")),
-                      vw.Row(("INFO", "11:59", "完成", "-", "-"))), title="日志")
-    view = vw.View(key="logs", title="日志", subtitle="", cards=(), table=table)
-    rows = [n for n in flatten_for_provider(build_tree(view)) if n.role == ROLE_ROW]
-    data_rows = [n for n in rows if not n.node_id.endswith("/head")]
-    assert data_rows and all("/row:h:" in n.node_id for n in data_rows), [n.node_id for n in rows]
-    assert not any("/row:2" in n.node_id or "/row:#2" in n.node_id for n in rows)
+def test_focus_follows_the_business_row_when_rows_shift():
+    """MF-2 契约：**焦点跟着业务行走**（不是「数字不变」）。
+
+    在顶部插一行 → 焦点那行整体下移 → `accFocus` 必须仍指向同一个业务路径，
+    并且 provider 用**新的** childId 重发了焦点事件。
+    """
+    base = _log_entries("a", "b", "c")
+    provider = msaa.Provider(root=None)
+    provider.refresh(vw.build_view("logs", _logs_snapshot(base)))
+
+    target_path = [path for path in provider.children("") if "/row:" in path]
+    assert len(target_path) == 3, target_path
+    focused_path = target_path[1]                       # 中间那一行
+    provider.notify_focus(focused_path)
+    before_id = provider.child_id(focused_path)
+    provider._event_log.clear()
+
+    provider.refresh(vw.build_view("logs", _logs_snapshot(
+        [("new", "2026-11-16T09:00:00Z", "info")] + base)))   # 顶部插一行
+
+    focused_paths = provider.focusable_paths()
+    # 判据是**业务行**不是路径字符串：路径是身份，行名才是用户看到的那一行
+    focused_node = provider._node_by_path.get(provider._focused_path)
+    assert focused_node is not None, "刷新后焦点行不见了（身份丢了）"
+    assert "10:01:00Z" in focused_node.name, focused_node.name   # 被聚焦的那一行
+    assert provider.child_id(provider._focused_path) == before_id + 1, "位置动了，号就该跟着动"
+    assert focused_paths, "可聚焦集合不能空"
+    refires = [entry for entry in provider._event_log if entry[0] == 0x8005]
+    assert refires, "位置变了必须重发 EVENT_OBJECT_FOCUS（否则读屏还以为是旧那一行）"
+    assert refires[-1][1] == before_id + 1, refires[-1]
+    assert refires[-1][2] == focused_path
 
 
 def test_invalid_child_ids_are_tolerated_not_raised():
@@ -356,12 +370,31 @@ def test_trace_is_off_unless_env_points_to_a_file(monkeypatch, tmp_path):
     assert log.exists() and "method=accName" in log.read_text(encoding="utf-8")
 
 
-def test_trace_never_writes_accvalue_verbatim(monkeypatch, tmp_path):
+def test_accvalue_trace_is_length_only_at_the_call_site(monkeypatch, tmp_path):
+    """复核 SHOULD-FIX 4：这条以前是「自己调 `_trace` 再断言 `_trace`」= 同义反复。
+
+    现在直接扫 **`get_accValue` 的调用点**：交给 `_trace` 的必须是 ``"len=%d" % len(...)``
+    这种形式；哪天有人改成把凭据原文传进去，这条立刻红。
+    """
+    import ast
+
+    source = (pathlib.Path(__file__).resolve().parents[1]
+              / "djb_node" / "desktop" / "a11y" / "msaa.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == "get_accValue")
+    calls = [node for node in ast.walk(function)
+             if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "_trace"]
+    assert calls, "get_accValue 里没有 trace（S3 取证需要它）"
+    fmt = calls[0].args[2]
+    assert isinstance(fmt, ast.BinOp), "trace 第三参必须是格式化的长度，不是原始值：%s" % ast.dump(fmt)[:80]
+    assert isinstance(fmt.left, ast.Constant) and "len=" in str(fmt.left.value), ast.dump(fmt)[:80]
+    assert isinstance(fmt.right, ast.Call) and getattr(fmt.right.func, "id", "") == "len", \
+        "只许传长度：%s" % ast.dump(fmt.right)[:80]
+
+    # 行为面兜底：真跑一次，凭据原文一个字都不许进日志
     log = tmp_path / "a11y.log"
     monkeypatch.setenv(msaa.ENV_TRACE, str(log))
-    provider = msaa.Provider(root=None)
-    secret = "djb_ns_super_secret"
-    provider._trace("accValue", 2, "len=%d" % len(secret))
+    msaa.Provider(root=None)._trace("accValue", 2, "len=%d" % len("secret-value"))
     text = log.read_text(encoding="utf-8")
-    assert "super_secret" not in text
-    assert "len=%d" % len(secret) in text
+    assert "secret-value" not in text and "len=12" in text
