@@ -431,18 +431,29 @@ class UpstreamManager:
         # ⇒ 容量随**采样预算**抖动（与云端 `verified_at = moment if verified else None`
         # 是同一个 bug 的两端，cloud-auditor 2026-11-15 已确认）。
         # 语义对齐云端 b420f59：没有新证据 ⇒ 什么都不改，旧结论按新鲜度自然过期。
+        # 0.3.9 / D-RCA P0-a：**任何显式失败都先于任何 verified** 是 0.3.8 灰度失败的
+        # 直接原因——4 个模型 ok + qwen 一个 ``timeout`` 就把整条上游判 ``rejected``，
+        # `quotes.py` 的 `gated` 随即跳过该上游**全部**模型（2026-11-16 13:55 现场
+        # `quotes rows=0` 整条断流）。判定顺序必须与云端 `_probe_verdict_scoped` 的
+        # `if real_ok: verified` 对齐：**一个模型能用就是这条上游能用的证据**，
+        # 单模型失败只降该模型自己（它的 `inference_ok=false` 已被 quotes 按模型跳过）。
         explicit_failures = [item for item in checks
-                             if item.get("error_class")
+                             if not item.get("ok")
                              and item.get("error_class") != facts.PROBE_NOT_PROBED]
-        if not result.reachable or explicit_failures or not checks:
-            # 不可达 / 有明确失败 / **一个 enabled 模型都没有** ⇒ rejected（安全侧：
-            # 没启用模型的上游不该被当成可用容量）；只有「有 enabled 模型但全没探到」
-            # 才保留上一轮结论。
+        if not result.reachable or not checks:
+            # 不可达 / **一个 enabled 模型都没有** ⇒ rejected（安全侧：没启用模型的上游
+            # 不该被当成可用容量）。
             state = "rejected"
         elif verified:
+            # 任一模型 L2 通过 ⇒ 整条 verified（0.3.4 语义；与云端 real_ok 分支一致）。
             state = "verified"
+        elif explicit_failures:
+            # 一个都没通**且**确有失败（timeout / 5xx / auth / 下架 …）⇒ rejected。
+            # P0-c：``timeout`` 是真实失败，必须留在这里，否则「全部模型 timeout」会被
+            # 洗成可用；单模型 timeout 的降级由「上面那条 verified 优先」完成，不靠删失败。
+            state = "rejected"
         else:
-            state = record.state          # 全是 not_probed：保留上一轮结论
+            state = record.state          # 全是 not_probed：没证据，保留上一轮结论
         stamp = iso(moment)
         self.store.update_upstream(upstream_id, models=self._probe_models_payload(
             record, outcomes, stamp), state=state, last_probe_at=stamp)
