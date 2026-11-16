@@ -397,10 +397,14 @@ class DesktopApp:
     def _idle_seconds(self) -> float:
         return max(0.0, time.monotonic() - float(getattr(self, "_last_input", 0.0)))
 
+    #: 「窗口在眼前」的 wm state。**Windows/macOS 最大化是 ``zoomed``**，不是 ``normal``：
+    #: 旧实现只认 ``normal``，把最常见的最大化当成不可见，刷新悄悄降到 60s（复核 M2）。
+    VISIBLE_WM_STATES = ("normal", "zoomed")
+
     def _auto_visible(self) -> bool:
         """窗口是否「在眼前」：最小化（iconic/withdrawn）或长时间无输入都算不可见。"""
         try:
-            if str(self._root.state()) != "normal":
+            if str(self._root.state()) not in self.VISIBLE_WM_STATES:
                 return False
         except Exception:                            # pragma: no cover - 无窗口
             pass

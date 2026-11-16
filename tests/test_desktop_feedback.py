@@ -790,3 +790,27 @@ def test_real_tk_auto_refresh_landing_keeps_input_typed_while_the_request_was_in
             assert app._has_unsaved_edits() is False
         finally:
             _close(app, root)
+
+
+def test_auto_refresh_counts_a_maximized_window_as_visible():
+    """复核 M2：Windows/macOS 最大化是 `zoomed`，不许被判成「看不见」而降频到 60s。"""
+    tk, root = _tk_root_or_skip()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, _data = _auto_app(root, Path(home))
+        try:
+            root.update()
+            real_state = app._root.state
+            for state, expected in (("normal", True), ("zoomed", True),
+                                    ("iconic", False), ("withdrawn", False)):
+                app._root.state = lambda _s=state: _s
+                assert app._auto_visible() is expected, state
+                assert app._auto_interval_s() == (
+                    desktop_app.AUTO_REFRESH_VISIBLE_S if expected
+                    else desktop_app.AUTO_REFRESH_HIDDEN_S), state
+            app._root.state = real_state
+        finally:
+            _close(app, root)
+
