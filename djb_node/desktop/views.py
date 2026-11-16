@@ -15,8 +15,9 @@
 from __future__ import annotations
 
 import hashlib
+import re
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
@@ -658,6 +659,44 @@ YIELD_MODE_SUMMARY = {
 #: 以前一页叫「请求链接」、一页叫「上行 OpenAI」、还有一页叫「OpenAI 请求地址」，
 #: 同一件事三种名字，客户以为是三个不同的字段。
 BASE_URL_HINT = "填到 /v1 就行（例如 https://api.openai.com/v1）；不要带 key 参数"
+
+#: CLI 命令的识别（RC15-039 #11）：`djb init` / `djb auth --bind <码>` / `djb start` …
+_CLI_CALL = re.compile(r"djb\s+[a-z][a-z0-9_-]*(?:\s+--?[a-z][\w-]*(?:\s+<[^>]*>)?)?")
+
+
+def terminalize(text: Any) -> str:
+    """渲染边界统一处理「这一步要去终端跑」（RC15-039 #11）。
+
+    客户端里 CLI 的 ``next_step`` 是从 daemon / envcheck 原样搬上屏的，客户手上没有终端，
+    看到「执行 djb init 会收紧到 0700」只会一脸问号。规矩：**要么做成界面内动作，要么
+    明说这条要去终端跑并给完整命令**。这里统一补一句，而不是逐页打补丁——逐页补的结果
+    就是复核抓到的「只扫了 4 页，接入页/基准页漏了」。
+    """
+    value = str(text or "")
+    if not value or "终端" in value:
+        return value
+    match = _CLI_CALL.search(value)
+    if match is None:
+        return value
+    return value + "（这条要在终端里跑：" + match.group(0) + "；桌面端没有对应入口，界面里点不到）"
+
+
+def _terminalize_tree(value: Any) -> Any:
+    """把 :func:`terminalize` 应用到整个视图树上（只改含 CLI 命令的字符串）。"""
+    if isinstance(value, str):
+        return terminalize(value)
+    if isinstance(value, tuple):
+        return tuple(_terminalize_tree(item) for item in value)
+    if isinstance(value, list):
+        return [_terminalize_tree(item) for item in value]
+    if isinstance(value, frozenset):
+        return frozenset(_terminalize_tree(item) for item in value)
+    if dataclass_is_instance(value):
+        return replace(value, **{
+            f.name: _terminalize_tree(getattr(value, f.name))
+            for f in dataclass_fields(value)})
+    return value
+
 
 #: 贡献节奏图的时间窗（小时）
 CHART_HOURS = 24
@@ -2284,6 +2323,11 @@ LOG_LEVEL_TEXT = {"all": "全部级别", "debug": "debug（调试）", "info": "
                   "critical": "critical（严重）"}
 
 
+def dataclass_is_instance(value: Any) -> bool:
+    """``is_dataclass`` 对**类**也回真；这里只认实例。"""
+    return not isinstance(value, type) and is_dataclass(value)
+
+
 def _content_key(prefix: str, parts: Any, seen: dict[str, int]) -> str:
     """列表项的内容身份：``<prefix>-<内容哈希>``；**逐字相同**的行才补 ``#2``。
 
@@ -2382,13 +2426,17 @@ _BUILDERS = {
 
 
 def build_view(key: str, snapshot: Snapshot) -> View:
-    """构建单个视图；未知 key 抛 ``ValueError``（拼错不静默给空页）。"""
+    """构建单个视图；未知 key 抛 ``ValueError``（拼错不静默给空页）。
+
+    出口处统一过一遍 :func:`terminalize`（RC15-039 #11）：CLI 的 ``next_step`` 无论从哪个
+    域来（access / bench / daemon…），上屏前都会带上「这条要在终端里跑」。
+    """
     builder = _BUILDERS.get(str(key or ""))
     if builder is None:
         raise ValueError("未知视图：" + str(key))
-    return builder(snapshot)
+    return _terminalize_tree(builder(snapshot))
 
 
 def build_views(snapshot: Snapshot) -> dict[str, View]:
     """一次构建 13 个视图（顺序同 :data:`VIEWS`）。"""
-    return {key: _BUILDERS[key](snapshot) for key in VIEW_KEYS}
+    return {key: build_view(key, snapshot) for key in VIEW_KEYS}

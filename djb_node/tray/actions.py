@@ -23,11 +23,27 @@ def control_enabled(config: Any, *, today: date | None = None) -> bool:
         return False
 
 
+#: 开关关着时给客户看的话（RC15-039 #3）。**托盘兜底与直调共用这一条**——
+#: 以前托盘在 `enabled()` 为假时根本不进 ``apply_control``，直接落「命令指南 / 未执行」，
+#: 把 CLI 当唯一指引；文案只改 ``apply_control`` 等于只改了没人走的那条路。
+CONTROL_DISABLED_MESSAGE = (
+    "没有执行：这台机器的接单控制开关现在是关闭状态（或已过期），"
+    "所以暂停/恢复发不出去，服务状态一个字都没改。"
+    "下一步：去网页端「设备 · 本机节点」把控制开关打开或续期，"
+    "再回到托盘点一次；开关没打开之前点多少次都不会生效。"
+)
+
+
 @dataclass(frozen=True)
 class ControlResult:
     verified: bool
     message: str
     state: str = "unknown"
+
+
+def disabled_control(action: TrayAction) -> ControlResult:
+    """开关关着时的唯一结果（托盘兜底路径必须调它，不许自己写文案）。"""
+    return ControlResult(False, CONTROL_DISABLED_MESSAGE)
 
 
 def apply_control(action: TrayAction, *, call: Callable[..., Mapping[str, Any]],
@@ -41,14 +57,9 @@ def apply_control(action: TrayAction, *, call: Callable[..., Mapping[str, Any]],
         return ControlResult(False, "不支持的控制动作；未执行。")
     if not enabled():
         # RC15-039 #3：上一版文案是「开关…；命令指南，未执行。」——客户读不懂
-        # （「命令指南」是什么？没执行的是哪个命令？）。人话版必须说清**为什么没成**
-        # 与**下一步做什么**，并且明确「服务状态没变」——托盘动作最容易让人以为已经生效。
-        return ControlResult(
-            False,
-            "没有执行：这台机器的接单控制开关现在是关闭状态（或已过期），"
-            "所以暂停/恢复发不出去，服务状态一个字都没改。"
-            "下一步：去网页端「设备 · 本机节点」把控制开关打开或续期，"
-            "再回到托盘点一次；开关没打开之前点多少次都不会生效。")
+        # （「命令指南」是什么？没执行的是哪个命令？）。人话版集中在
+        # :data:`CONTROL_DISABLED_MESSAGE`，托盘兜底走的是同一条，文案不许分叉。
+        return disabled_control(action)
     message = ("暂停接收新任务；在途任务按现有护栏处理。不停止服务。" if action is TrayAction.PAUSE
                else "恢复用户暂停；现有护栏仍可阻止接单。不启动服务。")
     if not confirm(message):

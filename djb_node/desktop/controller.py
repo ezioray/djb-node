@@ -786,16 +786,10 @@ class DesktopController:
                                 upstream_count=self._upstream_count())
 
     def _bound_flag(self) -> bool | None:
-        sections = self.snapshot.sections
-        account = sections.get("account") if isinstance(sections.get("account"), Mapping) else {}
-        access = sections.get("access") if isinstance(sections.get("access"), Mapping) else {}
-        from .views import _account_bound
+        """引导流程的绑定态：走 :func:`views.binding_state`——**不许有第二个判定源**（#9）。"""
+        from .views import binding_state
 
-        profile = account.get("profile") if isinstance(account.get("profile"), Mapping) else {}
-        security = (account.get("security")
-                    if isinstance(account.get("security"), Mapping) else {})
-        binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
-        return _account_bound(profile, security, binding)
+        return binding_state(self.snapshot)[0]
 
     def _upstream_count(self) -> int:
         sections = self.snapshot.sections
