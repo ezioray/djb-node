@@ -1455,17 +1455,24 @@ class Daemon:
                           "error_class": item.get("error_class")}
                          for item in checks if isinstance(item, dict)]
             passed = sum(1 for item in per_model if item["ok"])
-            # 0.3.8（RC14 复盘 P0-2）：``not_probed``（本轮预算没轮到）与
-            # ``model_not_listed``（模型已下架，W6 owner 裁决「停用/下架不该拖死整条上游」）
-            # **不算真实失败**；其余（timeout / 5xx / auth / model_error）仍算失败。
-            # 判定：**至少 1 个 ok 且没有真实失败** ⇒ verified；有真实失败 ⇒ failed。
+            # 0.3.9 / D-RCA P0-b：``real_failures`` **降级为诊断字段**，不再是否决票。
+            #
+            # 0.3.8 的判定是「passed 且没有真实失败」⇒ verified：qwen 一个 ``timeout``
+            # 就让 ``passed=4`` 的整条上游计 ``failed``、不上报、进退避（2026-11-16 现场
+            # 连续两轮 ``verified=0`` 命中自动回滚阈值）。这与云端 `_probe_verdict_scoped`
+            # 的 `if real_ok: verified` 相反 ⇒ 同一个 timeout 在节点侧被放大成整条上游
+            # 「不可用」。现在：**有 ok 就上报**，单个模型的失败只体现在 per_model 里。
+            #
+            # P0-c：``timeout`` 仍**留在** ``real_failures`` / ``PROBE_TOLERATED_ERROR_CLASSES``
+            # 之外（它是真实失败，不能靠把这个错误类从元组里抹掉来「修好」），否则
+            # 「全部模型 timeout」会被洗成无真实失败、进而放行一条实际不可用的上游。
             tolerated = facts.PROBE_TOLERATED_ERROR_CLASSES
             real_failures = [item for item in per_model
                              if not item["ok"] and item.get("error_class") not in tolerated]
             not_probed = len([item for item in (payload.get("not_probed") or [])
                               if isinstance(item, dict) and item.get("reason") == "budget"])
             backlog += not_probed
-            if passed and not real_failures:
+            if passed:
                 verified += 1
                 # D-PROBE-03：**周期探针的结论必须上报**，否则云端 verified_at 不动。
                 # 旧行为：daemon 只写本地 last_probe_at ⇒ 本地算出正 QPS，但云端
@@ -1473,10 +1480,12 @@ class Daemon:
                 # 15 分钟后容量再次归零，且没有任何自动恢复路径（只能人工 `djb upstream probe`）。
                 # 上报走与 CLI 完全相同的一条路（含服务端 upstream_id 映射），失败不影响本地结论。
                 self._report_probe(record, payload, reason=reason)
-            elif real_failures or not not_probed:
-                # 真实失败 ⇒ failed；「一个都没探到且没有 backlog」也算 failed（防空转）。
+            elif not_probed == 0 or real_failures:
+                # 0.3.9 / D-RCA P0-c：只有「**0 个 ok** 且确有失败」才 failed；这条同时
+                # 兜住「全部模型 timeout」的全量故障，并保留「一个都没探到且没有 backlog」
+                # 的防空转口径（passed=0 且 not_probed=0 ⇒ failed）。
                 failed += 1
-            per_upstream.append({"upstream_id": record.id, "ok": bool(passed and not real_failures),
+            per_upstream.append({"upstream_id": record.id, "ok": bool(passed),
                                  "passed": passed, "total": len(per_model),
                                  "real_failures": [item["model"] for item in real_failures],
                                  "not_probed": not_probed,
