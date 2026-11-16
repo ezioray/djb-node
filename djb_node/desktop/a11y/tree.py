@@ -24,6 +24,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -226,11 +228,23 @@ def _action(item: Action) -> Node:
 
 
 def _row_id(row: Any, index: int) -> str:
-    """行 id：优先业务 key（收据号 / 时间戳），退回首列内容，最后才是序号。"""
+    """行 id = **业务身份**，不许含序号。
+
+    优先级：``Row.key``（收据号/任务号）→ 全部单元格内容的短哈希 → 真正的空行才退序号。
+
+    * 为什么首列不够：日志页首列是级别（``WARN``），好几行一样 ⇒ 路径撞车 ⇒ 上层按出现顺序
+      补 ``#2``/``#3``，序号就混进 id 里了——顶部插一行，下面每行的 id 全变（真机复现：
+      同一收据 `8→10`）。
+    * 内容哈希对「同内容两行」仍会撞（它们本来也分不出来），此时上层补的 ``#n`` 后缀就是
+      唯一的不稳定点，已在 :func:`build_tree` 文档里写明。
+    """
     if row.key:
         return str(row.key)
-    head = row.cells[0] if row.cells else ""
-    return head or "#" + str(index + 1)
+    cells = tuple(str(cell) for cell in row.cells)
+    if any(cells):
+        digest = hashlib.sha1("\x1f".join(cells).encode("utf-8")).hexdigest()[:8]
+        return "h:" + digest
+    return "#" + str(index + 1)                  # 真·空行：无身份可言，见文档说明
 
 
 def _table(table: Table, ordinal: int = 0, *, max_rows: int = TABLE_MAX_ROWS
@@ -244,7 +258,8 @@ def _table(table: Table, ordinal: int = 0, *, max_rows: int = TABLE_MAX_ROWS
     shown = table.rows[:max_rows]
     truncated = total > len(shown)
 
-    base = _seg("table" + ((":" + str(ordinal + 1)) if ordinal else ""))
+    base = _seg("table:" + table.title) if table.title else _seg(
+        "table" + ((":" + str(ordinal + 1)) if ordinal else ""))
     # 压平后每一行是「单元格用 | 拼起来」，用户听不出哪列是哪列——所以表节点自己的名字里
     # 必须带**列序 + 总行数**：读屏进表格先念这一句，后面每行才能对号入座。
     label = table.title or ("表格" + ((" " + str(ordinal + 1)) if ordinal else ""))
@@ -282,6 +297,14 @@ def _table(table: Table, ordinal: int = 0, *, max_rows: int = TABLE_MAX_ROWS
 
 
 def build_tree(view: View, *, max_rows: int = TABLE_MAX_ROWS) -> Node:
+    """一页 ``View`` → 树。
+    # 稳定性契约（#31，2026-11-16 复核 MUST-FIX 后收紧）
+
+    * 行 id = ``Row.key`` → 全单元格内容哈希 → （仅真·空行）序号；
+    * 因此**顶部插入/删除一行不会改动其它行的 id**，正则筛选也不会；
+    * 唯一不稳定：两行内容**逐字相同**且都没有 ``key``——它们本来不可区分，上层补 ``#2``/``#3``
+      后缀，删掉其中一行会让幸存者换后缀。这类表在 ``View`` 里应给 ``Row.key``。
+    """
     """一页 :class:`View` → 一棵 :class:`Node` 树（``node_id`` 已填成绝对路径键）。
 
     顺序与 :meth:`View.plain_text` 一致（不可用提示 → 卡片 → 主卡 → 图 → 右栏 → 开关 →

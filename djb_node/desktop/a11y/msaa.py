@@ -309,6 +309,12 @@ class Provider:
         self._focused_path = ""
         self._selection_path = ""
         self._root_path = ""
+        # childId 是**身份**不是位置：路径一经分配就不再变，行插入/删除都不动老行。
+        # 读屏按 childId 升序遍历；代价见 refresh() 文档（新行排在读序末尾）。
+        self._id_by_path: dict[str, int] = {}
+        self._path_by_id: dict[int, str] = {}
+        self._next_child_id = 1
+        self._free_ids: list[int] = []
         self._tree: Node | None = None
         self._error_count = 0
         self._trace_path = (os.environ.get(ENV_TRACE) or "").strip()
@@ -413,6 +419,21 @@ class Provider:
             self._node_by_path[path] = node
             self._parent_by_path[path] = ""
             self._children_by_path[path] = ()
+        # 回收消失的路径（这些 id 可能被新行复用；客户端手里的旧 id 只对旧行有意义）
+        live = set(paths)
+        for path, child_id in list(self._id_by_path.items()):
+            if path not in live:
+                del self._id_by_path[path]
+                self._path_by_id.pop(child_id, None)
+                self._free_ids.append(child_id)
+        for path in paths:
+            if path in self._id_by_path:
+                continue
+            child_id = self._free_ids.pop(0) if self._free_ids else self._next_child_id
+            if child_id >= self._next_child_id:
+                self._next_child_id = child_id + 1
+            self._id_by_path[path] = child_id
+            self._path_by_id[child_id] = path
         self._children_by_path[""] = tuple(paths)
         self._children_by_path[self._root_path] = tuple(paths)
         self._node_by_path[""] = tree
@@ -435,7 +456,13 @@ class Provider:
         return self._node_by_path.get(path or self._root_path)
 
     def children(self, path: str) -> tuple[str, ...]:
-        return self._children_by_path.get(path or self._root_path, ())
+        """直接子元素，**按 childId 升序**（= 读屏的遍历顺序）。
+
+        压平后只有根有孩子；根的子元素顺序由 id 决定，因此不会因为数据顺序变化而「串位」。
+        """
+        if path not in ("", self._root_path):
+            return ()
+        return tuple(self._path_by_id[child_id] for child_id in sorted(self._path_by_id))
 
     # ── 事件 / 日志 ───────────────────────────────────────────────────────────
     def focusable_paths(self) -> tuple[str, ...]:
@@ -491,15 +518,16 @@ class Provider:
             self._error("NotifyWinEvent", exc)
 
     def child_id(self, path: str) -> int:
-        """路径 → 它**在父节点里的** childId（1 起）；根给 0（CHILDID_SELF）。"""
-        parent = self._parent_by_path.get(path, "")
-        if not parent:
-            return 0
-        siblings = self._children_by_path.get(parent, ())
-        try:
-            return siblings.index(path) + 1
-        except ValueError:
-            return 0
+        """路径 → childId（1 起；根 0 = CHILDID_SELF）。
+
+        走注册表而不是 ``index(path)+1``：**位置会漂，身份不会**。顶部插一行时老行 id 不动，
+        新行拿新 id（读序排在末尾——顺序语义由行名里的时间/收据号表达）。
+        """
+        return self._id_by_path.get(path, 0)
+
+    def path_for_id(self, child_id: int) -> str:
+        """childId → 路径；无效/已回收给空串。"""
+        return self._path_by_id.get(int(child_id), "")
 
     def _nvda_pid(self) -> int:
         """NVDA 进程号（5 秒缓存）——trace 里用它证明「读屏软件当时在跑」。"""
@@ -574,10 +602,7 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
             index = _child_index(var_child)
             if index <= 0:
                 return self._path
-            kids = self._provider.children(self._path)
-            if 1 <= index <= len(kids):
-                return kids[index - 1]
-            return ""
+            return self._provider.path_for_id(index)       # 身份映射，不是位置
 
         def _child_node(self, var_child):
             path = self._child_path(var_child)
@@ -601,7 +626,8 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
 
         def get_accChildCount(self, pcount):
             try:
-                count = len(self._provider.children(self._path))
+                ids = self._provider._path_by_id
+                count = max(ids) if ids else 0
                 pcount[0] = count
                 self._provider._trace("accChildCount", 0, "count=%d" % count)
                 return 0
@@ -618,10 +644,10 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
             """
             try:
                 ppdispChild[0] = None
-                index = _child_index(varChild)
-                if index == 0:
-                    return S_FALSE
-                return S_FALSE if self._child_path(varChild) is not None else E_FAIL
+                # 0 = 自己 / 有效子元素 / 超界 / 负数：**一律** S_FALSE + NULL。
+                # MSAA 约定就是「这个 id 没有子对象」，客户端据此改用 childId 取属性；
+                # 只有真出异常才 E_FAIL（E_FAIL 会让 NVDA 认为整棵树坏了）。
+                return S_FALSE
             except Exception as exc:
                 self._provider._error("accChild", exc)
                 return E_FAIL
@@ -817,14 +843,26 @@ def _build_node_object(rt: _Runtime) -> Any:  # pragma: no cover - Windows only
                 return E_FAIL
 
         def accDoDefaultAction(self, varChild):
-            # S3：按钮/开关的触发要 PostMessage 回 Tk 主线程，S2 明确不支持
-            return E_NOTIMPL
+            """按钮/开关的触发要 PostMessage 回 Tk 主线程，本版明确不支持（不假装能点）。"""
+            try:
+                return E_NOTIMPL
+            except Exception as exc:                      # pragma: no cover - 契约：不许跨 COM 边界抛
+                self._provider._error("accDoDefaultAction", exc)
+                return E_FAIL
 
         def put_accName(self, varChild, szName):
-            return E_NOTIMPL
+            try:
+                return E_NOTIMPL                          # 只读镜像：改名一律不接
+            except Exception as exc:                      # pragma: no cover - 契约：不许跨 COM 边界抛
+                self._provider._error("put_accName", exc)
+                return E_FAIL
 
         def put_accValue(self, varChild, szValue):
-            return E_NOTIMPL
+            try:
+                return E_NOTIMPL                          # 只读镜像：改值一律不接
+            except Exception as exc:                      # pragma: no cover - 契约：不许跨 COM 边界抛
+                self._provider._error("put_accValue", exc)
+                return E_FAIL
 
         # ── IDispatch：交回 IAccessible 的型别信息（代理/桩要用） ──
         def GetTypeInfoCount(self, pctinfo):

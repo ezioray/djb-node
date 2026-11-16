@@ -29,6 +29,7 @@ from djb_node.desktop.a11y.tree import (
     TABLE_MAX_ROWS,
     build_tree,
     flatten,
+    flatten_for_provider,
     ids_by_key,
 )
 from djb_node.desktop.app import demo_snapshot
@@ -232,12 +233,91 @@ def test_a11y_is_imported_statically_for_pyinstaller():
         "别把 a11y 改成 import_module（PyInstaller 看不见）"
 
 
-def test_focus_and_selection_events_use_stable_child_ids():
-    """S3：焦点/选中事件的 childId 必须跟着**行**走，不能跟着位置漂（自动刷新 10s 一次）。
+def test_child_ids_survive_a_row_inserted_at_the_top():
+    """**数据变了，id 不变**（复核 MUST-FIX #1 的原话）。
 
-    做法：先 refresh 一次记住第 2 行的 childId，再换一版数据（行顺序不变）refresh，
-    同一个 ``node_id`` 的 childId 必须一样；同时焦点/选中只记录、不因为 refresh 被清掉或重发。
+    真机事故现场：logs 顶部多一行 → 同一行 childId 5→6。这里按**业务键**跟踪每一行，
+    在顶部插一行后，每个业务键的 childId 必须一个都不动；新行拿一个没被占用的 id。
     """
+    def log_view(rows):
+        return vw.View(key="logs", title="日志", subtitle="",
+                       cards=(), table=vw.Table(("级别", "时间", "事件", "原因", "下一步"),
+                                                tuple(rows), title="日志"))
+
+    def row(stamp):
+        return vw.Row(("WARN", stamp, "上游超时", "重试中", "等待"), key="log-" + stamp)
+
+    def ids_by_key(provider):
+        return {provider._node_by_path[path].key: provider.child_id(path)
+                for path in provider.children("") if provider._node_by_path[path].key}
+
+    base = [row("12:00"), row("11:59"), row("11:58")]
+    provider = msaa.Provider(root=None)
+    provider.refresh(log_view(base))
+    before = ids_by_key(provider)
+    assert len(before) == 3, before
+
+    provider.refresh(log_view([row("12:01")] + base))        # 顶部插一行
+    after = ids_by_key(provider)
+    for key, child_id in before.items():
+        assert after[key] == child_id, (key, child_id, after[key])
+    assert set(after) - set(before) == {"log-12:01"}
+    assert after["log-12:01"] not in set(before.values())
+
+
+def test_rows_without_key_get_content_ids_not_ordinals():
+    """没有 ``Row.key`` 的行：id 取内容哈希，**不许带序号**——顶部插一行不许牵连别人。"""
+    table = vw.Table(("级别", "时间", "事件", "原因", "下一步"),
+                     (vw.Row(("WARN", "12:00", "超时", "重试", "等待")),
+                      vw.Row(("INFO", "11:59", "完成", "-", "-"))), title="日志")
+    view = vw.View(key="logs", title="日志", subtitle="", cards=(), table=table)
+    rows = [n for n in flatten_for_provider(build_tree(view)) if n.role == ROLE_ROW]
+    data_rows = [n for n in rows if not n.node_id.endswith("/head")]
+    assert data_rows and all("/row:h:" in n.node_id for n in data_rows), [n.node_id for n in rows]
+    assert not any("/row:2" in n.node_id or "/row:#2" in n.node_id for n in rows)
+
+
+def test_invalid_child_ids_are_tolerated_not_raised():
+    """childId 的边界：0（自己）/ 超界 / 负数 都只许「查不到」，不许抛、不许乱指。"""
+    provider = msaa.Provider(root=None)
+    provider.refresh(vw.build_view("overview", demo_snapshot()))
+    assert provider.path_for_id(0) == ""            # CHILDID_SELF 不是子元素
+    assert provider.path_for_id(-3) == ""
+    assert provider.path_for_id(10 ** 6) == ""
+    assert provider.child_id("不存在的路径") == 0
+    # 有效 id 必须能反查回来，且双向一致
+    for path in provider.children("")[:5]:
+        assert provider.path_for_id(provider.child_id(path)) == path
+
+
+def test_every_acc_method_crosses_com_boundary_inside_try():
+    """COM 边界契约：`acc*` / `get_acc*` / `put_acc*` 方法体必须整段在 try 里。
+
+    跨 COM 边界抛异常会打断宿主的调用栈（读屏软件那边表现是「控件消失」）。这条用 AST 扫，
+    新加方法忘了包 try 就直接红。
+    """
+    import ast
+    source = (pathlib.Path(__file__).resolve().parents[1]
+              / "djb_node" / "desktop" / "a11y" / "msaa.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    checked = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if not (node.name.startswith(("acc", "get_acc", "put_acc"))):
+            continue
+        checked.append(node.name)
+        assert any(isinstance(stmt, ast.Try) for stmt in node.body), \
+            "%s 没有 try/except 包住方法体（跨 COM 边界不许抛）" % node.name
+    for required in ("accSelect", "accDoDefaultAction", "put_accName", "put_accValue",
+                     "get_accChild", "get_accName", "get_accState"):
+        assert required in checked, "没扫到 %s（用例失效）" % required
+    # 同一条链上也不许残留重复 except（复核 MUST-FIX #5）
+    assert source.count('_error("accChild", exc)') == 1
+
+
+def test_focus_and_selection_events_use_stable_child_ids():
+    """焦点/选中跨 refresh 不丢：路径还在，记录就还在，且不会重发事件。"""
     provider = msaa.Provider(root=None)
     provider.refresh(vw.build_view("overview", demo_snapshot()))
     rows = provider.selectable_paths()
@@ -246,12 +326,10 @@ def test_focus_and_selection_events_use_stable_child_ids():
     before = provider.child_id(target)
     provider.notify_focus(target)
     provider.select(target)
-    assert provider._focused_path == target
-    assert provider._selection_path == target
 
     provider.refresh(vw.build_view("overview", demo_snapshot()))   # 自动刷新
-    assert provider.child_id(target) == before                     # childId 稳定
-    assert provider._focused_path == target                        # 刷新不清焦点
+    assert provider.child_id(target) == before
+    assert provider._focused_path == target
     assert provider._selection_path == target
 
 

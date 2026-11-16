@@ -9,16 +9,24 @@ Linux CI 有 xvfb，能跑投影和窗口测试，但**抓不到 Windows Tk 的�
 `8b345e5` 给 Shift+Tab 绑了 X11 专有的 `<ISO_Left_Tab>`，Linux 一直全绿，Windows 上
 `TclError` 把 `DesktopApp.__init__` 炸掉——客户端双击打不开。这类问题只有真机、真 Tk 能抓。
 
+**每一步都返回 `(ok, detail)`，`ok=False` 就是这一步失败**（2026-11-16 复核 MUST-FIX #2：
+早先的版本只看「函数没抛异常」，`window-exists`/`a11y-provider`/`still-alive` 恒 ok，等于假绿）。
+
 两种跑法
 ========
 
-* ``--mode inproc``（默认，venv 里跑）：进程内建窗口 → 断言主窗口存在 → 依次切 13 个视图 →
-  逐个开/关弹窗 → 写 JSON。
-* ``--mode exe --exe <djb-desktop.exe>``（冻结包）：起进程 → 等主窗口出现 → 用 Ctrl+1..9 /
-  Ctrl+PageDown 切页 → 结束时进程还活着 + 窗口还在。冻结包里没法和进程内对话，所以 exe 模式
-  只验「起得来、切得动、不死」，**不验每页内容**（内容由 inproc 模式和 pytest 守）。
+* ``--mode inproc``（默认，venv 里跑）：进程内建窗口 → 断言主窗口存在且标题对 → 断言 a11y
+  provider 真的挂上且 ``accChildCount>0`` → 依次切 13 个视图 → 逐个开/关弹窗 → 写 JSON。
+* ``--mode exe --exe <djb-desktop.exe>``（冻结包）：起进程 → **按标题找窗口**（Tk 窗口属于
+  python 子进程，按启动 pid 找不到）→ ``SetForegroundWindow`` 抢前台 → 发 Ctrl+1..9 →
+  结束断言「进程活着 **且** 窗口还在」。
 
-输出：``win_smoke_<版本>.json``（每步 ok/fail/skip + 耗时），退出码 0 = 全 ok。
+自测（证明脚本会红）
+====================
+
+    python tools/win_smoke.py --self-test-fail      # 故意把窗口标题写错 → 必须退出码 1
+
+输出：``win_smoke_<版本>.json``（每步 ok/fail + 耗时 + detail），退出码 0 = 全 ok，1 = 有失败。
 
 用法
 ====
@@ -38,20 +46,26 @@ from pathlib import Path
 
 IS_WINDOWS = sys.platform == "win32"
 RESULT: list[dict] = []
+TITLE = "DJB 联脑 · 桌面控制台"
+BAD_TITLE = "这个标题故意不存在 · self-test"
 
 
-def step(name: str, ok: bool, detail: str = "", ms: float = 0.0, status: str | None = None) -> None:
-    RESULT.append({"step": name, "status": status or ("ok" if ok else "fail"),
+def step(name: str, ok: bool, detail: str = "", ms: float = 0.0) -> None:
+    RESULT.append({"step": name, "status": "ok" if ok else "fail",
                    "detail": detail, "ms": round(ms, 1)})
-    print("[%s] %s %s" % ("ok" if ok else (status or "fail"), name, detail), flush=True)
+    print("[%s] %s %s" % ("ok" if ok else "FAIL", name, detail), flush=True)
 
 
 def run_step(name: str, fn) -> bool:
+    """跑一步：``fn`` 必须返回 ``(ok, detail)``；抛异常算失败。**不返回 bool 也算失败**。"""
     start = time.perf_counter()
     try:
-        detail = fn() or ""
-        step(name, True, str(detail), (time.perf_counter() - start) * 1000)
-        return True
+        result = fn()
+        if not (isinstance(result, tuple) and len(result) == 2):
+            raise AssertionError("这一步没返回 (ok, detail)，返回值=%r" % (result,))
+        ok, detail = result
+        step(name, bool(ok), str(detail), (time.perf_counter() - start) * 1000)
+        return bool(ok)
     except Exception as exc:                    # 冒烟脚本要报告，不要自己崩
         step(name, False, "%s: %s" % (type(exc).__name__, exc),
              (time.perf_counter() - start) * 1000)
@@ -82,12 +96,13 @@ def _widget_count(widget) -> int:
 
 
 # ── inproc 模式 ───────────────────────────────────────────────────────────────
-def smoke_inproc(out: Path, views: list[str]) -> int:
+def smoke_inproc(out: Path, views: list[str], self_test_fail: bool = False) -> int:
     import tkinter as tk
 
     from djb_node.desktop.app import DesktopApp, make_controller
     from djb_node.desktop.views import VIEW_KEYS
 
+    expect_title = BAD_TITLE if self_test_fail else TITLE
     started = time.perf_counter()
     controller = make_controller(home=None, demo=True, boot=None)
     app = DesktopApp(controller, on_quit=lambda: None)
@@ -95,9 +110,28 @@ def smoke_inproc(out: Path, views: list[str]) -> int:
     step("launch", True, "Tk %s" % tk.TkVersion, (time.perf_counter() - started) * 1000)
 
     ok_all = True
-    ok_all &= run_step("window-exists", lambda: "exists=%s" % bool(root.winfo_exists()))
-    ok_all &= run_step("a11y-provider",
-                       lambda: "provider=%s" % type(getattr(app, "_a11y", None)).__name__)
+
+    def window_exists():
+        alive = bool(root.winfo_exists())
+        title = ""
+        try:
+            title = root.title()
+        except Exception:
+            pass
+        return alive and title == expect_title, "exists=%s title=%r" % (alive, title)
+
+    ok_all &= run_step("window-exists", window_exists)
+
+    def a11y_provider():
+        provider = getattr(app, "_a11y", None)
+        if provider is None:
+            return False, "provider=None（读屏没挂上）"
+        kids = provider.children("")
+        if not kids:
+            return False, "provider 在，但 accChildCount=0"
+        return True, "childCount=%d" % len(kids)
+
+    ok_all &= run_step("a11y-provider", a11y_provider)
 
     wanted = VIEW_KEYS if (not views or views == ["all"]) else views
     for key in wanted:
@@ -106,10 +140,10 @@ def smoke_inproc(out: Path, views: list[str]) -> int:
             root.update_idletasks()
             root.update()
             current = getattr(app._last_view, "key", "")
-            assert current == key, "视图没切过去：期望 %s 实际 %s" % (key, current)
+            if current != key:
+                return False, "视图没切过去：期望 %s 实际 %s" % (key, current)
             count = _widget_count(root)
-            assert count > 1, "控件数为 %d" % count
-            return "控件 %d 个" % count
+            return count > 1, "控件 %d 个" % count
         ok_all &= run_step("view:" + key, switch)
 
     dialogs = []
@@ -123,58 +157,104 @@ def smoke_inproc(out: Path, views: list[str]) -> int:
             root.after(250, lambda: _close_toplevels(root))   # 模态：定时把它自己关掉
             opener()
             root.update()
-            assert not _toplevels(root), "弹窗没关掉"
-            return "开 → 关"
+            left = _toplevels(root)
+            return not left, ("弹窗开 → 关" if not left else "还剩 %d 个弹窗" % len(left))
         ok_all &= run_step(name, open_and_close)
 
-    ok_all &= run_step("stop", lambda: (app.stop(), "已收场")[1])
+    def stop():
+        app.stop()
+        return True, "已收场"
+
+    ok_all &= run_step("stop", stop)
     payload = _payload(out, "inproc", ok_all)
+    payload["self_test_fail"] = bool(self_test_fail)
+    payload["expect_title"] = expect_title
     _write(out, payload)
     return 0 if ok_all else 1
 
 
 # ── exe 模式 ──────────────────────────────────────────────────────────────────
-def _find_window(title: str) -> int:
+def _user32():
     import ctypes
+    return ctypes.WinDLL("user32", use_last_error=True)
+
+
+def _find_window(title: str) -> int:
     import ctypes.wintypes as wt
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32 = _user32()
     user32.FindWindowW.restype = wt.HWND
     user32.FindWindowW.argtypes = [wt.LPCWSTR, wt.LPCWSTR]
     return int(user32.FindWindowW(None, title) or 0)
 
 
-def smoke_exe(exe: Path, out: Path, timeout: float = 40.0) -> int:
-    import ctypes
-    import ctypes.wintypes as wt
+def _window_title(hwnd: int) -> str:
+    from ctypes import create_unicode_buffer
+    user32 = _user32()
+    buffer = create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buffer, 512)
+    return buffer.value
 
-    title = os.environ.get("DJB_SMOKE_TITLE", "DJB 联脑 · 桌面控制台")
+
+def _window_present(hwnd: int) -> bool:
+    return bool(hwnd) and bool(_user32().IsWindow(hwnd))
+
+
+def smoke_exe(exe: Path, out: Path, timeout: float = 40.0, self_test_fail: bool = False) -> int:
+    title = BAD_TITLE if self_test_fail else os.environ.get("DJB_SMOKE_TITLE", TITLE)
+    user32 = _user32()
     proc = subprocess.Popen([str(exe)], cwd=str(exe.parent))
     step("launch", True, "pid=%d" % proc.pid)
     ok_all = True
+    state: dict[str, int] = {"hwnd": 0}
 
     def wait_window():
         deadline = time.time() + timeout
         while time.time() < deadline:
             if proc.poll() is not None:
-                raise AssertionError("进程提前退出，退出码 %s" % proc.returncode)
+                return False, "进程提前退出，退出码 %s" % proc.returncode
             hwnd = _find_window(title)
             if hwnd:
-                return "hwnd=0x%X" % hwnd
+                state["hwnd"] = hwnd
+                return True, "hwnd=0x%X title=%r" % (hwnd, _window_title(hwnd))
             time.sleep(0.3)
-        raise AssertionError("等 %ss 没等到主窗口 %r" % (timeout, title))
+        return False, "等 %ss 没等到主窗口 %r" % (timeout, title)
 
     ok_all &= run_step("window-exists", wait_window)
+    hwnd = state["hwnd"]
 
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    for key in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
-        user32.keybd_event(0x11, 0, 0, 0)                  # Ctrl down
-        user32.keybd_event(ord(key), 0, 0, 0)
-        user32.keybd_event(ord(key), 0, 2, 0)
-        user32.keybd_event(0x11, 0, 2, 0)
-        time.sleep(0.2)
-    ok_all &= run_step("switch-views",
-                       lambda: "已发 Ctrl+1..9；进程存活=%s" % (proc.poll() is None))
-    ok_all &= run_step("still-alive", lambda: "退出码=%s" % proc.poll())
+    def focus_window():
+        if not _window_present(hwnd):
+            return False, "窗口不在了，没法抢前台"
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.3)
+        foreground = int(user32.GetForegroundWindow() or 0)
+        return foreground == hwnd, "foreground=0x%X hwnd=0x%X" % (foreground, hwnd)
+
+    if hwnd:
+        ok_all &= run_step("foreground", focus_window)
+
+    def switch_views():
+        if not _window_present(hwnd):
+            return False, "窗口不在了，没法切页"
+        for key in "123456789":
+            user32.keybd_event(0x11, 0, 0, 0)                  # Ctrl down
+            user32.keybd_event(ord(key), 0, 0, 0)
+            user32.keybd_event(ord(key), 0, 2, 0)
+            user32.keybd_event(0x11, 0, 2, 0)
+            time.sleep(0.2)
+            if proc.poll() is not None:
+                return False, "发到 Ctrl+%s 时进程死了，退出码 %s" % (key, proc.returncode)
+        return True, "已发 Ctrl+1..9，进程存活"
+
+    ok_all &= run_step("switch-views", switch_views)
+
+    def still_alive():
+        alive = proc.poll() is None
+        present = _window_present(hwnd)
+        return alive and present, "进程存活=%s 窗口还在=%s 退出码=%s" % (
+            alive, present, proc.poll())
+
+    ok_all &= run_step("still-alive", still_alive)
 
     try:
         proc.terminate()
@@ -183,6 +263,7 @@ def smoke_exe(exe: Path, out: Path, timeout: float = 40.0) -> int:
         proc.kill()
     payload = _payload(out, "exe", ok_all)
     payload["exe"] = str(exe)
+    payload["self_test_fail"] = bool(self_test_fail)
     _write(out, payload)
     return 0 if ok_all else 1
 
@@ -205,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exe", type=Path, help="冻结包里的 djb-desktop.exe")
     parser.add_argument("--out", type=Path, help="结果 JSON（默认 win_smoke_<版本>.json）")
     parser.add_argument("--views", nargs="*", help="只跑这些视图（默认 13 个全跑）")
+    parser.add_argument("--self-test-fail", action="store_true",
+                        help="自测：故意让 window-exists 失败（标题写错），退出码必须是 1")
     args = parser.parse_args(argv)
 
     if not IS_WINDOWS:
@@ -215,8 +298,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "exe":
         if not args.exe:
             parser.error("--mode exe 需要 --exe")
-        return smoke_exe(args.exe, out)
-    return smoke_inproc(out, args.views or [])
+        return smoke_exe(args.exe, out, self_test_fail=args.self_test_fail)
+    return smoke_inproc(out, args.views or [], self_test_fail=args.self_test_fail)
 
 
 if __name__ == "__main__":

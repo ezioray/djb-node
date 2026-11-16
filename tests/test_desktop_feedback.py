@@ -831,8 +831,11 @@ def test_real_tk_auto_refresh_on_the_default_page_updates_its_numbers():
             app.show_view("overview")
             root.update()
             sections = app._auto_sections()
-            for needed in ("status", "earnings", "bench", "yield", "receipts", "tasks"):
-                assert needed in sections, needed          # 页面用到的域都要取
+            # 首屏**每一块**用到的域都要取——hero/rail 读 gpu/account/token_plan/access，
+            # 少一个就会出现「数字在涨、GPU 仪表钉住」的半截假新鲜（复核 MUST-FIX #4）。
+            for needed in ("status", "earnings", "bench", "yield", "receipts", "tasks",
+                           "gpu", "account", "token_plan", "access"):
+                assert needed in sections, needed
 
             # 数据变了：自动刷新落地后，总览页上的数字要跟着变
             data._sections["earnings"] = dict(data._sections["earnings"] or {})   # noqa: SLF001
@@ -846,6 +849,44 @@ def test_real_tk_auto_refresh_on_the_default_page_updates_its_numbers():
                 time.sleep(0.02)
             root.update()
             assert "999.99" in app._last_view.plain_text()
+        finally:
+            _close(app, root)
+
+
+def test_overview_tick_refreshes_every_block_on_the_first_screen():
+    """复核 MUST-FIX #4：hero / rail 读的域也必须进 tick，否则页头时间在跑、仪表不动。"""
+    import tempfile
+
+    tk, root = _tk_root_or_skip()
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as home:
+        app, _controller, data = _auto_app(root, Path(home))
+        try:
+            app.show_view("overview")
+            root.update()
+            text = app._last_view.plain_text()
+            assert "GPU" in text or "显存" in text, "总览首屏没有 GPU 块，用例失效"
+            for domain in ("gpu", "account", "token_plan", "access"):
+                assert domain in app._auto_sections(), domain
+
+            # 真改一次 GPU 数据：tick 落地后首屏必须跟着变（旧实现的半截假新鲜会在这里红）
+            import copy
+            gpu = copy.deepcopy(data._sections["gpu"])
+            gpu["devices"][0]["utilization_pct"] = 17
+            gpu["devices"][0]["temperature_c"] = 41
+            data._sections["gpu"] = gpu
+            app._auto_refresh_tick()
+            import time
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                root.update()
+                if not app._refresh_worker.busy:
+                    break
+                time.sleep(0.02)
+            root.update()
+            refreshed = app._last_view.plain_text()
+            assert "17" in refreshed and "41" in refreshed, refreshed[:400]
         finally:
             _close(app, root)
 
