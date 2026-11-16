@@ -571,6 +571,23 @@ PROBE_PASS_BUDGET_MAX_S = float(HEARTBEAT_DEFAULT_S)
 """
 
 
+PROBE_MIN_MODEL_TIMEOUT_S = _float_env("DJB_NODE_PROBE_MIN_MODEL_TIMEOUT_S", 2.0,
+                                      minimum=1.0)
+"""单个模型的**最小预算切片**（秒）：单轮预算按「剩余模型数」切分时给每个模型保底这么多。
+
+0.3.9 / D-RCA P1-a：0.3.8 把完整的 ``PROBE_TIMEOUT_S``(20s) 原样传给**每个**
+``probe_model``，只在每个模型开始前看一次 deadline，没有 ``min(timeout, remaining)``:
+一个慢模型可以吃掉整轮预算（5 个模型最坏约 100 s > 30 s 心跳上限），慢模型排第一时
+其余模型全部 ``not_probed``（2026-11-16 现场 qwen 恰在列表末尾，**没饿死是运气**）。
+现在每个模型最多拿 ``remaining_s / remaining_models``，且不低于本值：L2 健康响应远小于
+2 s，确实需要更久的模型只丢自己这一行并进入 backlog，不再吃掉别人的预算。
+
+默认 2.0 s（下限 1.0 s：再小会把正常的网络抖动判成 timeout）。
+回滚：``DJB_NODE_PROBE_MIN_MODEL_TIMEOUT_S=20``（= ``PROBE_TIMEOUT_S``）即让切片退化成
+「每个模型都能拿满整轮预算」的旧行为，无需改代码。
+"""
+
+
 def probe_pass_budget_s(pass_budget: float | None = None) -> float:
     """实际生效的单轮探针预算（秒）：**不得超过一个心跳周期**。
 
