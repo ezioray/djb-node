@@ -2791,7 +2791,12 @@ class DesktopApp:
         self._activate_row()
 
     def _activate_row(self) -> None:
-        """回车 / 双击：表自己声明了 ``activate`` 就派发它，否则把焦点交给详情（#31③）。"""
+        """回车 / 双击：表自己声明了 ``activate`` 就派发它，否则**播报**这一行的详情（#31③）。
+
+        复核 M5：旧实现把焦点搬到详情框上，可那个 Frame ``highlightthickness=0``——
+        客户看不见焦点在哪，而 ↑↓/Home/End 绑在表格上，焦点一走键位立刻失效（实测选中不再变）。
+        现在焦点**留在表格**里，详情用状态条念一句；键盘路径不断，也不需要"看得见的焦点环"。
+        """
         table = getattr(self, "_table", None)
         action = str(getattr(table, "activate", "") or "")
         if action:
@@ -2808,16 +2813,9 @@ class DesktopApp:
             return
         cells = self._row_cells.get(str(selection[0]), ()) or ()
         head = " · ".join(str(item) for item in cells)
-        detail = getattr(self, "_detail", None)
-        if detail is not None:
-            # 读屏没有「实时区域」可用：把这一句挂成详情区的**名称**再把焦点交给它，
-            # 屏读器就会念出焦点控件的名字——这是 Tk 下唯一靠得住的播报方式。
-            self._a11y_name(detail, "详情：" + head)
-            try:
-                detail.configure(takefocus=1)
-                detail.focus_set()
-            except Exception:                            # pragma: no cover - 控件已销毁
-                pass
+        # 只播报，不搬焦点：焦点留在表格上，↑↓/Home/End/Enter 继续可用。
+        # 不宣称读屏会念出来——Tk 没有 UIA/MSAA provider，`djb_accessible_name` 只是
+        # Python 属性；真读屏要整段文字时用 `--export-text`（票面 #31④ 的兜底）。
         self._announce("详情：" + head)
 
     def _render_fields(self, fields: Sequence[Field], view_key: str,

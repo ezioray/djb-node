@@ -549,9 +549,13 @@ def test_real_tk_enter_on_a_non_action_table_opens_the_detail_instead():
             app._tree.event_generate("<Return>")
             root.update()
             assert controller.message == before            # 没派动作
-            # 读屏靠「焦点控件的名字」：详情区拿到焦点时名字里就有这一行的值
-            assert app._detail.focus_get() is app._detail
-            assert "详情：" in getattr(app._detail, app.A11Y_NAME_ATTR)
+            # 复核 M5：焦点**留在表格**（详情框没有焦点环，搬过去 ↑↓ 就断），详情用状态条播报
+            assert app._tree.focus_get() is app._tree
+            assert "详情：" in app._status.cget("text")
+            # 键位还活着：紧接着按 ↓ 选中行会动
+            app._tree.event_generate("<Down>", when="now")
+            root.update()
+            assert app._tree.selection() == (app._tree.get_children()[1],)
         finally:
             app.stop()
 
