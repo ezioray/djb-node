@@ -119,6 +119,9 @@ class DesktopController:
     #: RC15-039 #4：自动刷新开关（**本机界面状态**，不是服务端配置）。默认开；
     #: GUI 侧负责按 10s/60s 落一次刷新，并把偏好存进 desktop-prefs.json。
     auto_refresh: bool = True
+    #: RC15-039 #17/M7：最近一次**切档成功且回读一致**的档位；空 = 从来没回读过。
+    #: 只决定「已回读」四个字出不出现，不参与任何判断。
+    preset_readback: str = ""
     message: str = DEFAULT_MESSAGE
     view: str = "overview"
     drafts: dict[str, str] = field(default_factory=dict)
@@ -209,6 +212,14 @@ class DesktopController:
         access_sec = sections.get("access")
         if isinstance(access_sec, Mapping):
             sections["access"] = {**access_sec, "auto_refresh": bool(self.auto_refresh)}
+        yield_sec = sections.get("yield")
+        if isinstance(yield_sec, Mapping):
+            # RC15-039 复核 M7：首屏只说「本机配置」，「已回读」只在切档成功且回读一致后出现
+            sections["yield"] = {
+                **yield_sec,
+                "readback_ok": bool(self.preset_readback)
+                and str(self.preset_readback) == str(yield_sec.get("preset") or ""),
+            }
         logs = sections.get("logs")
         if isinstance(logs, Mapping):
             # RC15-039 #5：级别筛选是**真的**筛（旧实现只有一句页脚承诺，页面照旧全量）。
@@ -1034,10 +1045,12 @@ class DesktopController:
                                 ok=False)
         readback = self.current_preset(fresh=True)
         if readback == preset:
+            self.preset_readback = preset
             self.refresh(sections=("status", "yield"))
             return ActionResult("已切到「" + label + "」：写的是 " + preset
                                 + "，daemon 回读也是 " + preset + "。", effect="refresh")
         # 回读不到（daemon 没跑 / 没给 profile）**不是**成功；不一致则回到原档
+        self.preset_readback = ""                 # 没回读成功 → 别处不许出现「已回读」
         restored, note = self._restore_preset(before)
         if readback:
             head = ("切档未生效：写入的是 " + preset + "，daemon 回读却是 " + readback

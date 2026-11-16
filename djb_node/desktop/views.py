@@ -1895,17 +1895,21 @@ def _today_note(today: Any) -> str:
 
 
 #: RC15-039 #17：档位**只有三个**（owner 2026-11-16 D-1：``paused`` 是状态，不是第四档）。
-#: 每项 = (表内键, 档位文案, ``djb limits --preset`` 的取值, 一句话说明)。
+#: 每项 = (表内键, 档位文案, ``djb limits --preset`` 的取值)。
 #: 第三列是**写命令**的取值（「全速」在本机命令里叫「全力以赴」），必须一一对上，
 #: 否则切完回读永远不一致。前两列之外的地方不许再手写档位名。
-YIELD_TIERS: tuple[tuple[str, str, str, str], ...] = (
-    ("full", "全速", "全力以赴", "只要接单就满载"),
-    ("balanced", "均衡", "均衡", "工作时段实时算力，其余慢任务"),
-    ("saver", "省心", "省心", "只在我不使用电脑时工作"),
+#:
+#: RC15-039 复核 M7（owner a′）：原来的第四列「一句话说明」写的是"只要接单就满载 /
+#: 工作时段实时算力 / 只在我不使用电脑时工作"——这三句描述的是**本版 daemon 不做**的事
+#: （`facts.PRESET_CONCURRENCY` 零消费），与页脚"本版不按档位调整"同屏矛盾，整列删掉。
+YIELD_TIERS: tuple[tuple[str, str, str], ...] = (
+    ("full", "全速", "全力以赴"),
+    ("balanced", "均衡", "均衡"),
+    ("saver", "省心", "省心"),
 )
 #: 表内键 → 写命令取值 / 档位文案 → 写命令取值（动作层按选中的**标签**查）
-YIELD_PRESET_BY_KEY: dict[str, str] = {key: preset for key, _l, preset, _d in YIELD_TIERS}
-YIELD_PRESET_BY_LABEL: dict[str, str] = {label: preset for _k, label, preset, _d in YIELD_TIERS}
+YIELD_PRESET_BY_KEY: dict[str, str] = {key: preset for key, _l, preset in YIELD_TIERS}
+YIELD_PRESET_BY_LABEL: dict[str, str] = {label: preset for _k, label, preset in YIELD_TIERS}
 
 
 def _yield_state_text(state: str) -> str:
@@ -1935,13 +1939,16 @@ def _yield(snapshot: Snapshot) -> View:
     # RC15-039 #17：当前档位以**本机配置里的 preset** 为准（``djb limits --preset`` 写的就是它），
     # 不从 yield_mode 猜：以前那行「模式」读的是另一个键，跟切档根本不是一个东西。
     preset = str(data.get("preset") or "")
-    active_key = next((key for key, _l, value, _d in YIELD_TIERS if value == preset), "")
-    rows = tuple(Row((label, key, summary,
-                      (MARK_DONE + " 当前") if key == active_key else MARK_IDLE), key=key)
-                 for key, label, _value, summary in YIELD_TIERS)
+    # RC15-039 复核 M7：首屏**没有**任何回读动作（数据来自本机配置），所以只说「本机配置」；
+    # 「已回读」只在切档动作成功后出现（控制器注入 `readback_ok`）。
+    verified = bool(data.get("readback_ok"))
+    active_key = next((key for key, _l, value in YIELD_TIERS if value == preset), "")
+    rows = tuple(Row((label, key, (MARK_DONE + " 当前") if key == active_key else MARK_IDLE),
+                     key=key)
+                 for key, label, _value in YIELD_TIERS)
     if active_key:
-        now_text = next(label for key, label, _v, _d in YIELD_TIERS if key == active_key)
-        now_meta, now_tone = "本机配置 · 已回读", "mint"
+        now_text = next(label for key, label, _v in YIELD_TIERS if key == active_key)
+        now_meta, now_tone = ("本机配置 · 已回读" if verified else "本机配置"), "mint"
     else:
         now_text = "未知（没有回读到）"
         now_meta, now_tone = "读不到就不猜；点下面三档之一可重新写一次", "amber"
@@ -1954,7 +1961,7 @@ def _yield(snapshot: Snapshot) -> View:
                     _yield_state_tone(state)),
                Card("接单", _flag(data.get("accepting"), "允许", "禁止"), "", "default"),
                Card("档位", now_text, now_meta, now_tone)),
-        table=Table(("档位", "键", "说明", "当前"), rows, empty="档位暂不可用",
+        table=Table(("档位", "键", "当前"), rows, empty="档位暂不可用",
                     activate="yield.apply_mode"),
         actions=(Action("yield.apply_mode", "切到选中的档位", enabled=bool(rows),
                         reason="当前没有可切换的档位", primary=True),
@@ -1967,9 +1974,9 @@ def _yield(snapshot: Snapshot) -> View:
                "会先问一次，确认后写本机配置并回读 daemon。",
                "切档不打断在跑的任务、不重启服务；暂停/恢复是另一个动作，"
                "与托盘读同一份状态。",
-               # 诚实边界：本版 daemon 还不会按档位改并发，别让客户以为切了档就变了算力
-               "本版 daemon 尚未按档位调整并发与让路（已知缺口，修好后这里会删掉）；"
-               "所以在跑的任务不受影响。"),
+               # RC15-039 复核 M7（owner a′）：用**正面**口径说同一件事，别和上面的档位
+               # 描述互相打脸——"只记录偏好"是这版真实做的事，"后续版本生效"是真实计划。
+               "本版只记录档位偏好；并发与让路在后续版本生效。"),
     )
 
 

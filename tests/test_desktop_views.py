@@ -1419,11 +1419,13 @@ def test_yield_table_has_exactly_three_tiers_and_paused_is_not_one_of_them(tmp_p
 
 def test_yield_current_tier_comes_from_the_preset_and_degrades_honestly(tmp_path):
     view = make_controller(tmp_path, sections=_yield_sections("全力以赴")).show("yield")
-    current = [row.cells[0] for row in view.table.rows if "当前" in row.cells[3]]
+    # RC15-039 复核 M7：说明列已删（列 = 档位 / 键 / 当前）
+    assert view.table.columns == ("档位", "键", "当前")
+    current = [row.cells[0] for row in view.table.rows if "当前" in row.cells[2]]
     assert current == ["全速"]                        # 「全速」在本机命令里叫「全力以赴」
     assert view.table.activate == "yield.apply_mode"  # 回车/双击能切
     unknown = make_controller(tmp_path, sections=_yield_sections("")).show("yield")
-    assert not any("当前" in row.cells[3] for row in unknown.table.rows)
+    assert not any("当前" in row.cells[2] for row in unknown.table.rows)
     assert "未知（没有回读到）" in unknown.plain_text()
 
 
@@ -1605,3 +1607,27 @@ def test_log_empty_text_does_not_claim_the_file_is_missing_when_it_is_only_filte
                         "path": "~/.djb/logs/daemon.log"}
     empty = make_controller(tmp_path, sections=sections).show("logs").plain_text()
     assert "日志文件尚未生成" in empty
+
+
+def test_yield_copy_only_claims_what_this_version_actually_does(tmp_path):
+    """复核 M7（owner a′）：说明列三句删掉；「已回读」只在切档成功后才出现。
+
+    验收原话：这一页 `plain_text()` 里不许同时出现「满载/实时算力/不使用电脑时」
+    与「不生效」这类互斥说法。
+    """
+    sections = _yield_sections("均衡")
+    controller = make_controller(tmp_path, sections=sections)
+    text = controller.show("yield").plain_text()
+    for phrase in ("满载", "实时算力", "不使用电脑时"):
+        assert phrase not in text, phrase
+    assert "本版只记录档位偏好" in text and "后续版本生效" in text
+    assert "不生效" not in text
+    assert "已回读" not in text                    # 首屏没有任何回读动作
+
+    # 切档成功（回读一致）之后：「已回读」才出现
+    sections["yield"]["preset"] = "省心"           # 落盘后数据源读到的就是新档
+    controller.cli = _PresetCli("均衡")
+    controller.select_row("yield", "省心")
+    result = controller.action("yield.apply_mode", confirm=lambda _t: True)
+    assert result.ok is True, result.message
+    assert "已回读" in controller.show("yield").plain_text()
