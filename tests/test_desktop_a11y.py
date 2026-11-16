@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from djb_node.desktop import datasource as ds
@@ -216,6 +218,18 @@ def test_provider_resolves_the_root_after_refresh():
     assert root is not None and root.node_id == "view:overview"
     kids = provider.children("")
     assert kids and kids[0].startswith("view:overview/")
+
+
+def test_a11y_is_imported_statically_for_pyinstaller():
+    """冻结 exe 的门禁（票面 §6.5 第 1 条）：`a11y` 一旦改成动态 import，
+    PyInstaller 就收不进 exe，功能会**静默消失**——所以这里把 import 形态钉死。
+    """
+    import re
+    source = (pathlib.Path(__file__).resolve().parents[1]
+              / "djb_node" / "desktop" / "app.py").read_text(encoding="utf-8")
+    assert re.search(r"^from \.a11y import ", source, re.MULTILINE), "app.py 必须静态 from .a11y import …"
+    assert "import_module" not in source or "a11y" not in source.split("import_module")[1][:40], \
+        "别把 a11y 改成 import_module（PyInstaller 看不见）"
 
 
 def test_focus_and_selection_events_use_stable_child_ids():
