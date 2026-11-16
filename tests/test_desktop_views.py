@@ -1581,3 +1581,25 @@ def test_rollback_refuses_to_guess_when_the_local_tier_is_unreadable(tmp_path):
     assert cli.disk == "省心"                                    # 只写了用户选的那一次
     # 确认框里就要先讲清楚：读不到原档 → 失败时不回写
     assert "不会" in asked[0] and "回写" in asked[0]
+
+
+def test_log_empty_text_does_not_claim_the_file_is_missing_when_it_is_only_filtered(tmp_path):
+    """复核 M4：筛到 0 行 ≠「日志文件尚未生成」（同屏卡片写着「共 4 行」）。
+
+    三种「表体为空」必须分开说：筛空 / 有行但解析不出 / 真没有日志。
+    """
+    controller = make_controller(tmp_path)
+    controller.show("logs")
+    view = controller.set_log_level("debug")            # demo 数据里没有 debug 行
+    text = view.plain_text()
+    assert view.table.rows == ()
+    assert "当前筛选（debug）下没有日志行" in text
+    assert "日志文件尚未生成" not in text
+    assert "共 4 行" in text                            # 卡片仍说真话：文件里有 4 行
+
+    # 真没有日志（域可用、total=0）时才说「尚未生成」
+    sections = dict(demo_snapshot().sections)
+    sections["logs"] = {"rows": [], "total": 0, "levels": ["info"], "level": "all",
+                        "path": "~/.djb/logs/daemon.log"}
+    empty = make_controller(tmp_path, sections=sections).show("logs").plain_text()
+    assert "日志文件尚未生成" in empty

@@ -2261,6 +2261,18 @@ def _logs(snapshot: Snapshot) -> View:
     filtered = level != "all"
     count_meta = ("共 " + str(total) + " 行 · 已筛选" if filtered and _is_number(total)
                   else "共 " + str(total) + " 行" if _is_number(total) else "尾部 200 行")
+    # RC15-039 复核 M4：筛到 0 行时旧文案写「日志文件尚未生成」——同屏卡片却写着「共 N 行」，
+    # 屏幕上的事实性错误。行的有无有三种原因，文案必须分开说，不许拿「文件没生成」兜一切。
+    if rows:
+        empty_text = _empty_text(snapshot, "logs", "日志文件尚未生成")
+    elif filtered:
+        # 级别名用**裸名**（`LOG_LEVEL_TEXT` 里是「debug（调试）」，套进括号会变成套娃）
+        empty_text = ("当前筛选（" + level + "）下没有日志行；换一个级别，或选「"
+                      + LOG_LEVEL_TEXT["all"] + "」。")
+    elif _is_number(total) and int(total) > 0:
+        empty_text = "日志里有 " + str(total) + " 行，但没能解析出可显示的行（详情见日志文件）。"
+    else:
+        empty_text = "日志文件尚未生成（本机还没有任何日志行）。"
     return View(
         key="logs", title="日志",
         subtitle="本机日志 · 本页显示最近 200 行（级别筛选只改显示）",
@@ -2268,7 +2280,7 @@ def _logs(snapshot: Snapshot) -> View:
         # 窄窗先让出「原因/下一步」（正文在下面详情抽屉里，点一行就能看全）
         table=Table(("级别", "时间", "事件", "原因", "下一步"), tuple(rows),
                     note=str(logs.get("note") or ""),
-                    empty=_empty_text(snapshot, "logs", "日志文件尚未生成"),
+                    empty=empty_text,
                     narrow_hide=("时间", "原因", "下一步"),
                     narrow_headers=(("下一步", "下一步"),)),
         filters=(Filter("log_level", "级别", options=options, value=level,
