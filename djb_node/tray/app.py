@@ -50,7 +50,7 @@ from ..logging_setup import event
 from .model import TrayAction, TrayIntent, TrayMenuItem, TrayModel
 from .notifications import FETCH_LIMIT, summarize
 from ..gui.theme import COLORS, menu_options
-from .actions import apply_control, control_enabled
+from .actions import apply_control, control_enabled, disabled_control
 from .panels import DesktopPanel, project_pages
 
 __all__ = [
@@ -657,6 +657,14 @@ def desktop_intent_sink(backend, *, refresh):
             refresh()
             backend.show_feedback("本机控制回读", result.message)
             event("tray.control_result", action=intent.action.value, verified=result.verified)
+            return
+        if intent.action in (TrayAction.PAUSE, TrayAction.RESUME):
+            # RC15-039 #3 真路径：开关关着时上面那个分支进不去，以前直接落到最下面的
+            # 「命令指南 / 未执行」（客户看到的还是 CLI 指引）。这里用人话兜底，文案与
+            # 直调 ``apply_control`` 同源（``CONTROL_DISABLED_MESSAGE``）。
+            result = disabled_control(intent.action)
+            backend.show_feedback("本机控制 / 未执行", result.message)
+            event("tray.control_result", action=intent.action.value, verified=False)
             return
         if intent.action is TrayAction.BIND:
             ask = getattr(backend, "ask_bind_code", None)
