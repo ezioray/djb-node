@@ -436,8 +436,15 @@ class DesktopApp:
         return AUTO_REFRESH_VISIBLE_S if self._auto_visible() else AUTO_REFRESH_HIDDEN_S
 
     #: 总览页**真正**用到的域（复核 M3/S11：以前这里只给 `status`，主卡数字永不更新，
-    #: 而页头的「数据截至」照走 = 谎报新鲜度）。改 Overview 版面时这张清单要一起改。
-    OVERVIEW_SECTIONS = ("status", "earnings", "bench", "yield", "receipts", "tasks")
+    #: 而页头的「数据截至」照走 = 谎报新鲜度）。
+    #:
+    #: 2026-11-16 复核 MUST-FIX #4：上一版只补了 6 个域，``_hero``/``_rail`` 还在读
+    #: ``gpu``/``account``/``token_plan``/``access``——于是出现「今日贡献在涨、GPU 仪表钉在
+    #: 62%、页头时间在跑」的半截假新鲜。现在**首屏每一块用到的域都在这里**：
+    #: ``_hero``（gpu/account/token_plan/access/yield/receipts）+ ``_rail``（access/receipts）
+    #: + 卡片与表格（status/earnings/bench/tasks）。改版面必须同步改这张清单。
+    OVERVIEW_SECTIONS = ("status", "earnings", "bench", "yield", "receipts", "tasks",
+                         "gpu", "account", "token_plan", "access")
 
     def _auto_sections(self) -> tuple[str, ...]:
         """自动刷新取的域：**本页真正要用的那几个**（总览有 6 个域，不能只取 status）。
