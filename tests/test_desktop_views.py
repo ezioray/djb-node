@@ -1428,10 +1428,13 @@ def test_yield_current_tier_comes_from_the_preset_and_degrades_honestly(tmp_path
 class _PresetCli:
     """假 CLI：记下每次调用；``limits --preset`` 写进 ``preset``，``status`` 回报它。"""
 
-    def __init__(self, preset: str, *, readback: str | None = None, boom: bool = False) -> None:
+    def __init__(self, preset: str, *, readback: str | None = None, boom: bool = False,
+                 disk: str | None = None) -> None:
         self.preset = preset
         self.readback = readback                # None = 回读就是写入值
         self.boom = boom
+        # `disk` = 本机配置里的**真**档位（可与快照不同：造"快照落后"用）
+        self.disk = preset if disk is None else disk
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, argv):
@@ -1439,8 +1442,12 @@ class _PresetCli:
         self.calls.append(argv)
         if self.boom and argv[:1] == ("limits",):
             raise RuntimeError("boom")
+        if argv[:1] == ("limits",) and "--json" in argv and "--preset" not in argv:
+            # 复核 M6：`djb limits --json` 只读本机 profile（离线可用），不写任何东西
+            return {"profile": {"preset": self.disk}}
         if argv[:1] == ("limits",) and "--preset" in argv:
             self.preset = argv[argv.index("--preset") + 1]
+            self.disk = self.preset                 # 写也写在本机配置上
             return {"profile": {"preset": self.preset}}
         if argv[:1] == ("status",):
             seen = self.preset if self.readback is None else self.readback
@@ -1463,7 +1470,9 @@ def test_switch_tier_needs_a_selection_a_tier_and_a_second_confirmation(tmp_path
     result = controller.action("yield.apply_mode", confirm=lambda text: asked.append(text) or False)
     assert result.effect == "cancelled" and result.ok is False
     assert "已取消切换" in result.message
-    assert cli.calls == []                                          # 取消就一个字节都不写
+    # 取消就一个字节都不写（`limits --json` 是**只读**读原档，不算写；复核 M6）
+    assert [call for call in cli.calls if "--preset" in call] == []
+    assert ("limits", "--json") in cli.calls
     assert "在跑的任务不会被打断" in asked[0] and "回读" in asked[0]
 
 
@@ -1533,3 +1542,42 @@ def test_no_view_promises_settlement_with_the_old_conflicting_lines(tmp_path):
         text = controller.show(key).plain_text()
         assert "不可提现" not in text, key
         assert "直接结算" not in text, key
+
+
+def test_rollback_uses_the_real_local_tier_not_the_stale_snapshot(tmp_path):
+    """复核 M6：快照落后 + 回读失败 —— 写回必须是**本机配置里的真原档**。
+
+    旧实现 `before = current_preset()` 读快照：真原档「省心」、快照「均衡」时，
+    失败消息会说"已写回原来的「均衡」档"，落盘变成谁也没选过的值。
+    """
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))   # 快照说「均衡」
+    cli = _PresetCli("均衡", readback="", disk="省心")                          # 真原档是「省心」
+    controller.cli = cli
+    controller.select_row("yield", "均衡")                       # 客户要切到「均衡」
+    result = controller.action("yield.apply_mode", confirm=lambda _t: True)
+
+    assert result.ok is False
+    # 写「均衡」（用户选的）→ 回读不到 → 写回**真原档「省心」**（不是快照里的「均衡」）
+    written = [call[2] for call in cli.calls
+               if call[:1] == ("limits",) and "--preset" in call]
+    assert written == ["均衡", "省心"]
+    assert cli.disk == "省心"                                    # 落盘还是真原档
+    assert "写回原来的「省心」" in result.message
+
+
+def test_rollback_refuses_to_guess_when_the_local_tier_is_unreadable(tmp_path):
+    """复核 M6：读不到真原档 → **不回写**，并明说「原档未知，请手动选一次」。"""
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    cli = _PresetCli("均衡", readback="", disk="")
+    controller.cli = cli
+    controller.select_row("yield", "省心")
+    asked: list[str] = []
+    result = controller.action("yield.apply_mode", confirm=lambda text: asked.append(text) or True)
+
+    assert result.ok is False
+    written = [call for call in cli.calls if call[:1] == ("limits",) and "--preset" in call]
+    assert written == [("limits", "--preset", "省心")]           # 只写了用户选的那一次
+    assert "原档位未知" in result.message and "手动选一次" in result.message
+    assert cli.disk == "省心"                                    # 只写了用户选的那一次
+    # 确认框里就要先讲清楚：读不到原档 → 失败时不回写
+    assert "不会" in asked[0] and "回写" in asked[0]

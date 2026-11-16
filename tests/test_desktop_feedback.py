@@ -486,7 +486,9 @@ def test_real_tk_enter_on_a_tier_row_switches_after_confirmation():
         def __call__(self, argv):
             argv = tuple(argv)
             self.calls.append(argv)
-            if argv[:1] == ("limits",):
+            if argv[:1] == ("limits",) and "--json" in argv:      # 只读：读本机真原档
+                return {"profile": {"preset": self.preset}}
+            if argv[:1] == ("limits",) and "--preset" in argv:
                 self.preset = argv[argv.index("--preset") + 1]
             return {"profile": {"preset": self.preset}, "state": "online"}
 

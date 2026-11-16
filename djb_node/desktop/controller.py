@@ -1007,7 +1007,9 @@ class DesktopController:
         preset = YIELD_PRESET_BY_LABEL.get(label)
         if preset is None:
             return ActionResult("选中的行不是档位（" + label + "）；档位未改动。", ok=False)
-        before = self.current_preset()
+        # 复核 M6：**确认框之前**先读真原档（本机配置），不能拿快照当"原来的档"——
+        # 回读失败要写回的就是这个值，快照落后一格就会把客户档位静默改成第三个值。
+        before = self.profile_preset()
         if before and before == preset:
             return ActionResult("已经是「" + label + "」档，不用切换。", ok=False)
         if self.cli is None:
@@ -1015,9 +1017,13 @@ class DesktopController:
         # 「全速」在本机命令里叫「全力以赴」：只有两者不同名时才补这一句，否则读着像口吃
         target = ("「" + label + "」" if label == preset
                   else "「" + label + "」（" + preset + "）")
+        rollback = ("切完会回读 daemon 确认，回读不一致就退回原来的档位。"
+                    if before else
+                    "切完会回读 daemon 确认；现在读不到原来的档位，回读不一致时**不会**替你"
+                    "回写（需要你手动再选一次）。")
         if not confirm("把档位切到" + target + "？\n\n"
                        "写的是本机配置里的档位；在跑的任务不会被打断、daemon 不会重启。"
-                       "切完会回读 daemon 确认，回读不一致就退回原来的档位。"):
+                       + rollback):
             return ActionResult("已取消切换（档位未改动）。", ok=False, effect="cancelled")
         try:
             self.cli(["limits", "--preset", preset])
@@ -1040,6 +1046,23 @@ class DesktopController:
             head = "已写入 " + preset + "，但回读不到 daemon 的档位（daemon 可能没在运行），"
         self.refresh(sections=("status", "yield"))
         return ActionResult(head + note, ok=False, effect="refresh")
+
+    def profile_preset(self) -> str:
+        """本机配置里**当前**的档位：`djb limits --json`（离线可读本机 profile，不依赖 daemon）。
+
+        为什么不能拿快照当"原来的档"：快照是上一次取数的结果，可能落后几十秒甚至更久；
+        回写原档时用它，会把客户从「省心」静默改成快照里的「均衡」（复核 M6 实测）。
+        读不到就给空字符串——调用方据此**不回写**并明说，绝不猜一个值写下去。
+        """
+        if self.cli is None:
+            return ""
+        try:
+            payload = self.cli(["limits", "--json"])
+        except Exception:                            # noqa: BLE001 - 读不到就返回空，不冒充
+            return ""
+        profile = payload.get("profile") if isinstance(payload, Mapping) else None
+        preset = profile.get("preset") if isinstance(profile, Mapping) else ""
+        return str(preset or "")
 
     def current_preset(self, *, fresh: bool = False) -> str:
         """当前档位：默认读快照；``fresh=True`` 时**重新问一次 daemon**（回读用）。
