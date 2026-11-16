@@ -1388,3 +1388,125 @@ def test_theme_save_keeps_the_auto_refresh_flag(tmp_path):
     dual.save("day", tmp_path)
     assert dual.load_flag("auto_refresh", tmp_path, default=True) is False
     assert dual.load(tmp_path) == "day"
+
+
+# ───────────────── RC15-039 #17：档位三档（全速/均衡/省心）、二次确认、回读 daemon
+def _yield_sections(preset: str, state: str = "online") -> dict:
+    sections = dict(demo_snapshot().sections)
+    sections["yield"] = {"state": state, "reason": None, "reason_label": None,
+                         "accepting": state != "paused", "mode": "balanced",
+                         "preset": preset, "yield_enabled": True}
+    return sections
+
+
+def test_yield_table_has_exactly_three_tiers_and_paused_is_not_one_of_them(tmp_path):
+    """owner D-1：档位只有三个；``paused`` 是状态，不许占一行。"""
+    text = make_controller(tmp_path, sections=_yield_sections("均衡")).show("yield").plain_text()
+    assert "三档模式" in text and "四档" not in text
+    for label in ("全速", "均衡", "省心"):
+        assert label in text
+    assert "暂停 |" not in text                      # 表里没有「暂停」这一行
+    assert "| paused" not in text
+    # 暂停时：表还是三行，当前档位照旧显示（暂停不吞掉档位）
+    paused = make_controller(tmp_path, sections=_yield_sections("省心", "paused")).show("yield")
+    assert [row.key for row in paused.table.rows] == ["full", "balanced", "saver"]
+    assert "✓ 当前" in paused.plain_text()
+    assert any("已暂停" in card.value for card in paused.cards)
+
+
+def test_yield_current_tier_comes_from_the_preset_and_degrades_honestly(tmp_path):
+    view = make_controller(tmp_path, sections=_yield_sections("全力以赴")).show("yield")
+    current = [row.cells[0] for row in view.table.rows if "当前" in row.cells[3]]
+    assert current == ["全速"]                        # 「全速」在本机命令里叫「全力以赴」
+    assert view.table.activate == "yield.apply_mode"  # 回车/双击能切
+    unknown = make_controller(tmp_path, sections=_yield_sections("")).show("yield")
+    assert not any("当前" in row.cells[3] for row in unknown.table.rows)
+    assert "未知（没有回读到）" in unknown.plain_text()
+
+
+class _PresetCli:
+    """假 CLI：记下每次调用；``limits --preset`` 写进 ``preset``，``status`` 回报它。"""
+
+    def __init__(self, preset: str, *, readback: str | None = None, boom: bool = False) -> None:
+        self.preset = preset
+        self.readback = readback                # None = 回读就是写入值
+        self.boom = boom
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, argv):
+        argv = tuple(argv)
+        self.calls.append(argv)
+        if self.boom and argv[:1] == ("limits",):
+            raise RuntimeError("boom")
+        if argv[:1] == ("limits",) and "--preset" in argv:
+            self.preset = argv[argv.index("--preset") + 1]
+            return {"profile": {"preset": self.preset}}
+        if argv[:1] == ("status",):
+            seen = self.preset if self.readback is None else self.readback
+            return {"state": "online", "profile": {"preset": seen}}
+        return {}
+
+
+def test_switch_tier_needs_a_selection_a_tier_and_a_second_confirmation(tmp_path):
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    cli = _PresetCli("均衡")
+    controller.cli = cli
+    assert controller.action("yield.apply_mode").ok is False      # 没选行
+    assert cli.calls == []
+
+    controller.select_row("yield", "暂停")                          # 选中不是档位的行
+    assert "不是档位" in controller.action("yield.apply_mode").message
+
+    controller.select_row("yield", "省心")                          # 选了，但确认框被取消
+    asked: list[str] = []
+    result = controller.action("yield.apply_mode", confirm=lambda text: asked.append(text) or False)
+    assert result.effect == "cancelled" and result.ok is False
+    assert "已取消切换" in result.message
+    assert cli.calls == []                                          # 取消就一个字节都不写
+    assert "在跑的任务不会被打断" in asked[0] and "回读" in asked[0]
+
+
+def test_switch_tier_writes_the_preset_and_verifies_the_daemon_readback(tmp_path):
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    cli = _PresetCli("均衡")
+    controller.cli = cli
+    controller.select_row("yield", "省心")
+    result = controller.action("yield.apply_mode", confirm=lambda _text: True)
+    assert result.ok is True and result.effect == "refresh"
+    assert ("limits", "--preset", "省心") in cli.calls               # 写的是命令的取值
+    assert ("status",) in cli.calls                                 # 独立回读
+    assert "已切到「省心」" in result.message and "回读" in result.message
+
+
+def test_switch_tier_mismatch_writes_the_old_tier_back_and_says_so(tmp_path):
+    """回读不一致 = 失败（owner D-1）：写回原档 + 出声，界面不许装作切成功了。"""
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    cli = _PresetCli("均衡", readback="全力以赴")                    # daemon 回报的却是全速
+    controller.cli = cli
+    controller.select_row("yield", "省心")
+    result = controller.action("yield.apply_mode", confirm=lambda _text: True)
+    assert result.ok is False
+    assert ("limits", "--preset", "均衡") in cli.calls               # 写回原档
+    assert "回读" in result.message and "「均衡」档" in result.message
+
+
+def test_switch_tier_without_a_readback_is_not_success(tmp_path):
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    controller.cli = _PresetCli("均衡", readback="")                 # daemon 没跑：没有 profile
+    controller.select_row("yield", "省心")
+    result = controller.action("yield.apply_mode", confirm=lambda _text: True)
+    assert result.ok is False
+    assert "回读不到" in result.message and "不是" not in result.message
+
+
+def test_switch_tier_reports_an_already_current_tier_and_a_write_failure(tmp_path):
+    controller = make_controller(tmp_path, sections=_yield_sections("省心"))
+    controller.cli = _PresetCli("省心")
+    controller.select_row("yield", "省心")
+    assert "已经" in controller.action("yield.apply_mode", confirm=lambda _t: True).message
+
+    controller = make_controller(tmp_path, sections=_yield_sections("均衡"))
+    controller.cli = _PresetCli("均衡", boom=True)
+    controller.select_row("yield", "全速")
+    result = controller.action("yield.apply_mode", confirm=lambda _t: True)
+    assert result.ok is False and "档位未切换" in result.message

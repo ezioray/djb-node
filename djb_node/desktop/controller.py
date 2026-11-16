@@ -28,7 +28,8 @@ from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPP
                      validate_address)
 from .datasource import (LOG_LEVELS, SECTIONS, DataSource, LocalDataSource, ProviderError,
                          Snapshot, Unavailable, benchmark)
-from .views import VIEW_KEYS, VIEW_TITLES, View, build_view
+from .views import (VIEW_KEYS, VIEW_TITLES, YIELD_PRESET_BY_KEY, YIELD_PRESET_BY_LABEL,
+                    View, build_view)
 from .. import facts
 
 __all__ = ["ActionResult", "ControlOutcome", "DesktopController", "LocalControlChannel",
@@ -990,6 +991,81 @@ class DesktopController:
             return ActionResult("正在刷新 Token Plan…（可以继续拖动/切页）",
                                 effect="refresh")
         return ActionResult(self.message, effect="refresh")
+
+    def _act_yield_apply_mode(self, *, confirm=None) -> ActionResult:
+        """RC15-039 #17：切档 = 二次确认 → 写本机配置 → **回读 daemon** → 不一致就写回原档。
+
+        口径（owner 2026-11-16 D-1）：档位只有全速/均衡/省心；``paused`` 是状态不是档位；
+        回读不一致 = 失败（要出声），并回到原档。
+        """
+        label = str(self.selected.get("yield") or "").strip()
+        if not label:
+            return ActionResult("先在表格里选中一档（全速 / 均衡 / 省心），再点「切到选中的档位」。",
+                                ok=False)
+        preset = YIELD_PRESET_BY_LABEL.get(label)
+        if preset is None:
+            return ActionResult("选中的行不是档位（" + label + "）；档位未改动。", ok=False)
+        before = self.current_preset()
+        if before and before == preset:
+            return ActionResult("已经是「" + label + "」档，不用切换。", ok=False)
+        if self.cli is None:
+            return ActionResult("暂不可用（本机命令通道未接通）；档位未改动。", ok=False)
+        # 「全速」在本机命令里叫「全力以赴」：只有两者不同名时才补这一句，否则读着像口吃
+        target = ("「" + label + "」" if label == preset
+                  else "「" + label + "」（" + preset + "）")
+        if not confirm("把档位切到" + target + "？\n\n"
+                       "写的是本机配置里的档位；在跑的任务不会被打断、daemon 不会重启。"
+                       "切完会回读 daemon 确认，回读不一致就退回原来的档位。"):
+            return ActionResult("已取消切换（档位未改动）。", ok=False, effect="cancelled")
+        try:
+            self.cli(["limits", "--preset", preset])
+        except ProviderError as exc:
+            return ActionResult("档位未切换：" + exc.reason + "（本机配置未改动）", ok=False)
+        except Exception as exc:
+            return ActionResult("档位未切换（" + type(exc).__name__ + "）；本机配置未改动。",
+                                ok=False)
+        readback = self.current_preset(fresh=True)
+        if readback == preset:
+            self.refresh(sections=("status", "yield"))
+            return ActionResult("已切到「" + label + "」：写的是 " + preset
+                                + "，daemon 回读也是 " + preset + "。", effect="refresh")
+        # 回读不到（daemon 没跑 / 没给 profile）**不是**成功；不一致则回到原档
+        restored, note = self._restore_preset(before)
+        if readback:
+            head = ("切档未生效：写入的是 " + preset + "，daemon 回读却是 " + readback
+                    + "。界面按回读显示，")
+        else:
+            head = "已写入 " + preset + "，但回读不到 daemon 的档位（daemon 可能没在运行），"
+        self.refresh(sections=("status", "yield"))
+        return ActionResult(head + note, ok=False, effect="refresh")
+
+    def current_preset(self, *, fresh: bool = False) -> str:
+        """当前档位：默认读快照；``fresh=True`` 时**重新问一次 daemon**（回读用）。
+
+        读不到就给空字符串——绝不拿上一次的值冒充回读结果。
+        """
+        if fresh:
+            if self.cli is None:
+                return ""
+            try:
+                payload = self.cli(["status"])
+            except Exception:
+                return ""
+            profile = payload.get("profile") if isinstance(payload, Mapping) else None
+            return str((profile or {}).get("preset") or "")
+        section = self.snapshot.get("yield")
+        return str(section.get("preset") or "") if isinstance(section, Mapping) else ""
+
+    def _restore_preset(self, before: str) -> tuple[bool, str]:
+        """回读不一致时写回原档（原档未知就不猜着写）。返回（是否写回，给人看的一句话）。"""
+        if before not in set(YIELD_PRESET_BY_KEY.values()):
+            return False, "原档位未知，没有替你回写；请手动选一次正确的档位。"
+        try:
+            self.cli(["limits", "--preset", before])
+        except Exception as exc:                    # noqa: BLE001 - 回写失败也要说清楚
+            return False, ("写回原档「" + before + "」也失败了（" + type(exc).__name__
+                           + "）；请手动选一次。")
+        return True, "已写回原来的「" + before + "」档。"
 
     def _act_yield_pause(self, *, confirm=None) -> ActionResult:
         return self._control("pause", confirm)

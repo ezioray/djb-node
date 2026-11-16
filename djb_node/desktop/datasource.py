@@ -1385,11 +1385,15 @@ class LocalDataSource:
         status = self._safe("status", self._status)
         data = status if isinstance(status, Mapping) else {}
         mode = "unknown"
+        preset = ""
         try:
             store = self._store()
             stored = store.get_kv("yield_mode")
             if isinstance(stored, str) and stored:
                 mode = stored
+            # RC15-039 #17：档位 = ``djb limits --preset`` 写进本机配置的 ``profile.preset``
+            # （旧「模式」卡读的是 kv 里的另一个键，跟切档不是一回事）。
+            preset = str(getattr(store.profile(), "preset", "") or "")
         except Exception:
             pass
         return {"state": data.get("state") or "unknown",
@@ -1397,6 +1401,7 @@ class LocalDataSource:
                 "reason_label": data.get("reason_label"),
                 "accepting": data.get("accepting"),
                 "mode": mode,
+                "preset": preset,
                 "yield_enabled": data.get("yield_enabled")}
 
     def _account(self) -> Mapping[str, Any]:

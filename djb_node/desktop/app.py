@@ -2473,7 +2473,16 @@ class DesktopApp:
         self._tables = list(getattr(self, "_tables", ()) or ()) + [(table, tree)]
         if table.rows:
             tree.bind("<<TreeviewSelect>>", self._on_row_select)
-            tk.Label(body, text="选中一行看详情（↑↓ 或点击）",
+            # RC15-039 #31③/#32：↑↓/Home/End 真绑上，提示语才敢这么写
+            for sequence, handler in (("<Return>", lambda _e: self._activate_row()),
+                                      ("<KP_Enter>", lambda _e: self._activate_row()),
+                                      ("<Double-1>", self._on_double_click),
+                                      ("<space>", lambda _e: self._activate_row())):
+                tree.bind(sequence, handler)
+            hint = ("选中一行看详情（↑↓ 选择，Home/End 到首尾，Enter 打开详情）"
+                    if not table.activate else
+                    "选中一档再按 Enter（或双击这一行）＝切到它，会先问一次")
+            tk.Label(body, text=hint,
                      font=self._fonts.sans(kit.px("micro")),
                      foreground=dual.color("muted_text"),
                      background=dual.color("surface")).pack(anchor="w", pady=(6, 0))
@@ -2592,6 +2601,60 @@ class DesktopApp:
                                     foreground=dual.color("amber_text"), background=surface,
                                     anchor="w", justify="left",
                                     wraplength=self._wrap_hint())).pack(anchor="w", padx=10, pady=(4, 6))
+
+    def _announce(self, text: str) -> None:
+        """把一句话放到状态条：读屏用户靠它「听见」焦点与详情的当前值。
+
+        （RC15-039 #31④ 的配套：Tk 没有可用的 UIA 通知，状态条就是唯一的播报面。）
+        """
+        try:
+            self._status.configure(text=str(text or ""))
+        except Exception:                            # pragma: no cover - 控件已销毁
+            pass
+
+    def _on_double_click(self, event: Any = None) -> None:
+        row = ""
+        tree = getattr(self, "_tree", None)
+        try:
+            row = str(tree.identify_row(getattr(event, "y", 0))) if tree is not None else ""
+        except Exception:                                # pragma: no cover - 控件已销毁
+            row = ""
+        if row:
+            try:
+                tree.selection_set(row)
+            except Exception:                            # pragma: no cover
+                pass
+        self._activate_row()
+
+    def _activate_row(self) -> None:
+        """回车 / 双击：表自己声明了 ``activate`` 就派发它，否则把焦点交给详情（#31③）。"""
+        table = getattr(self, "_table", None)
+        action = str(getattr(table, "activate", "") or "")
+        if action:
+            self._on_action(action)
+            return
+        selection = ()
+        tree = getattr(self, "_tree", None)
+        try:
+            selection = tree.selection() if tree is not None else ()
+        except Exception:                                # pragma: no cover
+            selection = ()
+        if not selection:
+            self._toast("先用 ↑↓ 选中一行，再按 Enter 打开详情。", ok=False)
+            return
+        cells = self._row_cells.get(str(selection[0]), ()) or ()
+        head = " · ".join(str(item) for item in cells)
+        detail = getattr(self, "_detail", None)
+        if detail is not None:
+            # 读屏没有「实时区域」可用：把这一句挂成详情区的**名称**再把焦点交给它，
+            # 屏读器就会念出焦点控件的名字——这是 Tk 下唯一靠得住的播报方式。
+            self._a11y_name(detail, "详情：" + head)
+            try:
+                detail.configure(takefocus=1)
+                detail.focus_set()
+            except Exception:                            # pragma: no cover - 控件已销毁
+                pass
+        self._announce("详情：" + head)
 
     def _render_fields(self, fields: Sequence[Field], view_key: str,
                        parent: Any = None) -> None:
@@ -3200,7 +3263,7 @@ _DEMO_SECTIONS = {
             "node": {"node_id": "node-7c31", "bound": True},
             "note": ""},
         "yield": {"state": "online", "reason": None, "reason_label": None, "accepting": True,
-                  "mode": "balanced", "yield_enabled": True},
+                  "mode": "balanced", "preset": "均衡", "yield_enabled": True},
         "account": {"profile": {"email": "node@example.com", "role": "共享方",
                                 "twofa_enabled": True},
                     "security": {"node_id": "node-7c31", "storage": "file"},

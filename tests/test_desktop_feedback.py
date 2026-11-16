@@ -457,3 +457,98 @@ def test_real_tk_auto_refresh_yields_while_the_form_has_unsaved_edits():
             assert app._has_unsaved_edits() is False
         finally:
             app.stop()
+
+
+# ────── RC15-039 #17：让路页三档能切（回车/双击 → 二次确认 → 写 → 回读）
+def test_real_tk_enter_on_a_tier_row_switches_after_confirmation():
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    import tempfile
+    from pathlib import Path
+
+    from djb_node.desktop.app import DesktopApp, demo_snapshot
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    sections = dict(demo_snapshot().sections)
+    sections["yield"] = {"state": "online", "reason": None, "reason_label": None,
+                         "accepting": True, "mode": "balanced", "preset": "均衡",
+                         "yield_enabled": True}
+
+    class Cli:
+        def __init__(self) -> None:
+            self.preset = "均衡"
+            self.calls: list[tuple[str, ...]] = []
+
+        def __call__(self, argv):
+            argv = tuple(argv)
+            self.calls.append(argv)
+            if argv[:1] == ("limits",):
+                self.preset = argv[argv.index("--preset") + 1]
+            return {"profile": {"preset": self.preset}, "state": "online"}
+
+    with tempfile.TemporaryDirectory() as home:
+        controller = DesktopController(FakeDataSource(sections, source="demo"))
+        cli = Cli()
+        controller.cli = cli
+        app = DesktopApp(controller, root=root, prefs_home=Path(home))
+        asked: list[str] = []
+        app._confirm = lambda message: asked.append(message) or True   # 二次确认走假弹窗
+        try:
+            app.show_view("yield")
+            root.update()
+            assert app._tree is not None
+            assert "Enter" in str(app._root.nametowidget(app._tree.winfo_parent())
+                                  .winfo_children()[-1].cget("text"))
+            app._tree.focus_set()
+            app._tree.selection_set("saver")                # 选中「省心」这一行
+            root.update()
+            app._tree.event_generate("<Return>")            # 回车 = 切到它
+            root.update()
+            assert asked and "省心" in asked[0]             # 先问了一次
+            assert ("limits", "--preset", "省心") in cli.calls
+            assert ("status",) in cli.calls                 # 回读
+            assert "已切到「省心」" in app._status.cget("text")
+        finally:
+            app.stop()
+
+
+def test_real_tk_enter_on_a_non_action_table_opens_the_detail_instead():
+    """收据/日志这类表行不是动作：回车只打开详情，不许误触发任何动作。"""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    import tempfile
+    from pathlib import Path
+
+    from djb_node.desktop.app import DesktopApp, demo_snapshot
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    with tempfile.TemporaryDirectory() as home:
+        controller = DesktopController(FakeDataSource(dict(demo_snapshot().sections),
+                                                     source="demo"))
+        app = DesktopApp(controller, root=root, prefs_home=Path(home))
+        try:
+            app.show_view("receipts")
+            root.update()
+            first = app._tree.get_children()[0]
+            root.focus_force()                            # Xvfb 没有窗口管理器：先给窗口焦点
+            app._tree.selection_set(first)
+            root.update()
+            before = str(controller.message)
+            app._tree.focus_set()                          # 键盘事件先要落在表上
+            root.update()
+            app._tree.event_generate("<Return>")
+            root.update()
+            assert controller.message == before            # 没派动作
+            # 读屏靠「焦点控件的名字」：详情区拿到焦点时名字里就有这一行的值
+            assert app._detail.focus_get() is app._detail
+            assert "详情：" in getattr(app._detail, app.A11Y_NAME_ATTR)
+        finally:
+            app.stop()

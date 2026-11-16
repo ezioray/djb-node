@@ -29,7 +29,8 @@ __all__ = [
     "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "Toggle",
     "VIEWS",
     "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
-    "with_field_errors",
+    "YIELD_PRESET_BY_KEY", "YIELD_PRESET_BY_LABEL", "YIELD_TIERS",
+    "Filter", "with_field_errors",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -200,6 +201,10 @@ class Table:
     narrow_hide: tuple[str, ...] = ()
     #: 窄窗下的表头短名（只改表头，不改数据）
     narrow_headers: tuple[tuple[str, str], ...] = ()
+    #: RC15-039 #17：回车/双击**激活**这一行时派发的动作（``""`` = 老行为：只看详情）。
+    #: 只给「行本身就是一个可执行选择」的表用（让路页的三档就是）；收据/日志这类
+    #: 行不是动作，保持默认空，回车仍然只是打开详情。
+    activate: str = ""
 
 
 @dataclass(frozen=True)
@@ -1879,6 +1884,20 @@ def _today_note(today: Any) -> str:
     return "服务端下发值（UTC 日界）；本机不换算"
 
 
+#: RC15-039 #17：档位**只有三个**（owner 2026-11-16 D-1：``paused`` 是状态，不是第四档）。
+#: 每项 = (表内键, 档位文案, ``djb limits --preset`` 的取值, 一句话说明)。
+#: 第三列是**写命令**的取值（「全速」在本机命令里叫「全力以赴」），必须一一对上，
+#: 否则切完回读永远不一致。前两列之外的地方不许再手写档位名。
+YIELD_TIERS: tuple[tuple[str, str, str, str], ...] = (
+    ("full", "全速", "全力以赴", "只要接单就满载"),
+    ("balanced", "均衡", "均衡", "工作时段实时算力，其余慢任务"),
+    ("saver", "省心", "省心", "只在我不使用电脑时工作"),
+)
+#: 表内键 → 写命令取值 / 档位文案 → 写命令取值（动作层按选中的**标签**查）
+YIELD_PRESET_BY_KEY: dict[str, str] = {key: preset for key, _l, preset, _d in YIELD_TIERS}
+YIELD_PRESET_BY_LABEL: dict[str, str] = {label: preset for _k, label, preset, _d in YIELD_TIERS}
+
+
 def _yield_state_text(state: str) -> str:
     """让路页的状态卡：没跑就别说「运行中」（本地状态词只有 stopped/paused/online…）。"""
     if state == "paused":
@@ -1903,30 +1922,44 @@ def _yield(snapshot: Snapshot) -> View:
     state = str(data.get("state") or "unknown")
     paused = state == "paused"
     reason = data.get("reason_label") or data.get("reason")
-    mode = str(data.get("mode") or "unknown")
-    modes = (("full", "全速", "只要接单就满载"),
-             ("balanced", "均衡", "工作时段实时算力，其余慢任务"),
-             ("saver", "省心", "只在我不使用电脑时工作"),
-             ("paused", "暂停", "不接新任务；在途任务按护栏处理"))
-    active = mode if mode != "unknown" else ("paused" if paused else "")
+    # RC15-039 #17：当前档位以**本机配置里的 preset** 为准（``djb limits --preset`` 写的就是它），
+    # 不从 yield_mode 猜：以前那行「模式」读的是另一个键，跟切档根本不是一个东西。
+    preset = str(data.get("preset") or "")
+    active_key = next((key for key, _l, value, _d in YIELD_TIERS if value == preset), "")
     rows = tuple(Row((label, key, summary,
-                      (MARK_DONE + " 当前") if key == active else MARK_IDLE), key=key)
-                 for key, label, summary in modes)
+                      (MARK_DONE + " 当前") if key == active_key else MARK_IDLE), key=key)
+                 for key, label, _value, summary in YIELD_TIERS)
+    if active_key:
+        now_text = next(label for key, label, _v, _d in YIELD_TIERS if key == active_key)
+        now_meta, now_tone = "本机配置 · 已回读", "mint"
+    else:
+        now_text = "未知（没有回读到）"
+        now_meta, now_tone = "读不到就不猜；点下面三档之一可重新写一次", "amber"
     return View(
         key="yield", title="让路 / 节能",
-        subtitle="四档模式 · 暂停后与托盘状态一致",
+        # 「暂停」是**状态**不是档位（owner D-1）：它只由下面两个按钮进出
+        subtitle="三档模式 · 暂停是状态，不占档位",
         cards=(Card("当前状态", _yield_state_text(state),
                     str(reason or data.get("reason_label") or "无让路原因"),
                     _yield_state_tone(state)),
                Card("接单", _flag(data.get("accepting"), "允许", "禁止"), "", "default"),
-               Card("模式", mode, "本机配置", "muted")),
-        table=Table(("模式", "键", "说明", "当前"), rows, empty="模式暂不可用"),
-        actions=(Action("yield.pause", "暂停接单", enabled=not paused,
+               Card("档位", now_text, now_meta, now_tone)),
+        table=Table(("档位", "键", "说明", "当前"), rows, empty="档位暂不可用",
+                    activate="yield.apply_mode"),
+        actions=(Action("yield.apply_mode", "切到选中的档位", enabled=bool(rows),
+                        reason="当前没有可切换的档位", primary=True),
+                 Action("yield.pause", "暂停接单", enabled=not paused,
                         reason="已经是暂停状态"),
                  Action("yield.resume", "恢复接单", enabled=paused,
-                        reason="当前不是暂停状态", primary=True)),
+                        reason="当前不是暂停状态")),
         unavailable=_missing(snapshot, ("yield",)),
-        notes=("暂停只停止接新任务，不停止服务；托盘与窗口读同一份状态。",),
+        notes=("先选中一档（↑↓ 或点击），再点「切到选中的档位」或按回车："
+               "会先问一次，确认后写本机配置并回读 daemon。",
+               "切档不打断在跑的任务、不重启服务；暂停/恢复是另一个动作，"
+               "与托盘读同一份状态。",
+               # 诚实边界：本版 daemon 还不会按档位改并发，别让客户以为切了档就变了算力
+               "本版 daemon 尚未按档位调整并发与让路（已知缺口，修好后这里会删掉）；"
+               "所以在跑的任务不受影响。"),
     )
 
 
