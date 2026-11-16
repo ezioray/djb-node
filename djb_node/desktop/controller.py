@@ -26,8 +26,8 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPPORTED,
                      AccessConfig, AccessService, FileAccessStore, SaveResult, mask_secret,
                      validate_address)
-from .datasource import (SECTIONS, DataSource, LocalDataSource, ProviderError, Snapshot,
-                         Unavailable, benchmark)
+from .datasource import (LOG_LEVELS, SECTIONS, DataSource, LocalDataSource, ProviderError,
+                         Snapshot, Unavailable, benchmark)
 from .views import VIEW_KEYS, VIEW_TITLES, View, build_view
 from .. import facts
 
@@ -200,13 +200,16 @@ class DesktopController:
                     (self.last_discover or {}).get("protocol") or
                     merged_plan.get("protocol") or "")
             sections["token_plan"] = merged_plan
-        if self.log_level and self.log_level != "all":
-            logs = sections.get("logs")
-            if isinstance(logs, Mapping):
-                rows = [row for row in (logs.get("rows") or [])
-                        if isinstance(row, Mapping)
-                        and str(row.get("level")) == self.log_level]
-                sections["logs"] = {**logs, "rows": rows}
+        logs = sections.get("logs")
+        if isinstance(logs, Mapping):
+            # RC15-039 #5：级别筛选是**真的**筛（旧实现只有一句页脚承诺，页面照旧全量）。
+            # ``total`` 保留筛选前的行数：卡片要能说清「这 3 行是筛出来的」。
+            level = str(self.log_level or "all")
+            all_rows = [row for row in (logs.get("rows") or []) if isinstance(row, Mapping)]
+            rows = ([row for row in all_rows if str(row.get("level")) == level]
+                    if level != "all" else all_rows)
+            sections["logs"] = {**logs, "rows": rows, "level": level,
+                                "total": logs.get("total", len(all_rows))}
         return Snapshot(sections=sections, fetched_at=base.fetched_at, source=base.source,
                         notes=base.notes)
 
@@ -1256,6 +1259,24 @@ class DesktopController:
     def set_log_level(self, level: str) -> View:
         self.log_level = str(level or "all")
         return self.current()
+
+    def _act_logs_filter(self, *, confirm=None) -> ActionResult:
+        """日志级别筛选（``Filter`` 选中即生效）：只改本页显示，**不碰日志文件**。
+
+        级别不在白名单 → 明确拒绝（不静默退回「全部」：那会让客户以为筛选生效了）。
+        """
+        level = str(self.drafts.get("log_level") or "").strip()
+        if level not in ("all",) + tuple(LOG_LEVELS):
+            return ActionResult("筛选没生效：不认识的日志级别「" + (level or "（空）") + "」",
+                                ok=False)
+        self.drafts.pop("log_level", None)          # 视图状态，不是要写进配置的草稿
+        view = self.set_log_level(level)
+        rows = len(view.table.rows) if view.table is not None else 0
+        if level == "all":
+            return ActionResult("已显示全部级别：本页 " + str(rows)
+                                + " 行（日志文件未改动）", effect="filter")
+        return ActionResult("筛选只看 " + level + "：本页 " + str(rows)
+                            + " 行（日志文件未改动）", effect="filter")
 
     def status_line(self) -> str:
         """状态栏文案：daemon 状态 + 让路 + 最近一次消息。"""

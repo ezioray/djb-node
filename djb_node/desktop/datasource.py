@@ -1451,8 +1451,10 @@ class LocalDataSource:
 
     def _logs_section(self) -> Mapping[str, Any]:
         rows = self._logs.tail(limit=200)
+        # ``total`` = 筛选**前**的行数（筛选在 controller 层叠加）：卡片要说清
+        # 「3 行」是筛出来的还是本来就只有 3 行——旧实现只有「尾部 200 行」，看不出来。
         return {"rows": rows, "path": str(self._logs.path),
-                "levels": list(LOG_LEVELS), "note": ""}
+                "levels": list(LOG_LEVELS), "total": len(rows), "note": ""}
 
 
 #: 「读取模型清单」失败时的可操作文案（RC14 I：每种失败都要说下一步）

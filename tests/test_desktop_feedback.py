@@ -234,3 +234,51 @@ def test_real_tk_inline_error_marks_the_field_and_takes_focus():
             root.destroy()
         except Exception:                          # pragma: no cover
             pass
+
+
+# ─────────────── RC15-039 #5：日志级别筛选是**真控件**（旧版只有页脚一句承诺）
+def test_real_tk_log_level_dropdown_filters_the_table():
+    """下拉选「error（错误）」→ 表格真的只剩 error 行，状态栏说清「文件未改动」。"""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:                                  # pragma: no cover - 无显示
+        pytest.skip("没有可用的 Tk 显示")
+    from djb_node.desktop.app import DesktopApp
+    from djb_node.desktop.controller import DesktopController
+    from djb_node.desktop.datasource import FakeDataSource
+
+    rows = [{"ts": "2026-11-16T10:00:01Z", "level": "info", "event": "daemon.started",
+             "fields": {}},
+            {"ts": "2026-11-16T10:00:05Z", "level": "error", "event": "upstream.probe_failed",
+             "fields": {"reason": "上游返回 401", "next_step": "在接入配置里更新密钥"}}]
+    sections = {"status": {"state": "online", "accepting": True, "daemon_running": True},
+                "logs": {"rows": rows, "levels": ["debug", "info", "warning", "error"],
+                         "total": 2, "note": "", "path": "/tmp/djb-test/logs/desktop.jsonl"}}
+    app = DesktopApp(DesktopController(FakeDataSource(sections, source="demo")), root=root)
+    try:
+        app.show_view("logs")
+        root.update()
+        assert len(app._tree.get_children()) == 2
+        assert app._filter_widgets, "日志页没有任何筛选控件（页脚又变成空承诺了）"
+        box = app._filter_widgets[0]
+        box.current(list(box.cget("values")).index("error（错误）"))
+        box.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert len(app._tree.get_children()) == 1
+        values = app._tree.item(app._tree.get_children()[0], "values")
+        assert "error" in str(values[0]) and "上游返回 401" in str(values[3])
+        assert "未改动" in app._status.cget("text")
+        # 切页再回来：筛选状态还在（不能悄悄退回「全部」）
+        app.show_view("overview")
+        root.update()
+        app.show_view("logs")
+        root.update()
+        assert app._last_view.filters[0].current_text() == "error（错误）"
+        assert len(app._tree.get_children()) == 1
+    finally:
+        app.stop()
+        try:
+            root.destroy()
+        except Exception:                          # pragma: no cover
+            pass

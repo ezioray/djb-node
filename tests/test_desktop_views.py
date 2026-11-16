@@ -1262,3 +1262,78 @@ def test_save_access_success_clears_field_errors(tmp_path):
     result = controller.action("access.save")
     assert result.ok is True and result.fields == {}
     assert store.load().price_mode == "manual"
+
+
+# ──────────────────── RC15-039 #5：日志的「原因 / 下一步」真上屏 + 级别筛选真能筛
+def _logs_snapshot(rows):
+    sections = dict(demo_snapshot().sections)
+    sections["logs"] = {"rows": rows, "levels": list(ds.LOG_LEVELS), "total": len(rows),
+                        "note": "", "path": "/tmp/djb-test/logs/desktop.jsonl"}
+    return ds.Snapshot(sections)
+
+
+_LOG_ROWS = [
+    {"ts": "2026-11-16T10:00:01Z", "level": "info", "event": "daemon.started", "fields": {}},
+    {"ts": "2026-11-16T10:00:05Z", "level": "error", "event": "upstream.probe_failed",
+     "fields": {"reason": "上游返回 401", "next_step": "在接入配置里更新密钥"}},
+    {"ts": "2026-11-16T10:00:09Z", "level": "warning", "event": "yield.detected",
+     "fields": {"reason": "全屏游戏在前台"}},
+]
+
+
+def test_logs_table_shows_reason_and_next_step_verbatim():
+    """错误行自带的 reason / next_step **原样**上屏；没有就写「—」，绝不编一句原因。"""
+    view = vw.build_view("logs", _logs_snapshot(_LOG_ROWS))
+    assert view.table.columns == ("级别", "时间", "事件", "原因", "下一步")
+    error_row = view.table.rows[1]
+    assert error_row.cells[3] == "上游返回 401"
+    assert error_row.cells[4] == "在接入配置里更新密钥"
+    # 行里没有这两个字段 → 两个「—」（不是空字符串，也不是「成功」）
+    assert view.table.rows[0].cells[3:] == ("—", "—")
+    assert "在接入配置里更新密钥" in view.plain_text()
+
+
+def test_logs_has_a_real_level_filter_and_no_phantom_promise():
+    """页脚旧文案承诺「all / debug / info / …」却没有控件（走查原话）。
+
+    现在：筛选项是真的（每个级别一个 option）、页脚只说它真做了什么。
+    """
+    view = vw.build_view("logs", _logs_snapshot(_LOG_ROWS))
+    item = view.filters[0]
+    assert item.key == "log_level" and item.action == "logs.filter"
+    values = [value for value, _text in item.options]
+    assert values == ["all"] + list(ds.LOG_LEVELS)
+    assert item.current_text() == "全部级别"
+    assert "只改本页显示" in view.plain_text()
+    assert "筛选只改本页显示；日志文件本身一个字都不动。" in view.notes
+
+
+def test_controller_log_filter_really_filters_and_leaves_the_file_alone(tmp_path):
+    """级别筛选是**真筛**（filter 之前只有一句页脚）：行数、卡片、复制内容一起变。"""
+    controller = make_controller(tmp_path, sections=dict(_logs_snapshot(_LOG_ROWS).sections))
+    controller.show("logs")
+    controller.set_draft("log_level", "error")
+    result = controller.action("logs.filter")
+    assert result.ok and result.effect == "filter"
+    assert "1 行" in result.message and "未改动" in result.message
+    view = controller.current()
+    assert len(view.table.rows) == 1 and "error" in view.table.rows[0].cells[0]
+    assert view.filters[0].current_text() == "error（错误）"
+    assert "共 3 行 · 已筛选" in view.plain_text()          # 卡片说清「1 是筛出来的」
+    assert controller.drafts == {}                          # 筛选不写进配置草稿
+    # 复制跟随筛选：只剩筛出来的那一行
+    copied = controller.action("logs.copy")
+    assert "upstream.probe_failed" in copied.payload and "daemon.started" not in copied.payload
+    controller.set_draft("log_level", "all")
+    controller.action("logs.filter")
+    assert len(controller.current().table.rows) == 3
+
+
+def test_controller_log_filter_refuses_an_unknown_level(tmp_path):
+    """不认识的级别：明确拒绝，**不许**静默退回「全部」（那会让客户以为筛过了）。"""
+    controller = make_controller(tmp_path, sections=dict(_logs_snapshot(_LOG_ROWS).sections))
+    controller.show("logs")
+    controller.set_draft("log_level", "alert")
+    result = controller.action("logs.filter")
+    assert result.ok is False and "alert" in result.message
+    assert len(controller.current().table.rows) == 3

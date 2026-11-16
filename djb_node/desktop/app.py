@@ -2102,6 +2102,8 @@ class DesktopApp:
             bar.pack(fill="x", pady=(0, 12))
             for action in view.actions:
                 self._render_action(bar, action)
+        for item in view.filters:                    # RC15-039 #5：表格上方的下拉筛选
+            self._render_filter(item)
         if view.table is not None:
             self._render_table(view.table)
         for extra in view.tables:                     # RC14 D：模型与探针页的第二张表
@@ -2164,6 +2166,54 @@ class DesktopApp:
     def _ttk_family(self) -> str:
         from ..gui.theme import FONT
         return FONT[0]
+
+    #: 可读名称的属性名（读屏软件读不到 Tk 子控件，但导出/证据/测试能读到；
+    #: 真 UIA 命名需要 provider，见 RC15-039 #31 的边界说明）
+    A11Y_NAME_ATTR = "djb_accessible_name"
+
+    def _a11y_name(self, widget: Any, text: str) -> Any:
+        """给控件挂一个**人类可读的名称**（#31 最小切片的底座，也供本条筛选控件用）。"""
+        try:
+            setattr(widget, self.A11Y_NAME_ATTR, str(text))
+        except Exception:                            # pragma: no cover - 控件已销毁
+            pass
+        return widget
+
+    def _render_filter(self, item: Any) -> None:
+        """下拉筛选：一条标签 + 只读 Combobox（键盘可达：Tab 到、↑↓ 选、回车生效）。"""
+        tk, ttk, kit = self._tk, self._ttk, self._kit
+        base = dual.color("bg")
+        bar = tk.Frame(self._body, background=base, bd=0, highlightthickness=0)
+        bar.pack(fill="x", pady=(0, 8))
+        tk.Label(bar, text=item.label, font=self._fonts.sans(kit.px("small")),
+                 foreground=dual.color("muted_text"), background=base).pack(
+                     side="left", padx=(2, 8))
+        values = [text for _value, text in item.options]
+        box = ttk.Combobox(bar, state="readonly", values=values, width=16, takefocus=True,
+                           font=self._fonts.sans(kit.px("small")))
+        box.set(item.current_text())
+        box.pack(side="left")
+        # 选中即生效（下拉本身就是「确认」动作，不再要一次点击）
+        box.bind("<<ComboboxSelected>>",
+                 lambda _event, target=item, widget=box: self._on_filter(target, widget))
+        if item.hint:
+            tk.Label(bar, text=item.hint, font=self._fonts.sans(kit.px("micro")),
+                     foreground=dual.color("muted_text"), background=base).pack(
+                         side="left", padx=(10, 0))
+        try:
+            self._filter_widgets.append(box)
+        except AttributeError:                     # pragma: no cover - 还没渲染过
+            self._filter_widgets = [box]
+        self._a11y_name(box, item.label + "筛选")
+
+    def _on_filter(self, item: Any, widget: Any) -> None:
+        """把下拉的选择值交给动作层（草稿 → 动作 → 重画 + 播报）。"""
+        index = int(widget.current())
+        if index < 0 or index >= len(item.options):
+            return
+        value = item.options[index][0]
+        self._controller.set_draft(item.key, value)
+        self._on_action(item.action or ("filter." + item.key))
 
     def _render_action(self, parent: Any, action: Action, *,
                        ground: str | None = None) -> None:
@@ -2581,7 +2631,7 @@ class DesktopApp:
         elif result.effect == "payout_submit":
             # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
             self._start_payout_submit(str(result.payload), result.message)
-        elif result.effect in ("refresh", "access", "bench", "control", "reload"):
+        elif result.effect in ("refresh", "access", "bench", "control", "reload", "filter"):
             self._render(self._controller.current())
         elif fields:
             # 表单错误回来了，但这个 effect 自己不重画（例如收款提交）：补一次，

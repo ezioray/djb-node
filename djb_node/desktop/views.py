@@ -245,6 +245,32 @@ class Field:
 
 
 @dataclass(frozen=True)
+class Filter:
+    """表格上方的一条下拉筛选（RC15-039 #5：日志级别筛选的**真**入口）。
+
+    为什么单独一个类型而不是复用 ``Field``：``Field`` 会被 ``app._on_action`` 收成草稿
+    交给「保存配置」，而日志筛选是**本机只读视图状态**——混进草稿会写出「草稿字段不被支持」
+    的告警，甚至把 `log_level` 写进接入配置。筛选有自己的动作 key（``action``）。
+    """
+
+    key: str
+    label: str
+    #: (值, 显示文案)：值是内部契约（``all`` / ``debug`` …），文案是客户看到的
+    options: tuple[tuple[str, str], ...] = ()
+    value: str = ""
+    #: 选中后派发的动作 key；动作侧从草稿 ``key`` 读新值
+    action: str = ""
+    #: 一句话说明「筛选影响什么、不影响什么」
+    hint: str = ""
+
+    def current_text(self) -> str:
+        for value, text in self.options:
+            if value == self.value:
+                return text
+        return self.value or "—"
+
+
+@dataclass(frozen=True)
 class Action:
     """可点动作；``enabled=False`` 时按钮置灰并显示 ``reason``（不隐藏）。
 
@@ -358,6 +384,8 @@ class View:
     hero: Hero | None = None
     chart: Chart | None = None
     rail: tuple[RailCard, ...] = ()
+    #: 表格上方的下拉筛选（RC15-039 #5）。默认空 = 0.3.7 行为（没有筛选控件）。
+    filters: tuple[Filter, ...] = ()
     #: 渲染后要**获得键盘焦点**的字段 key（RC15-039 #1：校验失败聚焦首个错误字段）。
     #: 空 = 不动焦点（0.3.7 行为）。由 :func:`with_field_errors` 填，投影层自己不产生。
     focus_field: str = ""
@@ -382,6 +410,10 @@ class View:
             lines.extend(_chart_text(self.chart))
         if self.rail:
             lines.extend(_rail_text(self.rail))
+        for item in self.filters:
+            lines.append("")
+            lines.append("筛选 " + item.label + "：" + item.current_text()
+                         + (("   " + item.hint) if item.hint else ""))
         for table in ((self.table,) + self.tables if self.table is not None else self.tables):
             lines.append("")
             lines.append(" | ".join(table.columns))
@@ -1287,7 +1319,7 @@ def _receipts(snapshot: Snapshot) -> View:
                         reason="没有可校验的收据"),),
         unavailable=_missing(snapshot, ("receipts",)),
         notes=("状态列是云端受理结果（accepted/rejected/expired）；「本机校验」列才是本机比对结论。",
-               "哈希 / seq 用等宽字体 + 弱化颜色；证据常驻但不发光。"),
+               "哈希与 seq 可以原样复制给对方核对；颜色只用来弱化，不承载信息。"),
     )
 
 
@@ -1813,7 +1845,7 @@ def _diag_hint(diag: Sequence[Mapping[str, Any]]) -> str:
 def _today_note(today: Any) -> str:
     """「今日」按 UTC 日界（服务端口径）；本地时区跨日时数字会看起来对不上，得写明。"""
     if today in (None, ""):
-        return "服务端未下发今日字段；不拿总计冒充今日"
+        return "服务端没有下发今天的数字（不是 0）"
     return "服务端下发值（UTC 日界）；本机不换算"
 
 
@@ -2117,8 +2149,15 @@ def onboarding_panel(step: int, *, total: int = 3, bound: bool | None = None,
         body=onboarding_mod.step_body(step), actions=tuple(actions))
 
 
+#: 日志级别 → 客户看到的筛选文案（值仍是契约里的 ``debug``/``info``/…）
+LOG_LEVEL_TEXT = {"all": "全部级别", "debug": "debug（调试）", "info": "info（信息）",
+                  "warning": "warning（警告）", "error": "error（错误）",
+                  "critical": "critical（严重）"}
+
+
 def _logs(snapshot: Snapshot) -> View:
     logs = _section(snapshot, "logs")
+    total = logs.get("total")
     rows = []
     for index, row in enumerate(logs.get("rows") if isinstance(logs.get("rows"), list) else []):
         if not isinstance(row, Mapping):
@@ -2130,23 +2169,44 @@ def _logs(snapshot: Snapshot) -> View:
         tone = ("red" if level in ("error", "critical") else
                 "amber" if level == "warning" else
                 "muted" if level == "unknown" else "default")
+        # RC15-039 #5：错误行自带的原因/下一步**原样上屏**（`_parse_log_line` 已把它们
+        # 摊在 row["fields"] 里）。没有就写「—」，绝不拿别的东西冒充一句原因。
+        payload = row.get("fields") if isinstance(row.get("fields"), Mapping) else {}
+        reason = str(payload.get("reason") or "").strip()
+        next_step = str(payload.get("next_step") or "").strip()
         # key 必须唯一：日志里同一微秒可能被写两次（init 与 daemon 各写一遍同一事件），
         # 用 ts 当 iid 会让 Treeview 抛 TclError「Item ... already exists」把整个窗口打死。
         rows.append(Row((mark + " " + level, str(row.get("ts") or "—"),
-                         str(row.get("event") or "—")),
+                         str(row.get("event") or "—"),
+                         reason or "—", next_step or "—"),
                         key="logs-%04d-%s" % (index, row.get("ts") or ""),
                         tone=tone))
+    level = str(logs.get("level") or "all")
+    levels = [str(item) for item in (logs.get("levels") or []) if str(item)]
+    options = (("all", LOG_LEVEL_TEXT["all"]),) + tuple(
+        (item, LOG_LEVEL_TEXT.get(item, item)) for item in levels)
+    filtered = level != "all"
+    count_meta = ("共 " + str(total) + " 行 · 已筛选" if filtered and _is_number(total)
+                  else "共 " + str(total) + " 行" if _is_number(total) else "尾部 200 行")
     return View(
         key="logs", title="日志",
-        subtitle="本地 ring buffer（最近 2000 行，按需筛选）",
-        cards=(Card("行数", _count(snapshot, "logs", str(len(rows))), "尾部 200 行", "default"),),
-        table=Table(("级别", "时间", "事件"), tuple(rows),
+        subtitle="本机日志 · 本页显示最近 200 行（级别筛选只改显示）",
+        cards=(Card("行数", _count(snapshot, "logs", str(len(rows))), count_meta, "default"),),
+        # 窄窗先让出「原因/下一步」（正文在下面详情抽屉里，点一行就能看全）
+        table=Table(("级别", "时间", "事件", "原因", "下一步"), tuple(rows),
                     note=str(logs.get("note") or ""),
-                    empty=_empty_text(snapshot, "logs", "日志文件尚未生成")),
+                    empty=_empty_text(snapshot, "logs", "日志文件尚未生成"),
+                    narrow_hide=("时间", "原因", "下一步"),
+                    narrow_headers=(("下一步", "下一步"),)),
+        filters=(Filter("log_level", "级别", options=options, value=level,
+                        action="logs.filter",
+                        hint="只改本页显示；日志文件不动。"),) if levels else (),
         actions=(Action("logs.copy", "复制当前筛选", enabled=bool(rows), reason="没有日志行"),
                  Action("logs.open_dir", "打开日志目录")),
         unavailable=_missing(snapshot, ("logs",)),
-        notes=("级别筛选：all / debug / info / warning / error；不改日志文件。",),
+        # 旧页脚许诺「级别筛选：all / debug / …」却**没有**任何筛选控件（走查原话：
+        # 「页脚承诺的功能根本不存在」）。现在筛选是真的，页脚只说它真做了什么。
+        notes=("筛选只改本页显示；日志文件本身一个字都不动。",),
     )
 
 
