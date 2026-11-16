@@ -571,6 +571,23 @@ PROBE_PASS_BUDGET_MAX_S = float(HEARTBEAT_DEFAULT_S)
 """
 
 
+PROBE_MIN_MODEL_TIMEOUT_S = _float_env("DJB_NODE_PROBE_MIN_MODEL_TIMEOUT_S", 2.0,
+                                      minimum=1.0)
+"""单个模型的**最小预算切片**（秒）：单轮预算按「剩余模型数」切分时给每个模型保底这么多。
+
+0.3.9 / D-RCA P1-a：0.3.8 把完整的 ``PROBE_TIMEOUT_S``(20s) 原样传给**每个**
+``probe_model``，只在每个模型开始前看一次 deadline，没有 ``min(timeout, remaining)``:
+一个慢模型可以吃掉整轮预算（5 个模型最坏约 100 s > 30 s 心跳上限），慢模型排第一时
+其余模型全部 ``not_probed``（2026-11-16 现场 qwen 恰在列表末尾，**没饿死是运气**）。
+现在每个模型最多拿 ``remaining_s / remaining_models``，且不低于本值：L2 健康响应远小于
+2 s，确实需要更久的模型只丢自己这一行并进入 backlog，不再吃掉别人的预算。
+
+默认 2.0 s（下限 1.0 s：再小会把正常的网络抖动判成 timeout）。
+回滚：``DJB_NODE_PROBE_MIN_MODEL_TIMEOUT_S=20``（= ``PROBE_TIMEOUT_S``）即让切片退化成
+「每个模型都能拿满整轮预算」的旧行为，无需改代码。
+"""
+
+
 def probe_pass_budget_s(pass_budget: float | None = None) -> float:
     """实际生效的单轮探针预算（秒）：**不得超过一个心跳周期**。
 
@@ -607,6 +624,24 @@ PROBE_BACKLOG_RETRY_S = 5.0
 
 不按常规周期（half-fresh）等，而是很快续跑，几轮内把 backlog 清空；
 清空后自动回到 ``periodic_interval_s``。"""
+
+PROBE_REUSE_OK_S = _float_env("DJB_NODE_PROBE_REUSE_OK_S", 20.0, minimum=0.0)
+"""**预算受限的轮次**里，刚探过且 ok 的模型可以直接复用结论、不必重探的时间窗（秒）。
+
+0.3.9 / D-RCA P1-b：5s backlog 续跑是为了**补缺口**（``not_probed`` / 未覆盖 / 已知失败），
+不是把 5 秒前刚验过的模型再跑一遍。没有这个复用窗，一轮 20s 预算里 4 个刚 ok 的模型
+会把预算重新吃光，缺口（例如排最后的 qwen）依旧轮不到 —— 与 0.3.4 的 635s 逐模型 stale
+是同一类「没轮到」的累积。
+
+窗口必须**远小于** ``PROBE_FRESH_AFTER_S``(600)：复用期间的 ok 行仍然进报价，
+窗口一旦接近新鲜度窗口，就会把模型拖成逐模型 ``stale_probe``（0.3.4 事故模式 5 行→1 行）。
+默认 20s（= 一个 ``PROBE_PASS_BUDGET_S``）：跨过一轮预算就没有复用价值了。
+
+* 只在**有 deadline** 的轮次生效（周期/启动/预算受限）；手动 ``djb upstream probe``
+  （``deadline=None``）永远实探，不拿旧结论糊弄人；
+* 被复用的模型**不刷新** ``last_probe_at``（不伪造新鲜度），也不进 ``not_probed[]``。
+回滚：``DJB_NODE_PROBE_REUSE_OK_S=0`` 即关闭复用（每轮所有模型都实探），无需改代码。
+"""
 
 # ─────────────────────────────────────────────────────────── 报价发布（CR-20261106-OFFICIAL-SUPPLY-01）
 # 口径：`design/17-官方供给与价格配置-设计方案-v1.md` §15 + CR 第 3 节 P1/P2/P4/P6。
