@@ -1410,10 +1410,14 @@ class Daemon:
         超预算的模型留到下一轮（`not_probed`，不算失败）。
         失败按指数退避拉长下一轮间隔（`probe.periodic_interval_s`）。
         """
-        deadline = now + timedelta(seconds=facts.PROBE_PASS_BUDGET_S)
+        # 0.3.8（RC14 复盘 P0-2）：预算可配，但**不得超过一个心跳周期** ——
+        # 探针内联在主循环里，超一个心跳就会让节点 presence 掉档（见 facts 注释）。
+        budget_s = facts.probe_pass_budget_s()
+        deadline = now + timedelta(seconds=budget_s)
         verified = 0
         failed = 0
         models = 0
+        backlog = 0
         per_upstream: list[dict[str, Any]] = []
         for record in self.upstreams.list():
             if not record.enabled:
@@ -1422,8 +1426,9 @@ class Daemon:
                 break
             try:
                 payload = self.upstreams.probe(
-                    record.id, timeout=facts.PROBE_TIMEOUT_S, now=now,
-                    deadline=deadline, clock=self._now)
+                    record.id, timeout=facts.PROBE_TIMEOUT_S,
+                    level=facts.PROBE_PERIODIC_LEVEL,
+                    now=now, deadline=deadline, clock=self._now)
             except DjbError as exc:
                 failed += 1
                 event("upstream.probe_failed", level="warning", reason=reason,
@@ -1450,7 +1455,17 @@ class Daemon:
                           "error_class": item.get("error_class")}
                          for item in checks if isinstance(item, dict)]
             passed = sum(1 for item in per_model if item["ok"])
-            if passed:
+            # 0.3.8（RC14 复盘 P0-2）：``not_probed``（本轮预算没轮到）与
+            # ``model_not_listed``（模型已下架，W6 owner 裁决「停用/下架不该拖死整条上游」）
+            # **不算真实失败**；其余（timeout / 5xx / auth / model_error）仍算失败。
+            # 判定：**至少 1 个 ok 且没有真实失败** ⇒ verified；有真实失败 ⇒ failed。
+            tolerated = facts.PROBE_TOLERATED_ERROR_CLASSES
+            real_failures = [item for item in per_model
+                             if not item["ok"] and item.get("error_class") not in tolerated]
+            not_probed = len([item for item in (payload.get("not_probed") or [])
+                              if isinstance(item, dict) and item.get("reason") == "budget"])
+            backlog += not_probed
+            if passed and not real_failures:
                 verified += 1
                 # D-PROBE-03：**周期探针的结论必须上报**，否则云端 verified_at 不动。
                 # 旧行为：daemon 只写本地 last_probe_at ⇒ 本地算出正 QPS，但云端
@@ -1458,24 +1473,30 @@ class Daemon:
                 # 15 分钟后容量再次归零，且没有任何自动恢复路径（只能人工 `djb upstream probe`）。
                 # 上报走与 CLI 完全相同的一条路（含服务端 upstream_id 映射），失败不影响本地结论。
                 self._report_probe(record, payload, reason=reason)
-            else:
+            elif real_failures or not not_probed:
+                # 真实失败 ⇒ failed；「一个都没探到且没有 backlog」也算 failed（防空转）。
                 failed += 1
-            per_upstream.append({"upstream_id": record.id, "ok": bool(passed),
+            per_upstream.append({"upstream_id": record.id, "ok": bool(passed and not real_failures),
                                  "passed": passed, "total": len(per_model),
+                                 "real_failures": [item["model"] for item in real_failures],
+                                 "not_probed": not_probed,
                                  "per_model": per_model})
         self._probe_failures = min(self._probe_failures + 1, facts.PROBE_MAX_BACKOFF_SHIFT) \
             if failed else 0
         self._probe_interval_s = periodic_interval_s(self._upstream_model_count(),
                                                      self._probe_failures)
-        self._next_probe_at = now + timedelta(seconds=self._probe_interval_s)
+        # 有 backlog（预算没轮到）⇒ 很快续跑，几轮内清空；否则回常规周期。
+        self._next_probe_at = now + timedelta(
+            seconds=facts.PROBE_BACKLOG_RETRY_S if backlog else self._probe_interval_s)
         self._last_probe = {"at": iso(now), "reason": reason, "verified": verified,
                             "failed": failed, "models": models,
                             "failures": self._probe_failures,
+                            "backlog": backlog,
                             "interval_s": self._probe_interval_s,
                             # 逐模型结论（本地排障用；上行仍走 model_checks，不重复发）
                             "per_upstream": per_upstream}
         event("upstream.probe_pass", reason=reason, verified=verified, failed=failed,
-              models=models, failures=self._probe_failures,
+              models=models, failures=self._probe_failures, backlog=backlog,
               interval_s=self._probe_interval_s)
         return self._last_probe
 

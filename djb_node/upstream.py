@@ -424,10 +424,35 @@ class UpstreamManager:
                 item.pop("error_class", None)
         verified = [model_id for model_id, outcome in outcomes.items()
                     if outcome.inference_ok]
-        state = "verified" if (result.reachable and verified) else "rejected"
+        # RC14 复盘 P0-2（0.3.8）：**没有证据的轮次不改状态**。
+        # 旧写法 `verified if reachable and verified else rejected` 会在「预算截断、
+        # 一个模型都没探到」时把本地 state 抹成 rejected；而 `quotes.py` 的
+        # `gated = ... or record.state == "rejected"` 会因此把这条上游的全部报价门掉
+        # ⇒ 容量随**采样预算**抖动（与云端 `verified_at = moment if verified else None`
+        # 是同一个 bug 的两端，cloud-auditor 2026-11-15 已确认）。
+        # 语义对齐云端 b420f59：没有新证据 ⇒ 什么都不改，旧结论按新鲜度自然过期。
+        explicit_failures = [item for item in checks
+                             if item.get("error_class")
+                             and item.get("error_class") != facts.PROBE_NOT_PROBED]
+        if not result.reachable or explicit_failures or not checks:
+            # 不可达 / 有明确失败 / **一个 enabled 模型都没有** ⇒ rejected（安全侧：
+            # 没启用模型的上游不该被当成可用容量）；只有「有 enabled 模型但全没探到」
+            # 才保留上一轮结论。
+            state = "rejected"
+        elif verified:
+            state = "verified"
+        else:
+            state = record.state          # 全是 not_probed：保留上一轮结论
         stamp = iso(moment)
         self.store.update_upstream(upstream_id, models=self._probe_models_payload(
             record, outcomes, stamp), state=state, last_probe_at=stamp)
+        # RC14 复盘 P0-2（0.3.8）：**不要**把 ``not_probed`` 从 ``model_checks`` 里剔掉。
+        # 云端 main（745eddc）的 ``_probe_verdict_scoped`` 已按 ``models[]``（enabled 集合）
+        # + ``not_probed[]`` 判定：not_probed 记 ``ok=None``、不算失败，全都没探到时判 verified；
+        # 节点侧再剔除会让 ``models[]`` 从「enabled 集合」退化成「探过的集合」，
+        # 把云端的 ``not_reported`` 分支和排障信息一起抹掉（2026-11-15 cloud-auditor 校正）。
+        # 节点只负责**如实上报**：``models[]`` = 本轮 L1 进过清单的 enabled 模型，
+        # ``not_probed[]`` = 没探到的及原因；「算不算失败」由云端 scoped 判定负责。
         payload = {"upstream_id": upstream_id, "reachable": result.reachable,
                    "latency_ms": result.latency_ms,
                    "error_class": result.error_class,
@@ -453,16 +478,21 @@ class UpstreamManager:
           ``model_not_listed``），不在这里。
         """
         rows: list[dict[str, Any]] = []
-        probed = {str(item.get("model")) for item in checks}
+        checked = {str(item.get("model")): item for item in checks}
         for raw in record.models:
             entry = ModelEntry.from_dict(raw)
             if not entry.id:
                 continue
             if not entry.enabled:
                 rows.append({"model": entry.id, "reason": "disabled"})
-            elif entry.id not in probed:
+            elif entry.id not in checked:
                 rows.append({"model": entry.id, "reason": "not_listed"})
             elif outcomes.get(entry.id) is None:
+                # 已有明确结论（如 model_not_listed / L2 失败）的模型属于**失败**，
+                # 不能重复记成 backlog；只有「L1 通过但预算没轮到」才算 budget。
+                reason = checked[entry.id].get("error_class")
+                if reason and reason != facts.PROBE_NOT_PROBED:
+                    continue
                 rows.append({"model": entry.id, "reason": "budget"})
         return rows
 
