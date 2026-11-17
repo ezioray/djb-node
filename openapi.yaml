@@ -2,7 +2,7 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: DJB Protocol API
-  version: 1.14.0
+  version: 1.15.0
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面 + S4 TokenRouter 加性字段（覆盖 M01–M14、M16–M18）
   description: "DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、\n契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。\n\n- 命名空间：`/v1/*` 为 OpenAI\
     \ 兼容网关面；`/api/v1/*` 为控制面（节点/用方/协议/后台）。\n- 可用性：`x-djb-availability` 标记「不是所有部署都提供」的面；`m03` = 仅 M03 网关装配\n  （`DJB_GATEWAY_M03=1`）时挂载，默认部署返回\
@@ -16239,6 +16239,17 @@ components:
               type: number
               minimum: -2
               maximum: 2
+            djb_effort:
+              type: string
+              enum:
+              - minimal
+              - low
+              - medium
+              - high
+              description: 平台思考强度档（1.15.0 显式登记；此前靠 additionalProperties
+                容忍先行下发）。只有调用方显式给了非 auto 档位才出现；节点侧
+                upstream.reasoning_effort.enabled 打开时映射为 reasoning_effort
+                下发上游，关闭时忽略（tolerant reader）。
         timeout_s:
           type: number
           minimum: 1
