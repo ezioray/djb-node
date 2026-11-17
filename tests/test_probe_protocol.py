@@ -281,8 +281,9 @@ def test_cli_upstream_list_shows_kind(ready, store, credentials, capsys):
     assert any("third_party_relay" in line for line in lines)
     plain = [line for line in lines if "local-model" in line][0]
     assert "third_party_relay" not in plain
-    # id·access·base·state·模型 + P6 的「最近探针」（第 6 段，一行里看得到掉容量）
-    assert plain.count(" · ") == 5
+    # id·access·base·state·模型 + 来源分类（0.3.11）+ P6 的「最近探针」（第 7 段）
+    assert plain.count(" · ") == 6
+    assert "来源:unknown" in plain          # 127.0.0.1 本地地址 ⇒ unknown（fail-closed）
     assert "最近探针：" in plain
 
 
