@@ -2,7 +2,7 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: DJB Protocol API
-  version: 1.13.0
+  version: 1.15.0
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面 + S4 TokenRouter 加性字段（覆盖 M01–M14、M16–M18）
   description: "DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、\n契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。\n\n- 命名空间：`/v1/*` 为 OpenAI\
     \ 兼容网关面；`/api/v1/*` 为控制面（节点/用方/协议/后台）。\n- 可用性：`x-djb-availability` 标记「不是所有部署都提供」的面；`m03` = 仅 M03 网关装配\n  （`DJB_GATEWAY_M03=1`）时挂载，默认部署返回\
@@ -12884,6 +12884,185 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '400':
           $ref: '#/components/responses/InvalidArgument'
+
+  /api/v1/public/pricing-source:
+    get:
+      operationId: rc14_get_public_pricing_source
+      summary: 公开读——两个通道当前生效的价源（匿名，Cache-Control 60s）
+      tags: [rc8]
+      description: |
+        默认 `source=legacy`（= 1.13.0 的老行为）。选中表为空/未发布/超期时自动回退，
+        并**显式**给出 `fallback_from`，不得静默回退。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schema: {type: string}
+                  web_display: {$ref: "#/components/schemas/ChannelSummary"}
+                  node_suggested: {$ref: "#/components/schemas/ChannelSummary"}
+                additionalProperties: true
+
+  /api/v1/admin/pricing/source:
+    get:
+      operationId: rc14_get_admin_pricing_source
+      summary: 管理面读——通道摘要 + 绑定明细 + 表状态（加性字段 channels/bindings/tables/wired）
+      tags: [rc8]
+      parameters:
+        - {name: channel, in: query, required: false, schema: {type: string, enum: [web_display, node_suggested]}}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schema: {type: string}
+                  web_display: {$ref: "#/components/schemas/ChannelSummary"}
+                  node_suggested: {$ref: "#/components/schemas/ChannelSummary"}
+                  channels: {type: object, additionalProperties: {$ref: "#/components/schemas/ChannelSummary"}}
+                  bindings: {type: array, items: {type: object, additionalProperties: true}}
+                  tables:
+                    type: object
+                    description: '键为 `<source>:<window_kind>`，如 `market_min:7d`'
+                    additionalProperties: {type: object, additionalProperties: true}
+                  wired: {type: object, additionalProperties: {type: array, items: {type: string}}}
+                additionalProperties: true
+    put:
+      operationId: rc14_put_admin_pricing_source
+      summary: 管理面写——切换价源（SUPER 单签；只追加 + 撤销旧行；幂等）
+      tags: [rc8]
+      description: |
+        `reason` 与 `ticket` **必填**（留痕）；`model` 省略/`null` = 全局行。
+        选中的表与当前生效行完全相同 ⇒ 不写库，返回 `changed=false`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, source, reason, ticket]
+              properties:
+                channel: {type: string, enum: [web_display, node_suggested]}
+                source: {type: string, enum: [legacy, settled_avg, market_min, market_avg, djb_manual]}
+                model: {type: [string, "null"], maxLength: 200}
+                window_kind: {type: string, enum: [spot, "1d", "7d", "30d"]}
+                reason: {type: string, minLength: 4, maxLength: 512}
+                ticket: {type: string, minLength: 1, maxLength: 200}
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK（含 changed、当前生效行）
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+        "400": {description: "channel/source/window_kind/reason/ticket 非法（40001 invalid_argument）"}
+        "403": {description: "非 SUPER（40301）"}
+
+  /api/v1/node/binding/device:
+    post:
+      operationId: rc14_create_device_authorization
+      summary: 客户端建码——生成一次性设备授权（匿名），返回唯一一次可见的 device_code
+      tags: [rc8]
+      description: |
+        `device_code` **只在这一次响应里返回**；服务端只存 `sha256(device_code)`。
+        `user_code` 为 8 位大写字母数字（去掉易混字符，且**不含 `U`**，与门户 `/activate` 输入集对齐）。
+        有效期 10 分钟。
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  device_code: {type: string, description: 仅本次可见}
+                  user_code: {type: string, pattern: "^[A-Z2-9]{8}$"}
+                  verify_url: {type: string, description: 门户确认页（/activate）}
+                  expires_in: {type: integer, description: 秒}
+                additionalProperties: true
+        "429":
+          description: "建码被限流（按来源 IP 滑窗；每副本配额，不是全局配额）"
+          headers:
+            Retry-After: {schema: {type: integer}, description: 建议等待秒数}
+        "503": {description: "授权码生成冲突（50001 user_code_collision，可重试）"}
+
+  /api/v1/node/binding/device/poll:
+    post:
+      operationId: rc14_poll_device_authorization
+      summary: 客户端轮询——查授权状态（终态一次性消费）
+      tags: [rc8]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_code]
+              properties:
+                device_code: {type: string}
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [pending, approved, denied, expired]}
+                  expires_at: {type: string, format: date-time}
+                  node_id: {type: string, description: 仅 approved 时出现}
+                  already_consumed: {type: boolean, description: 结论已被取走过（不重放，仍报终态）}
+                additionalProperties: true
+        "404": {description: "授权请求不存在（40401）"}
+
+  /api/v1/user/node-binding/device/confirm:
+    post:
+      operationId: rc14_confirm_device_authorization
+      summary: 网页确认——登录态用户输入 8 位码后批准/拒绝（门户 /activate 调用）
+      tags: [rc8]
+      description: |
+        `decision` **必填**，只认 `approve` / `deny`；缺省或非法一律 **400**，**绝不默认 approve**。
+        `deny` 与 `approve` 同等实现（都落 state + decided_by/at + decision_reason）。
+        **幂等**：同一 `user_code` 重复确认返回首次结论，不翻转。
+
+        **反枚举（1.14.0 定稿）**：未知码 / 已过期 / 已消费 三者**响应体与耗时同形**，一律
+        `{"status":"invalid"}`。因此本端点的 `status` 枚举**没有 `expired`** —— 对猜码者
+        暴露"这个码曾经存在但过期了"本身就是信息泄漏。
+        对照组：`/poll` 仍保留 `expired`，因为调用方持有 32 字节 `device_code`，不是猜码者。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_code, decision]
+              properties:
+                user_code: {type: string, pattern: "^[A-Z2-9]{8}$"}
+                decision: {type: string, enum: [approve, deny]}
+                reason: {type: [string, "null"], maxLength: 200}
+                node_id: {type: [string, "null"], description: approve 时可选，指定绑定到哪台节点}
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [approved, denied, invalid]}
+                  node_id: {type: string}
+                additionalProperties: true
+        "400": {description: "user_code/decision/node_id 非法（40001）"}
+
+
 components:
   securitySchemes:
     userBearer:
@@ -16060,6 +16239,17 @@ components:
               type: number
               minimum: -2
               maximum: 2
+            djb_effort:
+              type: string
+              enum:
+              - minimal
+              - low
+              - medium
+              - high
+              description: 平台思考强度档（1.15.0 显式登记；此前靠 additionalProperties
+                容忍先行下发）。只有调用方显式给了非 auto 档位才出现；节点侧
+                upstream.reasoning_effort.enabled 打开时映射为 reasoning_effort
+                下发上游，关闭时忽略（tolerant reader）。
         timeout_s:
           type: number
           minimum: 1
@@ -25671,3 +25861,14 @@ components:
           type: invalid_request_error
           message: max_tokens 必须是 ≥1 的整数
         request_id: 9f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b
+
+    ChannelSummary:
+      type: object
+      description: 通道级价源摘要（四字段，平铺）
+      properties:
+        source: {type: string, enum: [legacy, settled_avg, market_min, market_avg, djb_manual]}
+        fallback_from: {type: [string, "null"], description: 非 null 表示发生了回退，值为原本想用的 source}
+        effective_at: {type: [string, "null"], format: date-time}
+        reason: {type: string, description: 回退/生效原因（人话，可直接展示）}
+      additionalProperties: true
+
