@@ -367,19 +367,62 @@ def verify_artifact(data: bytes, artifact: dict[str, Any], anchor: Any,
     _verify_any(data, signature, anchor_set, what="下载包")
 
 
+#: 清单 os 字段 ↔ 客户端平台标识的别名归一（K4 / CR-20261117-AUDIT-FOLLOWUP #39）：
+#: 签名器写 ``macos``，客户端 ``facts.PLATFORM`` 在 macOS 上是 ``darwin``；
+#: 两边都过这张表，谁加别名都不破坏另一边（tolerant reader）。
+_OS_ALIASES: dict[str, str] = {
+    "darwin": "macos", "macos": "macos", "osx": "macos", "mac-os": "macos",
+    "windows": "windows", "win": "windows", "win32": "windows", "win64": "windows",
+    "linux": "linux",
+}
+
+
+def _norm_os(value: Any) -> str:
+    return _OS_ALIASES.get(str(value or "").strip().lower(), str(value or "").strip().lower())
+
+
+def _norm_arch(value: Any) -> str:
+    """arch 归一：x64/x86_64/amd64 同义；arm64/aarch64 同义；universal/any/空 = 通配。"""
+    from .platform import normalize_arch
+    text = str(value or "").strip().lower()
+    if text in ("", "any", "universal"):
+        return "any"
+    return normalize_arch(text)
+
+
 def select_artifact(payload: dict[str, Any], *, os_name: str = facts.PLATFORM,
                     arch: str | None = None) -> dict[str, Any]:
+    """按 os/arch 选安装包（K4：macOS 通道 + 全平台别名归一）。
+
+    匹配规则（tolerant reader，两边都归一）：
+
+    * os：``darwin↔macos``、``win↔windows`` 等别名同义（签名器写 ``macos``，
+      客户端 ``facts.PLATFORM`` 在 macOS 上是 ``darwin``——0.3.10 及以前因此恒
+      ``no_artifact``；windows 的 ``AMD64`` vs 清单 ``x64`` 同病）；
+    * arch：``x64/x86_64/amd64`` 同义、``arm64/aarch64`` 同义；
+      ``any/universal/空`` 为通配，**只在无精确匹配时兜底**（防通配行抢占：
+      0.3.10 实测 linux x86_64 错选 machine-room ``any`` 离线包）。
+    """
     import platform
     arch = arch or platform.machine() or "x86_64"
+    want_os = _norm_os(os_name)
+    want_arch = _norm_arch(arch)
+    fallback: dict[str, Any] | None = None
     for item in payload.get("artifacts") or []:
         if not isinstance(item, dict):
             continue
-        if str(item.get("os") or "") != os_name:
+        if _norm_os(item.get("os")) != want_os:
             continue
-        if str(item.get("arch") or "") not in (arch, "any", ""):
+        item_arch = _norm_arch(item.get("arch"))
+        if item_arch == "any":
+            if fallback is None:
+                fallback = dict(item)          # 通配行：记住但先找精确
             continue
-        return dict(item)
-    raise UpdateError("没有匹配本机 os/arch 的安装包（" + os_name + "/" + arch + "）")
+        if item_arch == want_arch:
+            return dict(item)
+    if fallback is not None:
+        return fallback
+    raise UpdateError("没有匹配本机 os/arch 的安装包（" + want_os + "/" + want_arch + "）")
 
 
 def bucket_eligible(bucket: int, payload: dict[str, Any], *,

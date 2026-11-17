@@ -388,3 +388,61 @@ def test_mock_branch_requires_env_flag_and_key(tmp_path, paths, store, clock, mo
     assert manager3.mock_requested() is False
     manager3.source = build_source(tmp_path, version="0.9.0")
     assert manager3.check()["state"] in ("failed_verify", "not_eligible")
+
+
+# ───────────────────────────────────── K4：macOS 通道 + 全平台 os/arch 归一
+def test_select_artifact_macos_and_alias_normalization():
+    """K4（CR-20261117-AUDIT-FOLLOWUP #39）：darwin↔macos、AMD64↔x64、arm64↔aarch64 归一。
+
+    0.3.10 及以前：清单写 os=macos/arch=x64，客户端 darwin/AMD64/arm64 原样比对
+    ⇒ mac 恒 no_artifact、windows AMD64 恒 no_artifact、linux x86_64 错落
+    machine-room 的 any 离线包（实测线上清单复现）。
+    """
+    payload = {"artifacts": [
+        {"os": "macos", "arch": "arm64", "url": "dmg-arm", "sha256": "a" * 64,
+         "signature": "ed25519:" + "b" * 128},
+        {"os": "macos", "arch": "x64", "url": "dmg-x64", "sha256": "a" * 64,
+         "signature": "ed25519:" + "b" * 128},
+        {"os": "windows", "arch": "x64", "url": "win", "sha256": "a" * 64,
+         "signature": "ed25519:" + "b" * 128},
+    ]}
+    # macOS：客户端 PLATFORM=darwin；Apple Silicon machine()=arm64，Intel=x86_64
+    assert select_artifact(payload, os_name="darwin", arch="arm64")["url"] == "dmg-arm"
+    assert select_artifact(payload, os_name="darwin", arch="x86_64")["url"] == "dmg-x64"
+    assert select_artifact(payload, os_name="macos", arch="aarch64")["url"] == "dmg-arm"
+    # Windows：machine()=AMD64 vs 清单 x64
+    assert select_artifact(payload, os_name="windows", arch="AMD64")["url"] == "win"
+    # 大小写与 macos 别名写法
+    assert select_artifact(payload, os_name="Darwin", arch="ARM64")["url"] == "dmg-arm"
+
+
+def test_select_artifact_universal_and_any_fallback():
+    payload = {"artifacts": [
+        {"os": "linux", "arch": "any", "url": "any-row", "sha256": "a" * 64,
+         "signature": "ed25519:" + "b" * 128},
+        {"os": "linux", "arch": "x64", "url": "exact-row", "sha256": "a" * 64,
+         "signature": "ed25519:" + "b" * 128},
+    ]}
+    # 精确 arch 优先；any 只兜底（0.3.10 实测：x86_64 错选 machine-room any 行）
+    assert select_artifact(payload, os_name="linux", arch="x86_64")["url"] == "exact-row"
+    assert select_artifact(payload, os_name="linux", arch="riscv64")["url"] == "any-row"
+    # universal dmg 通配两架构
+    uni = {"artifacts": [{"os": "macos", "arch": "universal", "url": "uni",
+                          "sha256": "a" * 64, "signature": "ed25519:" + "b" * 128}]}
+    assert select_artifact(uni, os_name="darwin", arch="arm64")["url"] == "uni"
+    assert select_artifact(uni, os_name="darwin", arch="x86_64")["url"] == "uni"
+
+
+def test_select_artifact_live_manifest_shape():
+    """线上 0.3.10 清单形状（2026-11-17 实取）回归：三平台选择结果。"""
+    payload = {"artifacts": [
+        {"os": "linux", "arch": "x64", "url": "src"},
+        {"os": "linux", "arch": "any", "url": "offline"},
+        {"os": "linux", "arch": "x64", "url": "official"},
+        {"os": "windows", "arch": "x64", "url": "winzip"},
+        {"os": "macos", "arch": "arm64", "url": "dmg"},
+    ]}
+    assert select_artifact(payload, os_name="windows", arch="AMD64")["url"] == "winzip"
+    assert select_artifact(payload, os_name="darwin", arch="arm64")["url"] == "dmg"
+    # linux 精确 x64 命中第一行（src 是 consumer-linux 主通道，产品口径如此）
+    assert select_artifact(payload, os_name="linux", arch="x86_64")["url"] == "src"
