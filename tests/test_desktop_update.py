@@ -168,7 +168,9 @@ def test_apply_requires_confirmation_and_never_runs_without_it():
 def test_apply_success_and_failure_copy():
     controller, _ = _controller({"state": "eligible"})
     ok = controller.run_update_apply()
-    assert ok.ok is True and "已安装 0.3.7" in ok.message and "重启" in ok.message
+    # K1（CR-20261117-AUDIT-FOLLOWUP #26）：S1 骨架只下载校验、不换二进制，
+    # 文案不得再宣称「已安装 … 重启后生效」。
+    assert ok.ok is True and "已下载待安装 0.3.7" in ok.message and "换装" in ok.message
 
     controller, manager = _controller({"state": "eligible"})
     manager.apply = lambda: {"installed": False, "state": "failed_verify",

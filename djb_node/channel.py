@@ -128,9 +128,17 @@ class ChannelJob:
     seed: int | None = None
     frequency_penalty: float | None = None
     presence_penalty: float | None = None
+    # 平台思考强度档（djb_effort；auto/缺省 = None，与改前逐字节一致）
+    djb_effort: str | None = None
 
-    def body(self) -> dict[str, Any]:
-        """转给本机镜像端点的 body（只带白名单字段；stream 固定 False）。"""
+    def body(self, *, reasoning_effort_enabled: bool = False) -> dict[str, Any]:
+        """转给本机镜像端点的 body（只带白名单字段；stream 固定 False）。
+
+        ``reasoning_effort_enabled``（默认 False = 改前行为）：把平台的
+        ``djb_effort`` 档位映射成 OpenAI 兼容的 ``reasoning_effort`` 真实下发。
+        由 :class:`ChannelClient` 按 ``upstream.reasoning_effort.enabled`` 开关传入；
+        关闭时 body 与接入前逐字节一致。
+        """
         body: dict[str, Any] = {"model": self.model, "messages": self.messages,
                                 "stream": False}
         if self.max_tokens is not None:
@@ -153,6 +161,10 @@ class ChannelJob:
             body["frequency_penalty"] = self.frequency_penalty
         if self.presence_penalty is not None:
             body["presence_penalty"] = self.presence_penalty
+        if reasoning_effort_enabled and self.djb_effort:
+            mapped = facts.EFFORT_TO_REASONING.get(str(self.djb_effort))
+            if mapped:
+                body["reasoning_effort"] = mapped
         return body
 
 
@@ -216,6 +228,10 @@ def parse_job(payload: Any) -> ChannelJob | None:
     stop = request.get("stop")
     tools = request.get("tools")
     node_id = payload.get("node_id")
+    # djb_effort（加性）：只认四档白名单；auto/非法/缺省 → None（不改前行为）
+    raw_effort = request.get("djb_effort")
+    djb_effort = (str(raw_effort) if isinstance(raw_effort, str)
+                  and raw_effort in facts.EFFORT_TO_REASONING else None)
     return ChannelJob(
         job_id=job_id,
         node_id=str(node_id) if isinstance(node_id, str) and node_id else None,
@@ -233,6 +249,7 @@ def parse_job(payload: Any) -> ChannelJob | None:
         seed=_int_or_none(request.get("seed")),
         frequency_penalty=_float_or_none(request.get("frequency_penalty")),
         presence_penalty=_float_or_none(request.get("presence_penalty")),
+        djb_effort=djb_effort,
     )
 
 
@@ -413,7 +430,8 @@ class ChannelClient:
 
     def _execute(self, job: ChannelJob) -> dict[str, Any]:
         """调本机镜像端点；成功映射 content/finish_reason/tokens_*，失败映射 error_code。"""
-        body = job.body()
+        body = job.body(reasoning_effort_enabled=bool(
+            feature_flag(self.config, facts.REASONING_EFFORT_FLAG)))
         started = time.monotonic()
         try:
             response = self.chat_call(body, job.timeout_s)

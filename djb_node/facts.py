@@ -1005,5 +1005,30 @@ FEATURE_FLAGS["plan.groups"] = {
     "description": "多 plan 组：组内按 priority 自动切换、组级共享日/月预算，默认关闭",
 }
 PLAN_GROUPS_FLAG = "plan.groups"
+
+# ─────────────────────────────────────────────────────────── djb_effort → 上游思考强度
+# 口径（INTEGRITY-REVIEW-20261117 §6 / CR-20261117-AUDIT-FOLLOWUP）：
+# 平台 djb_effort（minimal/low/medium/high）此前只回显 X-DJB-Effort 诊断头，
+# 不改上游生成参数（空转）。打开本开关后，通道 job 里的 djb_effort 会被映射成
+# 上游 reasoning_effort（OpenAI 兼容系）真实生效。
+# **默认关闭**；两端（cloud gateway.effort_upstream + 本开关）都打开才生效。
+# Anthropic 线不做映射：thinking.budget_tokens 需要模型目录按 slug 下发的真实
+# token 数（v0.3 Q9 欠账），没有目录就不编数（不虚标）。
+FEATURE_FLAGS["upstream.reasoning_effort.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2027-06-30",
+    "rollback_rule": ("djb flags --disable upstream.reasoning_effort.enabled + 重启 daemon"
+                      " → 通道 job 不再向上游转发 reasoning_effort，body 与打开前逐字节"
+                      "一致；平台侧 gateway.effort_upstream 关闭即可整体回滚，无数据残留"),
+    "description": ("通道 job 的 djb_effort 映射为上游 reasoning_effort（OpenAI 兼容系），"
+                    "默认关闭；Anthropic 线待模型目录（Q9）后接入"),
+}
+REASONING_EFFORT_FLAG = "upstream.reasoning_effort.enabled"
+#: djb_effort 四档 → OpenAI reasoning_effort 合法值（1:1；auto 不映射）
+EFFORT_TO_REASONING: dict[str, str] = {
+    "minimal": "minimal", "low": "low", "medium": "medium", "high": "high",
+}
+
 # 注意：尝试次数上限与冷却秒数只在 djb_node/plan_router.py 里定义一份
 # （MAX_ATTEMPTS / AUTH_COOLDOWN_S），这里不再复制，避免两处漂移。

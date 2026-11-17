@@ -49,8 +49,9 @@ from . import quotes as quotes_mod
 from . import store as store_module
 from . import tokens as tokens_mod
 from .update import UpdateManager, apply_exit_code
-from .upstream import (UpstreamManager, a2_prompt, parse_models, probe_upstream,
-                       validate_access_type, validate_base_url, validate_min_price)
+from .upstream import (UpstreamManager, a2_prompt, classify_base_url, origin_hint,
+                       parse_models, probe_upstream, validate_access_type,
+                       validate_base_url, validate_min_price)
 from .util import (ensure_dir, iso, new_token, parse_iso, redact_text, utcnow)
 
 PROG = "djb"
@@ -1188,6 +1189,8 @@ def _upstream_line(item: dict[str, Any]) -> str:
     kind = item.get("upstream_kind")
     if kind:
         parts.append(str(kind))
+    # 来源分类（INTEGRITY-REVIEW-20261117 §5）：官方/知名开源/未识别，只作信任先验
+    parts.append("来源:" + classify_base_url(item.get("base_url")))
     parts.extend([str(item.get("base_url")), str(item.get("state"))])
     models = ",".join(str(model.get("id")) for model in item.get("models") or [])
     # P6：把「最近探针 / 还有多久掉容量」直接印在这一行（原来只能看 state=verified，
@@ -1293,12 +1296,16 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         payload = {"upstream": manager.store.upstream(record.id).to_dict(),
                    "relay": relay_profile.to_dict() if relay_profile else None,
                    "declare": declared,
+                   "base_url_origin": classify_base_url(
+                       record.base_url),
                    "credential_stored": bool(secret),
                    "credential_note": "凭据只在 0600 本机文件；申报只上行 credential_handle"}
         _emit(payload, as_json=_json_flag(args), text=lambda value: (
             "已添加上游 " + str(value["upstream"]["id"]) + "（"
             + str(value["upstream"]["access_type"]) + " · "
             + str(value["upstream"]["base_url"]) + "）\n"
+            + "来源：" + str(value.get("base_url_origin")) + " · "
+            + origin_hint(value.get("base_url_origin")) + "\n"
             + ("已申报：" + json.dumps(value["declare"].get("response"), ensure_ascii=False)
                if value["declare"].get("declared")
                else "暂未申报：" + str(value["declare"].get("reason")))))
@@ -2045,8 +2052,9 @@ def cmd_update(args: argparse.Namespace) -> int:
     if getattr(args, "apply", False):
         result = manager.apply()
         _emit(result, as_json=_json_flag(args),
-              text=lambda value: (("已安装 " + str(value.get("version"))
-                                   + "（上一版 " + str(value.get("previous_version")) + "）")
+              text=lambda value: (("已下载待安装 " + str(value.get("version"))
+                                   + "（校验通过；安装器上线前不自动换装，当前仍运行 "
+                                   + str(value.get("previous_version")) + "）")
                                   if value.get("installed")
                                   else "未安装：" + str(value.get("state")) + " · "
                                   + str(value.get("message"))))

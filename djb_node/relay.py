@@ -171,6 +171,7 @@ class RelayProfile:
             "upstream_id": self.upstream_id,
             "kind": self.kind,
             "base_url": self.base_url,
+            "base_url_origin": upstream.classify_base_url(self.base_url),
             "auth_scheme": self.auth_scheme,
             "auth_header": self.auth_header_name,
             "extra_headers": sorted(self.extra_headers),

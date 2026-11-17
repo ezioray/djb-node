@@ -1348,8 +1348,9 @@ class DesktopController:
         self.last_update = result
         if result.get("installed"):
             version = str(result.get("version") or "")
-            return ActionResult("已安装 " + version + "（重启客户端后生效）。", ok=True,
-                                effect="update", payload=result)
+            return ActionResult("已下载待安装 " + version
+                                + "（校验通过；安装器上线前不自动换装，重启不改变运行版本）。",
+                                ok=True, effect="update", payload=result)
         state = str(result.get("state") or "")
         reason = str(result.get("message") or "更新器没有给出原因（state=" + state + "）")
         return ActionResult("未安装：" + reason, ok=False, effect="update", payload=result)

@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
@@ -176,6 +177,97 @@ def validate_base_url(base_url: Any) -> str:
     if parsed.fragment:
         raise UsageError("上游端点不得带 fragment")
     return text.rstrip("/")
+
+
+# ─────────────────────────────────────── base_url 来源分类（M17 先验；只作信任先验，永不拦截）
+#: 来源三分类（INTEGRITY-REVIEW-20261117 §5 / CR-20261117-AUDIT-FOLLOWUP）。
+#: **只作探针强度与提示的先验**：official 降探针频率但**永不免检**（前置代理仍可
+#: 作弊）；unknown 提示更严格抽检。分类失败/不认识一律 unknown（fail-closed）。
+ORIGIN_OFFICIAL = "official"
+ORIGIN_TRUSTED_OPEN_SOURCE = "trusted_open_source"
+ORIGIN_UNKNOWN = "unknown"
+
+#: 厂商官方端点（host 精确匹配；缺省端口）。**新增厂商只加这里，不写逻辑**。
+OFFICIAL_ENDPOINT_HOSTS: frozenset[str] = frozenset({
+    "api.openai.com",             # OpenAI
+    "api.anthropic.com",          # Anthropic
+    "api.deepseek.com",           # DeepSeek
+    "api.moonshot.cn", "api.moonshot.ai",   # 月之暗面 Kimi
+    "open.bigmodel.cn",           # 智谱 GLM
+    "dashscope.aliyuncs.com",     # 阿里通义
+    "api.minimax.chat", "api.minimaxi.com", # MiniMax
+    "generativelanguage.googleapis.com",    # Google Gemini
+    "api.mistral.ai",             # Mistral
+    "api.cohere.com", "api.cohere.ai",      # Cohere
+    "api.groq.com",               # Groq（自托管官方端点）
+    "api.x.ai",                   # xAI
+})
+
+#: 知名开源/聚合端点（域名背后是知名运营方；**OneAPI/NewAPI 自部署不属于**——
+#: 域名可同、背后可改，只能按 unknown 处理，除非走 M17 §5.6 独立探针凭据）。
+TRUSTED_OPEN_SOURCE_HOSTS: frozenset[str] = frozenset({
+    "openrouter.ai",
+})
+
+#: 缺省端口（host 精确匹配且端口为空或等于缺省端口才算命中；非标端口一律 unknown）。
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+ORIGIN_HINTS: dict[str, str] = {
+    ORIGIN_OFFICIAL: "官方端点（信任先验高；仍保留抽检，不因官方免检）",
+    ORIGIN_TRUSTED_OPEN_SOURCE: "知名开源/聚合端点（信任先验中；保留常规探针）",
+    ORIGIN_UNKNOWN: "未识别端点（不拦截；接入后将按更严格的探针与抽检处理）",
+}
+
+
+def classify_base_url(base_url: Any) -> str:
+    """按 host 精确匹配判来源三分类。
+
+    防绕过口径（M17 §2 威胁模型的工程化）：
+
+    * **只认 host 精确匹配**：``api.openai.com.evil.tld`` / ``api-openai-com.tld``
+      这类前后缀伪装全部落 unknown；
+    * **端口必须缺省**：官方域名 + 非标端口（8443 等）多为前置代理 → unknown；
+    * **userinfo / 非 http(s) / 解析失败** → unknown（``validate_base_url`` 会先拦，
+      这里防御性兜底，保证任何输入都有确定分类）；
+    * IP 直连 / 回环 / 内网 → unknown（本机 Agent 场景由 access/kind 区分，不用来源分）。
+
+    该函数是**纯函数**：不查 DNS（不把解析结果当信任依据）、不联网、不落盘。
+    """
+    try:
+        text = str(base_url or "").strip().rstrip("/")
+        parsed = urlparse(text)
+    except (ValueError, TypeError):
+        return ORIGIN_UNKNOWN
+    if parsed.scheme not in ("http", "https"):
+        return ORIGIN_UNKNOWN
+    if parsed.username or parsed.password or parsed.fragment:
+        return ORIGIN_UNKNOWN
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or not host.isascii():
+        # 非 ASCII（IDN 同形字）→ 不认识就是 unknown
+        return ORIGIN_UNKNOWN
+    if not (host[0].isalnum() and host[-1].isalnum()):
+        return ORIGIN_UNKNOWN
+    port = parsed.port
+    if port is not None and port != _DEFAULT_PORTS[parsed.scheme]:
+        return ORIGIN_UNKNOWN
+    # IP 直连（v4/v6）一律 unknown：官方端点不会用裸 IP
+    try:
+        ipaddress.ip_address(host)
+        return ORIGIN_UNKNOWN
+    except ValueError:
+        pass
+    if host in OFFICIAL_ENDPOINT_HOSTS:
+        # 官方端点要求 https（http 官方域名 = 中间人/镜像风险）
+        return ORIGIN_OFFICIAL if parsed.scheme == "https" else ORIGIN_UNKNOWN
+    if host in TRUSTED_OPEN_SOURCE_HOSTS:
+        return ORIGIN_TRUSTED_OPEN_SOURCE if parsed.scheme == "https" else ORIGIN_UNKNOWN
+    return ORIGIN_UNKNOWN
+
+
+def origin_hint(origin: Any) -> str:
+    """分类 → 客户可见提示文案（未知分类回落 unknown 文案）。"""
+    return ORIGIN_HINTS.get(str(origin or "").strip(), ORIGIN_HINTS[ORIGIN_UNKNOWN])
 
 
 def credential_ref_for(upstream_id: str) -> str:
