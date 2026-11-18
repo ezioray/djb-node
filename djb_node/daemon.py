@@ -1283,6 +1283,9 @@ class Daemon:
             "capacity": self.upstreams.announce_capacity(
                 profile, now=now, relay=self._relay_capacity_targets(now)),
             "load": {"inflight": self._inflight, "queue_seconds": 0.0},
+            # D1（2026-11-18）：版本如实——心跳自述程序版本，云端只在变化时落库。
+            # 加性字段：老云端忽略未知键（spec ``additionalProperties: true``），零感知。
+            "client_version": facts.CLIENT_VERSION,
         }
         # M3：加性字段（开关关闭时不出现；云端忽略未知键，老版本零感知）
         machine = self._machine_payload()
