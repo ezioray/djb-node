@@ -391,3 +391,46 @@ def test_refresh_engine_has_a_single_timer_and_no_pile_up():
     tick = inspect.getsource(desktop_app.DesktopApp._auto_refresh_tick)
     assert "busy" in tick and "self._schedule_auto_refresh()" in tick, \
         "忙时不发新请求，但无论如何要排下一次（不堆叠、不断链）"
+
+
+# ─────────────── D9（2026-11-18 14:15：失败的 UI 要提醒 + 成功也要说清 + 自动审批）
+def test_bind_again_on_same_account_says_it_was_already_bound():
+    """「已经绑定该账户」不是失败：要说「本来就绑着、没有新变化」。"""
+    snapshot = ds.Snapshot({"access": {"binding": {"bound": True, "state": "bound",
+                                                  "bound_at": "2026-11-11T05:03:56Z"}}},
+                           source="test")
+    controller = DesktopController(ds.FakeDataSource({"account": {}}, source="test"),
+                                   cli=lambda argv: {"ok": True},
+                                   ask_code=lambda: "code-1")
+    controller._snapshot = snapshot                              # noqa: SLF001
+    result = controller.action("account.bind")
+    assert result.ok is True
+    assert "本来就绑在" in result.message and "2026-11-11T05:03:56Z" in result.message
+
+
+def test_bind_failure_on_other_account_points_at_unbind_not_at_new_code():
+    """409「已绑其它账户」要给解绑路径，不能只让客户「重新生成绑定码」（那会白试）。"""
+    from djb_node.desktop.controller import _bind_failure_hint
+
+    hint = _bind_failure_hint("节点已绑定其它账户，请先解绑（INV-08）")
+    assert "解绑" in hint and "重新生成" not in hint
+    assert "没有等待期" in hint
+
+
+def test_bind_failure_cooldown_is_forward_compatible_with_server_time():
+    """云端将来加「换账户冷却」时，老客户端按 reason 前缀也能显示可再绑时间。"""
+    from djb_node.desktop.controller import _bind_failure_hint
+
+    hint = _bind_failure_hint("rebind_cooldown", available_at="2026-11-20T10:00:00Z")
+    assert "冷却" in hint and "2026-11-20T10:00:00Z" in hint
+
+
+def test_auto_approved_payout_is_written_as_such():
+    """云端自动审批通过 → 客户端说「系统自动校验通过」，而不是和人工审批同一句话。"""
+    from djb_node.desktop import payout as payout_mod
+
+    text = payout_mod.submit_message({"address": "0x" + "a" * 40, "status": "whitelisted",
+                                      "auto_approved": True})
+    assert "已生效" in text and "自动" in text
+    manual = payout_mod.submit_message({"address": "0x" + "a" * 40, "status": "whitelisted"})
+    assert "自动" not in manual

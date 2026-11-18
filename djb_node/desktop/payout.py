@@ -176,6 +176,10 @@ def submit_message(data: Mapping[str, Any] | None, *, now: datetime | None = Non
     tail = ("（" + extra + "；此刻不能再次修改）" if cooldown_active(row, now=now)
             else ("（" + extra + "）" if extra else ""))
     if status == "whitelisted":
+        # 云端 2026-11-18 起支持「校验通过自动审批」：多一个只加不改的布尔，
+        # 客户端据此说清「为什么这次不用等审核」。
+        if row.get("auto_approved") is True:
+            return "已提交到云端：收款地址已生效（系统自动校验通过：链与格式合法）。" + tail
         return "已提交到云端：收款地址已生效。" + tail
     if status == "pending":
         return "已提交到云端：待审核（审核通过后生效，页面会显示审核结果）。" + tail
