@@ -462,3 +462,19 @@ def test_change_notice_says_already_changeable_after_24h():
     row = {"changed_at": "2026-11-15T00:00:00Z"}
     assert "已可修改" in po.change_notice(row, now=po._moment("2026-11-18T00:00:00Z"))
     assert po.change_notice({}) == "", "缺 changed_at 时不许编造时间"
+
+
+# ───────── D12（2026-11-18 边界一）：EIP-55 拒绝要有精确文案，不能落回泛泛的「格式不对」
+def test_checksum_rejection_has_its_own_actionable_copy():
+    from djb_node.desktop.nodecloud import _payout_error
+
+    class _Resp:
+        def error_code(self):
+            return 40001
+
+        def json(self):
+            return {"error": {"code": 40001, "reason": "address_checksum_invalid",
+                              "message": "地址校验和不对（EIP-55）"}}
+
+    exc = _payout_error(_Resp(), 400)
+    assert "校验和" in exc.reason and "重新完整复制" in exc.hint

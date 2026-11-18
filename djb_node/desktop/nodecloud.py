@@ -219,6 +219,11 @@ def _payout_error(response: Any, status: int) -> ProviderError:
         "address_cooldown": by_code[40919],
         "node_not_bound": by_code[40305],
         "feature_disabled": by_code[40401],
+        # EIP-55（CHG-20261118 边界一）：云端在校验和上拒绝 = 地址抄错了一位，
+        # 重试同一个地址一定还失败——必须给出「重新复制」这个真下一步。
+        "address_checksum_invalid": (
+            "地址校验和不对（EIP-55）：多半是复制/输入时错了一位",
+            "从钱包重新完整复制 0x 开头 42 位地址后再提交；地址未变更"),
         "idempotency_conflict": (
             "提交被云端判为重复请求（409/40919 幂等冲突）",
             "再点一次「提交到云端」（客户端每次都会换新的幂等键）；地址未变更"),
