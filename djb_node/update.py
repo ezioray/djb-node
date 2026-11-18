@@ -649,7 +649,7 @@ class UpdateManager:
                      "released_at": payload.get("released_at"),
                      "signature": anchor.to_dict()})
         if _version_tuple(version) <= _version_tuple(self.store.install().version):
-            base.update({"state": "up_to_date", "message": "已是最新版本（不做降级）"})
+            base.update({"state": "up_to_date", "message": "已是最新版本"})
             self._record("up_to_date", None, version)
             return base
         install = self.store.install()
