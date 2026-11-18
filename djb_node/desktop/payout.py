@@ -23,12 +23,13 @@ owner 2026-11-13 决策（**方案 B**）：收款地址由客户端**直接提�
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from .access import mask_address
 
-__all__ = ["UNREADABLE", "UNSUBMITTED", "STATUS_TEXT", "CHAIN_HINT", "cooldown_active",
+__all__ = ["UNREADABLE", "UNSUBMITTED", "STATUS_TEXT", "CHAIN_HINT",
+           "ADDRESS_CHANGE_COOLDOWN_H", "change_notice", "cooldown_active",
            "cooldown_notice", "short_state", "status_text", "submit_blocker",
            "submit_message", "summarize"]
 
@@ -140,8 +141,7 @@ def summarize(data: Mapping[str, Any] | None, *, now: datetime | None = None) ->
         return "云端：" + UNSUBMITTED + "（填好后点「提交到云端」）"
     parts = [mask_address(address)] if address else []
     if cooldown_active(data, now=now):
-        parts.append("冷却中（这次改动要等冷却结束，可再改时间 "
-                     + str(data.get("cooldown_until")) + "）")
+        parts.append(cooldown_notice(data, now=now))
     elif status == "rejected":
         parts.append("已拒绝（改地址后重新提交）")
     elif status == "revoked":
@@ -157,15 +157,51 @@ def summarize(data: Mapping[str, Any] | None, *, now: datetime | None = None) ->
 
 #: 冷却期的可执行说明（2026-11-18 客户要求：「更换 USDT 提交要提示冷却时间等返回」）。
 #: 云端规则：地址 24 小时内只能改一次；``cooldown_until`` 就是「下一次能改」的时刻。
+#: 地址变更冷却（云端 ``facts.ADDRESS_CHANGE_COOLDOWN_H``）：改一次之后 24h 才能再改。
+ADDRESS_CHANGE_COOLDOWN_H = 24
+
+
+def _local(value: Any) -> str:
+    """ISO → 本机时区的「YYYY-MM-DD HH:MM:SS」；解析不了就原样返回（不猜）。"""
+    moment = _moment(value)
+    if moment is None:
+        return str(value or "")
+    try:
+        return moment.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:                                  # pragma: no cover - 极端时区数据
+        return str(value or "")
+
+
 def cooldown_notice(data: Mapping[str, Any] | None, *, now: datetime | None = None) -> str:
-    """``cooldown_until`` → 「可再改时间 …（北京/本地时间由调用方格式化）…」；无冷却给空串。"""
+    """``cooldown_until`` → 「可出款时间 …」；无冷却给空串。
+
+    **别把它说成「可再改时间」**（2026-11-18 owner 抓到过）：``cooldown_until`` 是
+    「新地址 72h 准入冷却」的终点（``facts.ADDRESS_COOLDOWN_H``），它决定**能不能出款**；
+    「能不能再改地址」看的是 ``changed_at + 24h``，由 :func:`change_notice` 单独说。
+    """
     if not isinstance(data, Mapping):
         return ""
     raw = str(data.get("cooldown_until") or "").strip()
     if not raw:
         return ""
-    prefix = "冷却中" if cooldown_active(data, now=now) else "下次可改时间"
-    return prefix + "：" + raw
+    active = cooldown_active(data, now=now)
+    return ("可出款时间（新地址 72h 冷却，冷却中）：" if active else "可出款时间：") + _local(raw)
+
+
+def change_notice(data: Mapping[str, Any] | None, *, now: datetime | None = None) -> str:
+    """``changed_at + 24h`` → 「可改地址时间 …」；缺 ``changed_at`` 给空串（不编造）。"""
+    if not isinstance(data, Mapping):
+        return ""
+    changed = _moment(data.get("changed_at"))
+    if changed is None:
+        return ""
+    until = changed + timedelta(hours=ADDRESS_CHANGE_COOLDOWN_H)
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    if until <= moment:
+        return "可改地址时间：已可修改（距上次登记超过 24h）"
+    return "可改地址时间（变更后 24h）：" + _local(until)
 
 
 def submit_message(data: Mapping[str, Any] | None, *, now: datetime | None = None) -> str:
@@ -173,8 +209,9 @@ def submit_message(data: Mapping[str, Any] | None, *, now: datetime | None = Non
     row = data if isinstance(data, Mapping) else {}
     status = str(row.get("status") or "").strip().lower()
     extra = cooldown_notice(row, now=now)
-    tail = ("（" + extra + "；此刻不能再次修改）" if cooldown_active(row, now=now)
-            else ("（" + extra + "）" if extra else ""))
+    change = change_notice(row, now=now)
+    bits = [piece for piece in (extra, change) if piece]
+    tail = ("（" + "；".join(bits) + "）") if bits else ""
     if status == "whitelisted":
         # 云端 2026-11-18 起支持「校验通过自动审批」：多一个只加不改的布尔，
         # 客户端据此说清「为什么这次不用等审核」。

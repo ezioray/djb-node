@@ -120,7 +120,9 @@ def _cooldown_suffix(controller: Any, exc: Any) -> str:
         row = ((access.get("payout") or {}).get("data")) or {}
     except Exception:                              # 快照还没取过：不编造时刻
         return ""
-    notice = payout_mod.cooldown_notice(row)
+    # 「变更 24h 冷却」是**改地址**的门槛 → 用 change_notice；`cooldown_until` 是
+    # 「新地址 72h 准入冷却」（可出款时间），两者不同，2026-11-18 owner 抓到过混用。
+    notice = payout_mod.change_notice(row) or payout_mod.cooldown_notice(row)
     return ("；云端记录：" + notice) if notice else ""
 
 

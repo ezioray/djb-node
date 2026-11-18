@@ -1829,8 +1829,13 @@ def _payout_state(access: Mapping[str, Any]) -> dict[str, Any]:
     elif ok:
         hint = state
         meta = mask_address(str(row.get("address") or "")) or "—"
+        # 2026-11-18 owner 纠正：`cooldown_until` 是「可出款时间」（新地址 72h 冷却），
+        # **不是**「可再改时间」；改地址看 `changed_at + 24h`。两个时间点分开写。
         if payout_mod.cooldown_active(row):
-            meta += "．可再改时间 " + str(row.get("cooldown_until"))
+            meta += "．" + payout_mod.cooldown_notice(row)
+        change = payout_mod.change_notice(row)
+        if change:
+            meta += "．" + change
     else:
         hint = payout_mod.UNREADABLE
         meta = reason or "完成节点绑定后重试"

@@ -311,7 +311,7 @@ def test_submit_message_surfaces_cooldown_window():
     text = payout_mod.submit_message({"address": "0x" + "a" * 40, "status": "pending",
                                       "cooldown_until": future})
     assert "待审核" in text
-    assert "2099-01-01T00:00:00Z" in text and "冷却中" in text
+    assert "可出款时间" in text and "冷却中" in text, text
 
 
 def test_cooldown_failure_names_the_deadline_from_last_snapshot():
@@ -319,7 +319,7 @@ def test_cooldown_failure_names_the_deadline_from_last_snapshot():
     cooldown_until —— 失败文案必须把它写出来（否则客户只能猜「什么时候能改」）。"""
     snapshot = ds.Snapshot({"access": {"payout": {"ok": True, "data": {
         "address": "0x" + "a" * 40, "status": "pending",
-        "cooldown_until": "2099-01-01T00:00:00Z"}}}}, source="test")
+        "changed_at": "2099-01-01T00:00:00Z"}}}}, source="test")
 
     class _Source(ds.FakeDataSource):
         def submit_payout_address(self, address, label=""):   # noqa: ANN001 - 桩
@@ -332,7 +332,7 @@ def test_cooldown_failure_names_the_deadline_from_last_snapshot():
     controller._snapshot = snapshot                              # noqa: SLF001 - 最小装配
     result = controller.submit_payout("0x" + "a" * 40)
     assert result.ok is False
-    assert "2099-01-01T00:00:00Z" in result.message, "必须说出可再改时间"
+    assert "可改地址时间" in result.message, result.message
 
 
 def test_payout_result_is_shown_in_a_dialog():
@@ -434,3 +434,31 @@ def test_auto_approved_payout_is_written_as_such():
     assert "已生效" in text and "自动" in text
     manual = payout_mod.submit_message({"address": "0x" + "a" * 40, "status": "whitelisted"})
     assert "自动" not in manual
+
+
+# ───────── D11（2026-11-18 14:31 owner 抓到口径混用）：两个时间点不许混为一谈
+def test_cooldown_until_is_payout_eligibility_not_change_window():
+    """`cooldown_until` = 新地址 72h 准入冷却（**可出款时间**）；
+    「可不可以再改地址」= `changed_at + 24h`。混用会让客户以为 3 天内不能改。"""
+    from djb_node.desktop import payout as po
+
+    row = {"address": "0x" + "a" * 40, "status": "whitelisted",
+           "cooldown_until": "2026-11-21T03:00:33Z",          # UTC = 北京 11:00:33
+           "changed_at": "2026-11-18T03:00:33Z"}
+    now = po._moment("2026-11-18T06:31:00Z")
+
+    notice = po.cooldown_notice(row, now=now)
+    assert "可出款时间" in notice and "可再改" not in notice
+
+    change = po.change_notice(row, now=now)
+    assert "可改地址时间" in change
+    # changed_at + 24h 而不是 +72h：2026-11-19（不是 11-21）
+    assert "2026-11-19" in change and "2026-11-21" not in change
+
+
+def test_change_notice_says_already_changeable_after_24h():
+    from djb_node.desktop import payout as po
+
+    row = {"changed_at": "2026-11-15T00:00:00Z"}
+    assert "已可修改" in po.change_notice(row, now=po._moment("2026-11-18T00:00:00Z"))
+    assert po.change_notice({}) == "", "缺 changed_at 时不许编造时间"

@@ -83,7 +83,7 @@ def test_summarize_separates_unsubmitted_from_unreadable():
     cold = po.summarize({"address": EVM, "status": "pending",
                          "cooldown_until": "2026-11-14T00:00:00Z"},
                         now=po._moment("2026-11-13T00:00:00Z"))
-    assert "冷却中" in cold and "2026-11-14T00:00:00Z" in cold
+    assert "可出款时间" in cold and "冷却中" in cold, cold
 
 
 def test_submit_message_never_promises_whitelist():
