@@ -1047,7 +1047,7 @@ class DesktopApp:
                 return self._controller.current()
         self._set_field_errors({})          # 切页清空上一页的字段红字（走查原话：跨页残留）
         self._clear_sticky()                # D4：上一页的失败提示也不许跟到下一页
-        self._render(view)
+        self._render(view, force=True)      # 切页 = 显式意图：布局/焦点都要重来
         self._sync_nav(key)
         self._update_status()
         try:
@@ -1075,7 +1075,7 @@ class DesktopApp:
     def refresh_now(self) -> View:
         """同步刷新（阻塞到取数完成）：截图脚本 / 单测 / 无事件循环环境专用。"""
         view = self._controller.refresh()
-        self._render(view)
+        self._render(view, force=True)      # 显式「立即刷新」（截图脚本/单测要确定性重画）
         self._update_status()
         return view
 
@@ -1556,7 +1556,7 @@ class DesktopApp:
             view = getattr(self, "_last_view", None)
             if view is not None:
                 # 表格 tag 颜色、卡片 tone 都是渲染时取的：重画一次才真正换色
-                self._render(view)
+                self._render(view, force=True)          # 换肤：颜色要真的重取
                 tree = getattr(self, "_tree", None)
                 if tree is not None:
                     self._fit_columns(tree)
@@ -1714,7 +1714,7 @@ class DesktopApp:
         try:
             # 重画**同一份快照**：resize 不该顺手再拉一次数据（会白等网络，
             # 还可能撞上瞬时失败把「已停止」变成「状态未知」）。
-            self._render(view)
+            self._render(view, force=True)               # 宽度翻转：布局要重排
             tree = getattr(self, "_tree", None)
             if tree is not None:
                 self._fit_columns(tree)
@@ -1974,15 +1974,44 @@ class DesktopApp:
             button.pack(side="left", padx=(0, 8))
         self._onboarding_panel = card
 
-    def _render(self, view: View) -> None:
+    def _should_skip_render(self, view: View) -> bool:
+        """这一版视图和屏幕上那版**一模一样**时，不重建控件（客户反馈「经常卡顿」）。
+
+        为什么值得单独一条：``_render`` 先 ``_clear()``（销毁本页全部控件，含 Treeview），
+        再逐块重建，最后把整棵树推给读屏（MSAA）。数据没变也照做的话，每 10 秒就有一次
+        「全量拆装 + 读屏重建」——在慢机器上就是肉眼可见的停顿。空转的重画只该更新
+        状态栏那点文字（那部分在 ``_update_status`` 里，与这里无关）。
+
+        宽度档位翻转（窄/宽、双列/单列）时**不能**跳过：布局本身变了。
+        """
+        previous = getattr(self, "_last_view", None)
+        if previous is None or previous != view:
+            return False
+        if getattr(self, "_body", None) is None:
+            return False                                   # 还没画过，必须画
+        try:
+            if self._rendered_narrow != self._is_narrow():
+                return False
+            if self._rendered_two_col != self._two_col():
+                return False
+        except Exception:                                  # pragma: no cover - 无窗口
+            return False
+        return True
+
+    def _render(self, view: View, *, force: bool = False) -> None:
         """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。
 
         RC15-039 #1：渲染前把**本页**的字段级错误贴上去（纯函数 ``with_field_errors``），
         渲染后把焦点送到第一个错误字段——客户点完「保存」不用自己找哪一行错了。
+
+        ``force=True``：换肤 / 换布局 / 显式重画（``show_view``）时不许走「内容没变就跳过」。
         """
         tk = self._tk
         kit = self._kit
-        view = with_field_errors(view, self._field_errors)
+        patched = with_field_errors(view, self._field_errors)
+        if not force and self._should_skip_render(patched):
+            return
+        view = patched
         self._last_view = view
         self._in_render = True
         self._rendered_narrow = self._is_narrow()

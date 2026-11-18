@@ -353,3 +353,41 @@ def test_payout_result_is_shown_in_a_dialog():
 
     app._apply_payout(None, RuntimeError("boom"))                 # noqa: SLF001
     assert shown[-1][1] is False and "地址未变更" in shown[-1][0]
+
+
+# ───────────────────────── D8（2026-11-18：「客户端经常卡顿，是多个刷新卡的吗」）
+def test_unchanged_view_is_not_rebuilt():
+    """D8：数据没变就不许重建控件。
+
+    ``_render`` 会 ``_clear()`` 销毁本页全部控件（含 Treeview）再重建，并把整棵树推给
+    读屏——每 10 秒空转一次就是客户嘴里的「经常卡顿」。同一版视图再来时应直接跳过。
+    """
+    app = _bare_app()
+    app._field_errors = {}                                       # noqa: SLF001
+    app._body = object()                                         # noqa: SLF001
+    app._rendered_narrow = False                                 # noqa: SLF001
+    app._rendered_two_col = True                                 # noqa: SLF001
+    app._is_narrow = lambda: False                               # noqa: SLF001
+    app._two_col = lambda: True                                  # noqa: SLF001
+    view = build_views(desktop_app.demo_snapshot())["overview"]
+
+    assert app._should_skip_render(view) is False, "还没画过 → 必须画"      # noqa: SLF001
+    app._last_view = view                                        # noqa: SLF001
+    assert app._should_skip_render(view) is True                 # noqa: SLF001
+
+    changed = build_views(desktop_app.demo_snapshot())["account"]
+    assert app._should_skip_render(changed) is False             # noqa: SLF001
+    app._rendered_narrow = True                                  # 宽度档位变了 → 必须重排
+    assert app._should_skip_render(view) is False                # noqa: SLF001
+
+
+def test_refresh_engine_has_a_single_timer_and_no_pile_up():
+    """「多个刷新卡的么」：自动刷新只有**一个** ``after`` 定时器，且上一轮没回来不叠请求。"""
+    import inspect
+
+    source = inspect.getsource(desktop_app.DesktopApp._schedule_auto_refresh)
+    assert "after(" in source and "_cancel_auto_refresh()" in source, \
+        "排下一次前必须取消旧的（单定时器）"
+    tick = inspect.getsource(desktop_app.DesktopApp._auto_refresh_tick)
+    assert "busy" in tick and "self._schedule_auto_refresh()" in tick, \
+        "忙时不发新请求，但无论如何要排下一次（不堆叠、不断链）"
