@@ -29,7 +29,8 @@ from typing import Any, Mapping
 from .access import mask_address
 
 __all__ = ["UNREADABLE", "UNSUBMITTED", "STATUS_TEXT", "CHAIN_HINT", "cooldown_active",
-           "short_state", "status_text", "submit_blocker", "submit_message", "summarize"]
+           "cooldown_notice", "short_state", "status_text", "submit_blocker",
+           "submit_message", "summarize"]
 
 #: 云端**只收 Polygon（EVM）** 地址。理由（cloud-payout 2026-11-13 实测，三道硬闸）：
 #: ① 服务端 ``CHAIN_ID=polygon``；② 表约束 ``payout_addresses_chain_ck CHECK (chain_id
@@ -154,16 +155,32 @@ def summarize(data: Mapping[str, Any] | None, *, now: datetime | None = None) ->
     return "云端：" + "．".join(parts)
 
 
-def submit_message(data: Mapping[str, Any] | None) -> str:
-    """提交成功后的 toast 文案：只复述服务端回的状态，不写「已生效」。"""
+#: 冷却期的可执行说明（2026-11-18 客户要求：「更换 USDT 提交要提示冷却时间等返回」）。
+#: 云端规则：地址 24 小时内只能改一次；``cooldown_until`` 就是「下一次能改」的时刻。
+def cooldown_notice(data: Mapping[str, Any] | None, *, now: datetime | None = None) -> str:
+    """``cooldown_until`` → 「可再改时间 …（北京/本地时间由调用方格式化）…」；无冷却给空串。"""
+    if not isinstance(data, Mapping):
+        return ""
+    raw = str(data.get("cooldown_until") or "").strip()
+    if not raw:
+        return ""
+    prefix = "冷却中" if cooldown_active(data, now=now) else "下次可改时间"
+    return prefix + "：" + raw
+
+
+def submit_message(data: Mapping[str, Any] | None, *, now: datetime | None = None) -> str:
+    """提交成功后的 toast 文案：只复述服务端回的状态（含冷却期），不写「已生效」。"""
     row = data if isinstance(data, Mapping) else {}
     status = str(row.get("status") or "").strip().lower()
+    extra = cooldown_notice(row, now=now)
+    tail = ("（" + extra + "；此刻不能再次修改）" if cooldown_active(row, now=now)
+            else ("（" + extra + "）" if extra else ""))
     if status == "whitelisted":
-        return "已提交到云端：收款地址已生效。"
+        return "已提交到云端：收款地址已生效。" + tail
     if status == "pending":
-        return "已提交到云端：待审核（审核通过后生效，页面会显示审核结果）。"
+        return "已提交到云端：待审核（审核通过后生效，页面会显示审核结果）。" + tail
     if status == "rejected":
-        return "已提交到云端，但云端判定「已拒绝」：按提示改地址后重新提交。"
+        return "已提交到云端，但云端判定「已拒绝」：按提示改地址后重新提交。" + tail
     if status == "revoked":
-        return "已提交到云端，但云端状态是「已撤销」：确认地址归属后重新提交。"
-    return "已提交到云端：云端未返回状态，点「刷新」核对（不替你判断是否生效）。"
+        return "已提交到云端，但云端状态是「已撤销」：确认地址归属后重新提交。" + tail
+    return "已提交到云端：云端未返回状态，点「刷新」核对（不替你判断是否生效）。" + tail

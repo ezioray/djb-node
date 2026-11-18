@@ -108,6 +108,22 @@ BIND_CODE_HINT = "；绑定码一次性、10 分钟有效——请到网页端�
 _BIND_CODE_REASONS = ("binding_code_expired", "binding_code_mismatch", "40905", "过期", "失效")
 
 
+def _cooldown_suffix(controller: Any, exc: Any) -> str:
+    """失败文案后缀：冷却类错误补上「可再改时间 X（来自云端上一轮返回）」。"""
+    from . import payout as payout_mod
+
+    text = str(getattr(exc, "reason", "") or "") + " " + str(getattr(exc, "hint", "") or "")
+    if "冷却" not in text and "cooldown" not in text:
+        return ""
+    try:
+        access = controller.snapshot.get("access") or {}
+        row = ((access.get("payout") or {}).get("data")) or {}
+    except Exception:                              # 快照还没取过：不编造时刻
+        return ""
+    notice = payout_mod.cooldown_notice(row)
+    return ("；云端记录：" + notice) if notice else ""
+
+
 def _bind_failure_hint(text: str) -> str:
     """只有「码本身过期/不匹配」才追加重新生成的引导；网络/权限错不加（免得误导）。"""
     lowered = str(text or "")
@@ -601,7 +617,11 @@ class DesktopController:
             data = handler(address)
         except ProviderError as exc:
             hint = ("；" + exc.hint) if exc.hint else ""
-            return ActionResult("提交失败：" + exc.reason + hint + "（地址未变更）", ok=False)
+            # 2026-11-18 客户要求：**更换**收款地址被冷却挡住时，必须把「什么时候能再改」
+            # 说出来。云端 409 只回「24h 冷却未结束」（不带时刻），而本机上一轮 GET 已经
+            # 拿到了 cooldown_until —— 现成的事实不许浪费。
+            return ActionResult("提交失败：" + exc.reason + hint + _cooldown_suffix(self, exc)
+                                + "（地址未变更）", ok=False)
         except Exception as exc:                   # 数据层理论上有归一，兜底不冒栈
             return ActionResult("提交失败（" + type(exc).__name__ + "）；地址未变更。", ok=False)
         return ActionResult(payout_mod.submit_message(data), ok=True)
@@ -697,7 +717,9 @@ class DesktopController:
 
         if flow.state == "approved":
             # 绑定成功后重新取数：绑定状态/收款面板都要立刻反映
-            return ActionResult("绑定成功：这台电脑已经绑到你的账户（" + flow.user_code + "）",
+            return ActionResult("绑定成功：这台电脑已经绑到你的账户（" + flow.user_code + "）"
+                                "（USDT 收款地址是另一件事：在本页「② 提交 USDT 收款地址」"
+                                "里单独提交才生效）",
                                 effect="refresh", payload=flow.as_dict())
         if flow.state == "unavailable":
             return ActionResult(flow_mod.NOT_OPEN_TEXT + "（" + (flow.reason or "云端没有响应")
@@ -1184,7 +1206,11 @@ class DesktopController:
             return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
                                 + "；本机凭据未改动。", ok=False)
         self.request_refresh(None)
-        return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。", effect="refresh")
+        # D6（2026-11-18）：绑定**不含**收款地址。客户把地址填在同一页，绑定成功后以为
+        # 地址也一起提交了，结果云端仍是「尚未提交」。绑定成功的这句话必须把两件事分开。
+        return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。"
+                            "（USDT 收款地址是**另一件事**：在本页「② 提交 USDT 收款地址」"
+                            "里单独点一次「提交收款地址到云端」才生效）", effect="refresh")
 
     def _act_account_open_web(self, *, confirm=None) -> ActionResult:
         """在系统浏览器打开网页端（只给地址与动作，不在 controller 里碰 GUI）。"""

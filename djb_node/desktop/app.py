@@ -345,6 +345,8 @@ class DesktopApp:
         #: D4：粘住的失败提示（非空时 ``_update_status`` 不许用常规状态行覆盖它）
         self._sticky_error: str = ""
         self._sticky_job: Any = None
+        #: D5：刷新被「已有刷新在跑」吃掉时记在这里，等这一轮结束后补一次
+        self._refresh_deferred: Any = None
         self._root.title(title)
         # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
         try:
@@ -1151,6 +1153,7 @@ class DesktopApp:
         quiet = bool(getattr(self, "_refresh_quiet", False))
         view = self._controller.apply_refresh(fresh, sections=sections, error=error,
                                              quiet=quiet)
+        self._consume_deferred_refresh()          # D5：补上被丢弃的那次刷新
         # RC15-039 复核 M1：**派发时判过，落地时还要再判一次**。
         # 派发到落地之间的几百毫秒里客户可能刚开始打字；这时重画会把输入框刷回旧值，
         # 还会顺手把 `_entry_initial` 一起刷新——"有改动"的证据被抹掉，下一轮继续冲。
@@ -1172,6 +1175,47 @@ class DesktopApp:
         if duration and message.startswith("已刷新"):
             message += "（用时 %.1f s）" % duration
         self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
+
+    def _show_payout_dialog(self, text: str, *, ok: bool) -> None:
+        """收款地址提交结果的模态提示（失败用 warning，成功用 info）。
+
+        设计取舍：Tk 的 messagebox 在没有显示环境（单测 / 截图脚本 / Xvfb 缺失）会抛
+        TclError——那种情况下**只保留状态条**，绝不因为「弹不出来」把结果弄丢，也绝不
+        让异常冒到事件循环里把窗口打死。
+        """
+        root = getattr(self, "_root", None)
+        if root is None or not callable(getattr(root, "after", None)):
+            return                                   # 无事件循环（测试 / headless）
+        try:
+            from tkinter import messagebox
+        except Exception:                            # pragma: no cover - 极简 Tk
+            return
+        title = "DJB / 收款地址提交成功" if ok else "DJB / 收款地址没提交成功"
+        try:
+            if ok:
+                messagebox.showinfo(title, text, parent=root)
+            else:
+                messagebox.showwarning(title, text, parent=root)
+        except Exception:                            # pragma: no cover - 无显示环境
+            return
+
+    def _consume_deferred_refresh(self) -> None:
+        """把「提交成功后没刷成」的那次刷新补上（D5）。
+
+        ``RefreshWorker.start`` 忙时**丢弃**请求，因此不能只靠一次派发：记下 sections，
+        这一轮结束后再试；仍在忙就 300ms 后重试（有界：只重试到成功一次为止）。
+        """
+        sections = getattr(self, "_refresh_deferred", None)
+        if sections is None:
+            return
+        worker = getattr(self, "_refresh_worker", None)
+        if worker is not None and getattr(worker, "busy", False):
+            root = getattr(self, "_root", None)
+            if callable(getattr(root, "after", None)):
+                root.after(300, self._consume_deferred_refresh)
+            return
+        self._refresh_deferred = None
+        self._request_refresh_async(sections)
 
     def _note_skipped_render(self) -> None:
         """落地时发现新输入 → 只留一句话，不重画（同一次跳过只念一遍，别每 10 秒吵一次）。"""
@@ -1312,17 +1356,32 @@ class DesktopApp:
 
     def _apply_payout(self, result: Any, error: BaseException | None,
                       sections: Any = None) -> None:
-        """结果落地（主线程）：先 toast 说清成败，再异步重拉云端状态（GET 也不在主线程）。"""
+        """结果落地（主线程）：先弹窗 + toast 说清成败，再异步重拉云端状态。
+
+        2026-11-18 客户要求：「更换 USDT 提交要提示冷却时间等返回和弹窗」。收款地址是
+        钱相关的一次性动作，服务端回什么（待审核 / 冷却到什么时候 / 哪种拒绝）必须让
+        客户在**看得见、停得住**的地方读完——所以除了状态条，还给一个模态提示框。
+        """
         if error is not None:
-            self._toast("提交失败（" + type(error).__name__ + "）；地址未变更", ok=False)
+            text = "提交失败（" + type(error).__name__ + "）；地址未变更"
+            ok = False
         elif result is None:
-            self._toast("提交失败：没有拿到结果；地址未变更", ok=False)
+            text = "提交失败：没有拿到结果；地址未变更"
+            ok = False
         else:
-            self._toast(str(getattr(result, "message", "") or "提交完成"),
-                        ok=bool(getattr(result, "ok", False)))
+            text = str(getattr(result, "message", "") or "提交完成")
+            ok = bool(getattr(result, "ok", False))
+        self._toast(text, ok=ok)
+        self._show_payout_dialog(text, ok=ok)
+        # D5（2026-11-18）：POST 成功后必须让卡片追上来。旧实现遇到「已有刷新在跑」
+        # 就直接放弃这次刷新（RefreshWorker.start 忙时丢弃请求）⇒ 卡片停在提交前的
+        # 「尚未提交」，客户看到的却是「刚提交成功」，于是再点一次（真机 11:00:33 /
+        # 11:00:49 两次 POST 就是这么来的）。现在改成「记下来，这一轮结束立刻补」。
         refresh = getattr(self, "_refresh_worker", None)
         if refresh is None or not getattr(refresh, "busy", False):
             self._request_refresh_async(("access",))
+        else:
+            self._refresh_deferred = ("access",)
 
     # ── 探针（RC14 D）：「立即探测」也要在 worker 里跑（网络 10 s 级）
     def _ensure_probe_worker(self) -> Any:
@@ -2091,10 +2150,38 @@ class DesktopApp:
         for card in view.rail:
             self._render_rail_card(right, card)
         if view.actions:
-            bar = tk.Frame(left, background=dual.color("bg"))
-            bar.pack(fill="x", pady=(2, 0))
-            for action in view.actions:
+            self._render_action_bar(left, view.actions, pady=(2, 0))
+
+    def _render_action_bar(self, parent: Any, actions: Any, *,
+                           pady: tuple[int, int] = (0, 0)) -> None:
+        """动作栏。D6：带 ``group`` 的动作各自成块（小标题 + 独立一行按钮）。
+
+        客户原话「UI 上拆分绑定节点和提交 USDT 地址可以么，隔离两个动作」——原来整页只有
+        一条按钮栏，用户填完地址顺手点了「绑定网页端」，会以为地址跟着提交了。现在两组
+        之间有小标题和间距，按错的可能性肉眼可见地降低。
+        """
+        tk = self._tk
+        from .views import action_groups
+
+        groups = action_groups(actions)
+        if not any(title for title, _ in groups):
+            # 老行为（无分组）：一条栏，逐字节等价
+            bar = tk.Frame(parent, background=dual.color("bg"))
+            bar.pack(fill="x", pady=pady)
+            for action in actions:
                 self._render_action(bar, action)
+            return
+        wrap = tk.Frame(parent, background=dual.color("bg"))
+        wrap.pack(fill="x", pady=pady)
+        for title, members in groups:
+            if title:
+                tk.Label(wrap, text=title, font=self._fonts.sans(self._kit.px("micro"), bold=True),
+                         foreground=dual.color("muted_text"), background=dual.color("bg"),
+                         anchor="w").pack(fill="x", pady=(6, 2))
+            row = tk.Frame(wrap, background=dual.color("bg"))
+            row.pack(fill="x")
+            for action in members:
+                self._render_action(row, action)
 
     def _render_hero(self, parent: Any, hero: Hero) -> None:
         """状态主卡：左「标题 + 说明 + 运行时长 + 动作」，右 125px 仪表环，下面四指标。"""
@@ -2325,10 +2412,7 @@ class DesktopApp:
         if view.fields:
             self._render_fields(view.fields, view.key)
         if view.actions:
-            bar = tk.Frame(self._body, background=dual.color("bg"))
-            bar.pack(fill="x", pady=(0, 12))
-            for action in view.actions:
-                self._render_action(bar, action)
+            self._render_action_bar(self._body, view.actions, pady=(0, 12))
         for item in view.filters:                    # RC15-039 #5：表格上方的下拉筛选
             self._render_filter(item)
         if view.table is not None:

@@ -218,3 +218,138 @@ def test_account_view_keeps_plain_hint_when_record_matches():
 
 if __name__ == "__main__":                                    # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ─────────────────────────────────────── D5/D6（2026-11-18 第二次报障）
+def test_bind_success_says_payout_is_a_separate_action():
+    """客户把地址填在同一页 → 绑定成功后以为地址一起提交了（云端仍「尚未提交」）。
+    绑定成功的文案必须当场把两件事分开。"""
+    controller = DesktopController(
+        FakeDataSource({"account": {"profile": {}, "security": {}, "note": ""}}, source="test"),
+        cli=lambda argv: {"ok": True}, ask_code=lambda: "code-1")
+    result = controller.action("account.bind")
+    assert result.ok is True
+    assert "USDT" in result.message and "单独" in result.message
+
+
+def test_account_page_actions_are_grouped_into_two_blocks():
+    """D6：账户页的「绑定节点」与「提交 USDT 收款地址」必须是两个独立动作区。"""
+    base = desktop_app.demo_snapshot()
+    sections = dict(base.sections)
+    access = dict(base.get("access") or {})
+    access["binding"] = {"bound": False}           # 未绑定 → 绑定入口可见（真实场景）
+    sections["access"] = access
+    view = build_views(ds.Snapshot(sections, fetched_at=base.fetched_at,
+                                   source="test"))["account"]
+    from djb_node.desktop.views import GROUP_BIND, GROUP_PAYOUT, action_groups
+
+    groups = action_groups(view.actions)
+    titles = [title for title, _ in groups if title]
+    assert GROUP_BIND in titles and GROUP_PAYOUT in titles
+    bind_keys = [a.key for title, members in groups if title == GROUP_BIND for a in members]
+    payout_keys = [a.key for title, members in groups if title == GROUP_PAYOUT for a in members]
+    assert "account.bind" in bind_keys
+    assert payout_keys == ["account.submit_payout"]
+    assert not (set(bind_keys) & set(payout_keys)), "两块不许共用动作"
+
+
+def test_action_groups_keeps_legacy_single_bar_when_ungrouped():
+    """没写 group 的页面仍是老行为（一条按钮栏，不插标题）。"""
+    from djb_node.desktop.views import Action, action_groups
+
+    groups = action_groups([Action("a", "A"), Action("b", "B")])
+    assert groups == [("", [groups[0][1][0], groups[0][1][1]])]
+
+
+def test_payout_refresh_is_deferred_when_refresh_busy():
+    """D5：POST 成功后的刷新被「已有刷新在跑」丢弃 → 卡片停在「尚未提交」（真机两次
+    重复 POST）。现在必须记下来，等这一轮结束再补。"""
+    app = _bare_app()
+    app._refresh_deferred = None                                  # noqa: SLF001
+
+    class _Busy:
+        busy = True
+        last_duration_s = 0.0
+        started = []
+
+        def start(self, sections=None):                           # noqa: ANN001 - 桩
+            self.started.append(sections)
+            return True
+
+    busy = _Busy()
+
+    class _C:
+        message = ""
+
+        def submit_payout(self, address):                         # noqa: ANN001 - 桩
+            from djb_node.desktop.controller import ActionResult
+            return ActionResult("已提交收款地址（待审核）", ok=True)
+
+        def apply_refresh(self, *args, **kwargs):                 # noqa: ANN001 - 桩
+            return build_views(desktop_app.demo_snapshot())["account"]
+
+    app._controller = _C()                                        # noqa: SLF001
+    app._refresh_worker = busy                                    # noqa: SLF001
+    app._ensure_refresh_worker = lambda: busy                     # noqa: SLF001
+    app._render = lambda view: None                               # noqa: SLF001
+    app._apply_payout(None, None)                                 # 提交失败的兜底路径也会补刷
+
+    assert app._refresh_deferred == ("access",), "忙时被丢弃的刷新必须记下来"  # noqa: SLF001
+
+    busy.busy = False
+    app._consume_deferred_refresh()                                # noqa: SLF001
+    assert busy.started == [("access",)]
+    assert app._refresh_deferred is None                           # noqa: SLF001
+
+
+# ─────────────────────────────────────── D7（2026-11-18 第三次报障）
+def test_submit_message_surfaces_cooldown_window():
+    """「更换 USDT 提交要提示冷却时间」：成功回执里带上可再改时刻。"""
+    from djb_node.desktop import payout as payout_mod
+
+    future = "2099-01-01T00:00:00Z"
+    text = payout_mod.submit_message({"address": "0x" + "a" * 40, "status": "pending",
+                                      "cooldown_until": future})
+    assert "待审核" in text
+    assert "2099-01-01T00:00:00Z" in text and "冷却中" in text
+
+
+def test_cooldown_failure_names_the_deadline_from_last_snapshot():
+    """冷却挡住**更换**时，云端 409 只回「24h 冷却未结束」；本机上一轮 GET 已知
+    cooldown_until —— 失败文案必须把它写出来（否则客户只能猜「什么时候能改」）。"""
+    snapshot = ds.Snapshot({"access": {"payout": {"ok": True, "data": {
+        "address": "0x" + "a" * 40, "status": "pending",
+        "cooldown_until": "2099-01-01T00:00:00Z"}}}}, source="test")
+
+    class _Source(ds.FakeDataSource):
+        def submit_payout_address(self, address, label=""):   # noqa: ANN001 - 桩
+            raise ProviderError("地址变更 24h 冷却未结束（409）",
+                                hint="等冷却结束再改")
+
+    controller = DesktopController(_Source({"account": {}}, source="test"),
+                                   cli=lambda argv: {"ok": True},
+                                   ask_code=lambda: "x")
+    controller._snapshot = snapshot                              # noqa: SLF001 - 最小装配
+    result = controller.submit_payout("0x" + "a" * 40)
+    assert result.ok is False
+    assert "2099-01-01T00:00:00Z" in result.message, "必须说出可再改时间"
+
+
+def test_payout_result_is_shown_in_a_dialog():
+    """收款地址提交结果要给模态提示（客户不会盯着状态条）。"""
+    app = _bare_app()
+    shown: list[tuple[str, bool]] = []
+    app._show_payout_dialog = lambda text, ok: shown.append((text, ok))  # noqa: SLF001
+    app._refresh_worker = None                                   # noqa: SLF001
+    app._request_refresh_async = lambda sections=None: None       # noqa: SLF001
+    app._controller = type("C", (), {
+        "submit_payout": lambda self, address: None,
+        "message": "",
+    })()                                                         # noqa: SLF001
+
+    from djb_node.desktop.controller import ActionResult
+    app._apply_payout(ActionResult("已提交到云端：待审核。", ok=True), None)   # noqa: SLF001
+    assert shown and shown[0][1] is True and "待审核" in shown[0][0]
+
+    app._apply_payout(None, RuntimeError("boom"))                 # noqa: SLF001
+    assert shown[-1][1] is False and "地址未变更" in shown[-1][0]
