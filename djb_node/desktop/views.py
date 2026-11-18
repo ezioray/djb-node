@@ -2186,12 +2186,23 @@ def _account(snapshot: Snapshot) -> View:
     verify_state = str(update.get("verify_state") or "")
     state_text = UPDATE_STATE_TEXT.get(verify_state) or (
         "尚未检查过" if not verify_state else verify_state)
+    # D2（2026-11-18 客户报障）：版本卡必须写**实际在跑的程序版本**。
+    # 旧实现读 ``current_version``（= 安装记录），手工解压换包不会写记录，于是
+    # 侧栏 v0.3.11 / 本条 0.3.0 自相矛盾。记录值只在提示里出现（并且明说已校正），
+    # 后端字段 ``package_version`` / ``install_record_version`` 见 ``update.status()``。
+    package_version = str(update.get("package_version") or update.get("current_version") or "")
+    recorded_version = str(update.get("install_record_version") or "")
+    record_stale = bool(package_version and recorded_version
+                        and recorded_version != package_version)
+    version_hint = (str(update.get("channel") or "") + " 渠道 · "
+                    + (str(update.get("edition") or "") or "本机"))
+    if record_stale:
+        version_hint += "（安装记录为 " + recorded_version + "，已按实际程序显示）"
     fields.extend([
-        Field("当前版本", str(update.get("current_version") or "暂不可用"),
+        Field("当前版本", package_version or "暂不可用",
               key="update_version",
-              hint=str(update.get("channel") or "") + " 渠道 · "
-                   + (str(update.get("edition") or "") or "本机"),
-              tone="muted"),
+              hint=version_hint,
+              tone="amber" if record_stale else "muted"),
         Field("上次检查", checked_at or "还没检查过", key="update_checked_at"),
         Field("上次结果", (update_unavailable or state_text), key="update_state",
               hint=str(update.get("hint") or ""),

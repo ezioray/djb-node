@@ -269,6 +269,12 @@ class Daemon:
                                     channel=self.config.update_channel,
                                     client_version=facts.CLIENT_VERSION, http=self.http,
                                     config=self.config, edition=self.config.edition, now=now)
+        # D2：启动自检——手工解压换包不写安装记录，界面「当前版本」会一直停在旧值。
+        # 只读＋一次 UPDATE，失败不拦启动（记录不准不该让节点起不来）。
+        try:
+            self.update.reconcile_install_record()
+        except Exception:                            # pragma: no cover - 防御
+            log.exception("daemon.update_reconcile_failed")
         self.server = LocalApiServer(self, token=self.token, port=self.port, http=self.http,
                                         settings=self.config.extra)
         self._stop_event = threading.Event()

@@ -101,6 +101,19 @@ class LocalControlChannel:
         return ControlOutcome(result.verified, result.message, result.state)
 
 
+#: 绑定码一次性、10 分钟有效（``supply.BINDING_CODE_TTL_S``）。失败文案必须把
+#: 「下一步做什么」写清楚：2026-11-18 客户报障时服务端确实回了「绑定码已过期」，
+#: 但客户端只在状态条闪一行小字，客户看到的是「点 OK 没反应」。
+BIND_CODE_HINT = "；绑定码一次性、10 分钟有效——请到网页端「节点」页重新生成后再粘贴"
+_BIND_CODE_REASONS = ("binding_code_expired", "binding_code_mismatch", "40905", "过期", "失效")
+
+
+def _bind_failure_hint(text: str) -> str:
+    """只有「码本身过期/不匹配」才追加重新生成的引导；网络/权限错不加（免得误导）。"""
+    lowered = str(text or "")
+    return BIND_CODE_HINT if any(word in lowered for word in _BIND_CODE_REASONS) else ""
+
+
 @dataclass
 class DesktopController:
     """13 视图的状态机：唯一入口 ``show`` / ``action`` / ``refresh``。"""
@@ -1160,12 +1173,15 @@ class DesktopController:
         try:
             payload = self.cli(["auth", "--bind", code])
         except ProviderError as exc:
-            return ActionResult("绑定未成功：" + exc.reason + "；本机凭据未改动。", ok=False)
+            reason = str(exc.reason or "")
+            return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
+                                + "；本机凭据未改动。", ok=False)
         except Exception as exc:
             return ActionResult("绑定未成功（" + type(exc).__name__ + "）；本机凭据未改动。",
                                 ok=False)
         if isinstance(payload, Mapping) and payload.get("ok") is False:
-            return ActionResult("绑定未成功：" + str(payload.get("error") or "服务端拒绝")
+            reason = str(payload.get("error") or "服务端拒绝")
+            return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
                                 + "；本机凭据未改动。", ok=False)
         self.request_refresh(None)
         return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。", effect="refresh")

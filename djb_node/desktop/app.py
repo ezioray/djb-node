@@ -82,6 +82,13 @@ AUTO_IDLE_S = 60
 #: 也不该继承上一份错误——所以名单是**白名单**，不是「除黑名单外都清」。
 FORM_EFFECTS = ("access", "payout_submit")
 
+#: D4（2026-11-18 客户报障「点 OK 没反应」）：失败提示的存活时间。
+#:
+#: 旧实现 ``_toast`` 只把文案写进状态条，下一轮刷新（可见时 10s）就用
+#: ``_status_line()`` 覆写 ⇒ 客户还没看到就没了。失败文案现在进 ``_sticky_error``，
+#: 由 ``_update_status`` 让位，并一直留到「下一次动作 / 换页 / 本秒数超时」。
+STICKY_ERROR_SECONDS = 120
+
 TOP_NAV_KEYS = VIEW_KEYS
 
 # ── IA 接线（第三轮）：侧栏 / 快捷键 / 窄窗下拉 / 页头眉标全部由 ``ia.py`` 驱动
@@ -335,6 +342,9 @@ class DesktopApp:
         self._field_errors: dict[str, str] = {}
         #: 当前已渲染视图（含贴上去的错误）；证据/测试读它判断「红字是否真的上屏」
         self._last_view: View | None = None
+        #: D4：粘住的失败提示（非空时 ``_update_status`` 不许用常规状态行覆盖它）
+        self._sticky_error: str = ""
+        self._sticky_job: Any = None
         self._root.title(title)
         # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
         try:
@@ -1034,6 +1044,7 @@ class DesktopApp:
             except ValueError:                       # pragma: no cover - 与 route 双保险
                 return self._controller.current()
         self._set_field_errors({})          # 切页清空上一页的字段红字（走查原话：跨页残留）
+        self._clear_sticky()                # D4：上一页的失败提示也不许跟到下一页
         self._render(view)
         self._sync_nav(key)
         self._update_status()
@@ -1731,7 +1742,11 @@ class DesktopApp:
     def _update_status(self) -> None:
         """把快照里的状态一次写进四处：状态条消息、状态徽标、身份块、页头「数据截至」。"""
         snapshot = self._controller.snapshot
-        self._status.configure(text=self._status_line())
+        # D4：失败提示粘住期间不许被「已连接 · …」这类常规状态行覆盖
+        sticky = getattr(self, "_sticky_error", "")
+        self._status.configure(
+            text=(sticky or self._status_line()),
+            foreground=dual.color("red" if sticky else "muted_text"))
         pill, tone = self._pill_text()
         try:
             self._state_pill.set_text(pill, tone)
@@ -3067,6 +3082,8 @@ class DesktopApp:
 
     # ── 动作
     def _on_action(self, key: str) -> None:
+        # D4：客户按了新动作 ⇒ 上一条失败提示可以退场（新的失败会重新粘上）
+        self._clear_sticky()
         for name, variable in list(self._vars.items()):
             try:
                 self._controller.set_draft(name, variable.get())
@@ -3231,7 +3248,55 @@ class DesktopApp:
             return
 
     def _toast(self, message: str, *, ok: bool = True) -> None:
-        self._status.configure(text=("✓ " if ok else "! ") + message)
+        """状态条播报一句话；**失败要粘住**（D4）。
+
+        为什么不能只 ``configure(text=…)``：``_update_status()`` 每轮刷新都会调，它用
+        ``_status_line()`` 写状态条，于是「! 绑定未成功：绑定码已过期…」在 10 秒内就
+        被「已连接 · …」盖掉——客户看到的就是「点 OK 没反应」（2026-11-18 真机复现）。
+        失败文案进 ``_sticky_error`` 后由 :meth:`_update_status` 让位，并用红色区分。
+        """
+        text = ("✓ " if ok else "! ") + str(message or "")
+        self._sticky_error = "" if ok else text
+        try:
+            self._status.configure(
+                text=text,
+                foreground=dual.color("muted_text" if ok else "red"))
+        except Exception:                          # pragma: no cover - 控件已销毁
+            return
+        self._arm_sticky_clear()
+
+    def _arm_sticky_clear(self) -> None:
+        """给粘住的失败提示排一个退场；没有事件循环（测试 / 截图 / 假 root）就跳过。"""
+        if not self._sticky_error:
+            return
+        root = getattr(self, "_root", None)        # 假 root（测试 / 无窗口）没有 after
+        after = getattr(root, "after", None)
+        cancel = getattr(root, "after_cancel", None)
+        if not callable(after) or not callable(cancel):
+            return
+        previous = getattr(self, "_sticky_job", None)
+        if previous is not None:
+            try:
+                cancel(previous)
+            except Exception:                      # pragma: no cover - 窗口已销毁
+                pass
+        try:
+            self._sticky_job = after(int(STICKY_ERROR_SECONDS * 1000), self._clear_sticky)
+        except Exception:                          # pragma: no cover - 窗口已销毁
+            self._sticky_job = None
+
+    def _clear_sticky(self) -> None:
+        """撤掉粘住的失败提示，把状态条交还给常规状态行（新动作 / 换页 / 超时）。"""
+        has_sticky = bool(getattr(self, "_sticky_error", ""))
+        self._sticky_job = None
+        self._sticky_error = ""
+        if not has_sticky:
+            return
+        try:
+            self._status.configure(text=self._status_line(),
+                                   foreground=dual.color("muted_text"))
+        except Exception:                          # pragma: no cover - 控件已销毁
+            pass
 
     def _confirm(self, message: str) -> bool:
         """二次确认（模态，键盘可达：Esc 取消，Enter 确认）。"""
