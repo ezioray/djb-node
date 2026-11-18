@@ -268,16 +268,18 @@ class TrayModel:
                 "pause", "暂停接单", TrayAction.PAUSE,
                 enabled=daemon_running and raw_state in _PAUSE_AVAILABLE_STATES)
 
-        # 基础 6 项；仅在**明确未绑定**时插入第 7 项「绑定网页端」（退出保持末位）。
+        # 基础 6 项；仅在**明确未绑定**时插入第 7 项「绑定网页端」。
+        # 2026-11-18：插入位置从第 5 位提到状态项之后——未绑定节点不能接单，
+        # 这是首个该做的动作，埋在「诊断包」后面等于没放（退出保持末位）。
         bind_items = () if bound is not False else (
             TrayMenuItem("bind", "绑定网页端", TrayAction.BIND, enabled=True),)
         items = (
             TrayMenuItem("status", status_label, TrayAction.OPEN_STATUS, enabled=True),
+            *bind_items,
             pause_item,
             TrayMenuItem("messages", "消息中心", TrayAction.OPEN_MESSAGES, enabled=True,
                          badge=_badge(unread, p0_unread)),
             TrayMenuItem("diagnose", "生成诊断包", TrayAction.DIAGNOSE, enabled=True),
-            *bind_items,
             TrayMenuItem("logs", "打开日志", TrayAction.OPEN_LOGS, enabled=True),
             TrayMenuItem("quit", "退出", TrayAction.QUIT, enabled=True),
         )

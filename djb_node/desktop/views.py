@@ -1903,7 +1903,7 @@ def _access(snapshot: Snapshot) -> View:
                          action="access.toggle_auto_refresh",
                          hint="页面可见时每 10 秒；最小化或空闲 60 秒；只读本机数据"),),
         actions=(Action("access.save", "保存并回读", primary=True),
-                 Action("access.copy_node_id", "复制节点 ID", enabled=bool(node_id),
+                 Action("access.copy_node_id", "复制节点标识", enabled=bool(node_id),
                         reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
                                 + _diag_hint(diag) + "）") if not node_id else ""),
                  Action("access.reload", "请求 daemon 重载"),

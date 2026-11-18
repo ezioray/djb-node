@@ -295,9 +295,11 @@ def test_copy_verify_url_copies_the_link(home, monkeypatch):
     assert result.effect == "copy" and result.payload.endswith("/activate")
 
 
-def test_flag_registered_with_three_fields_and_off_by_default():
+def test_flag_registered_with_three_fields_and_on_by_default():
+    # 2026-11-18：三端已上线，0.3.12 起默认开启；三字段（owner/expire_at/rollback_rule）
+    # 仍必须齐全——这是「可回滚」的前提，不是可选装饰。
     spec = facts.FEATURE_FLAGS[facts.DEVICE_FLOW_FLAG]
-    assert spec["default"] is False
+    assert spec["default"] is True
     for name in ("owner", "expire_at", "rollback_rule", "description"):
         assert str(spec.get(name) or "").strip(), name
     assert facts.DEVICE_FLOW_FLAG == "client.binding.device_flow.enabled"

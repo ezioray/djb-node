@@ -739,7 +739,9 @@ FEATURE_FLAGS["supply.attestation.enabled"] = {
 # ── RC14 C 设备码自动绑定（默认关闭：关 → 只显示「高级 → 手输绑定码」老入口，
 # 云端 N1–N4 端点保留但客户端不调用，可随时下线，无状态依赖）
 FEATURE_FLAGS["client.binding.device_flow.enabled"] = {
-    "default": False,
+    # 2026-11-18：三端（契约/云端/网页）设备授权流已全部上线，0.3.12 起默认开启。
+    # 回滚=置 false：客户端只显示「粘贴绑定码」老入口，云端端点保留但无调用。
+    "default": True,
     "owner": "lead",
     "expire_at": "2027-03-31",
     "rollback_rule": "置 false → 只显示「粘贴绑定码」老入口；N1–N4 端点保留但客户端不调用，"

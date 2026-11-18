@@ -872,6 +872,11 @@ def guidance(result: dict[str, Any] | None, *,
     if state == "eligible" and result.get("artifact", {}).get("size"):
         size = result["artifact"]["size"]
         detail_bits.append(str(round(float(size) / 1048576.0, 1)) + " MB")
+    if state == "eligible":
+        target = str(result.get("manifest_version") or "").strip()
+        if target:
+            # 只说「有可用更新」用户不知道差多少、什么时候生效；标题里直接写清。
+            title = f"有可用更新：{current or '当前版本'} → {target}（重启后生效）"
     url = ""
     if action == "download":
         base = str(web_console or facts.WEB_CONSOLE_URL or "").rstrip("/")
