@@ -4080,15 +4080,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     boot_line = ""
     daemon: Mapping[str, Any] | None = None
-    if not args.demo and not args.no_auto:
-        # 首启自举（2026-11-06 外部客户实测：装完只看到「云端未接通/本机未初始化」）
-        from ..bootstrap import ensure_ready, start_daemon, summary_text
-        boot = ensure_ready(home=args.home)
-        daemon = start_daemon(home=args.home)
-        boot_line = summary_text(boot, daemon)
-    # 自举结论（尤其 start_daemon 的 no-cli / timeout）要带进数据层：
+    # 2026-11-19 真机：首窗 6~15 s，客户以为「双击没反应」。
+    # onefile 解包本身约 6 s（改不了），自举再叠数秒（可以挪）——
+    # 所以**先建窗口、先画出来，再跑自举**，自举结论用 controller.set_boot() 回填后重画。
+    # 自举结论（尤其 start_daemon 的 no-cli / timeout）仍要带进数据层：
     # 「接入配置」页的「节点进程」字段靠它说出真因，而不是只说「daemon 未运行」
-    controller = make_controller(home=args.home, demo=args.demo, boot=daemon)
+    controller = make_controller(home=args.home, demo=args.demo, boot=None)
     try:
         # prefs_home 必须显式给：demo 数据源没有 home，不给就会把主题偏好写到真实 ~/.djb
         app = DesktopApp(controller, on_quit=lambda: None,
@@ -4100,12 +4097,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(HEADLESS_HINT + "（" + type(exc).__name__ + "）")
         return EXIT_HEADLESS
     app.show_view(args.view)
-    if boot_line:
-        # 自举结果写进状态栏：用户看得到"已自动初始化/已修正云端地址/节点已启动"
+    # 先把窗口真正映射到屏幕，再去做可能很慢的首启自举（否则观感是「双击没反应」）
+    try:
+        app._root.update()                                # noqa: SLF001 - 纯展示
+    except Exception:                                     # pragma: no cover - 纯展示
+        pass
+    if not args.demo and not args.no_auto:
+        # 首启自举（2026-11-06 外部客户实测：装完只看到「云端未接通/本机未初始化」）
         try:
-            app._toast(boot_line)                         # noqa: SLF001 - 同模块私有状态栏
-        except Exception:                                # pragma: no cover - 纯展示
-            pass
+            from ..bootstrap import ensure_ready, start_daemon, summary_text
+            boot = ensure_ready(home=args.home)
+            daemon = start_daemon(home=args.home)
+            boot_line = summary_text(boot, daemon)
+            controller.set_boot(daemon)
+        except Exception as exc:                          # 自举失败不许拖垮启动
+            boot_line = "首启自举失败（" + type(exc).__name__ + "）；界面可继续使用"
+        if boot_line:
+            # 自举结果写进状态栏：用户看得到"已自动初始化/已修正云端地址/节点已启动"
+            try:
+                app._toast(boot_line)                     # noqa: SLF001 - 纯展示
+                app.show_view(args.view)                  # 回填「节点进程」后重画本页
+            except Exception:                             # pragma: no cover - 纯展示
+                pass
     if args.export_text:
         code = _export_text(app, args.view)
         app.stop()
