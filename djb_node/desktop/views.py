@@ -314,6 +314,32 @@ class Action:
     reason: str = ""
     primary: bool = False
     nav: str = ""
+    #: 动作分组标题（D6，2026-11-18 客户要求「绑定节点」与「提交 USDT 地址」隔离成两块）。
+    #: 空串 = 不分组（0.3.11 行为：整页一条按钮栏）。渲染层按「分组变化」插一条小标题 +
+    #: 另起一行按钮，于是同一页也能有两个互不干扰的动作区。
+    group: str = ""
+
+
+#: D6（2026-11-18 客户要求）：账户页两个**互不干扰**的动作区标题。
+#: 「绑定节点」= 设备码/手输码；「提交 USDT 收款地址」= 单独一次 Payout 提交。
+GROUP_BIND = "① 绑定节点"
+GROUP_PAYOUT = "② 提交 USDT 收款地址（与绑定是两件事）"
+
+
+def action_groups(actions: Sequence[Action]) -> list[tuple[str, list[Action]]]:
+    """按 ``Action.group`` 把动作切成有序块（同组相邻的合在一块；空组名不插标题）。
+
+    D6：客户要求「绑定节点」和「提交 USDT 地址」是两个**互不干扰**的动作。此前整页
+    只有一条按钮栏，用户填完地址顺手点了「绑定网页端」，就会误以为地址一起提交了。
+    """
+    groups: list[tuple[str, list[Action]]] = []
+    for action in actions:
+        title = str(getattr(action, "group", "") or "")
+        if groups and groups[-1][0] == title:
+            groups[-1][1].append(action)
+        else:
+            groups.append((title, [action]))
+    return groups
 
 
 @dataclass(frozen=True)
@@ -1803,8 +1829,13 @@ def _payout_state(access: Mapping[str, Any]) -> dict[str, Any]:
     elif ok:
         hint = state
         meta = mask_address(str(row.get("address") or "")) or "—"
+        # 2026-11-18 owner 纠正：`cooldown_until` 是「可出款时间」（新地址 72h 冷却），
+        # **不是**「可再改时间」；改地址看 `changed_at + 24h`。两个时间点分开写。
         if payout_mod.cooldown_active(row):
-            meta += "．可再改时间 " + str(row.get("cooldown_until"))
+            meta += "．" + payout_mod.cooldown_notice(row)
+        change = payout_mod.change_notice(row)
+        if change:
+            meta += "．" + change
     else:
         hint = payout_mod.UNREADABLE
         meta = reason or "完成节点绑定后重试"
@@ -2160,14 +2191,15 @@ def _account(snapshot: Snapshot) -> View:
     # RC14 C 设备码：主按钮 = 「在浏览器确认绑定」（开关关着 → 只保留老的手输码入口）
     if device_on and can_bind:
         actions.append(Action("account.bind_device", "在浏览器确认绑定", primary=True,
-                              enabled=device_state not in ("pending",)))
+                              enabled=device_state not in ("pending",), group=GROUP_BIND))
         if device_state == "pending":
-            actions.append(Action("account.bind_device_cancel", "停止等待"))
+            actions.append(Action("account.bind_device_cancel", "停止等待", group=GROUP_BIND))
             if device.get("verify_url"):
-                actions.append(Action("account.copy_verify_url", "复制确认链接"))
+                actions.append(Action("account.copy_verify_url", "复制确认链接",
+                                      group=GROUP_BIND))
     if can_bind:
         actions.append(Action("account.bind", "绑定网页端" if not device_on else "手输绑定码",
-                             primary=not device_on))
+                             primary=not device_on, group=GROUP_BIND))
     # G1-2（RC14 P0）：2FA 不在本机做绑定 ⇒ ①禁用态 + 说清原因；②旁边给**真能点**的入口。
     # 旧实现是一颗可点的按钮，点下去只回一句「暂不可用」——客户会以为客户端坏了。
     actions.append(Action("account.enable_2fa", "启用双因素验证", enabled=False,
@@ -2186,12 +2218,23 @@ def _account(snapshot: Snapshot) -> View:
     verify_state = str(update.get("verify_state") or "")
     state_text = UPDATE_STATE_TEXT.get(verify_state) or (
         "尚未检查过" if not verify_state else verify_state)
+    # D2（2026-11-18 客户报障）：版本卡必须写**实际在跑的程序版本**。
+    # 旧实现读 ``current_version``（= 安装记录），手工解压换包不会写记录，于是
+    # 侧栏 v0.3.11 / 本条 0.3.0 自相矛盾。记录值只在提示里出现（并且明说已校正），
+    # 后端字段 ``package_version`` / ``install_record_version`` 见 ``update.status()``。
+    package_version = str(update.get("package_version") or update.get("current_version") or "")
+    recorded_version = str(update.get("install_record_version") or "")
+    record_stale = bool(package_version and recorded_version
+                        and recorded_version != package_version)
+    version_hint = (str(update.get("channel") or "") + " 渠道 · "
+                    + (str(update.get("edition") or "") or "本机"))
+    if record_stale:
+        version_hint += "（安装记录为 " + recorded_version + "，已按实际程序显示）"
     fields.extend([
-        Field("当前版本", str(update.get("current_version") or "暂不可用"),
+        Field("当前版本", package_version or "暂不可用",
               key="update_version",
-              hint=str(update.get("channel") or "") + " 渠道 · "
-                   + (str(update.get("edition") or "") or "本机"),
-              tone="muted"),
+              hint=version_hint,
+              tone="amber" if record_stale else "muted"),
         Field("上次检查", checked_at or "还没检查过", key="update_checked_at"),
         Field("上次结果", (update_unavailable or state_text), key="update_state",
               hint=str(update.get("hint") or ""),
@@ -2207,7 +2250,7 @@ def _account(snapshot: Snapshot) -> View:
         update_actions.append(Action("update.download", "去下载页手动下载", primary=True))
     actions.extend(update_actions)
     actions.append(Action("account.submit_payout", "提交收款地址到云端",
-                          enabled=payout["can_submit"],
+                          enabled=payout["can_submit"], group=GROUP_PAYOUT,
                           reason="" if payout["can_submit"] else
                           ("云端收款地址功能还没开放（等平台开启后再提交）"
                            if payout["disabled"] else

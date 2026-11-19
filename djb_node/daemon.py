@@ -269,6 +269,12 @@ class Daemon:
                                     channel=self.config.update_channel,
                                     client_version=facts.CLIENT_VERSION, http=self.http,
                                     config=self.config, edition=self.config.edition, now=now)
+        # D2：启动自检——手工解压换包不写安装记录，界面「当前版本」会一直停在旧值。
+        # 只读＋一次 UPDATE，失败不拦启动（记录不准不该让节点起不来）。
+        try:
+            self.update.reconcile_install_record()
+        except Exception:                            # pragma: no cover - 防御
+            log.exception("daemon.update_reconcile_failed")
         self.server = LocalApiServer(self, token=self.token, port=self.port, http=self.http,
                                         settings=self.config.extra)
         self._stop_event = threading.Event()
@@ -1277,6 +1283,9 @@ class Daemon:
             "capacity": self.upstreams.announce_capacity(
                 profile, now=now, relay=self._relay_capacity_targets(now)),
             "load": {"inflight": self._inflight, "queue_seconds": 0.0},
+            # D1（2026-11-18）：版本如实——心跳自述程序版本，云端只在变化时落库。
+            # 加性字段：老云端忽略未知键（spec ``additionalProperties: true``），零感知。
+            "client_version": facts.CLIENT_VERSION,
         }
         # M3：加性字段（开关关闭时不出现；云端忽略未知键，老版本零感知）
         machine = self._machine_payload()

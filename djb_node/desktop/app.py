@@ -82,6 +82,13 @@ AUTO_IDLE_S = 60
 #: 也不该继承上一份错误——所以名单是**白名单**，不是「除黑名单外都清」。
 FORM_EFFECTS = ("access", "payout_submit")
 
+#: D4（2026-11-18 客户报障「点 OK 没反应」）：失败提示的存活时间。
+#:
+#: 旧实现 ``_toast`` 只把文案写进状态条，下一轮刷新（可见时 10s）就用
+#: ``_status_line()`` 覆写 ⇒ 客户还没看到就没了。失败文案现在进 ``_sticky_error``，
+#: 由 ``_update_status`` 让位，并一直留到「下一次动作 / 换页 / 本秒数超时」。
+STICKY_ERROR_SECONDS = 120
+
 TOP_NAV_KEYS = VIEW_KEYS
 
 # ── IA 接线（第三轮）：侧栏 / 快捷键 / 窄窗下拉 / 页头眉标全部由 ``ia.py`` 驱动
@@ -335,6 +342,11 @@ class DesktopApp:
         self._field_errors: dict[str, str] = {}
         #: 当前已渲染视图（含贴上去的错误）；证据/测试读它判断「红字是否真的上屏」
         self._last_view: View | None = None
+        #: D4：粘住的失败提示（非空时 ``_update_status`` 不许用常规状态行覆盖它）
+        self._sticky_error: str = ""
+        self._sticky_job: Any = None
+        #: D5：刷新被「已有刷新在跑」吃掉时记在这里，等这一轮结束后补一次
+        self._refresh_deferred: Any = None
         self._root.title(title)
         # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
         try:
@@ -1034,7 +1046,8 @@ class DesktopApp:
             except ValueError:                       # pragma: no cover - 与 route 双保险
                 return self._controller.current()
         self._set_field_errors({})          # 切页清空上一页的字段红字（走查原话：跨页残留）
-        self._render(view)
+        self._clear_sticky()                # D4：上一页的失败提示也不许跟到下一页
+        self._render(view, force=True)      # 切页 = 显式意图：布局/焦点都要重来
         self._sync_nav(key)
         self._update_status()
         try:
@@ -1062,7 +1075,7 @@ class DesktopApp:
     def refresh_now(self) -> View:
         """同步刷新（阻塞到取数完成）：截图脚本 / 单测 / 无事件循环环境专用。"""
         view = self._controller.refresh()
-        self._render(view)
+        self._render(view, force=True)      # 显式「立即刷新」（截图脚本/单测要确定性重画）
         self._update_status()
         return view
 
@@ -1140,6 +1153,7 @@ class DesktopApp:
         quiet = bool(getattr(self, "_refresh_quiet", False))
         view = self._controller.apply_refresh(fresh, sections=sections, error=error,
                                              quiet=quiet)
+        self._consume_deferred_refresh()          # D5：补上被丢弃的那次刷新
         # RC15-039 复核 M1：**派发时判过，落地时还要再判一次**。
         # 派发到落地之间的几百毫秒里客户可能刚开始打字；这时重画会把输入框刷回旧值，
         # 还会顺手把 `_entry_initial` 一起刷新——"有改动"的证据被抹掉，下一轮继续冲。
@@ -1161,6 +1175,47 @@ class DesktopApp:
         if duration and message.startswith("已刷新"):
             message += "（用时 %.1f s）" % duration
         self._toast(message or "已刷新", ok=bool(message.startswith("已刷新")))
+
+    def _show_payout_dialog(self, text: str, *, ok: bool) -> None:
+        """收款地址提交结果的模态提示（失败用 warning，成功用 info）。
+
+        设计取舍：Tk 的 messagebox 在没有显示环境（单测 / 截图脚本 / Xvfb 缺失）会抛
+        TclError——那种情况下**只保留状态条**，绝不因为「弹不出来」把结果弄丢，也绝不
+        让异常冒到事件循环里把窗口打死。
+        """
+        root = getattr(self, "_root", None)
+        if root is None or not callable(getattr(root, "after", None)):
+            return                                   # 无事件循环（测试 / headless）
+        try:
+            from tkinter import messagebox
+        except Exception:                            # pragma: no cover - 极简 Tk
+            return
+        title = "DJB / 收款地址提交成功" if ok else "DJB / 收款地址没提交成功"
+        try:
+            if ok:
+                messagebox.showinfo(title, text, parent=root)
+            else:
+                messagebox.showwarning(title, text, parent=root)
+        except Exception:                            # pragma: no cover - 无显示环境
+            return
+
+    def _consume_deferred_refresh(self) -> None:
+        """把「提交成功后没刷成」的那次刷新补上（D5）。
+
+        ``RefreshWorker.start`` 忙时**丢弃**请求，因此不能只靠一次派发：记下 sections，
+        这一轮结束后再试；仍在忙就 300ms 后重试（有界：只重试到成功一次为止）。
+        """
+        sections = getattr(self, "_refresh_deferred", None)
+        if sections is None:
+            return
+        worker = getattr(self, "_refresh_worker", None)
+        if worker is not None and getattr(worker, "busy", False):
+            root = getattr(self, "_root", None)
+            if callable(getattr(root, "after", None)):
+                root.after(300, self._consume_deferred_refresh)
+            return
+        self._refresh_deferred = None
+        self._request_refresh_async(sections)
 
     def _note_skipped_render(self) -> None:
         """落地时发现新输入 → 只留一句话，不重画（同一次跳过只念一遍，别每 10 秒吵一次）。"""
@@ -1301,17 +1356,32 @@ class DesktopApp:
 
     def _apply_payout(self, result: Any, error: BaseException | None,
                       sections: Any = None) -> None:
-        """结果落地（主线程）：先 toast 说清成败，再异步重拉云端状态（GET 也不在主线程）。"""
+        """结果落地（主线程）：先弹窗 + toast 说清成败，再异步重拉云端状态。
+
+        2026-11-18 客户要求：「更换 USDT 提交要提示冷却时间等返回和弹窗」。收款地址是
+        钱相关的一次性动作，服务端回什么（待审核 / 冷却到什么时候 / 哪种拒绝）必须让
+        客户在**看得见、停得住**的地方读完——所以除了状态条，还给一个模态提示框。
+        """
         if error is not None:
-            self._toast("提交失败（" + type(error).__name__ + "）；地址未变更", ok=False)
+            text = "提交失败（" + type(error).__name__ + "）；地址未变更"
+            ok = False
         elif result is None:
-            self._toast("提交失败：没有拿到结果；地址未变更", ok=False)
+            text = "提交失败：没有拿到结果；地址未变更"
+            ok = False
         else:
-            self._toast(str(getattr(result, "message", "") or "提交完成"),
-                        ok=bool(getattr(result, "ok", False)))
+            text = str(getattr(result, "message", "") or "提交完成")
+            ok = bool(getattr(result, "ok", False))
+        self._toast(text, ok=ok)
+        self._show_payout_dialog(text, ok=ok)
+        # D5（2026-11-18）：POST 成功后必须让卡片追上来。旧实现遇到「已有刷新在跑」
+        # 就直接放弃这次刷新（RefreshWorker.start 忙时丢弃请求）⇒ 卡片停在提交前的
+        # 「尚未提交」，客户看到的却是「刚提交成功」，于是再点一次（真机 11:00:33 /
+        # 11:00:49 两次 POST 就是这么来的）。现在改成「记下来，这一轮结束立刻补」。
         refresh = getattr(self, "_refresh_worker", None)
         if refresh is None or not getattr(refresh, "busy", False):
             self._request_refresh_async(("access",))
+        else:
+            self._refresh_deferred = ("access",)
 
     # ── 探针（RC14 D）：「立即探测」也要在 worker 里跑（网络 10 s 级）
     def _ensure_probe_worker(self) -> Any:
@@ -1486,7 +1556,7 @@ class DesktopApp:
             view = getattr(self, "_last_view", None)
             if view is not None:
                 # 表格 tag 颜色、卡片 tone 都是渲染时取的：重画一次才真正换色
-                self._render(view)
+                self._render(view, force=True)          # 换肤：颜色要真的重取
                 tree = getattr(self, "_tree", None)
                 if tree is not None:
                     self._fit_columns(tree)
@@ -1644,7 +1714,7 @@ class DesktopApp:
         try:
             # 重画**同一份快照**：resize 不该顺手再拉一次数据（会白等网络，
             # 还可能撞上瞬时失败把「已停止」变成「状态未知」）。
-            self._render(view)
+            self._render(view, force=True)               # 宽度翻转：布局要重排
             tree = getattr(self, "_tree", None)
             if tree is not None:
                 self._fit_columns(tree)
@@ -1731,7 +1801,11 @@ class DesktopApp:
     def _update_status(self) -> None:
         """把快照里的状态一次写进四处：状态条消息、状态徽标、身份块、页头「数据截至」。"""
         snapshot = self._controller.snapshot
-        self._status.configure(text=self._status_line())
+        # D4：失败提示粘住期间不许被「已连接 · …」这类常规状态行覆盖
+        sticky = getattr(self, "_sticky_error", "")
+        self._status.configure(
+            text=(sticky or self._status_line()),
+            foreground=dual.color("red" if sticky else "muted_text"))
         pill, tone = self._pill_text()
         try:
             self._state_pill.set_text(pill, tone)
@@ -1900,15 +1974,44 @@ class DesktopApp:
             button.pack(side="left", padx=(0, 8))
         self._onboarding_panel = card
 
-    def _render(self, view: View) -> None:
+    def _should_skip_render(self, view: View) -> bool:
+        """这一版视图和屏幕上那版**一模一样**时，不重建控件（客户反馈「经常卡顿」）。
+
+        为什么值得单独一条：``_render`` 先 ``_clear()``（销毁本页全部控件，含 Treeview），
+        再逐块重建，最后把整棵树推给读屏（MSAA）。数据没变也照做的话，每 10 秒就有一次
+        「全量拆装 + 读屏重建」——在慢机器上就是肉眼可见的停顿。空转的重画只该更新
+        状态栏那点文字（那部分在 ``_update_status`` 里，与这里无关）。
+
+        宽度档位翻转（窄/宽、双列/单列）时**不能**跳过：布局本身变了。
+        """
+        previous = getattr(self, "_last_view", None)
+        if previous is None or previous != view:
+            return False
+        if getattr(self, "_body", None) is None:
+            return False                                   # 还没画过，必须画
+        try:
+            if self._rendered_narrow != self._is_narrow():
+                return False
+            if self._rendered_two_col != self._two_col():
+                return False
+        except Exception:                                  # pragma: no cover - 无窗口
+            return False
+        return True
+
+    def _render(self, view: View, *, force: bool = False) -> None:
         """按视图能力分派：带 hero/chart/rail 的（总览）走设计样双列，其余走通用卡片版面。
 
         RC15-039 #1：渲染前把**本页**的字段级错误贴上去（纯函数 ``with_field_errors``），
         渲染后把焦点送到第一个错误字段——客户点完「保存」不用自己找哪一行错了。
+
+        ``force=True``：换肤 / 换布局 / 显式重画（``show_view``）时不许走「内容没变就跳过」。
         """
         tk = self._tk
         kit = self._kit
-        view = with_field_errors(view, self._field_errors)
+        patched = with_field_errors(view, self._field_errors)
+        if not force and self._should_skip_render(patched):
+            return
+        view = patched
         self._last_view = view
         self._in_render = True
         self._rendered_narrow = self._is_narrow()
@@ -2076,10 +2179,38 @@ class DesktopApp:
         for card in view.rail:
             self._render_rail_card(right, card)
         if view.actions:
-            bar = tk.Frame(left, background=dual.color("bg"))
-            bar.pack(fill="x", pady=(2, 0))
-            for action in view.actions:
+            self._render_action_bar(left, view.actions, pady=(2, 0))
+
+    def _render_action_bar(self, parent: Any, actions: Any, *,
+                           pady: tuple[int, int] = (0, 0)) -> None:
+        """动作栏。D6：带 ``group`` 的动作各自成块（小标题 + 独立一行按钮）。
+
+        客户原话「UI 上拆分绑定节点和提交 USDT 地址可以么，隔离两个动作」——原来整页只有
+        一条按钮栏，用户填完地址顺手点了「绑定网页端」，会以为地址跟着提交了。现在两组
+        之间有小标题和间距，按错的可能性肉眼可见地降低。
+        """
+        tk = self._tk
+        from .views import action_groups
+
+        groups = action_groups(actions)
+        if not any(title for title, _ in groups):
+            # 老行为（无分组）：一条栏，逐字节等价
+            bar = tk.Frame(parent, background=dual.color("bg"))
+            bar.pack(fill="x", pady=pady)
+            for action in actions:
                 self._render_action(bar, action)
+            return
+        wrap = tk.Frame(parent, background=dual.color("bg"))
+        wrap.pack(fill="x", pady=pady)
+        for title, members in groups:
+            if title:
+                tk.Label(wrap, text=title, font=self._fonts.sans(self._kit.px("micro"), bold=True),
+                         foreground=dual.color("muted_text"), background=dual.color("bg"),
+                         anchor="w").pack(fill="x", pady=(6, 2))
+            row = tk.Frame(wrap, background=dual.color("bg"))
+            row.pack(fill="x")
+            for action in members:
+                self._render_action(row, action)
 
     def _render_hero(self, parent: Any, hero: Hero) -> None:
         """状态主卡：左「标题 + 说明 + 运行时长 + 动作」，右 125px 仪表环，下面四指标。"""
@@ -2310,10 +2441,7 @@ class DesktopApp:
         if view.fields:
             self._render_fields(view.fields, view.key)
         if view.actions:
-            bar = tk.Frame(self._body, background=dual.color("bg"))
-            bar.pack(fill="x", pady=(0, 12))
-            for action in view.actions:
-                self._render_action(bar, action)
+            self._render_action_bar(self._body, view.actions, pady=(0, 12))
         for item in view.filters:                    # RC15-039 #5：表格上方的下拉筛选
             self._render_filter(item)
         if view.table is not None:
@@ -3067,6 +3195,8 @@ class DesktopApp:
 
     # ── 动作
     def _on_action(self, key: str) -> None:
+        # D4：客户按了新动作 ⇒ 上一条失败提示可以退场（新的失败会重新粘上）
+        self._clear_sticky()
         for name, variable in list(self._vars.items()):
             try:
                 self._controller.set_draft(name, variable.get())
@@ -3231,7 +3361,55 @@ class DesktopApp:
             return
 
     def _toast(self, message: str, *, ok: bool = True) -> None:
-        self._status.configure(text=("✓ " if ok else "! ") + message)
+        """状态条播报一句话；**失败要粘住**（D4）。
+
+        为什么不能只 ``configure(text=…)``：``_update_status()`` 每轮刷新都会调，它用
+        ``_status_line()`` 写状态条，于是「! 绑定未成功：绑定码已过期…」在 10 秒内就
+        被「已连接 · …」盖掉——客户看到的就是「点 OK 没反应」（2026-11-18 真机复现）。
+        失败文案进 ``_sticky_error`` 后由 :meth:`_update_status` 让位，并用红色区分。
+        """
+        text = ("✓ " if ok else "! ") + str(message or "")
+        self._sticky_error = "" if ok else text
+        try:
+            self._status.configure(
+                text=text,
+                foreground=dual.color("muted_text" if ok else "red"))
+        except Exception:                          # pragma: no cover - 控件已销毁
+            return
+        self._arm_sticky_clear()
+
+    def _arm_sticky_clear(self) -> None:
+        """给粘住的失败提示排一个退场；没有事件循环（测试 / 截图 / 假 root）就跳过。"""
+        if not self._sticky_error:
+            return
+        root = getattr(self, "_root", None)        # 假 root（测试 / 无窗口）没有 after
+        after = getattr(root, "after", None)
+        cancel = getattr(root, "after_cancel", None)
+        if not callable(after) or not callable(cancel):
+            return
+        previous = getattr(self, "_sticky_job", None)
+        if previous is not None:
+            try:
+                cancel(previous)
+            except Exception:                      # pragma: no cover - 窗口已销毁
+                pass
+        try:
+            self._sticky_job = after(int(STICKY_ERROR_SECONDS * 1000), self._clear_sticky)
+        except Exception:                          # pragma: no cover - 窗口已销毁
+            self._sticky_job = None
+
+    def _clear_sticky(self) -> None:
+        """撤掉粘住的失败提示，把状态条交还给常规状态行（新动作 / 换页 / 超时）。"""
+        has_sticky = bool(getattr(self, "_sticky_error", ""))
+        self._sticky_job = None
+        self._sticky_error = ""
+        if not has_sticky:
+            return
+        try:
+            self._status.configure(text=self._status_line(),
+                                   foreground=dual.color("muted_text"))
+        except Exception:                          # pragma: no cover - 控件已销毁
+            pass
 
     def _confirm(self, message: str) -> bool:
         """二次确认（模态，键盘可达：Esc 取消，Enter 确认）。"""

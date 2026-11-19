@@ -101,6 +101,67 @@ class LocalControlChannel:
         return ControlOutcome(result.verified, result.message, result.state)
 
 
+#: 绑定码一次性、10 分钟有效（``supply.BINDING_CODE_TTL_S``）。失败文案必须把
+#: 「下一步做什么」写清楚：2026-11-18 客户报障时服务端确实回了「绑定码已过期」，
+#: 但客户端只在状态条闪一行小字，客户看到的是「点 OK 没反应」。
+BIND_CODE_HINT = "；绑定码一次性、10 分钟有效——请到网页端「节点」页重新生成后再粘贴"
+_BIND_CODE_REASONS = ("binding_code_expired", "binding_code_mismatch", "40905", "过期", "失效")
+
+
+def _cooldown_suffix(controller: Any, exc: Any) -> str:
+    """失败文案后缀：冷却类错误补上「可再改时间 X（来自云端上一轮返回）」。"""
+    from . import payout as payout_mod
+
+    text = str(getattr(exc, "reason", "") or "") + " " + str(getattr(exc, "hint", "") or "")
+    if "冷却" not in text and "cooldown" not in text:
+        return ""
+    try:
+        access = controller.snapshot.get("access") or {}
+        row = ((access.get("payout") or {}).get("data")) or {}
+    except Exception:                              # 快照还没取过：不编造时刻
+        return ""
+    # 「变更 24h 冷却」是**改地址**的门槛 → 用 change_notice；`cooldown_until` 是
+    # 「新地址 72h 准入冷却」（可出款时间），两者不同，2026-11-18 owner 抓到过混用。
+    notice = payout_mod.change_notice(row) or payout_mod.cooldown_notice(row)
+    return ("；云端记录：" + notice) if notice else ""
+
+
+#: 「这台节点已经绑在**别的**账户上」→ 必须先解绑（云端 INV-08）。2026-11-18 owner 要求
+#: 这类失败要说清「下一步是什么」，而不是把 409 原文丢给客户。
+_BIND_OTHER_ACCOUNT_REASONS = ("node_already_bound", "already_bound", "account_mismatch",
+                               "绑定其它账户", "已绑定其它账户")
+#: 「换账户冷却中」：**平台当前没有这条规则**，但客户端先按 reason 前缀认——
+#: 以后云端加冷却期（reason 形如 ``rebind_cooldown`` / ``binding_cooldown``，可带
+#: ``available_at``）时，老客户端也不需要再升级就能显示可再绑时间。
+_BIND_COOLDOWN_REASONS = ("rebind_cooldown", "binding_cooldown", "switch_cooldown",
+                          "换绑冷却", "更换账户冷却")
+BIND_SWITCH_HINT = ("；这台节点已经绑在**别的**账户上：先在网页端「节点」页解绑（或用本页"
+                    "「解绑这台电脑」），再用新账户生成新的绑定码；解绑后可以立即重绑，"
+                    "当前平台对更换账户没有等待期")
+
+
+def _bind_failure_hint(text: str, *, available_at: str = "") -> str:
+    """按失败原因给**下一步**：码过期 → 重新生成；已绑别的账户 → 先解绑；冷却 → 给时刻。"""
+    lowered = str(text or "")
+    if any(word in lowered for word in _BIND_COOLDOWN_REASONS):
+        when = str(available_at or "").strip()
+        tail = ("（可再绑时间：" + when + "）") if when else "（云端会返回可再绑时间）"
+        return "；更换账户冷却中" + tail + "，冷却结束后再生成新码"
+    if any(word in lowered for word in _BIND_OTHER_ACCOUNT_REASONS):
+        return BIND_SWITCH_HINT
+    if any(word in lowered for word in _BIND_CODE_REASONS):
+        return BIND_CODE_HINT
+    return ""
+
+
+def _bind_already_bound_message(bound_at: Any) -> str:
+    """「已经绑定该账户」的**成功**提示：重复绑定没有副作用，但要说清「本来就绑着」。"""
+    stamp = str(bound_at or "").strip()
+    tail = ("（绑定于 " + stamp + "）") if stamp else ""
+    return ("这台电脑本来就绑在你的账户上" + tail
+            + "，这次绑定没有产生新变化（重复绑定不会重复占用节点名额）。")
+
+
 @dataclass
 class DesktopController:
     """13 视图的状态机：唯一入口 ``show`` / ``action`` / ``refresh``。"""
@@ -588,7 +649,11 @@ class DesktopController:
             data = handler(address)
         except ProviderError as exc:
             hint = ("；" + exc.hint) if exc.hint else ""
-            return ActionResult("提交失败：" + exc.reason + hint + "（地址未变更）", ok=False)
+            # 2026-11-18 客户要求：**更换**收款地址被冷却挡住时，必须把「什么时候能再改」
+            # 说出来。云端 409 只回「24h 冷却未结束」（不带时刻），而本机上一轮 GET 已经
+            # 拿到了 cooldown_until —— 现成的事实不许浪费。
+            return ActionResult("提交失败：" + exc.reason + hint + _cooldown_suffix(self, exc)
+                                + "（地址未变更）", ok=False)
         except Exception as exc:                   # 数据层理论上有归一，兜底不冒栈
             return ActionResult("提交失败（" + type(exc).__name__ + "）；地址未变更。", ok=False)
         return ActionResult(payout_mod.submit_message(data), ok=True)
@@ -684,7 +749,9 @@ class DesktopController:
 
         if flow.state == "approved":
             # 绑定成功后重新取数：绑定状态/收款面板都要立刻反映
-            return ActionResult("绑定成功：这台电脑已经绑到你的账户（" + flow.user_code + "）",
+            return ActionResult("绑定成功：这台电脑已经绑到你的账户（" + flow.user_code + "）"
+                                "（USDT 收款地址是另一件事：在本页「② 提交 USDT 收款地址」"
+                                "里单独提交才生效）",
                                 effect="refresh", payload=flow.as_dict())
         if flow.state == "unavailable":
             return ActionResult(flow_mod.NOT_OPEN_TEXT + "（" + (flow.reason or "云端没有响应")
@@ -1157,18 +1224,40 @@ class DesktopController:
             return ActionResult("已取消绑定（没有输入绑定码）。", ok=False, effect="cancelled")
         if self.cli is None:
             return ActionResult("暂不可用（本机命令通道未接通）；绑定未执行。", ok=False)
+        # 2026-11-18 owner 要求：**已经绑在这个账户上**要有一句「本来就绑着」的提醒，
+        # 而不是和首绑成功一模一样。绑之前先记一眼当前绑定态（纯本地读快照，不发请求）。
+        was_bound, bound_at = self._bound_before_bind()
         try:
             payload = self.cli(["auth", "--bind", code])
         except ProviderError as exc:
-            return ActionResult("绑定未成功：" + exc.reason + "；本机凭据未改动。", ok=False)
+            reason = str(exc.reason or "")
+            return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
+                                + "；本机凭据未改动。", ok=False)
         except Exception as exc:
             return ActionResult("绑定未成功（" + type(exc).__name__ + "）；本机凭据未改动。",
                                 ok=False)
         if isinstance(payload, Mapping) and payload.get("ok") is False:
-            return ActionResult("绑定未成功：" + str(payload.get("error") or "服务端拒绝")
+            reason = str(payload.get("error") or "服务端拒绝")
+            return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
                                 + "；本机凭据未改动。", ok=False)
         self.request_refresh(None)
-        return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。", effect="refresh")
+        if was_bound:
+            return ActionResult(_bind_already_bound_message(bound_at), effect="refresh")
+        # D6（2026-11-18）：绑定**不含**收款地址。客户把地址填在同一页，绑定成功后以为
+        # 地址也一起提交了，结果云端仍是「尚未提交」。绑定成功的这句话必须把两件事分开。
+        return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。"
+                            "（USDT 收款地址是**另一件事**：在本页「② 提交 USDT 收款地址」"
+                            "里单独点一次「提交收款地址到云端」才生效）", effect="refresh")
+
+    def _bound_before_bind(self) -> tuple[bool, str]:
+        """读「绑之前」的绑定态：``(是否已绑, bound_at 原文)``；读不到就当没绑。"""
+        try:
+            access = self.snapshot.get("access") or {}
+            binding = access.get("binding") or {}
+            bound = bool(binding.get("bound")) or str(binding.get("state") or "") == "bound"
+            return bound, str(binding.get("bound_at") or "")
+        except Exception:
+            return False, ""
 
     def _act_account_open_web(self, *, confirm=None) -> ActionResult:
         """在系统浏览器打开网页端（只给地址与动作，不在 controller 里碰 GUI）。"""

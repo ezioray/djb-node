@@ -83,6 +83,9 @@ def test_start_registers_heartbeats_and_goes_online(paths, windows_control_usabl
         clock.advance(30)
         daemon.tick(clock())
         assert mock.heartbeats[-1]["runtime_state"] == "online"
+        # D1（2026-11-18）：心跳必须自述**程序版本**，云端据此刷新 nodes.client_version；
+        # 少了这一行，云端永远只认 register 时的旧版本（报障里「客户端 0.3.11 却被记成 0.3.0」）。
+        assert mock.heartbeats[-1]["client_version"] == facts.CLIENT_VERSION
         # 本机镜像只绑回环
         assert daemon.server.address[0] == "127.0.0.1"
         assert daemon.server.address[1] > 0

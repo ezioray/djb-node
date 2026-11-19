@@ -587,6 +587,11 @@ class UpdateManager:
             anchor_error = str(exc)
         resolved = update_source.resolve(self.source, edition=self.edition)
         return {"channel": self.channel, "current_version": install.version,
+                # D2（2026-11-18 客户报障）：``current_version`` 取的是**安装记录**，手工解压
+                # 换包不写它 ⇒ 0.3.11 的机器上界面写 0.3.0。下面两个键让读取方同时看到
+                # 「实际在跑的程序版本」与「记录值」，据此显示与校正（只加键，不动既有键）。
+                "package_version": str(facts.CLIENT_VERSION),
+                "install_record_version": install.version,
                 "recorded_current": state.current_version, "next_version": state.next_version,
                 "rollback_to": state.rollback_to, "verify_state": state.verify_state,
                 "bucket": install.bucket, "checked_at": state.checked_at,
@@ -597,6 +602,34 @@ class UpdateManager:
                 "signature": {**anchor_info, "available": anchor_available,
                               "error": anchor_error,
                               "mock": bool(self.mock_requested())}}
+
+    def reconcile_install_record(self) -> dict[str, Any]:
+        """把安装记录对齐到**实际在跑的程序版本**（D2）。
+
+        现象（2026-11-18 真机）：左下角侧栏 ``v0.3.11``，而「账户与安全」页版本卡写
+        「当前版本 0.3.0 · stable 渠道 · 本机」。不是显示 bug：``status()`` 的
+        ``current_version`` 取的是**安装记录**，而 0.3.0–0.3.10 在 Windows 上只能手工解压
+        换包（自动更新选包缺陷修在 0.3.11），这条路径从不写记录。
+
+        只在**不一致**时写一次（``store.update_install``），from/to 进日志；
+        没有安装记录（未 ``djb init``）时什么都不做——绝不凭空建库。
+        """
+        try:
+            record = self.store.install()
+        except Exception as exc:                  # NotInstalledError / StoreNotInitializedError
+            return {"ok": False, "reason": type(exc).__name__}
+        actual = str(facts.CLIENT_VERSION)
+        recorded = str(record.version or "")
+        if recorded == actual:
+            return {"ok": True, "changed": False, "version": actual}
+        try:
+            self.store.update_install(version=actual)
+        except Exception as exc:                  # pragma: no cover - 磁盘 / 权限问题
+            event("update.install_record_reconcile_failed", ok=False,
+                  error=type(exc).__name__, recorded=recorded, actual=actual)
+            return {"ok": False, "reason": type(exc).__name__, "recorded": recorded}
+        event("update.install_record_reconciled", recorded=recorded, actual=actual)
+        return {"ok": True, "changed": True, "from": recorded, "to": actual}
 
     def check(self) -> dict[str, Any]:
         moment = self._now()
