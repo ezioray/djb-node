@@ -1875,6 +1875,8 @@ def _access(snapshot: Snapshot) -> View:
             node_id, node_source = from_config, "config"
     diag = [row for row in (access.get("node_id_diag") or []) if isinstance(row, Mapping)]
     daemon = access.get("daemon") if isinstance(access.get("daemon"), Mapping) else {}
+    # 「清退」是**不可逆**状态：判据用 code（reason 是本地化标签，不能拿来做条件）
+    retired = str(daemon.get("reason_code") or "") == "retired"
     if node_id:
         node_hint = ("网页端绑定要填这个 ID（本机只读）" if node_source != "config"
                      else "网页端绑定要填这个 ID")
@@ -1946,6 +1948,11 @@ def _access(snapshot: Snapshot) -> View:
                  Action("access.copy_node_id", "复制节点标识", enabled=bool(node_id),
                         reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
                                 + _diag_hint(diag) + "）") if not node_id else ""),
+                 Action("access.reset_node", "重新注册这台机器（清退恢复）",
+                        enabled=retired,
+                        reason="" if retired
+                        else "只有节点被云端清退后才需要（当前原因："
+                             + str(daemon.get("reason") or "—") + "）"),
                  Action("access.reload", "请求 daemon 重载"),
                  # 搬走的两个入口在这里只留**指路**（不是按钮）：本页不能做，就别假装能做
                  Action("access.goto_account", "绑定与收款在「账户与安全」")),
@@ -1955,7 +1962,12 @@ def _access(snapshot: Snapshot) -> View:
                    "节点 ID 三级回退：" + row.get("level", "?") + " → "
                    + ("读到" if row.get("ok") else str(row.get("reason") or "读不到"))
                    for row in diag)),
-               ("节点进程下一步：" + str(daemon.get("next_step"))) if daemon.get("next_step") else "",
+               (("节点进程下一步：节点已清退（不可逆）——「重新注册这台机器」会用同一台机器"
+                 "开一个新节点 ID（旧节点保留为档案，不复活）；新节点要在「账户与安全」"
+                 "重新绑定网页端才能接单。需要云端已上线 214（同机重注册）迁移。")
+                if retired
+                else (("节点进程下一步：" + str(daemon.get("next_step")))
+                      if daemon.get("next_step") else "")),
                "配置文件：" + str(access.get("path") or "—") + "（0600，只在本机）",
                ("收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
                 "（云端出款链只有 Polygon）—— 填地址与提交都在「账户与安全」。"),

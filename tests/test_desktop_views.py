@@ -1633,3 +1633,25 @@ def test_yield_copy_only_claims_what_this_version_actually_does(tmp_path):
     result = controller.action("yield.apply_mode", confirm=lambda _t: True)
     assert result.ok is True, result.message
     assert "已回读" in controller.show("yield").plain_text()
+
+
+def test_access_page_offers_reset_only_when_the_node_is_retired():
+    """清退恢复入口：只在 retired 时可点；其它原因置灰并说清为什么。"""
+    from djb_node.desktop import datasource as ds
+    from djb_node.desktop import views as vw
+
+    retired = vw.build_view("access", ds.Snapshot({"access": {
+        "node_id": "n_x", "daemon": {"running": True, "state": "paused",
+                                     "reason": "已清退", "reason_code": "retired"}}}))
+    action = next(item for item in retired.actions if item.key == "access.reset_node")
+    assert action.enabled is True
+
+    healthy = vw.build_view("access", ds.Snapshot({"access": {
+        "node_id": "n_x", "daemon": {"running": True, "state": "running",
+                                     "reason": "未绑定", "reason_code": "unbound"}}}))
+    disabled = next(item for item in healthy.actions if item.key == "access.reset_node")
+    assert disabled.enabled is False and "清退" in disabled.reason
+
+    text = retired.plain_text()
+    assert "节点已清退（不可逆）" in text          # 不再让客户以为「重装就好」
+    assert "重新注册" in text

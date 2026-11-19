@@ -663,6 +663,41 @@ class DesktopController:
             return ActionResult("提交失败（" + type(exc).__name__ + "）；地址未变更。", ok=False)
         return ActionResult(payout_mod.submit_message(data), ok=True)
 
+    def _act_access_reset_node(self, *, confirm=None) -> ActionResult:
+        """清退恢复：重启本机节点进程，让同一台机器**重新注册**一次。
+
+        背景（2026-11-19 真机实测 + 云端 214）：``retired`` 在服务端不可逆，旧实现
+        同指纹注册幂等返回同一 node_id，于是「重装」也只会拿回死节点。云端 214 起，
+        同指纹再注册会**新建** node_id（旧节点留作审计档案）。本机要做的只有一件事：
+        停掉持有旧身份的 daemon，再启动一次（注册发生在启动时）。
+        """
+        access = self.snapshot.get("access")
+        daemon = access.get("daemon") if isinstance(access, Mapping) else {}
+        reason = str((daemon or {}).get("reason_code") or "")
+        if reason != "retired":
+            return ActionResult("这台节点没有被清退，不需要重新注册。", ok=False,
+                                effect="noop")
+        if not confirm("这台节点已被云端清退（不可逆）。重新注册会用**同一台机器**开一个"
+                       "新节点 ID（旧节点保留为档案，不会复活），之后要重新绑定网页端才能"
+                       "接单。现在重启节点并重新注册？"):
+            return ActionResult("已取消重新注册（节点进程未改动）。", ok=False,
+                                effect="cancelled")
+        if self.cli is None:
+            return ActionResult("暂不可用（本机命令通道未接通）；节点进程未改动。", ok=False)
+        try:
+            self.cli(["stop"])
+            self.cli(["start"])
+        except ProviderError as exc:
+            return ActionResult("重新注册未完成：" + exc.reason
+                                + "；看「接入配置」页的注册状态与 logs/djb.log", ok=False)
+        except Exception as exc:
+            return ActionResult("重新注册未完成（" + type(exc).__name__
+                                + "）；看「接入配置」页的注册状态与 logs/djb.log", ok=False)
+        self.request_refresh(None)
+        return ActionResult("已重启节点并重新注册：刷新后看「节点标识」是否变成新的 ID；"
+                            "变了就回「账户与安全」用网页端绑定码绑定这个新节点。",
+                            effect="refresh")
+
     def _act_access_copy_node_id(self, *, confirm=None) -> ActionResult:
         """复制节点标识（网页端绑定要填的那个）：只读快照，不写真机、不发请求。
 

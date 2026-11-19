@@ -1324,7 +1324,10 @@ class LocalDataSource:
                 reason = "节点进程没在跑，且没拿到原因（看 logs/djb.log）"
         return {"running": running,
                 "state": str(info.get("state") or "unknown"),
-                "reason": reason, "next_step": next_step}
+                # reason 是**给人看**的标签（「已清退」），reason_code 是判据（"retired"）；
+                # 界面要按原因分支时必须用 code，拿标签比对会永远不命中（真机踩过）。
+                "reason": reason, "reason_code": str(info.get("reason") or ""),
+                "next_step": next_step}
 
     def _node_id_diag(self, config: AccessConfig, info: Mapping[str, Any],
                       resolved: str) -> list[dict[str, Any]]:
