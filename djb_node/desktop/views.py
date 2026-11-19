@@ -1952,9 +1952,15 @@ def _access(snapshot: Snapshot) -> View:
                                 + _diag_hint(diag) + "）") if not node_id else ""),
                  Action("access.reset_node", "重新注册这台机器（清退恢复）",
                         enabled=retired,
+                        # 2026-11-19 验收 P3：旧文案把「只有被清退才需要」与「当前原因：
+                        # daemon 未运行」糊成一句，daemon 没跑时读起来自相矛盾。
+                        # 拆成两条独立原因：节点没跑就只说「先启动节点」。
                         reason="" if retired
-                        else "只有节点被云端清退后才需要（当前原因："
-                             + str(daemon.get("reason") or "—") + "）"),
+                        else ("节点进程未运行：先启动节点（「重新注册」只在节点被云端清退后"
+                              "才需要）"
+                              if not daemon.get("running")
+                              else "只有节点被云端清退后才需要（当前原因："
+                                   + str(daemon.get("reason") or "—") + "）")),
                  Action("access.reload", "请求 daemon 重载"),
                  # 搬走的两个入口在这里只留**指路**（不是按钮）：本页不能做，就别假装能做
                  Action("access.goto_account", "绑定与收款在「账户与安全」")),

@@ -574,7 +574,14 @@ class UpdateManager:
     # ── 状态 / 检查
     def status(self) -> dict[str, Any]:
         state = self.store.update_state()
-        install = self.store.install()
+        # 2026-11-19 验收缺陷：空 home（未 djb init）时 install() 抛 NotInstalledError，
+        # 会让整个 status() 不可读 —— 账户页版本卡就此显示「暂不可用」，与侧栏正在跑的
+        # 程序版本自相矛盾。安装记录缺失是**合法状态**（手工解压/首启未初始化），
+        # 只应让 install_record_version 为空，不该拖垮 package_version（它来自代码常量）。
+        try:
+            install = self.store.install()
+        except NotInstalledError:
+            install = None
         # M10「版本与签名状态如实」：把当前**实际会用**的信任锚标识展示出来
         # （只有 scheme / key_id / 指纹，绝无密钥材料）。
         try:
@@ -586,15 +593,19 @@ class UpdateManager:
             anchor_available = False
             anchor_error = str(exc)
         resolved = update_source.resolve(self.source, edition=self.edition)
-        return {"channel": self.channel, "current_version": install.version,
+        running_version = str(facts.CLIENT_VERSION)
+        return {"channel": self.channel,
+                "current_version": (install.version if install is not None
+                                    else running_version),
                 # D2（2026-11-18 客户报障）：``current_version`` 取的是**安装记录**，手工解压
                 # 换包不写它 ⇒ 0.3.11 的机器上界面写 0.3.0。下面两个键让读取方同时看到
                 # 「实际在跑的程序版本」与「记录值」，据此显示与校正（只加键，不动既有键）。
-                "package_version": str(facts.CLIENT_VERSION),
-                "install_record_version": install.version,
+                "package_version": running_version,
+                "install_record_version": (install.version if install is not None else ""),
                 "recorded_current": state.current_version, "next_version": state.next_version,
                 "rollback_to": state.rollback_to, "verify_state": state.verify_state,
-                "bucket": install.bucket, "checked_at": state.checked_at,
+                "bucket": (install.bucket if install is not None else None),
+                "checked_at": state.checked_at,
                 "source": self.source or "(mock: versions/mock-manifest.json)",
                 # 0.3.1（RC8.3-C）：更新源显式化 —— 只加字段，不动既有键
                 "source_kind": resolved.kind, "source_origin": resolved.origin,
