@@ -34,7 +34,7 @@ import sys
 import time
 from typing import Any, Sequence
 
-from . import facts
+from . import facts, pidfile
 from .config import (GATEWAY_PLACEHOLDER, Paths, load_config, resolve_home,
                      save_config)
 from .platform.no_window import subprocess_window_kwargs
@@ -156,6 +156,27 @@ def _daemon_command(paths: Paths, config: Any) -> list[str] | None:
             "--port", str(getattr(config, "mirror_port", facts.MIRROR_PORT))]
 
 
+def _live_daemon_record(paths: Any) -> dict[str, Any] | None:
+    """pid 文件里是否有一个**可验证**的 daemon（控制面还没起来时用它认人）。
+
+    判据与 ``djb stop --force`` 完全一致（``pidfile.verify``）：宁可多起一次，
+    也不许因为一条陈旧/损坏的记录把启动卡死。
+    """
+    if not facts.single_instance_enabled():
+        return None
+    try:
+        record = pidfile.read(paths)
+    except Exception:                                  # pragma: no cover - 文件不可读
+        return None
+    if not record:
+        return None
+    try:
+        ok, _reason = pidfile.verify(record, paths)
+    except Exception:                                  # pragma: no cover - 探针不可用
+        return None
+    return record if ok else None
+
+
 def start_daemon(home: str | os.PathLike | None = None, *,
                  enabled: bool = True,
                  wait_seconds: float = 8.0) -> dict[str, Any]:
@@ -168,6 +189,13 @@ def start_daemon(home: str | os.PathLike | None = None, *,
     try:
         if control_ping(paths):
             result["reason"] = "already-running"
+            return result
+        record = _live_daemon_record(paths)
+        if record is not None:
+            # 控制面还没应答，但 pid 文件里那个进程**验得过**（pid 活 + 令牌一致 +
+            # 命令行是本 daemon + 同一个 home）：再起一个只会互相轮换 client_key。
+            result["reason"] = "already-running"
+            result["pid"] = int(record.get("pid") or 0)
             return result
         config = load_config(paths)
         command = _daemon_command(paths, config)

@@ -368,6 +368,7 @@ class Daemon:
             raise UsageError("启动清理未完成，拒绝重复启动")
         if self._started:
             return self.status()
+        self._refuse_if_another_daemon()
         # 先落 pid 文件：**启动过程本身挂住**（控制面起不来/等网络）时，
         # `djb stop --force` 才有东西可校验、可强杀。失败时文件自然被 stop() 或下次启动覆盖。
         self._write_pid_file()
@@ -561,8 +562,16 @@ class Daemon:
             self._register_conflict(exc)
             return False
         except DjbError as exc:
+            # T1：错误细节（原始异常类型/消息、是否证书校验、兜底通道）必须进日志。
+            # 旧行为只记 code=50903，现场无法区分「证书校验失败」和「端口不通」。
+            details = getattr(exc, "details", None)
+            detail = details if isinstance(details, dict) else {}
             event("daemon.register_failed", level="warning", error=type(exc).__name__,
-                  code=exc.code)
+                  code=exc.code,
+                  error_type=str(detail.get("exc_type") or ""),
+                  error_msg=str(detail.get("exc_msg") or ""),
+                  verify_failed=bool(detail.get("verify_failed")),
+                  fallback=str(detail.get("fallback") or ""))
             if isinstance(exc, (NetworkError, RateLimitError)):
                 self._consecutive_failures += 1
                 return False
@@ -628,6 +637,45 @@ class Daemon:
         finally:
             self.stop()
         return 0
+
+    def _refuse_if_another_daemon(self) -> None:
+        """T2：同一个 home 已经有**可验证的** daemon 在跑时，拒绝再起一个。
+
+        旧实现启动前完全不读旧记录（只写），于是 `djb-desktop` 与手动 `djb-node start`
+        能同时跑两个 daemon：两边都去注册、互相把 ``client_key`` 转掉，云端看到同一台
+        机器反复换密钥（客户现场 2026-11-19 实测两个 pid）。
+
+        只认 ``pidfile.verify()`` 通过（pid 活 + 启动令牌一致 + 命令行是本 daemon + home
+        相同）的记录：PID 复用、旧版记录、文件损坏一律放行，宁可多起一次也不许卡死启动。
+        ``DJB_DAEMON_SINGLE_INSTANCE=0`` 回到旧行为。
+        """
+        if not facts.single_instance_enabled():
+            return
+        paths = getattr(self, "paths", None)
+        if paths is None:                                      # 半成品 Daemon（测试替身）
+            return
+        try:
+            record = pidfile.read(paths)
+        except Exception:                                      # pragma: no cover - 文件不可读
+            return
+        if not record:
+            return
+        try:
+            pid = int(record.get("pid") or 0)
+        except (TypeError, ValueError):
+            return
+        if pid <= 0 or pid == os.getpid():
+            return
+        try:
+            ok, _reason = pidfile.verify(record, paths)
+        except Exception:                                      # pragma: no cover - 探针不可用
+            return
+        if not ok:
+            return
+        raise ConflictError(
+            "本机已经有一个 daemon 在跑（pid " + str(pid) + "）：同一个 home 只允许一个实例，"
+            "两个会互相轮换 client_key；要重启先 djb stop（或 djb stop --force）",
+            details={"pid": pid, "reason": "single_instance"})
 
     # ── runtime/daemon.pid：给 `djb stop --force` 的逃生门（(pid, 启动时刻) 双键）
     def _write_pid_file(self) -> None:
