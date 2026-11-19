@@ -3938,6 +3938,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     return EXIT_OK
 
 
+def _print_utf8(text: str) -> None:
+    """按 UTF-8 把一行文本写到 stdout（``--export-text`` 专用）。
+
+    CR-20261119-CLIENT-EXPORT-TEXT-GBK：中文 Windows 的 ``sys.stdout`` 编码是 GBK，
+    页面文本里带上主题图标 ``◐``(U+25D0) 就会 `UnicodeEncodeError` —— 导出直接崩，
+    连取证都拿不到。这里绕过控制台编码：有 ``buffer`` 就写 UTF-8 字节（重定向到文件/
+    管道时最干净），没有 buffer 或写失败再退回 ``print``，并把编不出的字符降级成 ``?``。
+    **任何情况都不抛**：导出是兜底功能，它自己不能成为新的故障点。
+    """
+    stream = getattr(sys, "stdout", None)
+    if stream is None:                                 # windowed + 无控制台/无重定向
+        return
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        try:
+            buffer.write((text + "\n").encode("utf-8", "replace"))
+            buffer.flush()
+            return
+        except Exception:                              # noqa: BLE001 - 退回文本写
+            pass
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        print(str(text).encode(encoding, "replace").decode(encoding, "replace"))
+
+
 def _export_text(app: DesktopApp, view: str = "") -> int:
     """RC15-039 #31④：把当前页的 ``View.plain_text()`` 打印出来并放进剪贴板。
 
@@ -3950,15 +3977,15 @@ def _export_text(app: DesktopApp, view: str = "") -> int:
     try:
         page = app._controller.show(view or app._controller.view)   # noqa: SLF001 - 同一模块
     except Exception as exc:                                        # pragma: no cover
-        print("取这一页失败（" + type(exc).__name__ + "）；没有导出任何内容。")
+        _print_utf8("取这一页失败（" + type(exc).__name__ + "）；没有导出任何内容。")
         return EXIT_HEADLESS
     text = page.plain_text()
-    print(text)
+    _print_utf8(text)
     copied = app.copy_text(text)
-    print()
-    print(("已复制到剪贴板（" if copied else "剪贴板不可用（")
-          + page.title + " · " + str(len(text)) + " 字符）"
-          + ("" if copied else "；上面的文字可直接从终端复制"))
+    _print_utf8("")
+    _print_utf8(("已复制到剪贴板（" if copied else "剪贴板不可用（")
+                + page.title + " · " + str(len(text)) + " 字符）"
+                + ("" if copied else "；上面的文字可直接从终端复制"))
     return EXIT_OK
 
 
