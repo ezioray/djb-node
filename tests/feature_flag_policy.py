@@ -21,6 +21,14 @@ DEFAULT_ON_APPROVED: dict[str, str] = {
         " 150 s 超时 → 503 50901，而客户端 status 仍显示「接单=是」，两侧都不说人话。"
         "留痕 reports/E2E-20261107-FULL/TICKETS.md E2E-04 + RELEASE-PREP/PATCHES.md P4；"
         "显式 flags --disable 优先于服务端协商 ⇒ 仍是真开关",
+    "client.binding.device_flow.enabled":
+        "CHG-20261118-BIND-DEVICE-ENABLE（设备码自动绑定）：2026-11-18 三端（契约/云端/网页）"
+        "设备授权流全部上线，客户端自 0.3.12 起默认开启；0.3.13 随"
+        " REL-2026-11-19-BIND-PAYOUT-0.3.13 发布。三字段：owner=lead /"
+        " expire_at=2027-03-31 / rollback_rule=djb flags --disable 或置 false ⇒ 只显示「粘贴"
+        "绑定码」老入口，云端 N1–N4 端点保留但不再被调用（仍是真开关）。"
+        "注：本行是 2026-11-19 补登记——该开关默认开启已两个版本，登记表此前漏记，"
+        "tests/test_cli_s2.py 因此一直红。",
     "client.probe.periodic.enabled":
         "ROUND3-20261109 DECISIONS.md §D-R3-01（Lead 签发）：默认关闭 ⇒ 探针 15 min 过期即掉容量，"
         "供方只能人工 djb upstream probe 续命（Windows 0.2.4 真机 status 原文见"
