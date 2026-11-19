@@ -119,7 +119,7 @@ PAGES: dict[str, PageSpec] = {
     "receipts": PageSpec("receipts", "收据", "RECEIPTS", "earn"),
     "earnings": PageSpec("earnings", "收益", "EARNINGS", "earn"),
     "agent": PageSpec("agent", "Agent 接入", "AGENT", "connect"),
-    "yield": PageSpec("yield", "让路 / 节能", "YIELD", "run"),
+    "yield": PageSpec("yield", "暂停接单", "YIELD", "run"),
     "gpu": PageSpec("gpu", "GPU 监控", "GPU", "system", beta=True,
                     subtitle="GPU 监控（BETA）· 共享算力为后续能力，当前仅本机监控"),
     "account": PageSpec("account", "账户与安全", "ACCOUNT", "connect"),

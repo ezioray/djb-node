@@ -88,7 +88,7 @@ VIEW_TITLES: dict[str, str] = {
     "token_plan": "提供 Token Plan",
     "agent": "Agent 接入",
     "access": "本机设置",
-    "yield": "让路 / 节能",
+    "yield": "暂停接单",
     "account": "账户与安全",
     "logs": "日志",
 }
@@ -382,7 +382,7 @@ class Hero:
     chip: str = ""
     chip_tone: str = "muted"
     body: str = ""
-    runtime_label: str = "连续贡献"
+    runtime_label: str = "连续运行"
     runtime: str = "—"
     gauge: GaugeData | None = None
     metrics: tuple[Metric, ...] = ()
@@ -812,7 +812,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
     anchor = _parse_ts(snapshot.fetched_at)
     if anchor is None and samples:
         anchor = max(moment for moment, _ in samples)
-    title, caption = "贡献节奏", "近 " + str(hours) + " 小时 · 每小时 tokens"
+    title, caption = "每小时用量", "近 " + str(hours) + " 小时 · 每小时 tokens"
     if anchor is None:
         return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
                      empty="暂不可用（当前没有收据时间戳）")
@@ -859,9 +859,9 @@ def _hero(snapshot: Snapshot) -> Hero:
     profile = _mapping(_section(snapshot, "account").get("profile"))
     state = str(status.get("state") or "unknown")
     paused = state == "paused"
-    titles = {"online": "这台机器，正在贡献。", "starting": "这台机器，正在准备。",
-              "paused": "这台机器，正在让路。", "updating": "这台机器，正在更新。",
-              "stopped": "这台机器，还没有开始。", "error": "这台机器，需要看一眼。"}
+    titles = {"online": "正在接单", "starting": "正在启动",
+              "paused": "已暂停接单", "updating": "正在更新",
+              "stopped": "还没开始接单", "error": "有异常，需要处理"}
     chips = {"online": ("● LIVE", "mint"), "starting": ("◐ STARTING", "amber"),
              "paused": ("● PAUSED", "amber"), "updating": ("◐ UPDATING", "amber"),
              "stopped": ("○ STOPPED", "muted"), "error": ("✕ ERROR", "red")}
@@ -877,9 +877,9 @@ def _hero(snapshot: Snapshot) -> Hero:
         elif accepting is False:
             body += "；当前不接新任务"
     elif snapshot.ok("yield"):
-        body = "让路规则已启用，" + ("当前允许接单" if accepting is True else "接单状态未知")
+        body = "自动暂停已开启，" + ("当前允许接单" if accepting is True else "接单状态未知")
     else:
-        body = "让路规则暂不可用（数据源未提供）"
+        body = "自动暂停状态读不到（数据源未提供）"
     util = _seconds(device.get("utilization_pct"))
     gauge = GaugeData(None if util is None else min(100, util) / 100.0,
                       "—" if util is None else str(util) + "%", "GPU 利用率")
@@ -919,7 +919,7 @@ def _hero(snapshot: Snapshot) -> Hero:
         hint = "还没有客户端授权"
     else:
         hint = "授权状态暂不可用"
-    return Hero(kicker="NODE STATUS / " + node_id, title=titles.get(state, "这台机器的状态未知。"),
+    return Hero(kicker="NODE STATUS / " + node_id, title=titles.get(state, "状态未知"),
                 chip=chip, chip_tone=chip_tone, body=body,
                 runtime=_runtime_text(status.get("uptime_s")), gauge=gauge, metrics=metrics,
                 actions=actions, hint=hint)
@@ -963,7 +963,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
         Field("USDT 收款地址", "已设置" if config.get("usdt_address") else "未设置",
               key="usdt_state"),
     )
-    setup = RailCard(kicker="SETUP / 三步接上", title="三步，把节点接上。", kind="setup",
+    setup = RailCard(kicker="SETUP / 接入进度", title="接入分三步", kind="setup",
                      badge=("接入完成" if done == 3 else "待完成"), badge_tone=("mint" if done == 3
                                                                           else "amber"),
                      note=str(done) + " / 3", fields=setup_fields,
@@ -1000,7 +1000,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
         ("并发上限", _num(limits.get("concurrent")) + " 路", "default"),
         ("每日 tokens 上限", "—" if limits.get("daily_tokens") in (None, 0)
                             else f"{_seconds(limits.get('daily_tokens')):,}", "default"),
-        ("让路模式", YIELD_MODE_SUMMARY.get(str(yield_state.get("mode") or ""),
+        ("暂停方式", YIELD_MODE_SUMMARY.get(str(yield_state.get("mode") or ""),
                                             str(yield_state.get("mode") or "未设置")), "muted"),
     )
     daily_cap = limits.get("daily_tokens")
@@ -1012,13 +1012,13 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
     if ratio is not None:
         progress = ("今日 tokens 已用", ratio,
                     f"{used_today:,} / {int(float(daily_cap)):,}（{ratio * 100:.0f}%）")
-    throttle = RailCard(kicker="THROTTLE / 让路规则", title="让路规则",
+    throttle = RailCard(kicker="PAUSE / 自动暂停", title="自动暂停",
                         badge="生效中" if yield_state.get("yield_enabled") else "已关闭",
                         badge_tone="mint" if yield_state.get("yield_enabled") else "muted",
                         kind="throttle", rows=throttle_rows,
-                        toggle=("自动让路", bool(yield_state.get("yield_enabled"))),
+                        toggle=("自动暂停接单", bool(yield_state.get("yield_enabled"))),
                         progress=progress,
-                        foot="只会用你让出来的算力；全屏游戏与会议期间自动让路。")
+                        foot="只在你不忙时接单：全屏游戏或开会自动暂停。")
     return (setup, today, throttle)
 
 
@@ -1041,7 +1041,7 @@ def _overview(snapshot: Snapshot) -> View:
                  "stopped": (MARK_IDLE + " 已停止", "muted"), "error": (MARK_FAIL + " 错误", "red")}
     state_text, tone = state_map.get(str(status.get("state")), (MARK_UNKNOWN + " 状态未知", "muted"))
     cards = (
-        Card("今日贡献", _num(earnings.get("today") or status.get("today_earnings")) + " USDT",
+        Card("今日用量", _num(earnings.get("today") or status.get("today_earnings")) + " USDT",
              _today_note(earnings.get("today") or status.get("today_earnings")), "mint"),
         Card("当前任务", task_text, "在途任务", "default"),
         Card("余额（可用）",
@@ -1050,10 +1050,10 @@ def _overview(snapshot: Snapshot) -> View:
              ("账户预付款 · 结算口径见「收益」页" if earnings.get("balance") is not None
               else str(earnings.get("balance_note") or "余额暂不可用；结算口径见「收益」页")),
              "default"),
-        Card("接单状态", state_text, str(reason or "无让路原因"), tone),
+        Card("接单状态", state_text, str(reason or "无暂停原因"), tone),
         Card("资源", _bytes(_section(snapshot, "bench").get("mem_available_bytes")) + " 可用内存",
              "CPU " + str(_section(snapshot, "bench").get("cpu_count") or "—") + " 核", "default"),
-        Card("让路 / 节能",
+        Card("暂停接单",
              YIELD_LABEL_BY_KEY.get(str(yield_state.get("mode") or ""),
                                     str(yield_state.get("mode") or "未设置")),
              "暂停后与托盘一致", "muted"),
@@ -1063,7 +1063,7 @@ def _overview(snapshot: Snapshot) -> View:
     recent = list(reversed(rows))[:5]
     return View(
         key="overview", title="总览",
-        subtitle="今日贡献 · 当前任务 · 资源 · 让路 · 收据",
+        subtitle="今日用量 · 当前任务 · 资源 · 接单状态 · 收据",
         cards=cards,
         table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(recent),
                     narrow_hide=("时间", "Tokens"),
@@ -2096,11 +2096,11 @@ def _yield(snapshot: Snapshot) -> View:
         now_text = "未知（没有回读到）"
         now_meta, now_tone = "读不到就不猜；点下面三档之一可重新写一次", "amber"
     return View(
-        key="yield", title="让路 / 节能",
+        key="yield", title="暂停接单",
         # 「暂停」是**状态**不是档位（owner D-1）：它只由下面两个按钮进出
         subtitle="三档模式 · 暂停是状态，不占档位",
         cards=(Card("当前状态", _yield_state_text(state),
-                    str(reason or data.get("reason_label") or "无让路原因"),
+                    str(reason or data.get("reason_label") or "无暂停原因"),
                     _yield_state_tone(state)),
                Card("接单", _flag(data.get("accepting"), "允许", "禁止"), "", "default"),
                Card("档位", now_text, now_meta, now_tone)),
@@ -2119,7 +2119,7 @@ def _yield(snapshot: Snapshot) -> View:
                "与托盘读同一份状态。",
                # RC15-039 复核 M7（owner a′）：用**正面**口径说同一件事，别和上面的档位
                # 描述互相打脸——"只记录偏好"是这版真实做的事，"后续版本生效"是真实计划。
-               "本版只记录档位偏好；并发与让路在后续版本生效。"),
+               "本版只记录档位偏好；并发控制与自动暂停在后续版本生效。"),
     )
 
 

@@ -20,7 +20,7 @@ SECRET = "djb_sk_live_9f2c41aa77be"
 SPEC_ORDER = ["overview", "bench", "gpu", "models", "tasks", "receipts", "earnings",
               "token_plan", "agent", "access", "yield", "account", "logs"]
 SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "模型与探针", "任务队列", "收据", "收益",
-               "提供 Token Plan", "Agent 接入", "本机设置", "让路/节能", "账户与安全",
+               "提供 Token Plan", "Agent 接入", "本机设置", "暂停接单", "账户与安全",
                "日志"]
 #: 分组口径（00-PLAN §1.1 已裁决）：组 key / 中文名 / 拉丁微标 / 成员顺序
 SPEC_SECTIONS = [
