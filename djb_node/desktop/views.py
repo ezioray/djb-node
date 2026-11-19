@@ -2295,7 +2295,9 @@ def _account(snapshot: Snapshot) -> View:
                                            reason=update_unavailable or "",
                                            group=GROUP_IDENTITY)]
     if verify_state == "eligible":
-        update_actions.append(Action("update.apply", "安装更新（重启生效）", primary=True,
+        # 2026-11-19：换装能力还没上线（N4），旧文案「安装更新（重启生效）」会让客户以为
+        # 点完重启就变新版，实际只是下载校验。改成实话，别把「没反应」再造一次。
+        update_actions.append(Action("update.apply", "下载更新包（不自动替换当前版本）", primary=True,
                                      group=GROUP_IDENTITY))
     elif verify_state == "no_artifact":
         # 只写「暂无安装包」客户会以为「没有更新」→ 必须给一条能点的路（G4-4）

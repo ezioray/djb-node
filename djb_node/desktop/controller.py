@@ -314,6 +314,22 @@ class DesktopController:
         self.view = key
         return self.current()
 
+    def set_boot(self, boot: Mapping[str, Any] | None) -> None:
+        """回填首启自举结论（供「先出窗口、后跑自举」的启动顺序使用）。
+
+        2026-11-19 真机实测：``djb-desktop.exe`` onefile 解包约 6 s，自举（ensure_ready +
+        start_daemon 等控制口）再叠数秒。原实现把自举放在窗口创建之前，客户观感是
+        「双击后十几秒没反应」。现在先画窗口，自举完再回填这里并重画，否则
+        「节点进程」字段会一直停在「未运行」。
+        """
+        source = getattr(self, "source", None)
+        if source is None:
+            return
+        try:
+            source._boot = dict(boot or {})           # noqa: SLF001 - 同包私有字段
+        except Exception:                              # pragma: no cover - 数据源不可写
+            pass
+
     def next_view(self, step: int = 1) -> View:
         index = (VIEW_KEYS.index(self.view) + int(step)) % len(VIEW_KEYS)
         return self.show(VIEW_KEYS[index])
@@ -1538,13 +1554,14 @@ class DesktopController:
                             payload=dict(result or {}))
 
     def _act_update_apply(self, *, confirm=None) -> ActionResult:
-        """「安装更新」：二次确认后走 worker（下载 + 校验 + 装到版本目录，重启生效）。
+        """「下载更新包」：二次确认后走 worker（下载 + 校验 + 落到版本目录；**不换装**）。
 
         与 CLI ``djb update --apply`` 同一条代码路径；桌面端**永不自动装**。
         """
         if confirm is not None and not confirm(
-                "现在下载并安装更新？装完需要重启客户端才生效。\n"
-                "（校验失败会自动拒绝安装，版本不变）"):
+                "现在下载并校验更新包？\n"
+                "当前版本不会被自动替换（安装器尚未上线），下载后按提示手动安装。\n"
+                "（校验失败会自动拒绝，版本不变）"):
             return ActionResult("已取消安装（版本未变）。", ok=False, effect="cancelled")
         hook = self.update_via
         if hook is not None:
@@ -1553,7 +1570,7 @@ class DesktopController:
             except Exception:
                 started = False
             if started:
-                return ActionResult("正在下载并安装更新…（校验签名与哈希，完成后提示重启）",
+                return ActionResult("正在下载并校验更新包…（签名与哈希校验，完成后给出安装路径）",
                                     effect="update", payload={"state": "applying"})
         return self.run_update_apply()
 
@@ -1568,8 +1585,15 @@ class DesktopController:
         self.last_update = result
         if result.get("installed"):
             version = str(result.get("version") or "")
+            where = ""
+            try:
+                paths = self._update_manager().paths
+                where = "安装包：" + os.path.join(str(paths.versions_dir), version, "artifact.bin") + "；"
+            except Exception:                          # 取不到路径不影响主结论
+                where = ""
             return ActionResult("已下载待安装 " + version
-                                + "（校验通过；安装器上线前不自动换装，重启不改变运行版本）。",
+                                + "（校验通过；安装器上线前不自动换装，重启不改变运行版本）。"
+                                + where + "当前运行的仍是原版本。",
                                 ok=True, effect="update", payload=result)
         state = str(result.get("state") or "")
         reason = str(result.get("message") or "更新器没有给出原因（state=" + state + "）")
