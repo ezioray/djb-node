@@ -1269,8 +1269,18 @@ class DesktopController:
                                 ok=False)
         error = str(result.get("error_class") or "")
         if error:
-            return ActionResult("联通失败：" + str(result.get("note") or error)
-                                + "（未保存任何配置）", ok=False)
+            # 2026-11-20：真机上只显示「连不上」，看不出是 401、404 还是 TLS 失败。
+            # 把错误类别与 HTTP 状态一起给人看，并落一条事件（不含密钥/地址正文）。
+            status = result.get("http_status")
+            extra = ("（" + error + ("" if status in (None, "") else " / HTTP " + str(status)) + "）")
+            try:
+                from ..logging_setup import event as _event
+                _event("desktop.discover.failed", error_class=error,
+                       http_status=status if status is not None else "")
+            except Exception:
+                pass
+            return ActionResult("联通失败：" + str(result.get("note") or error) + extra
+                                + "；未保存任何配置", ok=False)
         total = int(result.get("total") or 0)
         mapped = int(result.get("mapped") or 0)
         latency = result.get("latency_ms")

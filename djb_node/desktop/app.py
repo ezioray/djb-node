@@ -3411,6 +3411,11 @@ class DesktopApp:
             # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
             self._start_payout_submit(str(result.payload), result.message)
         elif result.effect in ("refresh", "access", "bench", "control", "reload", "filter"):
+            # 2026-11-20：「刷新」原来只在表单字段被忘掉时才强制重画；否则内容比对
+            # 认为没变化就跳过 —— 客户点了刷新，屏幕一动不动（底价/上游都是后到的
+            # 数据）。刷新语义就是「重读 + 重画」，这里一律强制。
+            if result.effect == "refresh" and result.ok:
+                self._force_next_render = True
             # 动作刚落地（有 forget ⇒ 真的写了盘）时强制重画：视图内容没变也得把新结论
             # （「读到 N 个模型 / 已添加上游 …」）画出来，否则客户还是看到「没反应」。
             self._force_next_render = bool(self._forget_keys)
