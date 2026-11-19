@@ -1793,6 +1793,21 @@ def _token_plan(snapshot: Snapshot) -> View:
         Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,
                reason=report_blocker),
     ])
+    # 2026-11-19（全功能 UX 复查）：七颗按钮同一视觉权重，客户不知道「下一步是哪颗」。
+    # 主操作随阶段走：没上游 → 添加上游；有上游没清单 → 读取清单；有清单 → 上报（不可用时退预览）。
+    _has_upstream = bool(str(plan.get("base_url") or "").strip()) and \
+        bool(str(plan.get("secret_seen") or "").strip()) and \
+        str(plan.get("secret_seen") or "").strip() != "未保存"
+    _has_models = bool(bid_rows)
+    if not _has_upstream:
+        _primary_key = "token_plan.add_upstream"
+    elif not _has_models:
+        _primary_key = "token_plan.discover"
+    elif not report_blocker:
+        _primary_key = "token_plan.report"
+    else:
+        _primary_key = "token_plan.preview_report"
+    plan_actions = [replace(_a, primary=(_a.key == _primary_key)) for _a in plan_actions]
     return View(
         key="token_plan", title="提供 Token Plan",
         subtitle="接入 / 模型清单 / 逐模型底价 / 探针（本页可操作）",

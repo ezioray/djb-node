@@ -1462,7 +1462,13 @@ class LocalDataSource:
                     "current_version": None, "channel": None, "verify_state": "",
                     "checked_at": "", "next_version": "", "bucket": None,
                     "edition": "", "source_kind": "", "note": ""}
+        # 2026-11-19 真机：account 版本卡写 0.3.15，而程序实际是 0.3.16。
+        # 根因就在这里——``update.status()`` 已经给出 ``package_version``（实际在跑的程序版本）
+        # 与 ``install_record_version``（安装记录），但本投影只搬了 ``current_version``，
+        # 于是视图层拿不到 package_version，回落到安装记录（手工换包/升级后记录会滞后）。
         return {"current_version": status.get("current_version"),
+                "package_version": status.get("package_version"),
+                "install_record_version": status.get("install_record_version"),
                 "channel": status.get("channel"), "verify_state": status.get("verify_state") or "",
                 "checked_at": status.get("checked_at") or "",
                 "next_version": status.get("next_version") or "",

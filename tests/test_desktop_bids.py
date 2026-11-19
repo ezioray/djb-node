@@ -426,3 +426,33 @@ def test_protocol_renders_as_a_readonly_combobox(has_display, monkeypatch):
             root.destroy()
         except Exception:                             # pragma: no cover - 已销毁
             pass
+
+def test_token_plan_primary_follows_the_stage():
+    """2026-11-19 全功能 UX 复查：七颗按钮同一权重时客户不知道下一步。
+
+    主操作必须随阶段走，且全程只能有一颗 primary。
+        """
+    # ① 没上游 → 添加上游
+    view = vw.build_view("token_plan", _plan_snapshot())
+    primaries = [a.key for a in view.actions if a.primary]
+    assert primaries == ["token_plan.add_upstream"]
+
+    # ② 有上游、云端上报被开关挡住 → 退到「预览将上报的内容」
+    view2 = vw.build_view(
+        "token_plan",
+        _plan_snapshot(base_url="https://api.example.com/v1", secret_seen="已保存"),
+    )
+    primaries2 = [a.key for a in view2.actions if a.primary]
+    assert len(primaries2) == 1
+    assert primaries2 == ["token_plan.preview_report"]
+
+    # ③ 有上游且上报可用 → 主操作是上报
+    view3 = vw.build_view(
+        "token_plan",
+        _plan_snapshot(base_url="https://api.example.com/v1", secret_seen="已保存",
+                       bids={"rows": {"gpt-4o-mini": {"min_price": "0.35"}},
+                             "cloud": {"state": "ok", "source": "cloud"},
+                             "report_blocker": "", "preview": {"models": []}}),
+    )
+    primaries3 = [a.key for a in view3.actions if a.primary]
+    assert primaries3 == ["token_plan.report"]
