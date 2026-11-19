@@ -304,6 +304,9 @@ class Daemon:
         # 运行态
         self._user_paused = bool(self.store.get_kv("user_paused", False))
         self._consecutive_failures = 0
+        # P5：注册指纹冲突是永久错误。单独记一个进程内标记，不能只依赖
+        # snapshot.detail（状态迁移会覆盖 detail，标记一丢就会按心跳周期重试 409）。
+        self._register_conflict_sticky = False
         # 403 的退避计数单独一份：403 不是网络失败，混进 _consecutive_failures 会让
         # 「等审核」被升格成「保守模式」，把原因换成更误导的那一条。
         self._forbidden_failures = 0
@@ -592,6 +595,7 @@ class Daemon:
             return False
         self.store.set_kv("node", {"node_id": node_id, "state": result.get("state"),
                                    "registered_at": iso(self._now())})
+        self._register_conflict_sticky = False
         return True
 
     def _register_conflict(self, exc: ConflictError) -> None:
@@ -607,15 +611,25 @@ class Daemon:
         next_step = (server_said + " · " + hint) if server_said else hint
         detail: dict[str, Any] = {"register_conflict": True, "code": code,
                                   "http_status": int(exc.details.get("status") or 409)}
+        node_id = str(exc.details.get("node_id") or "").strip()
+        if node_id:                       # 云侧 409 体里带 node_id（便于网页端定位）
+            detail["node_id"] = node_id
         if code == facts.REGISTER_CONFLICT_CODE:
             detail["reason_code"] = "fingerprint_bound"
+        self._register_conflict_sticky = True
         event("daemon.register_conflict", level="warning", code=code,
               http_status=detail["http_status"])
         self.machine.fail(next_step=next_step, detail=detail)
         self._persist()
 
     def _register_conflict_pending(self) -> bool:
-        """当前是否卡在「硬件指纹已注册」的永久冲突上（用于抑制自动重试）。"""
+        """当前是否卡在「硬件指纹已注册」的永久冲突上（用于抑制自动重试）。
+
+        同时看进程内标记与快照 detail：状态机迁移会用新 detail 覆盖旧 detail，
+        只看快照会让标记在 paused/error 切换时丢失（2026-11-19 现场 409 循环的根因）。
+        """
+        if self._register_conflict_sticky:
+            return True
         detail = self.machine.snapshot.detail or {}
         return bool(detail.get("register_conflict"))
 
@@ -1802,6 +1816,14 @@ class Daemon:
         conservative = (not policy_ok) or self._policy_invalid or \
             (self._consecutive_failures >= facts.HEARTBEAT_FAIL_CONSERVATIVE_AFTER)
         unbound = not bool(self.credentials.client_key())
+        snapshot = self.machine.snapshot
+        if unbound and self._register_conflict_pending():
+            # P5 永久冲突（40903，同指纹已绑定账户，INV-01）：保留 machine.fail 落的
+            # error 态、detail 与「怎么办」指引。不能再走下面的 unbound 兜底
+            # （也不接受策略指令改写）—— 一旦 pause，detail 被清空，
+            # `_register_conflict_pending()` 失效，每个心跳周期都会重打注册（409 循环）。
+            # pause_reason 置空 = 不改写状态机；人处理后（解绑/换回旧密钥）自动恢复。
+            return Decision(False, "unbound", None, snapshot.next_step or "")
         if policy is not None and policy_ok:
             paused, directive_reason = policy_mod.directives_pause(policy)
             if paused:

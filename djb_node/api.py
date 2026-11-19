@@ -371,6 +371,10 @@ def raise_for_response(response: HttpResponse, *, what: str) -> DjbError:
         raw_state = payload["error"].get("state")
         if isinstance(raw_state, str) and raw_state.strip():
             details["state"] = raw_state.strip()
+        # 40903（指纹冲突）把已占用节点的 node_id 平铺在 error.node_id，供界面定位
+        raw_node = payload["error"].get("node_id")
+        if isinstance(raw_node, str) and raw_node.strip():
+            details["node_id"] = raw_node.strip()
     if status == 401:
         return AuthError(message, code=code, details=details, reason=reason)
     if status == 403:

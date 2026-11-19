@@ -11,7 +11,7 @@ from djb_node.errors import UsageError
 from djb_node.limits import Limiter, Signal, YieldDetector
 from djb_node.store import Store
 from djb_node.util import iso
-from tests.mock_m02 import MockServer
+from tests.mock_m02 import NODE_ID, MockServer
 from tests.test_daemon import FakeResources, FixedProbe, _add_upstream, _daemon
 
 
@@ -214,3 +214,38 @@ def test_run_max_cycles_and_main_entry(paths, store, credentials, mock, clock):
     code = daemon_main(["--home", str(paths.home), "--port", "0", "--max-cycles", "1"])
     assert code == 0
     store.close()
+
+def test_register_fingerprint_conflict_is_terminal_across_ticks(paths, store, credentials,
+                                                                 mock, clock):
+    """40903 是永久冲突：跨多个心跳周期也只允许 1 次注册，且指引不能被状态机改写。
+
+    回归（v0.3.19 现场 2026-11-19）：日志每 ~20s 重复
+    ``register_conflict code=40903 → daemon.paused reason=unbound``。原因不是客户端
+    主动退避，而是 tick 里 ``_evaluate`` 的 unbound 兜底把 ``machine.fail`` 落的
+    error 态改写成 paused，``snapshot.detail`` 随迁移清空 →
+    ``_register_conflict_pending()`` 失效 → 下一个心跳周期重打注册（再 409），无限循环。
+    """
+    _add_upstream(store, mock)
+    mock.register_conflict_code = facts.REGISTER_CONFLICT_CODE
+    daemon = _daemon(paths, store, credentials, mock, clock=clock)
+    daemon.start()
+    try:
+        def registrations() -> int:
+            return len([item for item in mock.requests
+                        if item["path"] == "/api/v1/node/register"])
+
+        assert registrations() == 1
+        for _round in range(3):
+            clock.advance(600)
+            daemon.tick(clock())
+            assert registrations() == 1, "永久冲突不得按心跳周期重打注册"
+            snapshot = daemon.machine.snapshot
+            # 永久冲突必须保持 machine.fail 的 error 态（不是 paused/unbound）
+            assert snapshot.state == "error"
+            assert snapshot.detail.get("register_conflict") is True
+            # 云侧 409 体里的 node_id 必须透传到 daemon 快照（界面才能定位到具体节点）
+            assert snapshot.detail.get("node_id") == NODE_ID
+            assert "一台机器只跑一个节点" in (snapshot.next_step or "")
+        assert not credentials.client_key()
+    finally:
+        daemon.stop()
