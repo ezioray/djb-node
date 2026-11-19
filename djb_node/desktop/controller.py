@@ -836,7 +836,7 @@ class DesktopController:
         # 2026-11-20：这条动作原来**一行日志都不写**，真机「点了没反应」时无从判断
         # 是没触发、被开关挡住、还是网络卡住。入口先落一条事件（只记事实，不记凭据）。
         try:
-            from ..log import event as _event
+            from ..logging_setup import event as _event
             _event("desktop.device_flow.request", level="info",
                    enabled=bool(self.device_flow_enabled()))
         except Exception:                                  # pragma: no cover - 日志不可用
@@ -1220,6 +1220,65 @@ class DesktopController:
         """
         return ActionResult("在下方「添加接入」填：协议 → 请求地址 → 密钥，再点「读取模型清单」。",
                             effect="goto", payload="token_plan")
+
+    def _act_token_plan_enable_relay(self, *, confirm=None) -> ActionResult:
+        """一键开启 `client.relay.enabled`（默认关）。
+
+        真机 2026-11-20：客户填好地址和 Key 点「读取模型清单」，CLI 明明回了
+        「relay 接入开关关闭（默认关闭）…（本次未创建上游）」，GUI 却没有任何反馈，
+        客户只会看到「点了没反应」。这里把开关做成页面上的一次点击，并把「开了什么、
+        能不能回滚」一次讲清楚（flag 自带 owner/expire/rollback_rule）。
+        """
+        from .. import facts as facts_mod
+        from ..config import Paths, load_config, save_config
+
+        home = getattr(self.source, "_home", None)
+        if not home:
+            return ActionResult("本机配置目录不可用：无法开启中继接入", ok=False)
+        try:
+            config = load_config(Paths(str(home)))
+            extra = dict(config.extra or {})
+            flags = dict(extra.get("feature_flags") or {})
+            if flags.get(facts_mod.RELAY_FLAG):
+                return ActionResult("中继接入已经开着：直接点「读取模型清单」即可。",
+                                    effect="refresh")
+            flags[facts_mod.RELAY_FLAG] = True
+            extra["feature_flags"] = flags
+            config.extra = extra
+            save_config(Paths(str(home)), config)
+        except Exception as exc:                        # noqa: BLE001 - 配置坏了别打崩 UI
+            return ActionResult("开启失败（" + type(exc).__name__ + "）；配置未改动", ok=False)
+        return ActionResult("已开启中继接入（" + facts_mod.RELAY_FLAG
+                            + "）：现在点「读取模型清单并保存接入」就能落地。",
+                            effect="refresh")
+
+    def _act_token_plan_test_connectivity(self, *, confirm=None) -> ActionResult:
+        """「测试联通」：只探活 + 拉清单，**不写任何配置**（真做之前先验一次）。"""
+        base_url = str(self.drafts.get("base_url") or "").strip()
+        protocol = str(self.drafts.get("protocol") or "").strip()
+        secret = str(self.drafts.get("upstream_secret") or "").strip()
+        if not base_url:
+            return ActionResult("先填「请求地址」（例如 https://api.openai.com/v1）", ok=False)
+        fn = getattr(self.source, "discover_upstream_models", None)
+        if not callable(fn):
+            return ActionResult("暂不可用（当前数据源不支持联通测试）", ok=False)
+        try:
+            result = fn(base_url, protocol, secret) or {}
+        except Exception as exc:                        # noqa: BLE001 - 失败要给人话
+            return ActionResult("联通失败（" + type(exc).__name__ + "）；未保存任何配置",
+                                ok=False)
+        error = str(result.get("error_class") or "")
+        if error:
+            return ActionResult("联通失败：" + str(result.get("note") or error)
+                                + "（未保存任何配置）", ok=False)
+        total = int(result.get("total") or 0)
+        mapped = int(result.get("mapped") or 0)
+        latency = result.get("latency_ms")
+        took = (" / " + str(int(latency)) + " ms") if isinstance(latency, (int, float)) else ""
+        return ActionResult("联通正常：读到 " + str(total) + " 个模型（能对上目录 "
+                            + str(mapped) + " 个）" + took + "；还没保存，确认无误再点"
+                            + "「读取模型清单并保存接入」。",
+                            payload={"state": "probe", "total": total})
 
     def _act_token_plan_bind_node(self, *, confirm=None) -> ActionResult:
         """绑定只有**一个**入口（「账户与安全」）；这里只负责把客户送过去。"""

@@ -1662,6 +1662,49 @@ def cmd_plan(args: argparse.Namespace) -> int:
     raise UsageError("未知的 plan 动作：" + str(action))
 
 
+def cmd_bid(args: argparse.Namespace) -> int:
+    """逐模型底价的本地账本（与 GUI 同一份数据；不联网、不上报）。
+
+    成交口径（原始设计）：设一个**最低价**，撮合到的最优价 ≥ 最低价就成交。
+    平台费 15% 加在客户侧（客户实付 = 报价 × 1.15），不从供方报价里倒扣；
+    真实费率以云端在成交时的快照为准，本地只做告知。
+    """
+    from .bids import BidBook
+
+    _paths_, _config_, store = _context(args)
+    book = BidBook(store)
+    action = getattr(args, "bid_action", None) or "list"
+    if action == "set":
+        try:
+            saved = book.set_price(args.model, args.min_price)
+        except ValueError as exc:
+            raise UsageError(str(exc)) from None
+        payload = {"model": args.model, "min_price": saved, "mode": book.mode_of(args.model),
+                   "fee_bps": facts.SERVICE_FEE_BPS,
+                   "customer_pay_example": facts.customer_pay_text(saved)}
+        _emit(payload, as_json=_json_flag(args), text=lambda v: (
+            "已保存「" + v["model"] + "」最低价 " + v["min_price"] + " USD / 百万 token"
+            + "（成交规则：低于此价不成交，高于时按最优价成交）\n"
+            + "平台服务费 " + format(facts.service_fee_percent(), "g") + "%："
+            + "客户实付约 " + v["customer_pay_example"] + "（费率以成交时服务端快照为准）"
+            + "\n（只在本机账本，未上报）"))
+        return 0
+    if action == "remove":
+        removed = book.remove(args.model)
+        _emit({"model": args.model, "removed": removed}, as_json=_json_flag(args),
+              text=lambda v: ("已移除「" + v["model"] + "」的底价（这一行不再申报）"
+                              if v["removed"] else "本来就没有这个模型的底价"))
+        return 0
+    rows = [{"model": model, "min_price": item["min_price"], "mode": book.mode_of(model)}
+            for model, item in sorted(book.load().items())]
+    _emit({"bids": rows, "count": len(rows), "fee_bps": facts.SERVICE_FEE_BPS},
+          as_json=_json_flag(args),
+          text=lambda v: ("\n".join(item["model"] + "  ≥ " + item["min_price"]
+                                    + "  (" + item["mode"] + ")" for item in v["bids"])
+                          if v["bids"] else "还没有设任何底价（djb bid set --model … --min-price …）"))
+    return 0
+
+
 def cmd_flags(args: argparse.Namespace) -> int:
     """查看 / 设置本机特性开关（默认关闭；只允许登记过的开关）。"""
     paths, config, store = _context(args)
@@ -2531,6 +2574,17 @@ def build_parser() -> argparse.ArgumentParser:
         item = upstream_sub.add_parser(action, help=help_text)
         item.add_argument("--id", required=True)
         item.add_argument("--model", required=True)
+    # 2026-11-20：逐模型底价原来**只有 GUI 一条路**（且真机上那把行选中是坏的），
+    # 脚本/验收无法复核。这里补 CLI，与 GUI 共用同一个本地账本 ``rc14/model_bids``。
+    bid = add_common(cmd_bid, "bid", "逐模型最低申报价（最低价之上按最优价成交）")
+    bid_sub = bid.add_subparsers(dest="bid_action", metavar="<action>")
+    bid_set = bid_sub.add_parser("set", help="设置某模型的最低申报价")
+    bid_set.add_argument("--model", required=True)
+    bid_set.add_argument("--min-price", required=True)
+    bid_list = bid_sub.add_parser("list", help="列出本机已设的底价")
+    bid_remove = bid_sub.add_parser("remove", help="移除某模型的底价（= 不申报）")
+    bid_remove.add_argument("--model", required=True)
+
     price = upstream_sub.add_parser("price", help="设置逐模型最低价")
     price.add_argument("--id", required=True)
     price.add_argument("--model", required=True)

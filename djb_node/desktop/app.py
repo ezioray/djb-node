@@ -2833,7 +2833,12 @@ class DesktopApp:
         self._tree = tree
         # 主表也登记（窄窗紧凑文案要能连附加表一起遍历；见 _apply_narrow_cells）
         self._tables = list(getattr(self, "_tables", ()) or ()) + [(table, tree)]
-        if table.rows:
+        # 2026-11-20 真机：44 行的模型表**点不中任何一行**（「当前选中」永远不变），
+        # 客户因此没法设价。根因是这一层只在**构建时** ``table.rows`` 非空才绑
+        # ``<<TreeviewSelect>>``：空表先建、刷新后才填行的页面（Token Plan 就是）
+        # 永远没有这个绑定 —— 点上去没有任何反应，也不报错。
+        # 绑定与「有没有行」无关：选中事件由控件发出，行是后来填的也照样生效。
+        if True:
             tree.bind("<<TreeviewSelect>>", self._on_row_select)
             for sequence, step in (("<Up>", -1), ("<Down>", 1)):
                 tree.bind(sequence, lambda _e, delta=step: self._move_selection(delta))
@@ -3348,6 +3353,17 @@ class DesktopApp:
 
     # ── 动作
     def _on_action(self, key: str) -> None:
+        # 2026-11-20：动作级可观测性。真机上「点了没反应」时，日志里连一条动作记录
+        # 都没有，只能靠猜。这里在入口/出口各记一条（动作名、耗时、ok、effect），
+        # **不记**任何字段值（密钥/地址都不进日志）。
+        import time as _time
+        _started = _time.monotonic()
+        _log = None
+        try:
+            from ..logging_setup import event as _log
+            _log("desktop.action.start", action=key)
+        except Exception:                          # pragma: no cover - 日志不可用
+            _log = None
         # D4：客户按了新动作 ⇒ 上一条失败提示可以退场（新的失败会重新粘上）
         self._clear_sticky()
         for name, variable in list(self._vars.items()):
@@ -3425,6 +3441,15 @@ class DesktopApp:
         elif (result.effect != "cancelled" and result.message
               and not (result.effect == "refresh" and result.ok)):
             self._toast(result.message, ok=result.ok)
+        # 出口：一条动作的最终结局（成功/失败/耗时/分流方式）。与入口成对，
+        # 「点了没反应」时能直接看出是没进 action、进了但早退、还是失败被吞。
+        if _log is not None:
+            try:
+                _log("desktop.action.done", action=key, ok=bool(result.ok),
+                     effect=str(getattr(result, "effect", "") or ""),
+                     ms=int((_time.monotonic() - _started) * 1000))
+            except Exception:                      # pragma: no cover - 日志不可用
+                pass
 
     def copy_text(self, text: str) -> bool:
         """把文本放进系统剪贴板；**必须** ``update()`` 一次才算真的写进去。

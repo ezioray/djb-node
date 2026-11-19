@@ -1800,7 +1800,13 @@ def _token_plan(snapshot: Snapshot) -> View:
         # CR-20261119-CLIENT-TOKENPLAN-NOOP：读清单同时**保存接入**（第 1 步与第 2 步
         # 合成一颗按钮）——旧文案只写「读取模型清单」，客户以为读完就完事，实际上
         # 桌面端根本没落盘，模型表永远空。
+        # 2026-11-20：「测试联通」独立成一步 —— 先探活（只读、不写盘），
+        # 拿到「N 个模型 / X ms」再决定要不要保存接入。
+        Action("token_plan.test_connectivity", "测试联通（不保存）"),
         Action("token_plan.discover", "读取模型清单并保存接入"),
+        # relay 接入开关默认关闭；以前只在 CLI 报错可见，GUI 表现为「点了没反应」。
+        # 这里给一键开启（flag 自带 owner/expire/rollback，失败会回话）。
+        Action("token_plan.enable_relay", "开启中继接入（一次）"),
         # F4：「点了没反应」是缺陷。这两颗不再置灰（置灰的按钮点了不播报），
         # 前提不满足时由动作回一句人话（「先在上面的表格里选一行模型」…）。
         Action("token_plan.save_price", "保存这一行"),
