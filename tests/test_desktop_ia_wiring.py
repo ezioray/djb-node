@@ -113,8 +113,11 @@ def test_shortcuts_follow_the_active_order():
     order = desktop_app.nav_order(SHARE)
     bindings = dict(desktop_app.view_shortcut_bindings(keys=order))
     assert bindings["<Control-Key-1>"] == "token_plan"
-    assert bindings["<Control-Key-9>"] == "agent"
-    assert bindings["<Control-Shift-at>"] == "gpu"        # Shift+2 = @（X11 键名）
+    # 2026-11-20 IA v2：Ctrl+9 绑的是**第 9 项**，不写死页面（重排后仍是 agent，但别把顺序钉进测试）
+    assert bindings["<Control-Key-9>"] == order[8]
+    # Shift+2 = @（X11 键名）落在第 11 项（Ctrl+1..9 占前九项，Shift+1..4 接后四项），
+    # 同样不写死页面：顺序由分组表决定
+    assert bindings["<Control-Shift-at>"] == order[10]
     assert len(bindings) == 13 and set(bindings.values()) == set(order)
 
 

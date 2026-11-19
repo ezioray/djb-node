@@ -81,11 +81,21 @@ class PageSpec:
 
 #: 方案 A：5 组、共享前置（02-IA-TOKENPLAN §2）
 IA_SECTIONS_SHARE: tuple[SectionSpec, ...] = (
-    SectionSpec("share", "共享", "SHARE", ("token_plan", "models", "access")),
-    SectionSpec("run", "运行", "RUN", ("overview", "bench", "tasks")),
+    SectionSpec("share", "共享", "SHARE", ("token_plan", "models")),
+    # 2026-11-20 IA v2（owner：「导航分类还是不合理」）：按**用户要办的事**重排，
+    # 不按后端模块排。上一版的毛病：本机设置挂在「共享」下（它不是共享）、
+    # 「接入」只剩一个 Agent 接入（一组的价值撑不起一组）、让路/节能挂在「系统」里
+    # （它是运行行为，天天要看的）而账户与安全藏在「系统」最深处。
+    #
+    #   共享 SHARE    我能卖什么：Token Plan、模型与探针
+    #   运行 RUN      机器现在怎么样：总览、让路/节能、性能基准、任务队列
+    #   收益 EARN     赚了多少：收据、收益
+    #   接入 CONNECT  这台机器怎么接上云端和我的账号：Agent 接入、本机设置、账户与安全
+    #   系统 SYSTEM   出问题才来：GPU 监控（BETA）、日志
+    SectionSpec("run", "运行", "RUN", ("overview", "yield", "bench", "tasks")),
     SectionSpec("earn", "收益", "EARN", ("receipts", "earnings")),
-    SectionSpec("connect", "接入", "CONNECT", ("agent",)),
-    SectionSpec("system", "系统", "SYSTEM", ("yield", "gpu", "account", "logs")),
+    SectionSpec("connect", "接入", "CONNECT", ("agent", "access", "account")),
+    SectionSpec("system", "系统", "SYSTEM", ("gpu", "logs")),
 )
 
 #: 0.3.4 现状（回滚路径）：4 组，与 ``views.NAV_SECTIONS`` 逐项一致
@@ -101,7 +111,7 @@ PAGES: dict[str, PageSpec] = {
     "token_plan": PageSpec("token_plan", "提供 Token Plan", "TOKEN PLAN", "share",
                            subtitle="接入 / 模型清单 / 逐模型底价 / 探针"),
     "models": PageSpec("models", "模型与探针", "MODELS", "share"),
-    "access": PageSpec("access", "本机设置", "ACCESS", "share",
+    "access": PageSpec("access", "本机设置", "ACCESS", "connect",
                        subtitle="价格模式 / 节点凭证 / 配置文件（绑定与收款在「账户与安全」）"),
     "overview": PageSpec("overview", "总览", "OVERVIEW", "run"),
     "bench": PageSpec("bench", "性能基准", "BENCH", "run"),
@@ -109,10 +119,10 @@ PAGES: dict[str, PageSpec] = {
     "receipts": PageSpec("receipts", "收据", "RECEIPTS", "earn"),
     "earnings": PageSpec("earnings", "收益", "EARNINGS", "earn"),
     "agent": PageSpec("agent", "Agent 接入", "AGENT", "connect"),
-    "yield": PageSpec("yield", "让路 / 节能", "YIELD", "system"),
+    "yield": PageSpec("yield", "让路 / 节能", "YIELD", "run"),
     "gpu": PageSpec("gpu", "GPU 监控", "GPU", "system", beta=True,
                     subtitle="GPU 监控（BETA）· 共享算力为后续能力，当前仅本机监控"),
-    "account": PageSpec("account", "账户与安全", "ACCOUNT", "system"),
+    "account": PageSpec("account", "账户与安全", "ACCOUNT", "connect"),
     "logs": PageSpec("logs", "日志", "LOGS", "system"),
 }
 

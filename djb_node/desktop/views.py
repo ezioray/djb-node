@@ -903,7 +903,17 @@ def _hero(snapshot: Snapshot) -> Hero:
                primary=paused),
         Action("", "调整时段", nav="yield"),
     )
-    if binding.get("state") in ("bound", "active"):
+    # 2026-11-20 owner：「绑定等关键操作的按钮和文字提醒不够突出」。
+    # 绑定是**能不能接单收钱**的前置，不是普通设置项：没绑定就把主按钮直接给到它，
+    # 并在 hint 里说清后果（原来只有右栏一行小字「绑定与收款（账户与安全）」）。
+    bound_ok, _bound_id = binding_state(snapshot)
+    if bound_ok is not True:
+        actions = (Action("", "绑定这台电脑（先做这一步）", nav="account", primary=True),) + \
+            tuple(action for action in actions if not action.primary)
+    if bound_ok is not True:
+        hint = ("这台电脑还没绑定：绑定后才能接单和收款"
+                if snapshot.ok("account") else "绑定状态暂不可用（登录后再看）")
+    elif binding.get("state") in ("bound", "active"):
         hint = "已授权 1 个客户端"
     elif snapshot.ok("access"):
         hint = "还没有客户端授权"

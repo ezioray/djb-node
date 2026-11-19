@@ -52,7 +52,9 @@ def test_gpu_left_the_primary_path():
     index = ia.index_of("gpu")
     assert ia.MIN_GPU_INDEX == 5
     assert index > ia.MIN_GPU_INDEX
-    assert index == 10                      # 共享3 + 运行3 + 收益2 + 接入1 + 让路1
+    # 2026-11-20 IA v2 重排后 GPU 从第 10 项挪到第 11 项：**不要再写死序号**，
+    # 这里只守不变量（不在前 N 项 + 仍在系统组）；具体位置由分组表决定。
+    assert index == len(ia.flat_keys()) - 2   # 系统组第一项（系统 = GPU + 日志）
     assert ia.section_for("gpu").key == "system"
 
 
