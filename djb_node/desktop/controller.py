@@ -197,6 +197,11 @@ class DesktopController:
     device_flow: Any | None = None
     #: 设备流程异步通道：``(flow) -> bool``；返回 True = 已派给 worker（轮询不在主线程）
     device_via: Callable[[Any], Any] | None = None
+    #: 设备流程**状态变化**通知：``(flow) -> None``。app 用它做两件事——
+    #: 状态一到 ``pending`` 就打开浏览器确认页、以及每次变化都刷新账户页
+    #: （2026-11-19 客户报障「在浏览器确认绑定点了没反应」：以前只有全流程跑完才回一次，
+    #: 中间状态没有任何界面反馈）。默认 None = 老行为。
+    device_notify: Callable[[Any], Any] | None = None
     #: RC14 B：首次引导状态（``djb_node.onboarding.OnboardingStore``；None = 未接本机目录）
     onboarding: Any | None = None
     #: 当前引导步骤（1..3；4 = 完成页；None = 不显示面板）
@@ -664,6 +669,41 @@ class DesktopController:
             return ActionResult("提交失败（" + type(exc).__name__ + "）；地址未变更。", ok=False)
         return ActionResult(payout_mod.submit_message(data), ok=True)
 
+    def _act_access_reset_node(self, *, confirm=None) -> ActionResult:
+        """清退恢复：重启本机节点进程，让同一台机器**重新注册**一次。
+
+        背景（2026-11-19 真机实测 + 云端 214）：``retired`` 在服务端不可逆，旧实现
+        同指纹注册幂等返回同一 node_id，于是「重装」也只会拿回死节点。云端 214 起，
+        同指纹再注册会**新建** node_id（旧节点留作审计档案）。本机要做的只有一件事：
+        停掉持有旧身份的 daemon，再启动一次（注册发生在启动时）。
+        """
+        access = self.snapshot.get("access")
+        daemon = access.get("daemon") if isinstance(access, Mapping) else {}
+        reason = str((daemon or {}).get("reason_code") or "")
+        if reason != "retired":
+            return ActionResult("这台节点没有被清退，不需要重新注册。", ok=False,
+                                effect="noop")
+        if not confirm("这台节点已被云端清退（不可逆）。重新注册会用**同一台机器**开一个"
+                       "新节点 ID（旧节点保留为档案，不会复活），之后要重新绑定网页端才能"
+                       "接单。现在重启节点并重新注册？"):
+            return ActionResult("已取消重新注册（节点进程未改动）。", ok=False,
+                                effect="cancelled")
+        if self.cli is None:
+            return ActionResult("暂不可用（本机命令通道未接通）；节点进程未改动。", ok=False)
+        try:
+            self.cli(["stop"])
+            self.cli(["start"])
+        except ProviderError as exc:
+            return ActionResult("重新注册未完成：" + exc.reason
+                                + "；看「接入配置」页的注册状态与 logs/djb.log", ok=False)
+        except Exception as exc:
+            return ActionResult("重新注册未完成（" + type(exc).__name__
+                                + "）；看「接入配置」页的注册状态与 logs/djb.log", ok=False)
+        self.request_refresh(None)
+        return ActionResult("已重启节点并重新注册：刷新后看「节点标识」是否变成新的 ID；"
+                            "变了就回「账户与安全」用网页端绑定码绑定这个新节点。",
+                            effect="refresh")
+
     def _act_access_copy_node_id(self, *, confirm=None) -> ActionResult:
         """复制节点标识（网页端绑定要填的那个）：只读快照，不写真机、不发请求。
 
@@ -749,6 +789,12 @@ class DesktopController:
 
     def _device_update(self, flow: Any) -> None:
         self.device_flow = flow
+        notify = self.device_notify
+        if callable(notify):
+            try:
+                notify(flow)
+            except Exception:                     # 通知坏了不许打断绑定流程
+                pass
 
     def _device_result(self, flow: Any) -> ActionResult:
         from .. import device_flow as flow_mod
@@ -756,7 +802,7 @@ class DesktopController:
         if flow.state == "approved":
             # 绑定成功后重新取数：绑定状态/收款面板都要立刻反映
             return ActionResult("绑定成功：这台电脑已经绑到你的账户（" + flow.user_code + "）"
-                                "（USDT 收款地址是另一件事：在本页「② 提交 USDT 收款地址」"
+                                "（USDT 收款地址是另一件事：在本页「③ 提交 USDT 收款地址」"
                                 "里单独提交才生效）",
                                 effect="refresh", payload=flow.as_dict())
         if flow.state == "unavailable":
@@ -1331,7 +1377,7 @@ class DesktopController:
         # D6（2026-11-18）：绑定**不含**收款地址。客户把地址填在同一页，绑定成功后以为
         # 地址也一起提交了，结果云端仍是「尚未提交」。绑定成功的这句话必须把两件事分开。
         return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。"
-                            "（USDT 收款地址是**另一件事**：在本页「② 提交 USDT 收款地址」"
+                            "（USDT 收款地址是**另一件事**：在本页「③ 提交 USDT 收款地址」"
                             "里单独点一次「提交收款地址到云端」才生效）", effect="refresh")
 
     def _bound_before_bind(self) -> tuple[bool, str]:

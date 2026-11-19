@@ -184,6 +184,19 @@ PORT_MAX = 65535
 # ─────────────────────────────────────────────────────────── 日志（§8.2）
 LOG_RETENTION_DAYS = 7
 LOG_MAX_BYTES = 5 * 1024 * 1024
+#: 单实例护栏：同一个 home 只允许一个 daemon（``0``/``off`` 关掉 = 回旧行为）。
+#: 2026-11-19 客户现场：GUI 与手动 ``start`` 同时跑起两个 daemon，两边都去注册、
+#: 互相把 client_key 转掉。默认**开**（关掉是排障用的逃生门）。
+DAEMON_SINGLE_INSTANCE_ENV = "DJB_DAEMON_SINGLE_INSTANCE"
+
+
+def single_instance_enabled(raw: str | None = None) -> bool:
+    """是否启用「一个 home 一个 daemon」护栏（未设 = 启用）。"""
+    import os as _os
+    value = _os.environ.get(DAEMON_SINGLE_INSTANCE_ENV) if raw is None else raw
+    return str(value or "").strip().lower() not in ("0", "off", "false", "no", "none")
+
+
 LOG_FILE = "djb.log"
 
 #: daemon 的重定向输出文件名（``djb start`` / bootstrap 自愈 / uninstall 三处必须同一个名字）

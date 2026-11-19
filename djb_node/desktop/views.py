@@ -248,6 +248,10 @@ class Field:
     #: （RC15-039 #1）。默认空 = 0.3.7 行为；错误不由投影层产生，由动作层回投
     #: （见 :func:`with_field_errors`），所以 13 个视图的既有快照一字不变。
     error: str = ""
+    #: 字段分区标题（2026-11-19 客户报障「账户页太拥挤，绑定节点与 USDT 地址要完全隔离」）。
+    #: 空串 = 老行为（整页一个字段块）。非空时渲染层按分区插标题、**每组各成一块**
+    #: （各自的字段 + 各自的动作按钮），于是「填地址」和「点绑定」不再在同一屏同一条按钮栏里。
+    group: str = ""
 
     def can_reveal(self) -> bool:
         """是否画「显示 / 隐藏」：只有**可编辑**的秘密字段才有意义（只读值本就是掩码）。"""
@@ -322,8 +326,13 @@ class Action:
 
 #: D6（2026-11-18 客户要求）：账户页两个**互不干扰**的动作区标题。
 #: 「绑定节点」= 设备码/手输码；「提交 USDT 收款地址」= 单独一次 Payout 提交。
-GROUP_BIND = "① 绑定节点"
-GROUP_PAYOUT = "② 提交 USDT 收款地址（与绑定是两件事）"
+#:
+#: 2026-11-19 客户再次报障「绑定页面设置 UI 太拥挤，把绑定节点和 USDT 地址完全隔离开」：
+#: 只给动作按钮加小标题不够——字段还挤在同一块里。现在**字段也带 group**，渲染层按分区
+#: 各成一块（标题 → 该组字段 → 该组按钮），绑定区与收款区之间不再共享任何一块版面。
+GROUP_IDENTITY = "① 本机与身份"
+GROUP_BIND = "② 绑定节点"
+GROUP_PAYOUT = "③ 提交 USDT 收款地址（与绑定是两件事）"
 
 
 def action_groups(actions: Sequence[Action]) -> list[tuple[str, list[Action]]]:
@@ -1868,6 +1877,8 @@ def _access(snapshot: Snapshot) -> View:
             node_id, node_source = from_config, "config"
     diag = [row for row in (access.get("node_id_diag") or []) if isinstance(row, Mapping)]
     daemon = access.get("daemon") if isinstance(access.get("daemon"), Mapping) else {}
+    # 「清退」是**不可逆**状态：判据用 code（reason 是本地化标签，不能拿来做条件）
+    retired = str(daemon.get("reason_code") or "") == "retired"
     if node_id:
         node_hint = ("网页端绑定要填这个 ID（本机只读）" if node_source != "config"
                      else "网页端绑定要填这个 ID")
@@ -1939,6 +1950,11 @@ def _access(snapshot: Snapshot) -> View:
                  Action("access.copy_node_id", "复制节点标识", enabled=bool(node_id),
                         reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
                                 + _diag_hint(diag) + "）") if not node_id else ""),
+                 Action("access.reset_node", "重新注册这台机器（清退恢复）",
+                        enabled=retired,
+                        reason="" if retired
+                        else "只有节点被云端清退后才需要（当前原因："
+                             + str(daemon.get("reason") or "—") + "）"),
                  Action("access.reload", "请求 daemon 重载"),
                  # 搬走的两个入口在这里只留**指路**（不是按钮）：本页不能做，就别假装能做
                  Action("access.goto_account", "绑定与收款在「账户与安全」")),
@@ -1948,7 +1964,12 @@ def _access(snapshot: Snapshot) -> View:
                    "节点 ID 三级回退：" + row.get("level", "?") + " → "
                    + ("读到" if row.get("ok") else str(row.get("reason") or "读不到"))
                    for row in diag)),
-               ("节点进程下一步：" + str(daemon.get("next_step"))) if daemon.get("next_step") else "",
+               (("节点进程下一步：节点已清退（不可逆）——「重新注册这台机器」会用同一台机器"
+                 "开一个新节点 ID（旧节点保留为档案，不复活）；新节点要在「账户与安全」"
+                 "重新绑定网页端才能接单。需要云端已上线 214（同机重注册）迁移。")
+                if retired
+                else (("节点进程下一步：" + str(daemon.get("next_step")))
+                      if daemon.get("next_step") else "")),
                "配置文件：" + str(access.get("path") or "—") + "（0600，只在本机）",
                ("收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
                 "（云端出款链只有 Polygon）—— 填地址与提交都在「账户与安全」。"),
@@ -2144,32 +2165,48 @@ def _account(snapshot: Snapshot) -> View:
                       "登录保护的第二步", "mint" if twofa is True else "amber")
     if node_id:
         fields: list[Field] = [Field("节点标识", identity, key="node_id",
-                                     hint="节点身份由服务端下发，本机只读")]
+                                     hint="节点身份由服务端下发，本机只读",
+                                     group=GROUP_IDENTITY)]
     else:
-        fields = [Field("邮箱", identity, key="email", hint="登录后在服务端修改")]
+        fields = [Field("邮箱", identity, key="email", hint="登录后在服务端修改",
+                        group=GROUP_IDENTITY)]
     if node_id:
         fields.extend([
-            Field("节点状态", str(profile.get("state") or "—"), key="state"),
-            Field("地域", str(profile.get("region") or "—"), key="region"),
-            Field("平台", str(profile.get("platform") or "—"), key="platform"),
-            Field("最后在线", str(profile.get("last_seen_at") or "—"), key="last_seen_at"),
+            Field("节点状态", str(profile.get("state") or "—"), key="state",
+                  group=GROUP_IDENTITY),
+            Field("地域", str(profile.get("region") or "—"), key="region",
+                  group=GROUP_IDENTITY),
+            Field("平台", str(profile.get("platform") or "—"), key="platform",
+                  group=GROUP_IDENTITY),
+            Field("最后在线", str(profile.get("last_seen_at") or "—"), key="last_seen_at",
+                  group=GROUP_IDENTITY),
         ])
     if node_id and email:
-        fields.append(Field("邮箱", str(email), key="email", hint="登录后在服务端修改"))
+        fields.append(Field("邮箱", str(email), key="email", hint="登录后在服务端修改",
+                            group=GROUP_IDENTITY))
     if profile.get("role"):
-        fields.append(Field("角色", str(profile.get("role") or "—"), key="role"))
+        fields.append(Field("角色", str(profile.get("role") or "—"), key="role",
+                            group=GROUP_IDENTITY))
     if twofa is not None:
-        fields.append(Field("2FA 状态", _flag(twofa, "已开启", "未开启"), key="twofa"))
+        fields.append(Field("2FA 状态", _flag(twofa, "已开启", "未开启"), key="twofa",
+                            group=GROUP_IDENTITY))
     if can_bind:
         fields.append(Field("网页端", facts.WEB_CONSOLE_URL, key="web_console",
-                            hint="在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里"))
+                            hint="在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里",
+                            group=GROUP_BIND))
     # E（RC14 IA 拆分）：USDT 收款地址**只在这里**（原来在「接入配置」，两处都能填、
     # 两处都以为生效）。输入框不预填掩码（prefill=False），否则一点保存就把掩码写回配置。
     payout = _payout_state(access)
     fields.append(Field("USDT 收款地址", payout["local"], key="usdt_address", editable=True,
                         prefill=False,
                         hint=(payout_mod.CHAIN_HINT + "｜本机已存：" + payout["local"]
-                              + "｜云端：" + payout["hint"])))
+                              + "｜云端：" + payout["hint"]),
+                        group=GROUP_PAYOUT))
+    # 原来「USDT 收款地址（云端）」是首排第 4 张卡：和身份卡并排，等于把「收款」又和
+    # 「身份/绑定」混在一屏。现在降成收款区里的一行只读状态，整页只剩 3 张身份卡。
+    fields.append(Field("云端收款状态", payout["state"], key="payout_state",
+                        hint=payout["meta"], tone=payout["tone"],
+                        group=GROUP_PAYOUT))
     # RC14 C 设备码状态（开关关 → 整段不渲染，连状态都不显示）
     device = account.get("device_flow") if isinstance(account.get("device_flow"), Mapping) else {}
     device_on = bool(device.get("enabled"))
@@ -2183,17 +2220,23 @@ def _account(snapshot: Snapshot) -> View:
             "等待第 " + str(device.get("attempts") or 0) + " 次确认" if device_state == "pending" else "",
             str(device.get("reason") or "")) if item)
         fields.append(Field("设备码", detail or "未申请", key="device_state",
+                            group=GROUP_BIND,
                             hint=(("打开 " + str(device.get("verify_url") or "确认链接")
                                    + " 并在网页里点「确认」；本机每 5/15/30 秒自动问一次，10 分钟停")
                                   if device_state == "pending" else
                                   "状态：" + state_text + "（"
                                   + (str(device.get("hint") or "") or "点左边按钮开始") + "）")))
-    fields.append(Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录"))
+    fields.append(Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录",
+                        group=GROUP_IDENTITY))
     actions: list[Action] = []
     # RC14 C 设备码：主按钮 = 「在浏览器确认绑定」（开关关着 → 只保留老的手输码入口）
     if device_on and can_bind:
         actions.append(Action("account.bind_device", "在浏览器确认绑定", primary=True,
-                              enabled=device_state not in ("pending",), group=GROUP_BIND))
+                              enabled=device_state not in ("pending",),
+                              reason=("正在等待网页确认（" + str(device.get("user_code") or "")
+                                      + "）：确认后本机会自动接上；要重来先点「停止等待」"
+                                      if device_state == "pending" else ""),
+                              group=GROUP_BIND))
         if device_state == "pending":
             actions.append(Action("account.bind_device_cancel", "停止等待", group=GROUP_BIND))
             if device.get("verify_url"):
@@ -2207,11 +2250,13 @@ def _account(snapshot: Snapshot) -> View:
     actions.append(Action("account.enable_2fa", "启用双因素验证", enabled=False,
                           reason=("已开启（服务端）：如需关闭或换设备，去网页控制台安全页"
                                   if twofa is True else
-                                  "在网页控制台开启（TOTP）；本机不代理 2FA 绑定")))
+                                  "在网页控制台开启（TOTP）；本机不代理 2FA 绑定"),
+                          group=GROUP_IDENTITY))
     # 已开启也要给入口：客户要关闭 / 换设备 / 重装 TOTP 时同样得去这一页
     actions.append(Action("account.open_2fa_page",
                           "去控制台管理 2FA" if twofa is True else "去控制台开启 2FA",
-                          primary=not can_bind and twofa is not True))
+                          primary=not can_bind and twofa is not True,
+                          group=GROUP_IDENTITY))
     # ── G4（RC14 P0）：更新检查入口 + 九状态下的可操作项
     # 放在「账户与安全」而不是总览：低频操作，且本页已有「网页端」等外链字段。
     update = account.get("update") if isinstance(account.get("update"), Mapping) else {}
@@ -2236,20 +2281,26 @@ def _account(snapshot: Snapshot) -> View:
         Field("当前版本", package_version or "暂不可用",
               key="update_version",
               hint=version_hint,
-              tone="amber" if record_stale else "muted"),
-        Field("上次检查", checked_at or "还没检查过", key="update_checked_at"),
+              tone="amber" if record_stale else "muted",
+              group=GROUP_IDENTITY),
+        Field("上次检查", checked_at or "还没检查过", key="update_checked_at",
+              group=GROUP_IDENTITY),
         Field("上次结果", (update_unavailable or state_text), key="update_state",
               hint=str(update.get("hint") or ""),
-              tone="amber" if update_unavailable else "muted"),
+              tone="amber" if update_unavailable else "muted",
+              group=GROUP_IDENTITY),
     ])
     update_actions: list[Action] = [Action("update.check", "检查更新",
                                            enabled=not update_unavailable,
-                                           reason=update_unavailable or "")]
+                                           reason=update_unavailable or "",
+                                           group=GROUP_IDENTITY)]
     if verify_state == "eligible":
-        update_actions.append(Action("update.apply", "安装更新（重启生效）", primary=True))
+        update_actions.append(Action("update.apply", "安装更新（重启生效）", primary=True,
+                                     group=GROUP_IDENTITY))
     elif verify_state == "no_artifact":
         # 只写「暂无安装包」客户会以为「没有更新」→ 必须给一条能点的路（G4-4）
-        update_actions.append(Action("update.download", "去下载页手动下载", primary=True))
+        update_actions.append(Action("update.download", "去下载页手动下载", primary=True,
+                                     group=GROUP_IDENTITY))
     actions.extend(update_actions)
     actions.append(Action("account.submit_payout", "提交收款地址到云端",
                           enabled=payout["can_submit"], group=GROUP_PAYOUT,
@@ -2262,15 +2313,17 @@ def _account(snapshot: Snapshot) -> View:
     # RC14 B：引导重跑入口**永久**在本页（不是只在首次启动出现）；开关关 → 隐藏
     onboarding = access.get("onboarding") if isinstance(access.get("onboarding"), Mapping) else {}
     if onboarding.get("enabled"):
-        actions.append(Action("account.rerun_onboarding", "重新运行首次引导"))
+        actions.append(Action("account.rerun_onboarding", "重新运行首次引导",
+                              group=GROUP_IDENTITY))
     # 解绑 = 原来「接入配置」页那颗「粘贴绑定码绑定」的对偶：绑定与解绑都只在本页。
     # 键名保留 ``account.logout``（接口只加不改）：它就是「解绑 + 清本机密钥」那一个动作。
     actions.append(Action("account.logout", "解绑这台电脑（登出并清本机密钥）",
                           enabled=bool(security.get("node_id")),
                           reason=("尚未登录" if not node_id
-                                  else "本机无凭据（解绑要清本机密钥）")))
+                                  else "本机无凭据（解绑要清本机密钥）"),
+                          group=GROUP_IDENTITY))
     if can_bind:
-        actions.append(Action("account.open_web", "打开网页端"))
+        actions.append(Action("account.open_web", "打开网页端", group=GROUP_IDENTITY))
     notes = [str(account.get("note") or "未登录时只显示本机信息。"),
              ("收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
               "（云端出款链只有 Polygon）。"),
@@ -2299,10 +2352,11 @@ def _account(snapshot: Snapshot) -> View:
     return View(
         key="account", title="账户与安全",
         subtitle="节点身份 · 绑定 · 双因素 · 登出",
+        # 2026-11-19：首排只留**身份**三张卡。USDT 云端状态挪进「收款区」（见上），
+        # 否则收款信息又和身份并排出现，等于把刚分开的两件事重新混在一屏。
         cards=(Card("账户", identity, identity_meta, "default"), second,
                Card("本机凭据", str(security.get("storage") or "—"),
-                    str(security.get("node_id") or "本机未保存"), "muted"),
-               Card("USDT 收款地址（云端）", payout["state"], payout["meta"], payout["tone"])),
+                    str(security.get("node_id") or "本机未保存"), "muted")),
         fields=tuple(fields),
         actions=tuple(actions),
         unavailable=unavailable,

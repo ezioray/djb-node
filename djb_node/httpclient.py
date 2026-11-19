@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
 import ssl
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,7 +22,17 @@ from urllib.parse import urljoin, urlparse
 
 from . import facts
 from .errors import NetworkError
+from .platform.no_window import subprocess_window_kwargs
 from .util import first_line
+
+#: 兜底传输开关（2026-11-19 客户现场）：urllib 的 TLS/传输失败后，用**系统 curl** 再试一次。
+#: ``off`` 即回旧行为；未设/其它值 = 只在失败后兜底（成功路径一个字节都不变）。
+FALLBACK_ENV = "DJB_HTTP_FALLBACK"
+#: 指定 curl 可执行文件（运维/单测用；不设则用系统自带的那个）。
+CURL_BIN_ENV = "DJB_CURL_BIN"
+_STATUS_MARK = "__DJB_STATUS__"
+_DEFAULT_CONTEXT: ssl.SSLContext | None = None
+_CONTEXT_TRIED = False
 
 
 @dataclass
@@ -143,7 +156,7 @@ class HttpClient:
                  ssl_context: ssl.SSLContext | None = None) -> None:
         self.timeout = float(timeout)
         self.user_agent = user_agent
-        self.ssl_context = ssl_context
+        self.ssl_context = ssl_context if ssl_context is not None else _default_ssl_context()
         self._opener: urllib.request.OpenerDirector | None = None
 
     def _open(self) -> urllib.request.OpenerDirector:
@@ -193,7 +206,11 @@ class HttpClient:
                                 body=payload, url=url, elapsed_ms=elapsed)
         except (urllib.error.URLError, socket.timeout, TimeoutError, ssl.SSLError,
                 ConnectionError, OSError) as exc:
-            raise _network_error(url, exc) from exc
+            fallback, note = _curl_request(method, url, request_headers, data,
+                                           timeout or self.timeout)
+            if fallback is not None:
+                return fallback
+            raise _network_error(url, exc, fallback=note) from exc
 
     def get_json(self, url: str, *, headers: dict[str, str] | None = None,
                  timeout: float | None = None) -> HttpResponse:
@@ -244,15 +261,135 @@ def host_of(url: str) -> str:
     return parsed.hostname or ""
 
 
-def _network_error(url: str, exc: BaseException) -> NetworkError:
-    """网络异常归一：只给「不可达 / 超时」这类粗粒度原因，不含 URL 凭据。"""
+def _network_error(url: str, exc: BaseException, *, fallback: str = "") -> NetworkError:
+    """网络异常归一：对外仍是「不可达 / 超时」，但**细节里带上原始异常**。
+
+    T1（`changes/CR-20261119-CLIENT-TLS-DIAG.md`）：旧实现把 ``URLError`` /
+    ``SSLCertVerificationError`` / 连接被重置全部压成同一句话，现场只能看到
+    ``code 50903``，连「证书校验失败」和「端口不通」都分不开。这里只加
+    ``details``（日志/``diagnose`` 可见），错误码与对外文案不变。
+    """
     reason = "timeout" if isinstance(exc, (socket.timeout, TimeoutError)) else "unreachable"
     code = facts.LOCAL_ERROR_CODES["upstream_timeout"] if reason == "timeout" \
         else facts.LOCAL_ERROR_CODES["upstream_error"]
     host = host_of(url)
-    return NetworkError(
-        "无法连接服务端" + ("（" + host + "）" if host else "") + "：网络或服务不可用，稍后重试",
-        code=code, reason=reason, details={"host": host})
+    # urllib 把真正的异常塞在 URLError.reason 里：不解包就永远只看得到 "URLError"
+    inner = getattr(exc, "reason", None)
+    if not isinstance(inner, BaseException):
+        inner = exc
+    verify_failed = isinstance(inner, ssl.SSLCertVerificationError) \
+        or isinstance(exc, ssl.SSLCertVerificationError)
+    details: dict[str, Any] = {
+        "host": host,
+        "exc_type": type(inner).__name__,
+        "exc_msg": first_line(str(inner))[:200],
+        "fallback": fallback or "off",
+    }
+    if verify_failed:
+        details["verify_failed"] = True
+        details["verify_msg"] = first_line(
+            str(getattr(inner, "verify_message", "") or inner))[:200]
+    message = ("无法连接服务端" + ("（" + host + "）" if host else "")
+               + "：网络或服务不可用，稍后重试")
+    if verify_failed:
+        message += "（本机证书校验未通过）"
+    return NetworkError(message, code=code, reason=reason, details=details)
+
+
+def _default_ssl_context() -> ssl.SSLContext | None:
+    """出站 HTTPS 默认 context：系统默认 + Windows 存储枚举 + 内置根（见 trust_store）。"""
+    global _DEFAULT_CONTEXT, _CONTEXT_TRIED
+    if not _CONTEXT_TRIED:
+        _CONTEXT_TRIED = True
+        try:
+            from .trust_store import build_ssl_context
+            _DEFAULT_CONTEXT = build_ssl_context()
+        except Exception:                       # 信任面出问题不许让客户端起不来
+            _DEFAULT_CONTEXT = None
+    return _DEFAULT_CONTEXT
+
+
+def _fallback_enabled() -> bool:
+    raw = (os.environ.get(FALLBACK_ENV) or "").strip().lower()
+    return raw not in ("0", "off", "false", "no", "none")
+
+
+def curl_binary() -> str | None:
+    """系统 curl 的绝对路径（Windows 只用 System32，避免 PATH 劫持）。"""
+    override = (os.environ.get(CURL_BIN_ENV) or "").strip()
+    if override:
+        return override if os.path.isfile(override) else None
+    if os.name == "nt":
+        root = os.environ.get("SystemRoot") or r"C:\Windows"
+        candidate = os.path.join(root, "System32", "curl.exe")
+        return candidate if os.path.isfile(candidate) else None
+    return shutil.which("curl")
+
+
+def _config_line(key: str, value: str) -> str:
+    """curl ``-K`` 配置行：双引号 + 反斜杠转义（**凭据只走 stdin，不进 argv**）。"""
+    escaped = (value.replace("\\", "\\\\").replace('"', '\\"')
+               .replace("\r", "\\r").replace("\n", "\\n"))
+    return key + ' = "' + escaped + '"'
+
+
+def _curl_request(method: str, url: str, headers: dict[str, str],
+                  data: bytes | None, timeout: float) -> tuple[HttpResponse | None, str]:
+    """用系统 curl 发一次请求；返回 ``(响应 | None, 说明)``。
+
+    为什么要它：客户那台 Windows 上 ``curl``（Schannel + 系统信任库）能连上网关，
+    而 CPython/OpenSSL 在握手阶段必败，客户又无法再提供现场信息 —— 于是把「**系统 TLS
+    栈**」当成兜底通道。仍然做证书校验（用的是 OS 信任库），不提供跳过校验的选项。
+
+    凭据面：header 与 body 全部写进 ``-K -`` 的 **stdin 配置**，不落 argv、不落临时文件。
+    """
+    if not _fallback_enabled():
+        return None, "off"
+    binary = curl_binary()
+    if not binary:
+        return None, "no-curl"
+    text: str | None = None
+    if data is not None:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "binary-body"                # 非 UTF-8 体不走配置通道
+    seconds = int(max(1, round(float(timeout))))
+    lines = ["silent", "show-error", "location", "max-redirs = 3",
+             "max-time = " + str(seconds),
+             _config_line("url", url),
+             _config_line("request", method.upper()),
+             _config_line("write-out", "\n" + _STATUS_MARK + "%{http_code}")]
+    for name, value in headers.items():
+        lines.append(_config_line("header", str(name) + ": " + str(value)))
+    if text is not None:
+        lines.append(_config_line("data-binary", text))
+    started = _monotonic()
+    try:
+        proc = subprocess.run([binary, "-K", "-"], input="\n".join(lines) + "\n",
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=float(timeout) + 5.0,
+                              **subprocess_window_kwargs())
+    except (OSError, subprocess.SubprocessError):
+        return None, "curl-error"
+    if proc.returncode != 0:
+        return None, "curl-exit-" + str(proc.returncode)
+    out = proc.stdout or ""
+    index = out.rfind(_STATUS_MARK)
+    if index < 0:
+        return None, "curl-no-status"
+    status_text = out[index + len(_STATUS_MARK):].strip()[:3]
+    payload = out[:index]
+    if payload.endswith("\n"):
+        payload = payload[:-1]                        # 去掉 write-out 自带的分隔换行
+    try:
+        status = int(status_text)
+    except ValueError:
+        return None, "curl-bad-status"
+    return HttpResponse(status=status,
+                        headers={"x-djb-fallback": "curl"},
+                        body=payload.encode("utf-8"), url=url,
+                        elapsed_ms=int((_monotonic() - started) * 1000)), "ok"
 
 
 def _monotonic() -> float:
