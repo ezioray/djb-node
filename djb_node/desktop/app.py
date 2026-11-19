@@ -385,6 +385,7 @@ class DesktopApp:
         self._ensure_probe_worker()
         self._ensure_discover_worker()
         self._controller.device_via = self._start_device_flow
+        self._controller.device_notify = self._device_state_changed
         bind = getattr(self._root, "bind", None)
         if callable(bind):
             try:
@@ -1477,8 +1478,46 @@ class DesktopApp:
     def _apply_device(self, result: Any) -> None:
         message = str(getattr(result, "message", "") or "绑定流程结束")
         self._toast(message, ok=bool(getattr(result, "ok", False)))
-        if bool(getattr(result, "ok", False)):
-            self._request_refresh_async(("account", "overview", "access"))
+        # 2026-11-19 客户报障「在浏览器确认绑定点击没反应」：旧实现只在**成功**时刷新，
+        # 失败时页面一个字都不变，只闪一条 toast —— 客户看不到任何状态，就判成按钮坏了。
+        self._request_refresh_async(("account", "overview", "access"))
+
+    def _device_state_changed(self, flow: Any) -> None:
+        """设备流程状态一变就排队回主线程（这是 worker 线程，不能碰 Tk）。"""
+        try:
+            data = flow.as_dict() if callable(getattr(flow, "as_dict", None)) else {}
+        except Exception:                             # pragma: no cover - 形状异常
+            data = {}
+        snapshot = dict(data or {})
+        self._ui_call(lambda: self._on_device_state(snapshot))
+
+    def _on_device_state(self, data: Mapping[str, Any]) -> None:
+        state = str(data.get("state") or "")
+        url = str(data.get("verify_url") or "")
+        code = str(data.get("user_code") or "")
+        if state == "pending" and self._open_verify_url_once(url):
+            self._toast("已在浏览器打开确认页" + ("（码 " + code + "）" if code else "")
+                        + "：在网页里点「确认」，本机会自动接上", ok=True)
+        # 每个中间状态都刷一次：设备码/状态字段要立刻反映（含失败原因）
+        self._request_refresh_async(("account", "access"))
+
+    def _open_verify_url_once(self, url: str) -> bool:
+        """同一个确认链接只开一次浏览器（状态反复变化不许连开窗口）。"""
+        url = str(url or "")
+        if not url:
+            return False
+        seen = getattr(self, "_opened_verify_urls", None)
+        if seen is None:
+            seen = set()
+            self._opened_verify_urls = seen
+        if url in seen:
+            return False
+        seen.add(url)
+        try:
+            import webbrowser
+            return bool(webbrowser.open(url))
+        except Exception:                             # pragma: no cover - 无浏览器/无显示
+            return False
 
     # ── RC14 I：读取模型清单（网络在 worker 线程，主线程只播报）
     def _ensure_discover_worker(self) -> Any:
@@ -2182,7 +2221,8 @@ class DesktopApp:
             self._render_action_bar(left, view.actions, pady=(2, 0))
 
     def _render_action_bar(self, parent: Any, actions: Any, *,
-                           pady: tuple[int, int] = (0, 0)) -> None:
+                           pady: tuple[int, int] = (0, 0),
+                           titles: bool = True) -> None:
         """动作栏。D6：带 ``group`` 的动作各自成块（小标题 + 独立一行按钮）。
 
         客户原话「UI 上拆分绑定节点和提交 USDT 地址可以么，隔离两个动作」——原来整页只有
@@ -2192,6 +2232,12 @@ class DesktopApp:
         tk = self._tk
         from .views import action_groups
 
+        if not titles:                               # 分区渲染：外层已画过组标题
+            bar = tk.Frame(parent, background=dual.color("bg"))
+            bar.pack(fill="x", pady=pady)
+            for action in actions:
+                self._render_action(bar, action)
+            return
         groups = action_groups(actions)
         if not any(title for title, _ in groups):
             # 老行为（无分组）：一条栏，逐字节等价
@@ -2438,16 +2484,58 @@ class DesktopApp:
         for item in view.switches:                   # RC15-039 #4：本机界面开关
             self._render_switch(item)
         # 有表单的页：卡片 → 字段 → 动作（保存）→ 表格；没有表单的页：卡片 → 动作 → 表格
-        if view.fields:
-            self._render_fields(view.fields, view.key)
-        if view.actions:
-            self._render_action_bar(self._body, view.actions, pady=(0, 12))
+        sections = self._section_order(view)
+        if sections:
+            # 2026-11-19 客户报障：账户页「绑定节点」与「USDT 收款地址」必须完全隔离。
+            # 有分区的页改成「每组各成一块」：标题 → 该组字段 → 该组按钮，组与组之间
+            # 不再共享任何一条按钮栏。没有 group 的页走的还是下面这条老路径（逐字节等价）。
+            self._render_sections(view, sections)
+            rest = tuple(item for item in view.actions
+                         if not str(getattr(item, "group", "") or ""))
+            if rest:
+                self._render_action_bar(self._body, rest, pady=(0, 12))
+        else:
+            if view.fields:
+                self._render_fields(view.fields, view.key)
+            if view.actions:
+                self._render_action_bar(self._body, view.actions, pady=(0, 12))
         for item in view.filters:                    # RC15-039 #5：表格上方的下拉筛选
             self._render_filter(item)
         if view.table is not None:
             self._render_table(view.table)
         for extra in view.tables:                     # RC14 D：模型与探针页的第二张表
             self._render_table(extra, primary=False)
+
+    def _section_order(self, view: View) -> tuple[str, ...]:
+        """页面里的分区标题顺序（字段在前、动作在后，按首次出现排）。空 = 老行为。"""
+        order: list[str] = []
+        for item in tuple(view.fields) + tuple(view.actions):
+            title = str(getattr(item, "group", "") or "")
+            if title and title not in order:
+                order.append(title)
+        return tuple(order)
+
+    def _render_sections(self, view: View, sections: Sequence[str]) -> None:
+        """按分区画：标题 → 该组字段 → 该组按钮。组内按钮**不再**重复小标题。"""
+        tk = self._tk
+        plain = tuple(item for item in view.fields
+                      if not str(getattr(item, "group", "") or ""))
+        if plain:                                    # 兜底：没分区的字段照旧先渲染
+            self._render_fields(plain, view.key)
+        for title in sections:
+            block = tk.Frame(self._body, background=dual.color("bg"))
+            block.pack(fill="x", pady=(0, 6))
+            tk.Label(block, text=title, font=self._fonts.sans(self._kit.px("h2"), bold=True),
+                     foreground=dual.color("ink"), background=dual.color("bg"),
+                     anchor="w").pack(fill="x", pady=(10, 6))
+            fields = tuple(item for item in view.fields
+                           if str(getattr(item, "group", "") or "") == title)
+            if fields:
+                self._render_fields(fields, view.key, parent=block)
+            actions = tuple(item for item in view.actions
+                            if str(getattr(item, "group", "") or "") == title)
+            if actions:
+                self._render_action_bar(block, actions, pady=(0, 10), titles=False)
 
     def _cards_per_row(self, count: int = 0) -> int:
         """宽窗 4 张、中宽 2 张、窄窗 1 张（设计是四宫格；不许再把第三张挤出窗口）。
