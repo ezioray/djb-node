@@ -152,7 +152,7 @@ def test_flag_default_on_with_three_fields_and_kill_switch():
     spec = facts.FEATURE_FLAGS[facts.CHANNEL_FLAG]
     assert spec["default"] is True
     assert spec["owner"] == "client-seat"
-    assert spec["expire_at"] == "2026-12-31"
+    assert spec["expire_at"] == "2027-06-30"
     assert "停长轮询" in str(spec["rollback_rule"])
     assert spec.get("description")
     assert "desc" not in spec
@@ -706,3 +706,43 @@ def test_parse_job_accepts_envelope_request_and_flat_shapes():
     assert flat is not None and flat.job_id == "j3" and flat.model == "m3"
     assert flat.timeout_s == 5
     assert not hasattr(flat, "lease_expires_at")          # 租约只属平台侧，客户端忽略
+
+
+# ───────────────────────────────────── djb_effort → reasoning_effort（默认关；开关双端）
+def test_djb_effort_parsed_and_whitelisted():
+    job = parse_job({"job_id": "e1", "request": {"model": "m", "messages": MESSAGES,
+                                                 "djb_effort": "low"}})
+    assert job is not None and job.djb_effort == "low"
+    # 非法值 / auto / 缺省 → None（不改前行为）
+    for bad in ("auto", "ultra", "", None, 5):
+        parsed = parse_job({"job_id": "e2", "request": {"model": "m", "messages": MESSAGES,
+                                                        "djb_effort": bad}})
+        assert parsed is not None and parsed.djb_effort is None, bad
+
+
+def test_body_maps_effort_only_when_enabled():
+    job = parse_job({"job_id": "e3", "request": {"model": "m", "messages": MESSAGES,
+                                                 "djb_effort": "high"}})
+    assert job is not None
+    # 开关关：不出现 reasoning_effort（与改前逐字节一致）
+    assert "reasoning_effort" not in job.body()
+    assert "reasoning_effort" not in job.body(reasoning_effort_enabled=False)
+    # 开关开：四档 1:1 映射
+    assert job.body(reasoning_effort_enabled=True)["reasoning_effort"] == "high"
+    # 没有 djb_effort 时开关开也不加字段
+    plain = parse_job({"job_id": "e4", "request": {"model": "m", "messages": MESSAGES}})
+    assert plain is not None
+    assert "reasoning_effort" not in plain.body(reasoning_effort_enabled=True)
+
+
+def test_djb_effort_not_in_whitelist_leak(paths, credentials):
+    job = json.loads(json.dumps(JOB))
+    job["requests"].update({"djb_effort": "medium"})
+    job["requests"]["messages"] = MESSAGES
+    api = FakeApi([job])
+    chat = FakeChat()
+    client = _client(paths, credentials, api=api, chat_call=chat)
+    _run(client, api, stop_after=1)
+    # 默认关：djb_effort 只进 ChannelJob，不进上游 body
+    assert "djb_effort" not in chat.calls[0]["body"]
+    assert "reasoning_effort" not in chat.calls[0]["body"]

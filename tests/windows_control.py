@@ -84,7 +84,7 @@ def require_usable() -> None:
     """验证控制通道「本该可用」；不可用时**带可验证理由 skip**，不静默红、不静默绿。
 
     触发条件都是**确定事实**（未登记 / default 与发布决策不一致 / 到期 / 三字段缺失），
-    不是运行时抖动。到期（expire_at=2026-12-31）或按 rollback_rule 回滚时，
+    不是运行时抖动。到期（expire_at=2027-06-30）或按 rollback_rule 回滚时，
     这些用例会变成"环境不允许验证控制通道"的 skip，理由直接指向开关语义用例：
     ``tests/test_windows_ipc.py::test_flag_default_expiry_and_metadata``。
     """

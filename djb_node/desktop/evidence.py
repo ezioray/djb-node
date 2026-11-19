@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ..gui import theme
+from ..platform.no_window import subprocess_window_kwargs
 from .datasource import SECTIONS, NullDataSource, Snapshot, Unavailable
 from .views import VIEW_KEYS, build_view
 
@@ -115,7 +116,7 @@ def _headless_report() -> str:
     env["DJB_HOME"] = "/tmp/djb-evidence-home"
     try:
         done = subprocess.run(command, capture_output=True, text=True, timeout=180,
-                              env=env, cwd=os.getcwd())
+                              env=env, cwd=os.getcwd(), **subprocess_window_kwargs())
         code, out, err = done.returncode, done.stdout, done.stderr
     except (OSError, subprocess.SubprocessError) as exc:
         code, out, err = -1, "", type(exc).__name__

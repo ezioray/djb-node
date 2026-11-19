@@ -62,6 +62,14 @@ USER_AGENT = "djb-node/" + CLIENT_VERSION + " (" + PLATFORM + ")"
 #: 客户在生产包里点「打开网页端」会落到预发站。
 WEB_CONSOLE_URL = (os.environ.get("DJB_WEB_CONSOLE") or "").strip() or "https://tkbank.ai"
 
+#: 网页控制台的「账户安全」页路径（2FA / TOTP enroll 与 confirm 都在这一页）。
+#: 客户端不代理 2FA 绑定，只能把客户**送到这一页**（repos/djb-web/app/routes/consumer.py 的
+#: security 路由）；路径只在这里出现一次，改版时不用满仓找字符串。
+WEB_CONSOLE_SECURITY_PATH = "/console/security"
+
+#: 下载页路径（``no_artifact`` 必须给客户一条**能点**的路，而不是只说「暂无安装包」）。
+UPDATE_DOWNLOAD_PATH = "/download"
+
 # ─────────────────────────────────────────────────────────── 状态机（M15 §3 / §5.9）
 DAEMON_STATES: tuple[str, ...] = ("stopped", "starting", "online", "paused", "error", "updating")
 """daemon 运行态（M15 §3 状态机的运行侧投影）。"""
@@ -153,6 +161,9 @@ FIRST_RUN_BUDGET_S = 180
 
 # ─────────────────────────────────────────────────────────── client.* 默认值（§8.1）
 PRESETS: tuple[str, ...] = ("省心", "均衡", "全力以赴")
+# TODO(preset-effect): 目前**没有任何消费方**（定义 1 处、消费 0 处），且「省心=2」与
+# `DEFAULT_CONCURRENT = 3` 本就不一致——切档不会改并发/让路。等 daemon 侧开票接上
+# （RC15-039 #17 复核 M7/S12），在那之前界面不许宣称"切档会改算力"。
 PRESET_CONCURRENCY: dict[str, int] = {"省心": 2, "均衡": 3, "全力以赴": 8}
 DEFAULT_PRESET = "省心"
 DEFAULT_DAILY_TOKENS = 500_000
@@ -163,7 +174,8 @@ CONCURRENT_MIN = 1
 CONCURRENT_MAX = 64
 DEFAULT_YIELD_ENABLED = True
 DEFAULT_UPDATE_CHANNEL = "stable"
-UPDATE_CHANNELS: tuple[str, ...] = ("stable", "beta")
+UPDATE_CHANNELS: tuple[str, ...] = ("stable", "beta", "internal")
+"""`internal` = 内部机频道（0.3.5 起）：可见 wave 0 制品，且接受任一频道清单（超集）。"""
 DEFAULT_LOG_LEVEL = "info"
 LOG_LEVELS: tuple[str, ...] = ("info", "debug")
 PORT_MIN = 1024
@@ -201,11 +213,27 @@ A2_PROMPT_SECTIONS: tuple[str, ...] = ("目标", "约束", "输入", "输出", "
 """03-facts §11：A2 prompt 模板五字段（目标 / 约束 / 输入 / 输出 / 验收）。"""
 UPSTREAM_STATES: tuple[str, ...] = ("declared", "probing", "verified", "rejected")
 DEFAULT_UPSTREAM_PROTOCOL = "openai-chat"
+#: RC14 I：协议二选一（客户端下拉；切换**不改**已填链接）
+UPSTREAM_PROTOCOLS: tuple[str, ...] = ("openai-chat", "anthropic-messages")
+"""上游对话协议（``upstream_protocols.py`` 的实现口径）；默认 ``openai-chat``。"""
+UPSTREAM_PROTOCOL_LABELS: dict[str, str] = {
+    "openai-chat": "OpenAI 兼容（/v1/chat/completions）",
+    "anthropic-messages": "Anthropic（/v1/messages）",
+}
 DEFAULT_MIN_PRICE_UNIT = "usd_per_1m_tokens"
 TOKEN_RELAY_KIND = "token_relay"
 
 # ─────────────────────────────────────────────────────────── 更新（03-facts §11 / §8.2）
-UPDATE_BUCKET_WAVES: tuple[int, ...] = (5, 25, 100)
+UPDATE_BUCKET_WAVES: tuple[int, ...] = (1, 10, 50, 100)
+"""分桶灰度百分比，下标 = wave 序号（wave 1 → 1%，wave 4 → 100%）。
+
+0.3.5 起按硬约束阶梯 `1/10/50/100`；0.3.4 及更早的客户端常量是 `(5, 25, 100)`，
+因此**本次 0.3.4 → 0.3.5 升级实际仍只能 5/25/100**（旧代码不认新常量），新阶梯从下一次升级生效。
+见 `reports/RM-20261113/B-PREP/10-GRAY-LADDER.md` §2C。
+"""
+UPDATE_BUCKET_INTERNAL_CHANNEL = "internal"
+"""wave 0 = 内部档：**仅**该更新频道可见（`DJB_UPDATE_CHANNEL=internal` 的内部机）；
+`stable` / `beta` 命中的结果是 `not_in_wave_0`，等于永不进入内部档。"""
 UPDATE_BUCKET_OBSERVE_S = 24 * 3600
 UPDATE_KEEP_VERSIONS = 2
 UPDATE_SIGNATURE_PREFIX = "hmac-sha256:"
@@ -528,10 +556,95 @@ PROBE_MODELS_PER_STEP = 8
 """模型数退避：每多 8 个模型，周期复探间隔再加一档。"""
 PROBE_MAX_BACKOFF_SHIFT = 5
 """失败指数退避上限：2**5 = 32 倍（再乘上限截断）。"""
-PROBE_PASS_BUDGET_S = 10
-"""单轮探针预算（秒）：启动校验与周期复探共用，超出即把剩余模型留到下一轮。"""
+PROBE_PASS_BUDGET_S = _float_env("DJB_NODE_PROBE_PASS_BUDGET_S", 20.0, minimum=5.0)
+"""单轮探针预算（秒）：启动校验与周期复探共用，超出即把剩余模型留到下一轮。
+
+0.3.8（RC14 复盘 P0-2）：原值 10s 是死值。真机 L3 一轮 5 个模型实测 2 分 37 秒 ~ 6 分 06 秒
+（2026-11-15 生产 journal），预算内**永远**探不完，尾部模型被打成 ``not_probed``，0.3.4 的
+``all()`` 因此每轮 false、``verified_at`` 永不刷新。现在可配（env）且默认 20s，
+配合 :data:`PROBE_PERIODIC_LEVEL`（周期只跑 L2）一轮可在预算内跑完。
+"""
+
+PROBE_PASS_BUDGET_MAX_S = float(HEARTBEAT_DEFAULT_S)
+"""单轮预算硬上限（秒）＝一个心跳周期。
+
+探针在 daemon 主循环里**内联**执行，预算超过一个心跳周期会让节点 presence 掉档
+（云端 ``STALE_AFTER_S=45``、``OFFLINE_AFTER_CYCLES=3`` ⇒ 90s 判 offline）。
+要跑「一次 600s 全量 L3」必须先把探针移出主循环（独立线程/子进程），不要直接调大预算。
+"""
+
+
+PROBE_MIN_MODEL_TIMEOUT_S = _float_env("DJB_NODE_PROBE_MIN_MODEL_TIMEOUT_S", 2.0,
+                                      minimum=1.0)
+"""单个模型的**最小预算切片**（秒）：单轮预算按「剩余模型数」切分时给每个模型保底这么多。
+
+0.3.9 / D-RCA P1-a：0.3.8 把完整的 ``PROBE_TIMEOUT_S``(20s) 原样传给**每个**
+``probe_model``，只在每个模型开始前看一次 deadline，没有 ``min(timeout, remaining)``:
+一个慢模型可以吃掉整轮预算（5 个模型最坏约 100 s > 30 s 心跳上限），慢模型排第一时
+其余模型全部 ``not_probed``（2026-11-16 现场 qwen 恰在列表末尾，**没饿死是运气**）。
+现在每个模型最多拿 ``remaining_s / remaining_models``，且不低于本值：L2 健康响应远小于
+2 s，确实需要更久的模型只丢自己这一行并进入 backlog，不再吃掉别人的预算。
+
+默认 2.0 s（下限 1.0 s：再小会把正常的网络抖动判成 timeout）。
+回滚：``DJB_NODE_PROBE_MIN_MODEL_TIMEOUT_S=20``（= ``PROBE_TIMEOUT_S``）即让切片退化成
+「每个模型都能拿满整轮预算」的旧行为，无需改代码。
+"""
+
+
+def probe_pass_budget_s(pass_budget: float | None = None) -> float:
+    """实际生效的单轮探针预算（秒）：**不得超过一个心跳周期**。
+
+    探针内联在 daemon 主循环里，预算超过一个心跳周期会让节点 presence 掉档
+    （云端 ``STALE_AFTER_S=45``、``OFFLINE_AFTER_CYCLES=3`` ⇒ 90s 判 offline）。
+    要跑「一次 600s 全量 L3」必须先把探针移出主循环（独立线程/子进程），不要直接调大预算。
+    """
+    value = float(PROBE_PASS_BUDGET_S if pass_budget is None else pass_budget)
+    return max(1.0, min(value, PROBE_PASS_BUDGET_MAX_S))
+
+
+PROBE_PERIODIC_LEVEL = "L2"
+"""周期复探/启动校验的探针档位：只做推理级（L2），不重复流式与用量校验（L3）。
+
+为什么：L3 每个模型要 3 次 HTTP（L2 推理 + 流式 + usage），5 个模型真机实测 2.5–6 min，
+而云端门控只认 ``model_checks[].ok``（推理是否通过）。把 L3 留给 ``djb upstream probe``
+（人工/CLI）与 ``PROBE_DEFAULT_LEVEL``，周期健康检查就能在一轮预算内覆盖全部模型。
+"""
+
 PROBE_NOT_PROBED = "not_probed"
 """预算内没来得及探的模型：不算失败，但不进容量公告。"""
+
+PROBE_TOLERATED_ERROR_CLASSES: tuple[str, ...] = (PROBE_NOT_PROBED, "model_not_listed")
+"""daemon 判定「真实失败」时要排除的错误类（0.3.8 / RC14 复盘 P0-2）。
+
+* ``not_probed``：本轮预算没轮到（不是上游坏了）；
+* ``model_not_listed``：该模型已从上游清单下架（W6 owner 裁决：停用/下架不该拖死整条上游）。
+
+其余错误类（timeout / http_5xx / auth / model_error …）仍算真实失败 ⇒ rejected。
+"""
+
+PROBE_BACKLOG_RETRY_S = 5.0
+"""还有模型因预算没探到（backlog）时，下一轮的间隔（秒）。
+
+不按常规周期（half-fresh）等，而是很快续跑，几轮内把 backlog 清空；
+清空后自动回到 ``periodic_interval_s``。"""
+
+PROBE_REUSE_OK_S = _float_env("DJB_NODE_PROBE_REUSE_OK_S", 20.0, minimum=0.0)
+"""**预算受限的轮次**里，刚探过且 ok 的模型可以直接复用结论、不必重探的时间窗（秒）。
+
+0.3.9 / D-RCA P1-b：5s backlog 续跑是为了**补缺口**（``not_probed`` / 未覆盖 / 已知失败），
+不是把 5 秒前刚验过的模型再跑一遍。没有这个复用窗，一轮 20s 预算里 4 个刚 ok 的模型
+会把预算重新吃光，缺口（例如排最后的 qwen）依旧轮不到 —— 与 0.3.4 的 635s 逐模型 stale
+是同一类「没轮到」的累积。
+
+窗口必须**远小于** ``PROBE_FRESH_AFTER_S``(600)：复用期间的 ok 行仍然进报价，
+窗口一旦接近新鲜度窗口，就会把模型拖成逐模型 ``stale_probe``（0.3.4 事故模式 5 行→1 行）。
+默认 20s（= 一个 ``PROBE_PASS_BUDGET_S``）：跨过一轮预算就没有复用价值了。
+
+* 只在**有 deadline** 的轮次生效（周期/启动/预算受限）；手动 ``djb upstream probe``
+  （``deadline=None``）永远实探，不拿旧结论糊弄人；
+* 被复用的模型**不刷新** ``last_probe_at``（不伪造新鲜度），也不进 ``not_probed[]``。
+回滚：``DJB_NODE_PROBE_REUSE_OK_S=0`` 即关闭复用（每轮所有模型都实探），无需改代码。
+"""
 
 # ─────────────────────────────────────────────────────────── 报价发布（CR-20261106-OFFICIAL-SUPPLY-01）
 # 口径：`design/17-官方供给与价格配置-设计方案-v1.md` §15 + CR 第 3 节 P1/P2/P4/P6。
@@ -599,7 +712,7 @@ TOKEN_COMPARE_FLAG = "client.token.compare.enabled"
 TOKEN_COMPARE_FLAG_META: dict[str, object] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后只记录上游 usage、不做本地比较",
     "description": "真实请求路径做本地 token 计数与上游 usage 的差异检测（>1% 记 token_mismatch）",
 }
@@ -611,18 +724,63 @@ FEATURE_FLAGS[TOKEN_COMPARE_FLAG] = TOKEN_COMPARE_FLAG_META
 # ── M17 §9 开关（Lead 合并：与 C8 共用同一个 FEATURE_FLAGS 登记表）
 FEATURE_FLAGS["client.relay.enabled"] = {
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 隐藏 relay 接入；已有配置只读、不删除",
     "default": False,
     "description": "第三方中转站接入（M17 §4 / C11），默认关闭",
 }
 FEATURE_FLAGS["supply.attestation.enabled"] = {
     "owner": "platform",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 回退 L2 可达性判定；已有路由/账本不变；已存证明保留只读",
     "default": False,
     "description": "模型身份证明（M17 §5 / C12 客户端侧线索采集），默认关闭",
 }
+# ── RC14 C 设备码自动绑定（默认关闭：关 → 只显示「高级 → 手输绑定码」老入口，
+# 云端 N1–N4 端点保留但客户端不调用，可随时下线，无状态依赖）
+FEATURE_FLAGS["client.binding.device_flow.enabled"] = {
+    # 2026-11-18：三端（契约/云端/网页）设备授权流已全部上线，0.3.12 起默认开启。
+    # 回滚=置 false：客户端只显示「粘贴绑定码」老入口，云端端点保留但无调用。
+    "default": True,
+    "owner": "lead",
+    "expire_at": "2027-03-31",
+    "rollback_rule": "置 false → 只显示「粘贴绑定码」老入口；N1–N4 端点保留但客户端不调用，"
+                     "云端可随时下线（无状态依赖）",
+    "description": "设备码自动绑定（POST /node/binding/device + poll，网页 /activate 确认；RC14 C）",
+}
+DEVICE_FLOW_FLAG = "client.binding.device_flow.enabled"
+DEVICE_FLOW_PATHS = ("/api/v1/node/binding/device", "/api/v1/node/binding/device/poll")
+
+# ── RC14 B 首启引导（默认关闭：关 → 不渲染引导视图，onboarding.json 保留但不读，
+# 零数据迁移；QA 截图基线不受影响）
+FEATURE_FLAGS["client.onboarding.enabled"] = {
+    "default": False,
+    "owner": "lead",                     # 设计 §5.4 原表：lead（待指定到人）
+    "expire_at": "2027-03-31",
+    "rollback_rule": "置 false 重启客户端 → 不渲染引导视图；desktop/onboarding.json 保留但"
+                     "不读，零数据迁移（可用 djb onboarding --reset 清状态）",
+    "description": "首启引导（3 步 + 完成页，每步可跳过；RC14 B）",
+}
+ONBOARDING_FLAG = "client.onboarding.enabled"
+
+# ── RC14 I/J 逐模型底价上报（默认关闭：云端 ask-settings / schedule-quotes.models[]
+# 还没有主线实现，见 CHG-2026-11-14-RC14-IMPL §3-B.9；三字段齐全、到期强制关）
+FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
+    "default": False,
+    "owner": "lead",                     # 设计 §5.4：竞价/上报类开关统一 owner=lead
+    "expire_at": "2027-03-31",           # 与 §5.4 表的到期日一致
+    "rollback_rule": "关闭 → 客户端不再上报逐模型底价（本地账本只读保留、报价回到原口径）；"
+                     "djb flags --disable client.upstream.bid_report.enabled 即刻生效，"
+                     "无需迁移、无残留（云端没有收到过任何底价）",
+    "description": "逐模型底价上报到云端（RC14 I/J）；云端接口未开通前保持关闭",
+}
+UPSTREAM_BID_FLAG = "client.upstream.bid_report.enabled"
+UPSTREAM_BID_REPORT_PATHS: tuple[str, ...] = (
+    "/api/v1/user/provider/ask-settings",
+    "/api/v1/schedule/quotes",
+)
+"""逐模型底价最终要写的两个云端路径（P9 / 报价 models[]）；客户端只做本地账本 + 预览。"""
+
 RELAY_FLAG = "client.relay.enabled"
 ATTEST_FLAG = "supply.attestation.enabled"
 FLAG_REQUIRED_FIELDS: tuple[str, ...] = ("owner", "expire_at", "rollback_rule", "default")
@@ -636,12 +794,12 @@ FLAG_REQUIRED_FIELDS: tuple[str, ...] = ("owner", "expire_at", "rollback_rule", 
 FEATURE_FLAGS["client.probe.periodic.enabled"] = {
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-15T00:00:00+08:00",
+    "expire_at": "2027-06-30T00:00:00+08:00",
     "rollback_rule": "环境变量 DJB_FLAG_CLIENT_PROBE_PERIODIC_ENABLED=false 或配置 "
                      "feature_flags[\"client.probe.periodic.enabled\"]=false（djb flags --disable）"
                      "即停周期复探，只保留手动 probe（djb upstream probe），公告按已存 "
                      "last_probe_at 判新鲜；或 git revert 本提交",
-    "description": "客户端周期复探（L2/L3），0.2.5 起默认开启（显式关闭仍生效）",
+    "description": "客户端周期复探（L2/L3），0.2.5 起默认开启（显式关闭仍生效）；2026-11-09 复核：续期至 2027-06-30（原 2026-12-15 会在 12-16 静默 fail-closed，见 reports/RLS-20261109-CLIENT-025/DECISION-PROBE-FLAG-RENEWAL.md）",
 }
 PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
 
@@ -651,7 +809,7 @@ PROBE_FLAG_PERIODIC = "client.probe.periodic.enabled"
 FEATURE_FLAGS["client.quotes.publish.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭 → 停发新报价（daemon 报价环不启动、CLI publish 拒发）；"
                      "已发报价 ≤ TTL 自然过期，不改账本、无残留",
     "description": "客户端周期报价发布（design/17 §15；TTL=2×周期），默认关闭",
@@ -667,7 +825,7 @@ QUOTES_FLAG = "client.quotes.publish.enabled"
 FEATURE_FLAGS["client.channel.enabled"] = {
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": ("显式写盘 false 即停长轮询、退回无通道模式（已取 job 尽力回传后停止；"
                       "本地显式关闭优先于服务端 channel_required）。"
                       "回滚=djb flags --disable client.channel.enabled + 重启 daemon"),
@@ -713,7 +871,7 @@ CHANNEL_REQUIRED_KV = "channel"
 FEATURE_FLAGS["client.model_sync.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后停拉取、保留已应用版本（本地 model_sync.json 只读不删）",
     "description": "客户端模型/tokenizer 同步（M18b）：拉签名 bundle、校验后热应用，默认关闭",
 }
@@ -752,7 +910,7 @@ MODEL_SYNC_DRIFT_FIELDS: tuple[str, ...] = ("tokenizer_family", "tokenizer_versi
 FEATURE_FLAGS["client.notifications.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后停拉取、保留本地消息与待补发读态（本地只读不删）",
     "description": "客户端消息中心（C16）：拉取站内信、未读/已读/ack、离线补拉，默认关闭",
 }
@@ -772,7 +930,7 @@ FEATURE_FLAGS[MACHINE_PROFILE_FLAG] = {
 FEATURE_FLAGS[UPDATE_MOCK_FLAG] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭即回到内置公钥验签（唯一信任锚）；mock 不产生任何持久状态，"
                      "已安装版本与回滚点不变",
     "description": "自动更新验签的 test-only HMAC mock（必须同时满足 DJB_ENV=test + "
@@ -816,7 +974,7 @@ NOTIFICATIONS_ACTIONS: tuple[str, ...] = ("read", "ack")
 FEATURE_FLAGS["client.tray.control.enabled"] = {
     "default": False,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": "关闭后托盘暂停/恢复退回命令指南；不改变 daemon 状态，不写离线偏好",
     "description": "托盘用户确认后暂停/恢复；先读状态、独立回读、到期强制关闭",
 }
@@ -828,7 +986,7 @@ FEATURE_FLAGS["client.ipc.windows.enabled"] = {
     # 关掉即回到「控制不可用 + 可行动提示」，不退回 TCP、不改 daemon 运行偏好。
     "default": True,
     "owner": "client-seat",
-    "expire_at": "2026-12-31",
+    "expire_at": "2027-06-30",
     "rollback_rule": ("关闭Windows命名管道控制并显示不可用；不退TCP/不更改daemon运行偏好。回滚=成对改动：default→False 且 ipc_windows.py 的 tripwire 判据改回 `is not False`（只改一处=半截回滚：tripwire 会 fail closed，所有 Windows 控制用例会以「开关不可用」skip）"),
     "description": "Windows同SID/session/integrity安全命名管道；不解禁GUI托盘控制",
 }
@@ -849,5 +1007,30 @@ FEATURE_FLAGS["plan.groups"] = {
     "description": "多 plan 组：组内按 priority 自动切换、组级共享日/月预算，默认关闭",
 }
 PLAN_GROUPS_FLAG = "plan.groups"
+
+# ─────────────────────────────────────────────────────────── djb_effort → 上游思考强度
+# 口径（INTEGRITY-REVIEW-20261117 §6 / CR-20261117-AUDIT-FOLLOWUP）：
+# 平台 djb_effort（minimal/low/medium/high）此前只回显 X-DJB-Effort 诊断头，
+# 不改上游生成参数（空转）。打开本开关后，通道 job 里的 djb_effort 会被映射成
+# 上游 reasoning_effort（OpenAI 兼容系）真实生效。
+# **默认关闭**；两端（cloud gateway.effort_upstream + 本开关）都打开才生效。
+# Anthropic 线不做映射：thinking.budget_tokens 需要模型目录按 slug 下发的真实
+# token 数（v0.3 Q9 欠账），没有目录就不编数（不虚标）。
+FEATURE_FLAGS["upstream.reasoning_effort.enabled"] = {
+    "default": False,
+    "owner": "client-seat",
+    "expire_at": "2027-06-30",
+    "rollback_rule": ("djb flags --disable upstream.reasoning_effort.enabled + 重启 daemon"
+                      " → 通道 job 不再向上游转发 reasoning_effort，body 与打开前逐字节"
+                      "一致；平台侧 gateway.effort_upstream 关闭即可整体回滚，无数据残留"),
+    "description": ("通道 job 的 djb_effort 映射为上游 reasoning_effort（OpenAI 兼容系），"
+                    "默认关闭；Anthropic 线待模型目录（Q9）后接入"),
+}
+REASONING_EFFORT_FLAG = "upstream.reasoning_effort.enabled"
+#: djb_effort 四档 → OpenAI reasoning_effort 合法值（1:1；auto 不映射）
+EFFORT_TO_REASONING: dict[str, str] = {
+    "minimal": "minimal", "low": "low", "medium": "medium", "high": "high",
+}
+
 # 注意：尝试次数上限与冷却秒数只在 djb_node/plan_router.py 里定义一份
 # （MAX_ATTEMPTS / AUTH_COOLDOWN_S），这里不再复制，避免两处漂移。

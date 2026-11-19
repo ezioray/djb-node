@@ -19,7 +19,8 @@
 排版（R2 裁决 01-FONT-DECISION）
 ================================
 
-* 字号一律用**负数字号（像素）**：``-13`` = 13px，字阶只有 :data:`PX_*` 那几档。
+* 字号一律用**负数字号（像素）**：``-13`` = 13px；档位只有 :mod:`typography` 那 9 档，
+  取字号一律 :func:`px`（0.3.4 的 ``PX_*`` 常量已删除，见本文件「字阶」一节）。
 * **中文不许进 mono**：要画字符串就调 :meth:`Fonts.for_text`（ASCII → mono，其余 → sans）。
   手写 ``fonts.mono()`` 只允许出现在「确定是 ASCII」的地方（回执号/时间戳/版本/快捷键）。
 * 字重只有 normal / bold；用颜色（``muted_text``）做层级，不靠加粗。
@@ -31,44 +32,50 @@ import tkinter as tk
 from tkinter import font as tkfont
 from typing import Any, Callable, Iterable, Sequence
 
-from . import theme, ui_geom
+from . import theme, typography, ui_geom
 
 __all__ = [
-    "Bars", "Button", "Chip", "Divider", "Fonts", "Gauge", "Icon", "NavItem", "PX_BODY",
-    "PX_BODY_S", "PX_CARD", "PX_CJK_MIN", "PX_DISPLAY", "PX_H1", "PX_HERO", "PX_MICRO",
-    "PX_MICRO_CJK", "PX_NAV", "PX_NUM", "PX_NUM_L", "PX_NUM_XL", "PX_SMALL", "PX_TABLE",
-    "PX_TITLE", "RoundedCard", "SectionHead", "StatCell", "Switch",
-    "apply_kit_styles", "fonts_for",
+    "Bars", "Button", "Chip", "Divider", "Fonts", "Gauge", "Icon", "NavItem", "RoundedCard",
+    "SectionHead", "StatCell", "Switch", "apply_kit_styles", "fonts_for", "px",
 ]
 
-# ── 字阶（px；R2 裁决 01-FONT-DECISION §2.1：只保留 7 档）
+
+def surface_alt(ratio: float = 0.08) -> str:
+    """「二级面」：ghost 按钮的 hover / **按下**底色（A 类可交互态的唯一来源）。
+
+    为什么不用新色板键：``theme.PALETTES`` 被 ``test_desktop_dual_theme`` 逐键钉死
+    （裁决「色板不改」）。这里用 :func:`theme.blend` 把 ``surface`` 往 ``ink`` 混一点，
+    两套主题自洽：日间变略深的灰紫、夜间变略亮的紫，**都**能和白底/深底拉开可见色差。
+
+    为什么 ghost 必须有色差（G2-4）：ghost 的常态底就是 ``surface``，若按下/悬停也只换描边，
+    30px 高的按钮在真机上几乎看不出变化——「按下态」等于没做（客户仍然觉得「点了像卡住」）。
+    """
+    return theme.blend(theme.color("surface"), theme.color("ink"), ratio)
+
+# ── 字阶：**唯一来源**是 :mod:`djb_node.desktop.typography`
 #
-# 下表是**唯一**的字号来源：渲染层不许再写裸数字字号（``sans(14)`` 那种）。
-# 7 档 = 30 / 19 / 18 / 13 / 12 / 10，外加「表格正文 11」这一档**特例**
-# （设计 9px 在 CJK 上糊、10px 又比微标还小，见 01-FONT-DECISION §2.1 末段）。
-# 字重只两档：标题与关键数字 bold，正文/说明/微标 normal（§2.3）。
-PX_DISPLAY = 30     # 仪表环中心大数字                    bold
-PX_TITLE = 19       # 页头标题                            bold
-PX_HERO = 18        # 主卡标题                            bold
-PX_CARD = 13        # 卡片标题 / 关键数值                  bold
-PX_BODY = 13        # 正文                                normal
-PX_SMALL = 12       # 按钮、辅助说明                       normal
-PX_MICRO = 10       # 微标、表头、版本号（含中文也用它，sans）normal / 表头 bold
-PX_TABLE = 11       # 表格正文（特例档；行高 26 不变）      normal
+# 0.3.4 曾在这里定义 8 个真值常量（30/19/18/13/13/12/10 + 表格 11）和 7 个旧名别名
+# （``PX_H1`` / ``PX_BODY_S`` / ``PX_NAV`` / ``PX_NUM`` / ``PX_NUM_L`` / ``PX_NUM_XL`` /
+# ``PX_MICRO_CJK``）。T4 起**全部删除**：渲染层只写档位名（``px("body")``），本模块
+# 不再有任何字号字面量。旧名 → 档位的映射与「值等价」断言在
+# ``tests/test_desktop_px_wiring.py``（那里是 0.3.4 口径的唯一边界）。
+#
+# 两条例外（裁决与理由见 ``reports/RM-20261113/M1-PROGRESS.md`` §8）：
+#   * **表格**：0.3.4 是 11px 特例，现并入 ``table``（12px；行高 28 已接 ``rowheight``）；
+#   * **mono**：0.3.4 **没有**对应档位（当时等宽借微标 10px），现在 ``mono`` 是独立 token（12px）。
+def table_rowheight(scale: float = 1.0) -> int:
+    """表格行高（``ttk.Treeview`` 的 ``rowheight``）= ``typography.table`` 的行盒高度 28。
 
-#: 含中文时的**最小**字号：中文在 10px 以下会糊成一团（§1 F1 的根因就是 8px 塞中文）
-PX_CJK_MIN = PX_MICRO
+    0.3.4 写死 26（当时字号 11）；0.3.5 的 ``table`` 是 12px / 行高 28（01-FONT-TYPO §2.3），
+    行盒与字号同源 ⇒ 不会出现「字号涨了行高没涨、下沿被裁」。取整与字号同一条规则
+    （``typography.round_px``，继承 0.3.4 的 ``int(round(...))``），所以 100%/125% 各档一致。
+    """
+    return typography.scaled_line("table", scale)
 
-# ── 兼容别名：调用方（app.py / views.py 投影层）不改签名，值收敛到上面 7 档
-PX_H1 = PX_TITLE          # 旧名：页头标题（原 18）
-PX_BODY_S = PX_SMALL      # 旧名：按钮/次级正文（原 12）
-PX_NAV = PX_SMALL         # 旧名：侧栏导航项（原 12）
-PX_NUM = PX_BODY          # 旧名：指标数值（原 13）
-PX_NUM_L = PX_TITLE       # 旧名：四宫格数值（原 19）
-PX_NUM_XL = PX_DISPLAY    # 旧名：仪表环数字（原 30）
-#: 旧名：含中文的微标。**保留为别名**只为不打断调用方签名；
-#: 渲染层改用 :meth:`Fonts.for_text`（含中文 → sans 10px），不许再拿它把中文塞进 mono。
-PX_MICRO_CJK = PX_MICRO
+
+def px(name: str) -> float:
+    """按档位名取设计字号（px@96dpi）。渲染层取字号的**唯一**入口。"""
+    return typography.px(name)
 
 
 class Fonts:
@@ -90,19 +97,18 @@ class Fonts:
     ``scale=1.25`` 时 30px → 38px。默认 1.0，本轮不接线（由 lead 合并后注入）。
     """
 
-    #: 角色 → ``(族, px, bold)``；ttk 样式与 option 数据库都引用这些名字
-    ROLE_FONTS: dict[str, tuple[str, int, bool]] = {
-        "body": ("sans", PX_BODY, False),
-        "small": ("sans", PX_SMALL, False),
-        "micro": ("sans", PX_MICRO, False),
-        "heading": ("sans", PX_MICRO, True),
-        "table": ("sans", PX_TABLE, False),
-        "mono": ("mono", PX_MICRO, False),
-        "nav": ("sans", PX_NAV, False),
-        "card": ("sans", PX_CARD, True),
-        "title": ("sans", PX_TITLE, True),
-        "hero": ("sans", PX_HERO, True),
-        "display": ("sans", PX_DISPLAY, True),
+    #: 角色 → (族, 设计字号, 是否 bold)；ttk 样式与 option 数据库都引用这些名字。
+    #: 全部**派生自** :mod:`djb_node.desktop.typography`：
+    #: 角色到档位的对应关系在 ``typography.ROLE_TOKEN_MAP``（表头 ``heading`` 例外地取
+    #: ``small`` 的字号 + bold，见 ``typography.ROLE_WEIGHT_OVERRIDE``）。
+    #: 本文件不再出现任何字号字面量；改字号只能改 ``typography.TYPES`` 一处。
+    ROLE_FONTS: dict[str, tuple[str, float, bool]] = {
+        role: (
+            "mono" if typography.token(target).family == "mono" else "sans",
+            typography.px(target),
+            (typography.ROLE_WEIGHT_OVERRIDE.get(role) or typography.weight(target)) == "bold",
+        )
+        for role, target in typography.ROLE_TOKEN_MAP.items()
     }
 
     #: 角色的 Tcl 具名字体（``option_add`` / ``style.configure`` 只认名字）
@@ -132,11 +138,17 @@ class Fonts:
             self.named[role] = self._build(self.NAMES[role], kind, px, bold)
 
     # ── 取字体
-    def px(self, value: int) -> int:
-        """设计 px → 实际 px（乘 ``scale``，至少 1）。"""
-        return max(1, int(round(float(value) * self.scale)))
+    def px(self, value: float) -> int:
+        """设计 px → 实际整数 px（乘 ``scale``，至少 1）。
 
-    def _build(self, name: str | None, kind: str, px: int, bold: bool) -> Any:
+        取整**统一走** :func:`typography.round_px`，它继承 0.3.4 的 ``int(round(...))``
+        （银行家舍入）：Tk 只认整数像素字号，而且换一套取整会在 ``.5`` 边界上改外观
+        （``display``@1.15：34.5 → 34，不是 35）。**同一设计值下**逐档等价见
+        ``tests/test_desktop_px_wiring.py::test_rounding_matches_0_3_4_at_every_scale``。
+        """
+        return typography.round_px(float(value) * self.scale)
+
+    def _build(self, name: str | None, kind: str, px: float, bold: bool) -> Any:
         family = self.mono_family if kind == "mono" else self.sans_family
         weight = "bold" if bold else "normal"
         size = -self.px(px)
@@ -164,7 +176,7 @@ class Fonts:
         self._cache[key] = font
         return font
 
-    def _get(self, family: str, px: int, weight: str) -> Any:
+    def _get(self, family: str, px: float, weight: str) -> Any:
         size = -abs(self.px(px))
         key = (family, size, weight, "")
         if key not in self._cache:
@@ -175,14 +187,14 @@ class Fonts:
                 self._cache[key] = (family, size, weight)
         return self._cache[key]
 
-    def sans(self, px: int = PX_BODY, *, bold: bool = False) -> Any:
+    def sans(self, px: float = typography.px("body"), *, bold: bool = False) -> Any:
         return self._get(self.sans_family, px, "bold" if bold else "normal")
 
-    def mono(self, px: int = PX_MICRO, *, bold: bool = False) -> Any:
+    def mono(self, px: float = typography.px("micro"), *, bold: bool = False) -> Any:
         return self._get(self.mono_family, px, "bold" if bold else "normal")
 
-    def for_text(self, text: Any, px: int = PX_MICRO, *, bold: bool = False) -> Any:
-        """按**这段文字**选族：纯 ASCII → mono；含任何非 ASCII → sans（中文最小 10px）。
+    def for_text(self, text: Any, px: float = typography.px("micro"), *, bold: bool = False) -> Any:
+        """按**这段文字**选族：纯 ASCII → mono；含任何非 ASCII → sans（中文最小 = ``typography.CJK_MIN_PX``，11px）。
 
         为什么需要它：等宽族（Cascadia Mono / Menlo / DejaVu Sans Mono）**没有 CJK 字形**，
         Tk 会静默逐字回退到 CJK 族，但**字号仍是等宽那一档**，于是中文糊成一团、中英基线跳。
@@ -190,7 +202,7 @@ class Fonts:
         raw = "" if text is None else str(text)
         if raw.isascii():
             return self.mono(px, bold=bold)
-        return self.sans(max(int(px), PX_CJK_MIN), bold=bold)
+        return self.sans(max(typography.round_px(px), typography.CJK_MIN_PX), bold=bold)
 
     def named_name(self, role: str) -> Any:
         """该角色可放进 ``option_add`` / ``style.configure`` 的字体值（名字或元组）。"""
@@ -540,7 +552,7 @@ class Chip(tk.Canvas):
     }
 
     def __init__(self, master: Any, text: str, *, tone: str = "muted",
-                 ground: str | None = None, px: int = PX_MICRO_CJK, mono: bool = False,
+                 ground: str | None = None, px: float = typography.px("micro"), mono: bool = False,
                  pad: int = 6, height: int = 16, radius: int = 4,
                  outline: str | None = None, **kwargs: Any) -> None:
         self.tone = tone
@@ -599,7 +611,7 @@ class Button(tk.Canvas):
     }
 
     def __init__(self, master: Any, text: str, command: Callable[[], None] | None = None, *,
-                 kind: str = "ghost", ground: str | None = None, px: int = PX_BODY_S,
+                 kind: str = "ghost", ground: str | None = None, px: float = typography.px("small"),
                  height: int = 30, pad: int = 11, radius: int = 6,
                  enabled: bool = True, **kwargs: Any) -> None:
         self.kind = kind
@@ -612,10 +624,16 @@ class Button(tk.Canvas):
         self._radius = int(radius)
         self._enabled = bool(enabled)
         self._hover = False
+        # G2-4（RC14 P0）：按下态 + 幂等闸。
+        # ``_pressed`` 让「按下去」在**命令执行前**就重绘一次（≤200 ms 的视觉反馈）；
+        # ``_busy`` 让同一次点击只跑一遍命令（双击 / 事件重入不再叠两个动作）。
+        self._pressed = False
+        self._busy = False
         width = fonts.measure(self.text, self._font) + self._pad * 2 + 2
         super().__init__(master, width=width, height=int(height), background=self.ground,
                          bd=0, highlightthickness=0, takefocus=1 if enabled else 0, **kwargs)
-        self.bind("<Button-1>", self._on_click)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<Return>", self._on_click)
@@ -640,9 +658,33 @@ class Button(tk.Canvas):
         self._redraw()
 
     # ── 事件
+    def _on_press(self, _event: Any = None) -> None:
+        """按下即重绘（反馈先于命令）：真机上这一步就把「按到了」画出来。"""
+        if not self._enabled:
+            return
+        self._pressed = True
+        self._redraw()
+        try:
+            self.update_idletasks()      # 强制把这一帧推给 X11/Win32，不等事件循环
+        except Exception:                # pragma: no cover - 控件已销毁
+            pass
+
+    def _on_release(self, _event: Any = None) -> None:
+        was_pressed = self._pressed
+        self._pressed = False
+        self._redraw()
+        if was_pressed and self._hover:   # 松手时鼠标已移出 = 取消，不触发命令
+            self._on_click()
+
     def _on_click(self, _event: Any = None) -> None:
-        if self._enabled and callable(self.command):
+        """幂等闸：``_busy`` 期间的重入直接丢弃（双击不再派发两个动作）。"""
+        if not self._enabled or self._busy or not callable(self.command):
+            return
+        self._busy = True
+        try:
             self.command()
+        finally:
+            self._busy = False
 
     def _on_enter(self, _event: Any = None) -> None:
         self._hover = True
@@ -650,6 +692,7 @@ class Button(tk.Canvas):
 
     def _on_leave(self, _event: Any = None) -> None:
         self._hover = False
+        self._pressed = False             # 拖出按钮范围即视为取消按下
         self._redraw()
 
     # ── 绘制
@@ -667,6 +710,18 @@ class Button(tk.Canvas):
             text_color = theme.color(text_token)
             if self.kind == "ghost":
                 stroke = theme.color("border")        # 可点控件边界 ≥3:1（01 §1.3）
+                # ghost 常态底 = surface，所以 hover/按下必须**换底**才看得见（G2-4）：
+                # 只换描边在 30px 高的按钮上等于没有反馈。色差来自 surface_alt()。
+                if self._pressed:
+                    fill = surface_alt(0.16)
+                elif self._hover:
+                    fill = surface_alt(0.08)
+            elif self._pressed:
+                # 实心按钮：按下要比 hover **再变一档**（否则 hover 与 pressed 同色，
+                # 客户点下去看不到任何变化）。方向由 ``ink`` 决定：日间更深、夜间更亮。
+                base = theme.color(hover_token) if hover_token else fill
+                fill = theme.blend(base, theme.color("ink"), 0.18)
+                stroke = fill
             elif hover_token and self._hover:
                 fill = theme.color(hover_token)
                 stroke = fill
@@ -696,8 +751,13 @@ class Switch(tk.Canvas):
         self.on = bool(on)
         self.command = command
         self.ground = ground or theme.color("surface")
+        # RC15-039 #31②：开关也要有**看得见**的焦点环。28×15 画布内再画一圈会糊成一团，
+        # 所以用 Tk 原生 highlight 环（1px，聚焦时换成 theme 的 focus 令牌）。
         super().__init__(master, width=28, height=15, background=self.ground, bd=0,
-                         highlightthickness=0, takefocus=1 if command else 0, **kwargs)
+                         highlightthickness=1 if command else 0,
+                         highlightbackground=(ground or theme.color("surface")),
+                         highlightcolor=theme.color("focus"),
+                         takefocus=1 if command else 0, **kwargs)
         self.bind("<Button-1>", self._toggle)
         self.bind("<Return>", self._toggle)
         self.bind("<space>", self._toggle)
@@ -763,13 +823,13 @@ class Gauge(tk.Canvas):
             self.create_arc(*box, start=start, extent=extent, style=tk.ARC,
                             outline=theme.chart("mint_bright"), width=self.ring)
         center = self.size / 2.0
-        big = fonts.sans(PX_NUM_XL, bold=True)
+        big = fonts.sans(typography.px("display"), bold=True)
         self.create_text(center, center - 4, text=self._value,
                          fill=theme.color("ink"), font=big, anchor="center")
         if self._label:
             self.create_text(center, center + 20, text=self._label,
                              fill=theme.color("muted_text"),
-                             font=fonts.for_text(self._label, PX_MICRO), anchor="center")
+                             font=fonts.for_text(self._label, typography.px("micro")), anchor="center")
 
 
 class Bars(tk.Canvas):
@@ -853,7 +913,7 @@ class Bars(tk.Canvas):
             anchor = "w" if index == 0 else ("e" if index == len(labels) - 1 else "center")
             self.create_text(round(positions[index], 1), baseline + 7, text=label,
                              anchor=anchor, fill=theme.color("muted_text"),
-                             font=fonts.for_text(label, PX_MICRO))
+                             font=fonts.for_text(label, typography.px("micro")))
 
 
 class StatCell(tk.Frame):
@@ -865,13 +925,13 @@ class StatCell(tk.Frame):
     """
 
     def __init__(self, master: Any, *, label: str, value: str, unit: str = "",
-                 note: str = "", ground: str | None = None, value_px: int = PX_NUM_L,
+                 note: str = "", ground: str | None = None, value_px: float = typography.px("h1"),
                  value_tone: str | None = None, mono_value: bool = False,
                  align: str = "w", **kwargs: Any) -> None:
         self.ground = ground or theme.color("surface")
         super().__init__(master, background=self.ground, bd=0, highlightthickness=0, **kwargs)
         fonts = fonts_for(master)
-        tk.Label(self, text=label, font=fonts.sans(PX_MICRO),
+        tk.Label(self, text=label, font=fonts.sans(typography.px("micro")),
                  foreground=theme.color("muted_text"), background=self.ground,
                  anchor=align).pack(anchor=align, fill="x")
         line = tk.Frame(self, background=self.ground)
@@ -893,7 +953,7 @@ class StatCell(tk.Frame):
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor=align).pack(side="left" if align == "w" else "right")
         if note:
-            tk.Label(self, text=note, font=fonts.sans(PX_MICRO),
+            tk.Label(self, text=note, font=fonts.sans(typography.px("micro")),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor=align, justify="left").pack(anchor=align, fill="x", pady=(1, 0))
 
@@ -903,14 +963,14 @@ class SectionHead(tk.Frame):
 
     def __init__(self, master: Any, *, kicker: str = "", title: str = "", subtitle: str = "",
                  ground: str | None = None, right: Callable[[Any], Any] | None = None,
-                 title_px: int = PX_CARD, **kwargs: Any) -> None:
+                 title_px: float = typography.px("h2"), **kwargs: Any) -> None:
         self.ground = ground or theme.color("surface")
         super().__init__(master, background=self.ground, bd=0, highlightthickness=0, **kwargs)
         fonts = fonts_for(master)
         left = tk.Frame(self, background=self.ground)
         left.pack(side="left", fill="x", expand=True)
         if kicker:
-            tk.Label(left, text=kicker, font=fonts.for_text(kicker, PX_MICRO),
+            tk.Label(left, text=kicker, font=fonts.for_text(kicker, typography.px("micro")),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor="w").pack(anchor="w")
         if title:
@@ -918,7 +978,7 @@ class SectionHead(tk.Frame):
                      foreground=theme.color("ink"), background=self.ground,
                      anchor="w", justify="left").pack(anchor="w", pady=(3, 0))
         if subtitle:
-            tk.Label(left, text=subtitle, font=fonts.sans(PX_MICRO),
+            tk.Label(left, text=subtitle, font=fonts.sans(typography.px("micro")),
                      foreground=theme.color("muted_text"), background=self.ground,
                      anchor="w").pack(anchor="w", pady=(3, 0))
         if right is not None:
@@ -1024,9 +1084,9 @@ class NavItem(tk.Canvas):
         text_color = theme.color("ink") if self.active else theme.color("ink2")
         if not self.compact:
             self.create_text(34, height / 2.0, text=self.text, anchor="w",
-                             fill=text_color, font=fonts.sans(PX_NAV))
+                             fill=text_color, font=fonts.sans(typography.px("small")))
         if self.count and not self.compact:
-            count_font = fonts.mono(PX_MICRO)
+            count_font = fonts.mono(typography.px("micro"))
             label = str(self.count)
             badge_w = fonts.measure(label, count_font) + 10
             x0 = width - badge_w - 6
@@ -1093,7 +1153,7 @@ def apply_kit_styles(root: Any, ttk: Any) -> Any:
     style.configure("Kit.Treeview", background=theme.color("surface"),
                     fieldbackground=theme.color("surface"),
                     foreground=theme.color("ink2"), font=fonts.named_name("table"),
-                    rowheight=26, borderwidth=0, relief="flat")
+                    rowheight=table_rowheight(fonts.scale), borderwidth=0, relief="flat")
     style.map("Kit.Treeview",
               background=[("selected", theme.color("violet3"))],
               foreground=[("selected", theme.color("violet_text"))])

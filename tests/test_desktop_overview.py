@@ -165,13 +165,16 @@ def test_rail_has_setup_today_and_throttle():
     assert all(card.kicker and card.title for card in rail)
 
 
-def test_setup_card_is_read_only_and_hands_writing_to_the_access_page():
+def test_setup_card_is_read_only_and_hands_writing_to_the_two_real_pages():
+    """RC14 E：右栏只做摘要；写入分给**唯一**入口——绑定/收款 → account，价格/凭证 → access。"""
     setup = overview().rail[0]
     assert setup.fields
     assert not any(field.editable for field in setup.fields)  # 同一个配置文件不许两处可写
     assert setup.fields[0].secret is True                     # 凭证只露掩码
-    assert [action.nav for action in setup.actions] == ["access"]
+    assert [action.nav for action in setup.actions] == ["account", "access"]
     assert setup.note == "3 / 3" and setup.badge == "接入完成"
+    # 摘要里不许再出现「可填的收款地址」键（那是第二个入口）
+    assert [field.key for field in setup.fields][-1] == "usdt_state"
 
 
 def test_setup_card_counts_steps_from_the_real_config():
@@ -246,3 +249,15 @@ def test_recorded_receipts_read_as_in_flight_not_unknown():
     row = overview(patched(receipts=receipts(*rows))).table.rows[0]
     assert row.cells[3].startswith(vw.MARK_WAIT)
     assert "未知" not in row.cells[3]
+
+
+def test_overview_does_not_promise_tier_effects_this_version_does_not_have():
+    """复核 M7 残留（owner a′）：总览页也不许出现档位假承诺。
+
+    同一个常量 ``YIELD_MODE_SUMMARY`` 之前还写着「只要接单就满载 / 工作时段实时算力 /
+    只在我不使用电脑时工作」；总览是首屏，留着等于把假承诺搬到客户第一眼。
+    """
+    text = overview().plain_text()
+    for phrase in ("满载", "实时算力", "不使用电脑时"):
+        assert phrase not in text, phrase
+    assert "本版仅记录档位偏好" in text

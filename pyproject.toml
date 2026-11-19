@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "djb-node"
-version = "0.3.2"
+version = "0.3.13"
 description = "DJB 联脑 · M15 client-runtime（Linux CLI + daemon，S1 + S2 P1）"
 readme = "README-CLIENT.md"
 requires-python = ">=3.10"
@@ -17,7 +17,9 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
 ]
 # S1 刻意零第三方运行时依赖：只用标准库，便于在最小服务器镜像上安装。
-dependencies = []
+# 例外（0.3.9 / RC15-039 #31）：Windows 桌面端的读屏提供方需要 comtypes 才能实现 IAccessible。
+# 它只在 Windows 装；Linux（CLI + daemon）依赖保持不变、仍然零第三方运行时依赖。
+dependencies = ["comtypes>=1.4; sys_platform == \"win32\""]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

@@ -37,6 +37,7 @@ from typing import Any, Sequence
 from . import facts
 from .config import (GATEWAY_PLACEHOLDER, Paths, load_config, resolve_home,
                      save_config)
+from .platform.no_window import subprocess_window_kwargs
 from .store import Store
 
 __all__ = ["DEFAULT_GATEWAY_URL", "default_gateway", "is_placeholder",
@@ -174,11 +175,12 @@ def start_daemon(home: str | os.PathLike | None = None, *,
             result["reason"] = "no-cli"
             return result
         log_path = os.path.join(paths.logs_dir, facts.DAEMON_OUT_NAME)
+        result["log"] = log_path
         os.makedirs(paths.logs_dir, mode=0o700, exist_ok=True)
         with open(log_path, "ab") as stdout:
             subprocess.Popen(command, stdout=stdout, stderr=stdout,
                              stdin=subprocess.DEVNULL, start_new_session=True,
-                             close_fds=True)
+                             close_fds=True, **subprocess_window_kwargs())
         deadline = time.monotonic() + max(0.0, float(wait_seconds))
         while time.monotonic() < deadline:
             if control_ping(paths):
@@ -187,9 +189,27 @@ def start_daemon(home: str | os.PathLike | None = None, *,
                 return result
             time.sleep(0.25)
         result["reason"] = "timeout"
+        result["log"] = log_path
     except Exception as exc:                      # noqa: BLE001
         result["errors"].append(type(exc).__name__ + ": " + str(exc)[:160])
     return result
+
+
+#: daemon 启动失败的**客户可执行**文案（旧实现只处理 started/already-running/errors，
+#: 而 ``no-cli`` / ``timeout`` 两种最常见失败不产出任何字 → 用户只看到「先启动一次」）。
+DAEMON_REASON_TEXT = {
+    "no-cli": "节点没启动：同目录缺少 djb-node.exe（请从官方压缩包**整体解压**，"
+              "只留桌面端一个 exe 拉不起节点）",
+    "timeout": "节点启动超时：8 秒内没连上本机控制口",
+}
+
+
+def daemon_reason_text(reason: str, log: str = "") -> str:
+    """reason → 一句可执行文案（没有对应文案就返回空串，绝不编原因）。"""
+    text = DAEMON_REASON_TEXT.get(str(reason or ""), "")
+    if text and str(reason) == "timeout":
+        text += "，看日志 " + (log or facts.DAEMON_OUT_NAME) + " 末尾的报错"
+    return text
 
 
 def summary_text(boot: dict[str, Any], daemon: dict[str, Any] | None = None) -> str:
@@ -208,4 +228,10 @@ def summary_text(boot: dict[str, Any], daemon: dict[str, Any] | None = None) -> 
             parts.append("节点已在运行")
         elif daemon.get("errors"):
             parts.append("节点启动失败：" + daemon["errors"][0])
+        else:
+            # no-cli / timeout / 其它：**必须**有字，否则故障是静默的（S3 根因之一）
+            hint = daemon_reason_text(str(daemon.get("reason") or ""),
+                                      str(daemon.get("log") or ""))
+            if hint:
+                parts.append(hint)
     return "；".join(parts)

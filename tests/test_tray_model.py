@@ -39,7 +39,8 @@ def test_menu_is_six_base_items_plus_conditional_bind():
 
     unbound = TrayModel.build({**RUNNING, "node": {"node_id": "n-1", "bound": False}})
     assert len(unbound.items) == S2_MENU_SIZE + S2_BIND_MENU_SIZE
-    assert unbound.menu_keys == ("status", "pause", "messages", "diagnose", "bind",
+    # 2026-11-18：未绑定时「绑定网页端」提到状态项之后（首个该做的动作，不再埋在第 5 位）。
+    assert unbound.menu_keys == ("status", "bind", "pause", "messages", "diagnose",
                                  "logs", "quit")
     assert unbound.item("bind").action is TrayAction.BIND
     intent = unbound.intent_for("bind")

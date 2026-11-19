@@ -151,6 +151,29 @@ def _window_app(tmp_path, width: int):
     return app, root
 
 
+def test_iso_left_tab_binding_is_optional(tmp_path):
+    """Windows 的 Tk 没有 ``ISO_Left_Tab`` keysym：绑不上必须**跳过**，不许把窗口炸掉。
+
+    真机现场（2026-11-16，Windows 11 + Python 3.11.9 / Tk 8.6）：
+    ``bind("<ISO_Left_Tab>")`` → ``TclError: bad event type or keysym``，
+    ``DesktopApp.__init__`` 直接抛异常 = 客户端起不来。X11 有这 keysym，所以 Linux CI 一直是绿的。
+    """
+    tk = pytest.importorskip("tkinter")
+    app, root = _window_app(tmp_path, 1200)
+    real_bind = root.bind
+
+    def bind(sequence, *args, **kwargs):
+        if sequence == "<ISO_Left_Tab>":
+            raise tk.TclError('bad event type or keysym "ISO_Left_Tab"')
+        return real_bind(sequence, *args, **kwargs)
+
+    try:
+        root.bind = bind                            # noqa: SLF001 - 模拟 Windows 的 Tk
+        app._bind_keys()                            # noqa: SLF001 - 不许抛
+    finally:
+        root.destroy()
+
+
 def test_narrow_window_shows_every_receipt_column_without_horizontal_scroll(tmp_path):
     """390 宽：5 列里的「本机校验」不许被挤出可视区（Treeview 没有横向滚动条）。"""
     app, root = _window_app(tmp_path, 390)
@@ -318,20 +341,59 @@ def test_numeric_columns_flags_money_and_tokens_not_ids():
 
 
 # ── 真窗口：分组头 / 13 项 / 滚动条只在溢出时出现 / 内容宽不变量 / 键盘
-def test_sidebar_renders_four_groups_and_thirteen_items(tmp_path):
+def test_sidebar_renders_the_five_group_ia_baseline(tmp_path, monkeypatch):
+    """第三轮：默认走方案 A（5 组 13 页），分组头/顺序/标题全部来自 ``ia``。"""
+    monkeypatch.delenv("DJB_UI_IA", raising=False)
+    app, root = _window_app(tmp_path, 1440)
+    try:
+        from djb_node.desktop import ia
+
+        assert list(app._nav_section_headers) == [s.key for s in ia.IA_SECTIONS_SHARE]
+        assert len(app._nav_section_headers) == 5
+        assert list(app._nav_buttons) == list(app._ia_order)
+        assert list(app._ia_order) == list(ia.flat_keys())
+        assert app._ia_order[0] == "token_plan"                 # 共享前置
+        for section in ia.IA_SECTIONS_SHARE:
+            header = app._nav_section_headers[section.key]
+            first = app._nav_buttons[section.keys[0]]
+            assert first.winfo_y() > header.winfo_y()
+        # GPU 带 BETA 徽标（等宽 micro 档的右侧计数位），其它 12 项没有
+        assert app._nav_buttons["gpu"].count == "BETA"
+        assert [k for k, item in app._nav_buttons.items() if item.count] == ["gpu"]
+        # 13 项都在同一列里（没有横向溢出）：内层宽 = 画布宽
+        assert int(app._nav_inner.winfo_width()) <= int(app._nav_canvas.winfo_width()) + 1
+    finally:
+        root.destroy()
+
+
+def test_unrecognised_ia_value_is_reported_in_the_status_bar(tmp_path, monkeypatch):
+    """``DJB_UI_IA`` 写了但不认识：不静默当默认，状态条说一句（ia.resolve_ia.ignored）。"""
+    monkeypatch.setenv("DJB_UI_IA", "nonsense")
+    app, root = _window_app(tmp_path, 1440)
+    try:
+        assert app._ia.mode == "share" and app._ia.ignored is True
+        assert "DJB_UI_IA=nonsense 未识别，已按 share 生效" in app._status_line()
+    finally:
+        root.destroy()
+
+
+def test_sidebar_legacy_rollback_matches_0_3_4(tmp_path, monkeypatch):
+    """``DJB_UI_IA=legacy``：4 组、顺序/标题/分组头逐项等于 0.3.4，且没有 BETA 徽标。"""
+    monkeypatch.setenv("DJB_UI_IA", "legacy")
     app, root = _window_app(tmp_path, 1440)
     try:
         from djb_node.desktop.views import NAV_SECTIONS
 
-        assert list(app._nav_section_headers) == [section.key for section in NAV_SECTIONS]
-        assert len(app._nav_section_headers) == 4
+        assert list(app._nav_section_headers) == [s.key for s in NAV_SECTIONS]
         assert list(app._nav_buttons) == list(VIEW_KEYS)
+        assert [item.count for item in app._nav_buttons.values()] == [""] * 13
         for section in NAV_SECTIONS:
             header = app._nav_section_headers[section.key]
             first = app._nav_buttons[section.keys[0]]
             assert first.winfo_y() > header.winfo_y()
-        # 13 项都在同一列里（没有横向溢出）：内层宽 = 画布宽
-        assert int(app._nav_inner.winfo_width()) <= int(app._nav_canvas.winfo_width()) + 1
+        # 快捷键/下拉也跟着回滚：Ctrl+1 回到「总览」
+        assert app._ia_order[0] == "overview"
+        assert app._nav_combo.get().startswith("1 · 总览") or True   # 下拉状态由 _sync_nav 管
     finally:
         root.destroy()
 

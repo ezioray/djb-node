@@ -39,6 +39,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
+from .platform.no_window import subprocess_window_kwargs
 from .util import iso, utcnow
 
 SCHEMA_VERSION = 1
@@ -72,7 +73,8 @@ def _decode_output(raw: bytes) -> str:
 def _run(args: list[str], *, timeout: float = DEFAULT_TIMEOUT_S) -> tuple[int, str, str]:
     """跑一条只读命令 -> (returncode, stdout, stderr)。失败归一成 (-1, "", 原因)。"""
     try:
-        completed = subprocess.run(args, capture_output=True, timeout=timeout, check=False)
+        completed = subprocess.run(args, capture_output=True, timeout=timeout, check=False,
+                                   **subprocess_window_kwargs())
     except FileNotFoundError:
         return -1, "", "not_found"
     except subprocess.TimeoutExpired:

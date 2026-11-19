@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
@@ -176,6 +177,97 @@ def validate_base_url(base_url: Any) -> str:
     if parsed.fragment:
         raise UsageError("上游端点不得带 fragment")
     return text.rstrip("/")
+
+
+# ─────────────────────────────────────── base_url 来源分类（M17 先验；只作信任先验，永不拦截）
+#: 来源三分类（INTEGRITY-REVIEW-20261117 §5 / CR-20261117-AUDIT-FOLLOWUP）。
+#: **只作探针强度与提示的先验**：official 降探针频率但**永不免检**（前置代理仍可
+#: 作弊）；unknown 提示更严格抽检。分类失败/不认识一律 unknown（fail-closed）。
+ORIGIN_OFFICIAL = "official"
+ORIGIN_TRUSTED_OPEN_SOURCE = "trusted_open_source"
+ORIGIN_UNKNOWN = "unknown"
+
+#: 厂商官方端点（host 精确匹配；缺省端口）。**新增厂商只加这里，不写逻辑**。
+OFFICIAL_ENDPOINT_HOSTS: frozenset[str] = frozenset({
+    "api.openai.com",             # OpenAI
+    "api.anthropic.com",          # Anthropic
+    "api.deepseek.com",           # DeepSeek
+    "api.moonshot.cn", "api.moonshot.ai",   # 月之暗面 Kimi
+    "open.bigmodel.cn",           # 智谱 GLM
+    "dashscope.aliyuncs.com",     # 阿里通义
+    "api.minimax.chat", "api.minimaxi.com", # MiniMax
+    "generativelanguage.googleapis.com",    # Google Gemini
+    "api.mistral.ai",             # Mistral
+    "api.cohere.com", "api.cohere.ai",      # Cohere
+    "api.groq.com",               # Groq（自托管官方端点）
+    "api.x.ai",                   # xAI
+})
+
+#: 知名开源/聚合端点（域名背后是知名运营方；**OneAPI/NewAPI 自部署不属于**——
+#: 域名可同、背后可改，只能按 unknown 处理，除非走 M17 §5.6 独立探针凭据）。
+TRUSTED_OPEN_SOURCE_HOSTS: frozenset[str] = frozenset({
+    "openrouter.ai",
+})
+
+#: 缺省端口（host 精确匹配且端口为空或等于缺省端口才算命中；非标端口一律 unknown）。
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+ORIGIN_HINTS: dict[str, str] = {
+    ORIGIN_OFFICIAL: "官方端点（信任先验高；仍保留抽检，不因官方免检）",
+    ORIGIN_TRUSTED_OPEN_SOURCE: "知名开源/聚合端点（信任先验中；保留常规探针）",
+    ORIGIN_UNKNOWN: "未识别端点（不拦截；接入后将按更严格的探针与抽检处理）",
+}
+
+
+def classify_base_url(base_url: Any) -> str:
+    """按 host 精确匹配判来源三分类。
+
+    防绕过口径（M17 §2 威胁模型的工程化）：
+
+    * **只认 host 精确匹配**：``api.openai.com.evil.tld`` / ``api-openai-com.tld``
+      这类前后缀伪装全部落 unknown；
+    * **端口必须缺省**：官方域名 + 非标端口（8443 等）多为前置代理 → unknown；
+    * **userinfo / 非 http(s) / 解析失败** → unknown（``validate_base_url`` 会先拦，
+      这里防御性兜底，保证任何输入都有确定分类）；
+    * IP 直连 / 回环 / 内网 → unknown（本机 Agent 场景由 access/kind 区分，不用来源分）。
+
+    该函数是**纯函数**：不查 DNS（不把解析结果当信任依据）、不联网、不落盘。
+    """
+    try:
+        text = str(base_url or "").strip().rstrip("/")
+        parsed = urlparse(text)
+    except (ValueError, TypeError):
+        return ORIGIN_UNKNOWN
+    if parsed.scheme not in ("http", "https"):
+        return ORIGIN_UNKNOWN
+    if parsed.username or parsed.password or parsed.fragment:
+        return ORIGIN_UNKNOWN
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or not host.isascii():
+        # 非 ASCII（IDN 同形字）→ 不认识就是 unknown
+        return ORIGIN_UNKNOWN
+    if not (host[0].isalnum() and host[-1].isalnum()):
+        return ORIGIN_UNKNOWN
+    port = parsed.port
+    if port is not None and port != _DEFAULT_PORTS[parsed.scheme]:
+        return ORIGIN_UNKNOWN
+    # IP 直连（v4/v6）一律 unknown：官方端点不会用裸 IP
+    try:
+        ipaddress.ip_address(host)
+        return ORIGIN_UNKNOWN
+    except ValueError:
+        pass
+    if host in OFFICIAL_ENDPOINT_HOSTS:
+        # 官方端点要求 https（http 官方域名 = 中间人/镜像风险）
+        return ORIGIN_OFFICIAL if parsed.scheme == "https" else ORIGIN_UNKNOWN
+    if host in TRUSTED_OPEN_SOURCE_HOSTS:
+        return ORIGIN_TRUSTED_OPEN_SOURCE if parsed.scheme == "https" else ORIGIN_UNKNOWN
+    return ORIGIN_UNKNOWN
+
+
+def origin_hint(origin: Any) -> str:
+    """分类 → 客户可见提示文案（未知分类回落 unknown 文案）。"""
+    return ORIGIN_HINTS.get(str(origin or "").strip(), ORIGIN_HINTS[ORIGIN_UNKNOWN])
 
 
 def credential_ref_for(upstream_id: str) -> str:
@@ -379,6 +471,8 @@ class UpstreamManager:
         返回值**只含 spec 1.2.7 `NodeProbeReport` 已定义的字段**
         （upstream_id / reachable / latency_ms / error_class /
         model_checks[model, ok, error_class] / checked_at），可直接上报。
+        加上 RC14 §2.3 的两个**加性**字段 ``models[]``（这轮探了哪些，只含 enabled）与
+        ``not_probed[]{model, reason}``（没探的及原因）；旧服务端忽略未知字段。
         L2/L3 细节（inference_ok / stream_ok / usage_ok / token_usage /
         probe_version / last_probe_at）只落本地：`probe_details()` 可读。
         """
@@ -399,16 +493,26 @@ class UpstreamManager:
                                 protocol=record.protocol)
         checks: list[dict[str, Any]] = [dict(item) for item in result.model_checks]
         outcomes: dict[str, probe_mod.ProbeOutcome] = {}
+        reused: set[str] = set()
         if result.reachable:
             listed = [str(item.get("model")) for item in checks if item.get("ok")]
+            # 0.3.9 / D-RCA P1-b：排定探测顺序（没轮到的先探、已知失败排最后），并在
+            # 预算受限的轮次里复用「刚探过且 ok」的结论 —— 5s backlog 续跑只补缺口。
+            targets, reused = self._order_probe_targets(
+                record, listed, moment, budgeted=deadline is not None)
             outcomes = probe_mod.probe_models(
-                record.base_url, listed, credential=secret,
+                record.base_url, targets, credential=secret,
                 level=level or facts.PROBE_DEFAULT_LEVEL, timeout=seconds,
                 http=self.http, deadline=deadline, clock=clock,
                 protocol=record.protocol)
         # 逐模型合并：L2/L3 结论优先；未在清单 / 预算内没探到 -> 不 ok。
         for item in checks:
             model_id = str(item.get("model"))
+            if model_id in reused:
+                # P1-b：本轮复用上一轮 ok 证据（``PROBE_REUSE_OK_S`` 内实探过）。
+                # 保留 L1 的 ok；不写 ``last_probe_at``（不伪造新鲜度，见 probe() 的落盘）。
+                item.pop("error_class", None)
+                continue
             outcome = outcomes.get(model_id)
             if outcome is None:
                 if item.get("ok"):
@@ -420,17 +524,155 @@ class UpstreamManager:
                 item["error_class"] = outcome.error_class
             else:
                 item.pop("error_class", None)
-        verified = [model_id for model_id, outcome in outcomes.items()
-                    if outcome.inference_ok]
-        state = "verified" if (result.reachable and verified) else "rejected"
+        # 0.3.9：``verified`` 取自「本轮合并后的逐模型结论」，因此**复用**的模型也算证据
+        # （它的 ok 是几秒前实探出来的），与 P0-a 的「任一 verified ⇒ 整条 verified」一致。
+        verified = [str(item.get("model")) for item in checks if item.get("ok")]
+        # RC14 复盘 P0-2（0.3.8）：**没有证据的轮次不改状态**。
+        # 旧写法 `verified if reachable and verified else rejected` 会在「预算截断、
+        # 一个模型都没探到」时把本地 state 抹成 rejected；而 `quotes.py` 的
+        # `gated = ... or record.state == "rejected"` 会因此把这条上游的全部报价门掉
+        # ⇒ 容量随**采样预算**抖动（与云端 `verified_at = moment if verified else None`
+        # 是同一个 bug 的两端，cloud-auditor 2026-11-15 已确认）。
+        # 语义对齐云端 b420f59：没有新证据 ⇒ 什么都不改，旧结论按新鲜度自然过期。
+        # 0.3.9 / D-RCA P0-a：**任何显式失败都先于任何 verified** 是 0.3.8 灰度失败的
+        # 直接原因——4 个模型 ok + qwen 一个 ``timeout`` 就把整条上游判 ``rejected``，
+        # `quotes.py` 的 `gated` 随即跳过该上游**全部**模型（2026-11-16 13:55 现场
+        # `quotes rows=0` 整条断流）。判定顺序必须与云端 `_probe_verdict_scoped` 的
+        # `if real_ok: verified` 对齐：**一个模型能用就是这条上游能用的证据**，
+        # 单模型失败只降该模型自己（它的 `inference_ok=false` 已被 quotes 按模型跳过）。
+        explicit_failures = [item for item in checks
+                             if not item.get("ok")
+                             and item.get("error_class") != facts.PROBE_NOT_PROBED]
+        if not result.reachable or not checks:
+            # 不可达 / **一个 enabled 模型都没有** ⇒ rejected（安全侧：没启用模型的上游
+            # 不该被当成可用容量）。
+            state = "rejected"
+        elif verified:
+            # 任一模型 L2 通过 ⇒ 整条 verified（0.3.4 语义；与云端 real_ok 分支一致）。
+            state = "verified"
+        elif explicit_failures:
+            # 一个都没通**且**确有失败（timeout / 5xx / auth / 下架 …）⇒ rejected。
+            # P0-c：``timeout`` 是真实失败，必须留在这里，否则「全部模型 timeout」会被
+            # 洗成可用；单模型 timeout 的降级由「上面那条 verified 优先」完成，不靠删失败。
+            state = "rejected"
+        else:
+            state = record.state          # 全是 not_probed：没证据，保留上一轮结论
         stamp = iso(moment)
         self.store.update_upstream(upstream_id, models=self._probe_models_payload(
             record, outcomes, stamp), state=state, last_probe_at=stamp)
+        # RC14 复盘 P0-2（0.3.8）：**不要**把 ``not_probed`` 从 ``model_checks`` 里剔掉。
+        # 云端 main（745eddc）的 ``_probe_verdict_scoped`` 已按 ``models[]``（enabled 集合）
+        # + ``not_probed[]`` 判定：not_probed 记 ``ok=None``、不算失败，全都没探到时判 verified；
+        # 节点侧再剔除会让 ``models[]`` 从「enabled 集合」退化成「探过的集合」，
+        # 把云端的 ``not_reported`` 分支和排障信息一起抹掉（2026-11-15 cloud-auditor 校正）。
+        # 节点只负责**如实上报**：``models[]`` = 本轮 L1 进过清单的 enabled 模型，
+        # ``not_probed[]`` = 没探到的及原因；「算不算失败」由云端 scoped 判定负责。
         payload = {"upstream_id": upstream_id, "reachable": result.reachable,
                    "latency_ms": result.latency_ms,
                    "error_class": result.error_class,
-                   "model_checks": checks, "checked_at": stamp}
+                   "model_checks": checks, "checked_at": stamp,
+                   # RC14 §2.3 加性字段（只加不改）：明确「这一轮探了哪些 / 哪些没探」。
+                   # 云端据此判「至少一个 enabled 模型通过即 ok」；旧服务端忽略未知字段。
+                   "models": [str(item.get("model")) for item in checks],
+                   "not_probed": self._not_probed(record, checks, outcomes,
+                                                reused=reused)}
         return payload
+
+    @staticmethod
+    def _order_probe_targets(record: UpstreamRecord, listed: list[str], moment: Any,
+                             *, budgeted: bool) -> tuple[list[str], set[str]]:
+        """0.3.9 / D-RCA P1-b：排定「这一轮探谁、按什么顺序」，并挑出可复用证据的模型。
+
+        三条口径（都是 0.3.4/0.3.8 现场事故的直接教训）：
+
+        1. **没轮到的先探**：按 ``last_probe_at`` 升序，从未探过的（``""``）排最前。
+           0.3.4 的逐模型 ``stale_probe``（``last_probe_at`` 爬到 635s > 600s，5 行掉到
+           1 行）就是这个顺序没做：固定按上游 ``/models`` 顺序探，尾部模型永远轮不到。
+        2. **已知失败排最后**：``last_probe_at`` 相同时（例如刚在同一轮里一个 timeout、
+           一个 ok），用 ``probe_error_class`` 把刚失败的模型推到队尾 —— 否则慢模型
+           每轮第一个吃预算，其余模型永远 ``not_probed``（饥饿）。
+        3. **不重探刚 ok 的模型**：``budgeted``（本轮有 ``deadline``）且**确有缺口**
+           （有 enabled 模型没有新鲜 ok 证据）时，``PROBE_REUSE_OK_S`` 内刚实探过且 ok
+           的模型直接复用结论 —— 5s backlog 续跑只补缺口，不再把预算花在 5 秒前刚验过
+           的模型上。没有缺口就整轮实探（不给「靠复用混过一轮」留后门）；
+           手动 ``djb upstream probe``（``deadline=None``，不是 ``budgeted``）永远实探。
+
+        返回 ``(targets, reused)``。``reused`` 的模型本轮**不发请求**、**不刷新**
+        ``last_probe_at``（不伪造新鲜度），也不算 backlog。
+        """
+        entries = {entry.id: entry
+                   for entry in (ModelEntry.from_dict(raw) for raw in record.models)
+                   if entry.id}
+        tolerated = facts.PROBE_TOLERATED_ERROR_CLASSES
+
+        def known_failure(model: str) -> int:
+            entry = entries.get(model)
+            error = entry.probe_error_class if entry is not None else None
+            # 1 = 已知真实失败（timeout/5xx/…）⇒ 排最后；not_probed/未下架容忍类不算。
+            return 1 if (error and error not in tolerated) else 0
+
+        def last_probe(model: str) -> str:
+            entry = entries.get(model)
+            return (entry.last_probe_at or "") if entry is not None else ""
+
+        # ``dict.fromkeys`` 去重但保序：同一模型一轮只探一次（不重复探已 ok 的模型）。
+        ordered = sorted(dict.fromkeys(str(model) for model in listed),
+                         key=lambda model: (known_failure(model), last_probe(model)))
+        if not budgeted or facts.PROBE_REUSE_OK_S <= 0:
+            return ordered, set()
+        gap = [model for model in ordered
+               if not (entries.get(model) is not None
+                       and entries[model].inference_ok is True
+                       and entries[model].fresh(moment, ttl=facts.PROBE_FRESH_AFTER_S))]
+        if not gap:
+            return ordered, set()
+        reused: set[str] = set()
+        for model in ordered:
+            if model in gap:
+                continue
+            age = entries[model].probe_age_s(moment)
+            if age is not None and age <= facts.PROBE_REUSE_OK_S:
+                reused.add(model)
+        return [model for model in ordered if model not in reused], reused
+
+    @staticmethod
+    def _not_probed(record: UpstreamRecord, checks: list[dict[str, Any]],
+                    outcomes: dict[str, probe_mod.ProbeOutcome],
+                    reused: set[str] | None = None) -> list[dict[str, Any]]:
+        """``not_probed[]``：本地记录里有、但这一轮**没探到结论**的模型（原因可读）。
+
+        三种原因（与 W6 的口径一致，不再让「一个没探到」拖垮整条上游）：
+
+        * ``disabled``：模型被停用（本轮本来就不探，见 :meth:`probe` 的 W6-FIX 注释）；
+        * ``budget``：enabled 且进了 L1 清单，但本轮预算/期限到了（``PROBE_PASS_BUDGET_S``），
+          L2/L3 没轮到，留给下一轮，**不算失败**；
+        * ``not_listed``：enabled，但这一轮连 L1 请求都没进（记录在探针过程中被改写等边界）。
+          正常路径上「上游清单没列某模型」会落在 ``model_checks`` 里（``ok=False`` +
+          ``model_not_listed``），不在这里。
+
+        ``reused``（P1-b）：本轮**复用**了上一轮 ok 结论的模型 —— 它不是缺口（几秒前刚实探
+        过），既不进 ``not_probed[]``，也不该被算成 backlog 去触发 5s 续跑。
+        """
+        rows: list[dict[str, Any]] = []
+        checked = {str(item.get("model")): item for item in checks}
+        for raw in record.models:
+            entry = ModelEntry.from_dict(raw)
+            if not entry.id:
+                continue
+            if not entry.enabled:
+                rows.append({"model": entry.id, "reason": "disabled"})
+            elif entry.id not in checked:
+                rows.append({"model": entry.id, "reason": "not_listed"})
+            elif entry.id in (reused or ()):
+                continue                      # P1-b：刚 ok 且复用证据，不算缺口
+            elif outcomes.get(entry.id) is None:
+                # 已有明确结论（如 model_not_listed / L2 失败）的模型属于**失败**，
+                # 不能重复记成 backlog；只有「L1 通过但预算没轮到」才算 budget。
+                reason = checked[entry.id].get("error_class")
+                if reason and reason != facts.PROBE_NOT_PROBED:
+                    continue
+                rows.append({"model": entry.id, "reason": "budget"})
+        return rows
 
     @staticmethod
     def _probe_models_payload(record: UpstreamRecord,

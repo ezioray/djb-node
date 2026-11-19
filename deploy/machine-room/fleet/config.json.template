@@ -3,6 +3,7 @@
   "mirror_port": ${port},
   "update_channel": "${update_channel}",
   "update_source": "${update_source}",
+  "edition": "machine-room",
   "log_level": "${log_level}",
   "yield_enabled": ${yield_enabled},
   "extra": {

@@ -15,7 +15,7 @@
 #
 # 用法：
 #   sudo ./install.sh --gateway https://gateway.example.com
-#   sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.2-py3-none-any.whl
+#   sudo ./install.sh --gateway https://gateway.example.com --wheel ./djb_node-0.3.6-py3-none-any.whl
 #   sudo ./install.sh --gateway https://gateway.example.com --start
 #   ./install.sh --dry-run                       # 只打印将执行的动作（不需要 root）
 #
@@ -97,6 +97,9 @@ run install -d -m 0700 -o "$RUN_USER" -g "$RUN_USER" "$HOME_DIR"
 if [ -f "$HOME_DIR/config.json" ]; then
     say "√ 已有配置，不覆盖：$HOME_DIR/config.json"
     say "  （要改服务端地址：djb init --gateway <URL> 或直接编辑后 djb daemon reload）"
+    say "  ⚠ 升级请确认档位：djb init --edition official-supply"
+    say "     （0.3.3 及以前的 config 没有 edition 字段；本脚本第 3 步会补；漏了则"
+    say "     update --status 的 edition/source_channel 为空，自动升级只剩 config 里的 URL）"
 else
     if [ "$DRY_RUN" -eq 1 ]; then
         say "[dry-run] 写 $HOME_DIR/config.json（gateway_url=$GATEWAY）"
@@ -104,10 +107,16 @@ else
         # 原子写：临时文件 -> mv，并且先落成 0600 再改属主
         tmp=$(mktemp "$HOME_DIR/.config.json.XXXXXX")
         # 两个字段都要落到正式环境：gateway_url 由 --gateway 决定；
-        # update_source 决定客户端能不能自动升级（旧版保持 example.invalid 会永远升不了）。
-        sed -e "s#\"gateway_url\": \"[^\"]*\"#\"gateway_url\": \"$GATEWAY\"#" \
-            -e "s#\"update_source\": \"[^\"]*\"#\"update_source\": \"$UPDATE_SOURCE\"#" \
-            "$HERE/config.json" > "$tmp"
+        # update_source 决定客户端能不能自动升级（沿用旧版占位/旧域会永远升不了）。
+        #
+        # 用 render_config.py 而不是 sed：URL 里的 & / # / " / \ 会破坏 sed 替换，
+        # 写出的 config 要么 daemon 起不来，要么悄悄改错字段（2026-11-15 审计 P2）。
+        if ! "$PYTHON" "$HERE/render_config.py" "$HERE/config.json" "$tmp" \
+                "$GATEWAY" "$UPDATE_SOURCE"; then
+            rm -f "$tmp"
+            say "install.sh: 配置渲染失败，已中止（没有动现有 config.json）" >&2
+            exit 3
+        fi
         chmod 600 "$tmp"
         chown "$RUN_USER:$RUN_USER" "$tmp"
         mv -f "$tmp" "$HOME_DIR/config.json"
@@ -129,10 +138,10 @@ fi
 
 # 首次初始化状态库（幂等；DJB_HOME 指到状态目录，凭据仍为空）
 if [ "$DRY_RUN" -eq 1 ]; then
-    say "[dry-run] 以 $RUN_USER 身份：DJB_HOME=$HOME_DIR djb init --no-env"
+    say "[dry-run] 以 $RUN_USER 身份：DJB_HOME=$HOME_DIR djb init --no-env --edition official-supply"
 else
     su -s /bin/sh "$RUN_USER" -c \
-        "DJB_HOME='$HOME_DIR' '$PREFIX/venv/bin/djb' init --no-env" >/dev/null
+        "DJB_HOME='$HOME_DIR' '$PREFIX/venv/bin/djb' init --no-env --edition official-supply" >/dev/null
     say "√ 状态库就绪：$HOME_DIR/state.db"
 fi
 

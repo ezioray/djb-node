@@ -45,11 +45,12 @@ import sys
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from ..errors import UsageError
+from ..platform.no_window import subprocess_window_kwargs
 from ..logging_setup import event
 from .model import TrayAction, TrayIntent, TrayMenuItem, TrayModel
 from .notifications import FETCH_LIMIT, summarize
 from ..gui.theme import COLORS, menu_options
-from .actions import apply_control, control_enabled
+from .actions import apply_control, control_enabled, disabled_control
 from .panels import DesktopPanel, project_pages
 
 __all__ = [
@@ -543,7 +544,8 @@ def _run_cli_json(cli_args: Sequence[str], *, timeout: float = CLI_TIMEOUT_S) ->
         # 中文 Windows 上沿用 cp936 会 UnicodeDecodeError（见 desktop/datasource.py）
         completed = subprocess.run(command, capture_output=True,
                                    encoding="utf-8", errors="replace",
-                                   timeout=timeout, check=False, env=env)
+                                   timeout=timeout, check=False, env=env,
+                                   **subprocess_window_kwargs())
     except (OSError, subprocess.SubprocessError) as exc:
         event("tray.cli_failed", level="warning", command=label,
               error=type(exc).__name__)
@@ -603,7 +605,8 @@ def _run_cli_command(cli_args: Sequence[str], *,
         completed = subprocess.run(command, capture_output=True,
                                    encoding="utf-8", errors="replace",
                                    timeout=timeout, check=False, env=env,
-                                   stdin=subprocess.DEVNULL)
+                                   stdin=subprocess.DEVNULL,
+                                   **subprocess_window_kwargs())
     except (OSError, subprocess.SubprocessError) as exc:
         event("tray.cli_action_failed", level="warning", command=" ".join(cli_args[:2]),
               error=type(exc).__name__)
@@ -654,6 +657,14 @@ def desktop_intent_sink(backend, *, refresh):
             refresh()
             backend.show_feedback("本机控制回读", result.message)
             event("tray.control_result", action=intent.action.value, verified=result.verified)
+            return
+        if intent.action in (TrayAction.PAUSE, TrayAction.RESUME):
+            # RC15-039 #3 真路径：开关关着时上面那个分支进不去，以前直接落到最下面的
+            # 「命令指南 / 未执行」（客户看到的还是 CLI 指引）。这里用人话兜底，文案与
+            # 直调 ``apply_control`` 同源（``CONTROL_DISABLED_MESSAGE``）。
+            result = disabled_control(intent.action)
+            backend.show_feedback("本机控制 / 未执行", result.message)
+            event("tray.control_result", action=intent.action.value, verified=False)
             return
         if intent.action is TrayAction.BIND:
             ask = getattr(backend, "ask_bind_code", None)

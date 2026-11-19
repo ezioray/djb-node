@@ -380,16 +380,32 @@ def probe_models(base_url: str, models: Iterable[str], *, credential: str | None
     now = clock or utcnow
     client = http or HttpClient()
     chosen = normalize_level(level or facts.PROBE_DEFAULT_LEVEL)
+    base_timeout = float(timeout if timeout is not None else facts.PROBE_TIMEOUT_S)
+    # 0.3.9 / D-RCA P1-a：**单模型预算切片**。0.3.8 只在每个模型开始前看一次 deadline，
+    # 却把完整的 ``timeout``(20s) 交给**每个** ``probe_model`` ⇒ 一个慢模型可以吃掉整轮
+    # 预算（5 模型最坏 ~100s，超过 30s 心跳上限；慢模型排第一时其余全部 ``not_probed``，
+    # 2026-11-16 现场 qwen 排最后没饿死是运气）。现在剩余预算按「剩余模型数」均分，
+    # 每个模型至少 ``PROBE_MIN_MODEL_TIMEOUT_S``（2s，L2 健康响应远小于此）；
+    # 单个模型确实需要更久时只丢自己这一行，并进入 backlog（``not_probed``）等下一轮。
+    # 注意：L3 失败后的 L2 降级重试沿用同一个切片，所以单模型最坏花 2 个切片；
+    # 下一轮模型开始前会重新看 deadline，超预算的模型照样留给下一轮，不会无限拖延。
+    ordered = [str(model) for model in models]
     outcomes: dict[str, ProbeOutcome] = {}
-    for model in models:
-        if deadline is not None and now() >= deadline:
-            break
-        name = str(model)
+    for index, name in enumerate(ordered):
+        attempt_timeout = base_timeout
+        if deadline is not None:
+            remaining_s = (deadline - now()).total_seconds()
+            if remaining_s <= 0:
+                break
+            remaining_models = len(ordered) - index
+            attempt_timeout = min(base_timeout,
+                                  max(facts.PROBE_MIN_MODEL_TIMEOUT_S,
+                                      remaining_s / remaining_models))
         outcome = probe_model(base_url, name, credential=credential, level=chosen,
-                              timeout=timeout, http=client, protocol=protocol)
+                              timeout=attempt_timeout, http=client, protocol=protocol)
         if fallback_l2 and chosen == "L3" and not outcome.inference_ok:
             retry = probe_model(base_url, name, credential=credential, level="L2",
-                                timeout=timeout, http=client, protocol=protocol)
+                                timeout=attempt_timeout, http=client, protocol=protocol)
             if retry.inference_ok:
                 retry.stream_ok = outcome.stream_ok is True
                 retry.error_class = None

@@ -21,7 +21,7 @@ import time
 import unicodedata
 from typing import Any, Callable
 
-from . import __version__, facts, pidfile
+from . import __version__, facts, pidfile, update_source
 from .api import NodeApi
 from .attest import AttestationManager
 from .channel import channel_enabled
@@ -29,6 +29,7 @@ from .config import (ClientConfig, Paths, feature_flag, load_config, resolve_hom
 from .daemon import ControlClient, Daemon, control_socket_file
 from .diagnose import DiagnoseBuilder, DiagnoseError
 from .envcheck import EnvChecker
+from .platform.no_window import subprocess_window_kwargs
 from .errors import (AuthError, DjbError, NotInstalledError, NotRunningError,
                      UsageError, exit_code_of)
 from .httpclient import HttpClient
@@ -48,8 +49,9 @@ from . import quotes as quotes_mod
 from . import store as store_module
 from . import tokens as tokens_mod
 from .update import UpdateManager, apply_exit_code
-from .upstream import (UpstreamManager, a2_prompt, parse_models, probe_upstream,
-                       validate_access_type, validate_base_url, validate_min_price)
+from .upstream import (UpstreamManager, a2_prompt, classify_base_url, origin_hint,
+                       parse_models, probe_upstream, validate_access_type,
+                       validate_base_url, validate_min_price)
 from .util import (ensure_dir, iso, new_token, parse_iso, redact_text, utcnow)
 
 PROG = "djb"
@@ -121,6 +123,20 @@ def cmd_init(args: argparse.Namespace) -> int:
         config.mirror_port = int(args.port)
     if getattr(args, "channel", None):
         config.update_channel = args.channel
+    edition = getattr(args, "edition", None)
+    edition_note = ""
+    if edition:
+        # 0.3.1（RC8.3-C）：显式给档位 = 明确要该通道的签名更新源。
+        # 已有**自定义**源（内网镜像 / 本地目录）不覆盖 —— 那是运维刻意的选择。
+        config.edition = str(edition).strip()
+        known_sources = {item.update_source for item in update_source.channels()}
+        current = config.update_source.strip()
+        if getattr(args, "update_source", None) is None:
+            if not current or current in known_sources:
+                config.update_source = update_source.default_source(config.edition)
+            else:
+                edition_note = ("保留已有自定义 update_source（--edition 只登记档位，"
+                                "不改源；要改请显式 --update-source）")
     if getattr(args, "update_source", None) is not None:
         config.update_source = str(args.update_source).strip()
     if getattr(args, "log_level", None):
@@ -165,6 +181,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "home": paths.home,
         "initialized": True,
         "config": config.to_dict(),
+        "update_source": update_source.resolve(config.update_source,
+                                               edition=config.edition).to_dict(),
         "install": store.install().to_dict(),
         "profile": store.profile().to_dict(),
         "env": report.to_dict() if report else None,
@@ -183,6 +201,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("  预设 " + store.profile().preset + " · 并发 " + str(store.profile().concurrent)
               + " · 日配额 " + str(store.profile().daily_tokens) + " tokens")
         print("  本机镜像将监听 127.0.0.1:" + str(config.mirror_port) + "/v1（仅回环）")
+        resolved = update_source.resolve(config.update_source, edition=config.edition)
+        print("  更新源 " + resolved.label()
+              + ("（档位 " + config.edition + "）" if config.edition else ""))
+        if edition_note:
+            print("  注意：" + edition_note)
         if report is not None:
             print("")
             print(report.text())
@@ -548,7 +571,7 @@ def _spawn_daemon(paths: Paths, config: ClientConfig, token: str) -> None:
     try:
         subprocess.Popen(command, stdout=stdout, stderr=stdout, stdin=subprocess.DEVNULL,
                          start_new_session=True, env=env, close_fds=True,
-                         cwd=package_parent)
+                         cwd=package_parent, **subprocess_window_kwargs())
     finally:
         stdout.close()
 
@@ -651,6 +674,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         payload["daemon_running"] = True
     except NotRunningError:
         payload = _offline_status(paths, store)
+    # R-3（0.3.4）：顶层补 `edition`——**只加不改**，旧字段一个不动。
+    # daemon 分支的 payload 由 daemon 给（目前不含 edition），所以在这里兜底；
+    # 将来 daemon 自己带上时 `setdefault` 不会覆盖它的值。
+    payload.setdefault("edition", load_config(paths).edition)
     if getattr(args, "show_token", False):
         try:
             payload["local_token"] = ControlClient(paths).call({"cmd": "token"},
@@ -1162,6 +1189,8 @@ def _upstream_line(item: dict[str, Any]) -> str:
     kind = item.get("upstream_kind")
     if kind:
         parts.append(str(kind))
+    # 来源分类（INTEGRITY-REVIEW-20261117 §5）：官方/知名开源/未识别，只作信任先验
+    parts.append("来源:" + classify_base_url(item.get("base_url")))
     parts.extend([str(item.get("base_url")), str(item.get("state"))])
     models = ",".join(str(model.get("id")) for model in item.get("models") or [])
     # P6：把「最近探针 / 还有多久掉容量」直接印在这一行（原来只能看 state=verified，
@@ -1267,12 +1296,16 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         payload = {"upstream": manager.store.upstream(record.id).to_dict(),
                    "relay": relay_profile.to_dict() if relay_profile else None,
                    "declare": declared,
+                   "base_url_origin": classify_base_url(
+                       record.base_url),
                    "credential_stored": bool(secret),
                    "credential_note": "凭据只在 0600 本机文件；申报只上行 credential_handle"}
         _emit(payload, as_json=_json_flag(args), text=lambda value: (
             "已添加上游 " + str(value["upstream"]["id"]) + "（"
             + str(value["upstream"]["access_type"]) + " · "
             + str(value["upstream"]["base_url"]) + "）\n"
+            + "来源：" + str(value.get("base_url_origin")) + " · "
+            + origin_hint(value.get("base_url_origin")) + "\n"
             + ("已申报：" + json.dumps(value["declare"].get("response"), ensure_ascii=False)
                if value["declare"].get("declared")
                else "暂未申报：" + str(value["declare"].get("reason")))))
@@ -1288,6 +1321,21 @@ def cmd_upstream(args: argparse.Namespace) -> int:
         record = store.upstream(args.id)
         result = manager.probe(record.id, level=getattr(args, "level", None))
         details = manager.probe_details(record.id)
+        if not result.get("models"):
+            # P2-9（与 cloud P1-7 对齐）：全模型被停用 ⇒ 没有 enabled 模型 = **没有证据**。
+            # 此时上报 `models=[]` 会被云端旧口径（无 check ⇒ verified）判通过，
+            # 并按申报清单展开容量；所以节点这边直接不上报，原因码与云端
+            # `rejected_reason_code` 同名（`no_enabled_models`），审计链可对齐。
+            # 仅新增一种 `reported=false` 的情形，不改既有输出字段语义。
+            result["reported"] = False
+            result["report_error"] = "no_enabled_models"
+            payload = {**result, "local_details": details}
+            _emit(payload, as_json=_json_flag(args),
+                  text=lambda value: ("探测 " + str(value["upstream_id"]) + "："
+                                      + ("可达" if value["reachable"] else "不可达")
+                                      + " · 0 个 enabled 模型，未上报"
+                                      + "（no_enabled_models）"))
+            return 0
         try:
             api = NodeApi(config.gateway_url, client_key=credentials.client_key(),
                           http=HttpClient(timeout=15.0))
@@ -1656,6 +1704,42 @@ def cmd_flags(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_onboarding(args: argparse.Namespace) -> int:
+    """首启引导状态（RC14 B）：``--status`` 看进度 / ``--reset`` 清状态（下次启动重新引导）。
+
+    只读本机 ``desktop/onboarding.json``（**不含凭据**）；``--reset`` 只删这一个文件，
+    不动配置、不动凭据、不动账本。
+    """
+    from . import onboarding as onboarding_mod
+
+    # 引导状态是纯本机文件：**不要求 init 过**（未初始化的机器也该能看/清进度）
+    paths = Paths(resolve_home(getattr(args, "home", None)))
+    config = load_config(paths)
+    store = onboarding_mod.OnboardingStore(paths.home)
+    if getattr(args, "reset", False):
+        state = store.reset()
+        payload = {"reset": True, "state": state.as_dict(),
+                   "path": store.path, "flag": facts.ONBOARDING_FLAG}
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: "已清除引导状态（下次启动会重新引导）：" + value["path"])
+        return 0
+    state = store.load()
+    payload = {"state": state.as_dict(), "show": state.should_show(),
+               "steps": [dict(item) for item in onboarding_mod.STEPS],
+               "path": store.path, "flag": facts.ONBOARDING_FLAG,
+               "enabled": bool(feature_flag(config, facts.ONBOARDING_FLAG))}
+    _emit(payload, as_json=_json_flag(args),
+          text=lambda value: (
+              ("引导" + ("已完成" if value["state"]["completed_at"] else
+                         "已跳过" if value["state"]["dismissed_at"] else "未完成"))
+              + ("，下次启动会显示" if value["show"] else "，不再自动显示")
+              + "（第 " + str(value["state"]["last_step"]) + " / "
+              + str(len(value["steps"])) + " 步）\n开关 " + value["flag"] + "："
+              + ("开" if value["enabled"] else "关（默认）")
+              + "｜状态文件：" + value["path"]))
+    return 0
+
+
 def cmd_attest(args: argparse.Namespace) -> int:
     """查看本地模型身份证明记录（客户端证据只作线索，不自我宣称 verified）。"""
     paths, config, store = _context(args)
@@ -1950,6 +2034,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     manager = UpdateManager(paths, store,
                             source=source if source is not None else config.update_source,
                             channel=getattr(args, "channel", None) or config.update_channel,
+                            edition=config.edition,
                             http=HttpClient(timeout=20.0),
                             # 开关求值需要 config（mock 验签三条件之一）；生产路径用不到
                             config=config)
@@ -1967,8 +2052,9 @@ def cmd_update(args: argparse.Namespace) -> int:
     if getattr(args, "apply", False):
         result = manager.apply()
         _emit(result, as_json=_json_flag(args),
-              text=lambda value: (("已安装 " + str(value.get("version"))
-                                   + "（上一版 " + str(value.get("previous_version")) + "）")
+              text=lambda value: (("已下载待安装 " + str(value.get("version"))
+                                   + "（校验通过；安装器上线前不自动换装，当前仍运行 "
+                                   + str(value.get("previous_version")) + "）")
                                   if value.get("installed")
                                   else "未安装：" + str(value.get("state")) + " · "
                                   + str(value.get("message"))))
@@ -2311,6 +2397,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--port", type=int, help="本机镜像端口（1024–65535，默认 1717）")
     init.add_argument("--channel", choices=facts.UPDATE_CHANNELS, help="更新频道")
     init.add_argument("--update-source", help="更新源（URL / 本地目录；留空用 mock 源）")
+    init.add_argument("--edition", choices=update_source.editions(),
+                      help="发行档位：落该通道的显式签名更新源（consumer/machine-room/"
+                           "official-supply）；--update-source 优先级更高")
     init.add_argument("--log-level", choices=facts.LOG_LEVELS, help="日志级别")
     init.add_argument("--preset", choices=facts.PRESETS, help="预设：省心 / 均衡 / 全力以赴")
     init.add_argument("--daily-tokens", type=int, help="日配额（10000–100000000）")
@@ -2558,6 +2647,11 @@ def build_parser() -> argparse.ArgumentParser:
     flags = add_common(cmd_flags, "flags", "查看 / 设置本机特性开关（默认关闭）")
     flags.add_argument("--enable", metavar="NAME")
     flags.add_argument("--disable", metavar="NAME")
+
+    onboarding = add_common(cmd_onboarding, "onboarding",
+                            "首启引导状态：--status 看进度 / --reset 清状态（下次启动重新引导）")
+    onboarding.add_argument("--status", action="store_true", help="查看引导进度（默认动作）")
+    onboarding.add_argument("--reset", action="store_true", help="清除引导状态")
 
     attest_cmd = add_common(cmd_attest, "attest", "查看本地模型身份证明记录（客户端线索）")
     attest_cmd.add_argument("--id", help="上游 id")

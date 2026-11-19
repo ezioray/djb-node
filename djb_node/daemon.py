@@ -268,7 +268,13 @@ class Daemon:
         self.update = UpdateManager(paths, self.store, source=self.config.update_source,
                                     channel=self.config.update_channel,
                                     client_version=facts.CLIENT_VERSION, http=self.http,
-                                    config=self.config, now=now)
+                                    config=self.config, edition=self.config.edition, now=now)
+        # D2：启动自检——手工解压换包不写安装记录，界面「当前版本」会一直停在旧值。
+        # 只读＋一次 UPDATE，失败不拦启动（记录不准不该让节点起不来）。
+        try:
+            self.update.reconcile_install_record()
+        except Exception:                            # pragma: no cover - 防御
+            log.exception("daemon.update_reconcile_failed")
         self.server = LocalApiServer(self, token=self.token, port=self.port, http=self.http,
                                         settings=self.config.extra)
         self._stop_event = threading.Event()
@@ -783,11 +789,12 @@ class Daemon:
                 applied.append("log_level")
             except (OSError, ValueError) as exc:            # pragma: no cover - 防御
                 notes.append("日志级别未切换：" + (str(exc) or type(exc).__name__))
-        for name in ("update_channel", "update_source"):
+        for name in ("update_channel", "update_source", "edition"):
             if name in changed:
                 applied.append(name)
         self.update.source = fresh.update_source
         self.update.channel = fresh.update_channel
+        self.update.edition = fresh.edition
         if "extra" in changed:
             # 镜像端点用 extra 做行为开关（如 tokens.compare）；直接换掉旧字典
             self.server.settings = dict(fresh.extra or {})
@@ -1276,6 +1283,9 @@ class Daemon:
             "capacity": self.upstreams.announce_capacity(
                 profile, now=now, relay=self._relay_capacity_targets(now)),
             "load": {"inflight": self._inflight, "queue_seconds": 0.0},
+            # D1（2026-11-18）：版本如实——心跳自述程序版本，云端只在变化时落库。
+            # 加性字段：老云端忽略未知键（spec ``additionalProperties: true``），零感知。
+            "client_version": facts.CLIENT_VERSION,
         }
         # M3：加性字段（开关关闭时不出现；云端忽略未知键，老版本零感知）
         machine = self._machine_payload()
@@ -1409,10 +1419,15 @@ class Daemon:
         超预算的模型留到下一轮（`not_probed`，不算失败）。
         失败按指数退避拉长下一轮间隔（`probe.periodic_interval_s`）。
         """
-        deadline = now + timedelta(seconds=facts.PROBE_PASS_BUDGET_S)
+        # 0.3.8（RC14 复盘 P0-2）：预算可配，但**不得超过一个心跳周期** ——
+        # 探针内联在主循环里，超一个心跳就会让节点 presence 掉档（见 facts 注释）。
+        budget_s = facts.probe_pass_budget_s()
+        deadline = now + timedelta(seconds=budget_s)
         verified = 0
         failed = 0
         models = 0
+        backlog = 0
+        per_upstream: list[dict[str, Any]] = []
         for record in self.upstreams.list():
             if not record.enabled:
                 continue
@@ -1420,8 +1435,9 @@ class Daemon:
                 break
             try:
                 payload = self.upstreams.probe(
-                    record.id, timeout=facts.PROBE_TIMEOUT_S, now=now,
-                    deadline=deadline, clock=self._now)
+                    record.id, timeout=facts.PROBE_TIMEOUT_S,
+                    level=facts.PROBE_PERIODIC_LEVEL,
+                    now=now, deadline=deadline, clock=self._now)
             except DjbError as exc:
                 failed += 1
                 event("upstream.probe_failed", level="warning", reason=reason,
@@ -1434,11 +1450,38 @@ class Daemon:
                 continue
             checks = payload.get("model_checks") or []
             models += len(checks)
-            # 与服务端口径对齐（2026-11-04，D-PROBE-03）：云端 `_probe_verdict` 是
-            # **任一检查失败即 rejected**（零检查 ⇒ rejected/no_model_check）。
-            # 旧版这里用 `any(...)`：部分模型可用时节点自以为 verified、云端判 rejected，
-            # 两边日志对不上，排障时容易误判。改为 all + 非空，逐字对齐。
-            if checks and all(item.get("ok") for item in checks):
+            # RC14 §3-B.1（owner 裁决「修复探针一个失败即全空」）：判定改成
+            # **至少一个 enabled 模型通过即 ok**，逐模型结论进 `per_model[]`。
+            #
+            # 旧口径是 `checks and all(item.ok)`，与云端「任一检查失败即 rejected」对齐
+            # （D-PROBE-03/2026-11-04）。W6 现场 6/7 证明这条对齐是**放大故障**：
+            # 只要一个 enabled 模型临时失败（上游清单缺项 / L2 抖动 / 该模型下架），
+            # 整条上游就 rejected、全部容量归零，其余能用的模型被一起拖死。
+            # 现在 `payload["models"]` 只含 enabled（upstream.py 的 W6-FIX），
+            # 所以「任何一个能用的模型通过」就是这条上游可用的证据。
+            per_model = [{"model": str(item.get("model") or ""),
+                          "ok": bool(item.get("ok")),
+                          "error_class": item.get("error_class")}
+                         for item in checks if isinstance(item, dict)]
+            passed = sum(1 for item in per_model if item["ok"])
+            # 0.3.9 / D-RCA P0-b：``real_failures`` **降级为诊断字段**，不再是否决票。
+            #
+            # 0.3.8 的判定是「passed 且没有真实失败」⇒ verified：qwen 一个 ``timeout``
+            # 就让 ``passed=4`` 的整条上游计 ``failed``、不上报、进退避（2026-11-16 现场
+            # 连续两轮 ``verified=0`` 命中自动回滚阈值）。这与云端 `_probe_verdict_scoped`
+            # 的 `if real_ok: verified` 相反 ⇒ 同一个 timeout 在节点侧被放大成整条上游
+            # 「不可用」。现在：**有 ok 就上报**，单个模型的失败只体现在 per_model 里。
+            #
+            # P0-c：``timeout`` 仍**留在** ``real_failures`` / ``PROBE_TOLERATED_ERROR_CLASSES``
+            # 之外（它是真实失败，不能靠把这个错误类从元组里抹掉来「修好」），否则
+            # 「全部模型 timeout」会被洗成无真实失败、进而放行一条实际不可用的上游。
+            tolerated = facts.PROBE_TOLERATED_ERROR_CLASSES
+            real_failures = [item for item in per_model
+                             if not item["ok"] and item.get("error_class") not in tolerated]
+            not_probed = len([item for item in (payload.get("not_probed") or [])
+                              if isinstance(item, dict) and item.get("reason") == "budget"])
+            backlog += not_probed
+            if passed:
                 verified += 1
                 # D-PROBE-03：**周期探针的结论必须上报**，否则云端 verified_at 不动。
                 # 旧行为：daemon 只写本地 last_probe_at ⇒ 本地算出正 QPS，但云端
@@ -1446,19 +1489,32 @@ class Daemon:
                 # 15 分钟后容量再次归零，且没有任何自动恢复路径（只能人工 `djb upstream probe`）。
                 # 上报走与 CLI 完全相同的一条路（含服务端 upstream_id 映射），失败不影响本地结论。
                 self._report_probe(record, payload, reason=reason)
-            else:
+            elif not_probed == 0 or real_failures:
+                # 0.3.9 / D-RCA P0-c：只有「**0 个 ok** 且确有失败」才 failed；这条同时
+                # 兜住「全部模型 timeout」的全量故障，并保留「一个都没探到且没有 backlog」
+                # 的防空转口径（passed=0 且 not_probed=0 ⇒ failed）。
                 failed += 1
+            per_upstream.append({"upstream_id": record.id, "ok": bool(passed),
+                                 "passed": passed, "total": len(per_model),
+                                 "real_failures": [item["model"] for item in real_failures],
+                                 "not_probed": not_probed,
+                                 "per_model": per_model})
         self._probe_failures = min(self._probe_failures + 1, facts.PROBE_MAX_BACKOFF_SHIFT) \
             if failed else 0
         self._probe_interval_s = periodic_interval_s(self._upstream_model_count(),
                                                      self._probe_failures)
-        self._next_probe_at = now + timedelta(seconds=self._probe_interval_s)
+        # 有 backlog（预算没轮到）⇒ 很快续跑，几轮内清空；否则回常规周期。
+        self._next_probe_at = now + timedelta(
+            seconds=facts.PROBE_BACKLOG_RETRY_S if backlog else self._probe_interval_s)
         self._last_probe = {"at": iso(now), "reason": reason, "verified": verified,
                             "failed": failed, "models": models,
                             "failures": self._probe_failures,
-                            "interval_s": self._probe_interval_s}
+                            "backlog": backlog,
+                            "interval_s": self._probe_interval_s,
+                            # 逐模型结论（本地排障用；上行仍走 model_checks，不重复发）
+                            "per_upstream": per_upstream}
         event("upstream.probe_pass", reason=reason, verified=verified, failed=failed,
-              models=models, failures=self._probe_failures,
+              models=models, failures=self._probe_failures, backlog=backlog,
               interval_s=self._probe_interval_s)
         return self._last_probe
 

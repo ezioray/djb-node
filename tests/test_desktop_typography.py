@@ -25,44 +25,26 @@ import pytest
 from djb_node.desktop import ui_geom
 
 # ────────────────────────────────────────────────────────────── 纯逻辑（无需图形环境）
-def test_ramp_has_exactly_the_seven_steps_plus_table_exception():
-    """§2.1：30/19/18/13/12/10 六档 + 表格正文 11（特例）。"""
-    from djb_node.desktop import ui_kit
+def test_ui_kit_has_no_font_size_of_its_own():
+    """T4：0.3.4 的 8 个真值常量 + 7 个旧名别名**已全部删除**，字号只有一个来源。
 
-    ramp = {
-        "PX_DISPLAY": ui_kit.PX_DISPLAY,
-        "PX_TITLE": ui_kit.PX_TITLE,
-        "PX_HERO": ui_kit.PX_HERO,
-        "PX_CARD": ui_kit.PX_CARD,
-        "PX_BODY": ui_kit.PX_BODY,
-        "PX_SMALL": ui_kit.PX_SMALL,
-        "PX_MICRO": ui_kit.PX_MICRO,
-    }
-    assert ramp == {"PX_DISPLAY": 30, "PX_TITLE": 19, "PX_HERO": 18, "PX_CARD": 13,
-                    "PX_BODY": 13, "PX_SMALL": 12, "PX_MICRO": 10}
-    assert ui_kit.PX_TABLE == 11          # 特例：设计 9px 在中文上糊，10 又比微标小
-    # 全站字号集合 == 那 7 档 + 表格 11，多一个都不许出现
-    values = {value for name, value in vars(ui_kit).items()
-              if name.startswith("PX_") and isinstance(value, int)}
-    assert values == {10, 11, 12, 13, 18, 19, 30}
+    旧名 → 档位的映射、「值等价」与两条例外（表格 11→12、mono 无对应）在
+    ``tests/test_desktop_px_wiring.py``；这里只守两条底线：
+    ① ``ui_kit`` 上不再有 ``PX_*``；② 它报出的字号与 ``typography`` **逐项相等**（无第二份真值）。
+    """
+    from djb_node.desktop import typography, ui_kit
+
+    assert [name for name in dir(ui_kit) if name.startswith("PX_")] == []
+    for name in typography.TOKEN_ORDER:
+        assert ui_kit.px(name) == typography.px(name), name
 
 
-def test_legacy_names_are_kept_as_aliases():
-    """兼容：调用方不改签名，旧名字必须还在，且值收敛到新档位。"""
-    from djb_node.desktop import ui_kit
+def test_cjk_min_size_is_eleven():
+    """§2.2：CJK 下限 11px（0.3.4 是 10px；8px 中文是 F1 的根因）。"""
+    from djb_node.desktop import typography, ui_kit
 
-    assert (ui_kit.PX_H1, ui_kit.PX_BODY_S, ui_kit.PX_NAV) == (19, 12, 12)
-    assert (ui_kit.PX_NUM, ui_kit.PX_NUM_L, ui_kit.PX_NUM_XL) == (13, 19, 30)
-    # PX_MICRO_CJK 取消：留成别名（10），渲染层不许再用它把中文塞进 mono
-    assert ui_kit.PX_MICRO_CJK == ui_kit.PX_MICRO == 10
-    assert ui_kit.PX_CJK_MIN == ui_kit.PX_MICRO
-
-
-def test_cjk_min_size_is_ten():
-    """§2.2：含中文的微标 10px 起（8px 中文是本轮 F1 的根因）。"""
-    from djb_node.desktop import ui_kit
-
-    assert ui_kit.PX_CJK_MIN >= 10
+    assert typography.CJK_MIN_PX == 11
+    assert ui_kit.px("micro") == 11        # 最小的 sans 档正好踩在下限上
 
 
 @pytest.mark.parametrize("platform,head", [
@@ -126,7 +108,7 @@ def test_pick_mono_family_never_reaches_for_a_cjk_only_chain():
 def test_source_has_no_hand_written_cjk_in_mono_call():
     """静态扫描：不许再写 ``fonts.mono("中文…")`` 这种字面量（§2.2 的验收口径之一）。
 
-    只查**字符串字面量实参**：``fonts.mono(kit.PX_MICRO)``（传字号）不算；
+    只查**字符串字面量实参**：``fonts.mono(kit.px("micro"))``（传字号）不算；
     变量实参由运行时用例与 ``ui_audit.py`` 的 ``cjk-in-mono`` 项覆盖。
     """
     import ast
@@ -169,8 +151,8 @@ def test_for_text_routes_ascii_to_mono_and_cjk_to_sans():
         for text in ("共享方", "峰值 12,288 tokens · 04:00", "运行中", "✓ 已开启", "日间"):
             font = fonts.for_text(text, 10)
             assert font.actual("family") == fonts.sans_family, text
-        # 中文最小 10px：传 8px 也得抬到 10px（F1 的原点就是 8px 中文）
-        assert _configured_px(root, fonts.for_text("共享方", 8)) == -10
+        # 中文下限 11px：传 8px 也得抬到 11px（F1 的原点就是 8px 中文）
+        assert _configured_px(root, fonts.for_text("共享方", 8)) == -11
         assert _configured_px(root, fonts.for_text("SHARED", 8)) == -8
     finally:
         root.destroy()
@@ -254,7 +236,8 @@ def test_kit_styles_fonts_survive_garbage_collection():
 
 @needs_tk
 def test_ttk_fonts_are_the_ramp_sizes():
-    """§2.4 的硬数字：Treeview 11 / Heading 10 bold / Entry·Combobox·Button·Scrollbar 12。"""
+    """§2.4 的硬数字（0.3.5 设计值）：Treeview **12**（table）/ Heading **12** bold（small）/
+    Entry·Combobox·Button·Scrollbar 12（``small`` 设计值 12.5，按 0.3.4 的 ``round()`` 渲染 12）。"""
     from tkinter import ttk
 
     from djb_node.desktop import ui_kit
@@ -264,8 +247,8 @@ def test_ttk_fonts_are_the_ramp_sizes():
         style = ui_kit.apply_kit_styles(root, ttk)
         fonts = ui_kit.fonts_for(root)
         expect = {
-            "Treeview": ("table", -11, "normal"),
-            "Treeview.Heading": ("heading", -10, "bold"),
+            "Treeview": ("table", -12, "normal"),
+            "Treeview.Heading": ("heading", -12, "bold"),
             "TEntry": ("small", -12, "normal"),
             "TCombobox": ("small", -12, "normal"),
             "TButton": ("small", -12, "normal"),
@@ -278,8 +261,8 @@ def test_ttk_fonts_are_the_ramp_sizes():
             assert _configured_px(root, spec) == px, (name, _configured_px(root, spec))
             actual = root.tk.call("font", "actual", spec)
             assert weight in tuple(actual), (name, actual)
-        # 行高按裁决保持 26
-        assert int(style.lookup("Kit.Treeview", "rowheight")) == 26
+        # 行高已接 typography.table 的行盒 28（0.3.4 写死 26）
+        assert int(style.lookup("Kit.Treeview", "rowheight")) == 28
         # 表头必须是 sans（不许再给 heading 单独 mono）
         assert style.lookup("Kit.Treeview.Heading", "font") == fonts.named_name("heading")
         assert fonts.named["heading"].actual("family") == fonts.sans_family
@@ -288,8 +271,37 @@ def test_ttk_fonts_are_the_ramp_sizes():
 
 
 @needs_tk
+def test_treeview_row_holds_the_glyphs_without_clipping():
+    """行高 28 要**真的**容得下 table 字号的字形（不是只看常量）：linespace ≤ 行高 - 6。"""
+    from tkinter import ttk
+
+    from djb_node.desktop import ui_kit
+
+    root = _new_root()
+    try:
+        style = ui_kit.apply_kit_styles(root, ttk)
+        fonts = ui_kit.fonts_for(root)
+        row = int(style.lookup("Kit.Treeview", "rowheight"))
+        space = int(root.tk.call("font", "metrics", fonts.named_name("table"), "-linespace"))
+        assert row == ui_kit.table_rowheight(fonts.scale) == 28
+        assert space <= row - 6, (space, row)          # 上下各留 ≥3px，不贴边
+        tree = ttk.Treeview(root, style="Kit.Treeview", columns=("tokens",),
+                            show="tree headings", height=3)
+        tree.heading("#0", text="收据")
+        tree.insert("", "end", iid="i1", text="rcpt_0001", values=("1,500",))
+        tree.pack(fill="both", expand=True)
+        root.update_idletasks()
+        x, y, width, height = tree.bbox("i1")
+        assert height == row, (height, row)            # 项高 == 行高：没被压扁
+        assert width > 0 and tree.identify_row(y + 1) == "i1"   # 行内可命中，没裁掉
+        assert tree.identify_column(x + width - 2) in ("#1", "#0")
+    finally:
+        root.destroy()
+
+
+@needs_tk
 def test_default_font_option_points_at_the_named_body_font():
-    """§2.4：``option_add("*Font")`` 指向 ``DJB.Body``（13px），不再是 11pt 点值。"""
+    """§2.4：``option_add("*Font")`` 指向 ``DJB.Body``（**14px**，0.3.5 设计值），不再是 11pt 点值。"""
     import tkinter as tk
     from tkinter import ttk
 
@@ -301,7 +313,7 @@ def test_default_font_option_points_at_the_named_body_font():
         fonts = ui_kit.fonts_for(root)
         label = tk.Label(root, text="正文")
         assert str(label.cget("font")) == "DJB.Body", label.cget("font")
-        assert _configured_px(root, "DJB.Body") == -13
+        assert _configured_px(root, "DJB.Body") == -14
         assert fonts.named["body"].actual("family") == fonts.sans_family
     finally:
         root.destroy()
@@ -327,13 +339,13 @@ def test_kit_fonts_win_over_the_gui_theme_point_sizes():
         assert str(before.cget("font")) != "DJB.Body"
         ui_kit.apply_kit_styles(root, ttk)
         assert str(tk.Label(root, text="正文").cget("font")) == "DJB.Body"
-        assert _configured_px(root, "DJB.Body") == -13
+        assert _configured_px(root, "DJB.Body") == -14
         # 换肤会再写一次点值 —— 这就是「换肤后要重新 apply_kit_styles」的原因
         dual.apply(root, ttk, "night")
         assert str(tk.Label(root, text="正文").cget("font")) != "DJB.Body"
         ui_kit.apply_kit_styles(root, ttk)
         assert str(tk.Label(root, text="正文").cget("font")) == "DJB.Body"
-        assert _configured_px(root, "DJB.Body") == -13
+        assert _configured_px(root, "DJB.Body") == -14
     finally:
         root.destroy()
 
@@ -393,11 +405,11 @@ def test_scale_hook_multiplies_px_and_defaults_to_one():
     try:
         base = ui_kit.Fonts(root)
         assert base.scale == 1.0
-        assert base.px(ui_kit.PX_TITLE) == 19
-        assert _configured_px(root, base.sans(ui_kit.PX_TITLE)) == -19
+        assert base.px(ui_kit.px("h1")) == 18
+        assert _configured_px(root, base.sans(ui_kit.px("h1"))) == -18
         scaled = ui_kit.Fonts(root, scale=1.25)
-        assert scaled.px(ui_kit.PX_TITLE) == 24          # 19 × 1.25 = 23.75 → 24
-        assert _configured_px(root, scaled.sans(ui_kit.PX_TITLE)) == -24
+        assert scaled.px(ui_kit.px("h1")) == 22          # 18 × 1.25 = 22.5 → round() 22（0.3.4 同）
+        assert _configured_px(root, scaled.sans(ui_kit.px("h1"))) == -22
         # 非法注入不静默缩成 0
         assert ui_kit.Fonts(root, scale=0).scale == 1.0
         assert ui_kit.Fonts(root, scale=-2).scale == 1.0

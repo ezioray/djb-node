@@ -14,18 +14,26 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import re
+
+from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
+from . import payout as payout_mod
+from .access import mask_address
 from .datasource import Snapshot, UNAVAILABLE, Unavailable
 from .nodecloud import STATE_TEXT
 from .. import facts
 
 __all__ = [
     "Action", "Card", "Chart", "Field", "GaugeData", "Hero", "Mark", "Metric", "NAV_SECTIONS",
-    "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "VIEWS",
+    "NavSection", "PAGE_MICROS", "RailCard", "Row", "SECTION_FOR_VIEW", "Table", "Toggle",
+    "VIEWS",
     "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
+    "YIELD_PRESET_BY_KEY", "YIELD_PRESET_BY_LABEL", "YIELD_TIERS",
+    "Filter", "with_field_errors",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -34,6 +42,23 @@ MARK_WAIT = "◐"
 MARK_FAIL = "✕"
 MARK_UNKNOWN = "?"
 MARK_IDLE = "·"
+
+#: 上次更新检查的结果（``Store.update_state().verify_state``）→ 客户能看懂的一句话。
+#:
+#: 九状态全覆盖（``update.STATE_GUIDANCE`` 是权威表，这里只是**短标签**用于表格单元格；
+#: 详细「下一步」由 toast 用的 ``update.guidance()`` 给）。缺失的状态退回显示状态码，
+#: 绝不显示成「已是最新」。
+UPDATE_STATE_TEXT = {
+    "offline": "网络不通，没拿到清单",
+    "invalid": "更新源异常，不要安装",
+    "no_source": "本渠道暂无更新源",
+    "failed_verify": "校验失败，已拒装",
+    "channel_mismatch": "清单渠道与本机不一致",
+    "up_to_date": "已是最新",
+    "not_eligible": "灰度未命中，本轮不更新",
+    "no_artifact": "本平台暂无安装包",
+    "eligible": "有可用更新",
+}
 
 
 class Mark:
@@ -56,13 +81,13 @@ VIEW_TITLES: dict[str, str] = {
     "overview": "总览",
     "bench": "性能基准",
     "gpu": "GPU 监控",
-    "models": "可提供模型",
+    "models": "模型与探针",
     "tasks": "任务队列",
     "receipts": "收据",
     "earnings": "收益",
-    "token_plan": "共享 Token Plan",
+    "token_plan": "提供 Token Plan",
     "agent": "Agent 接入",
-    "access": "接入配置",
+    "access": "本机设置",
     "yield": "让路 / 节能",
     "account": "账户与安全",
     "logs": "日志",
@@ -73,8 +98,8 @@ VIEW_TITLES: dict[str, str] = {
 class NavSection:
     """侧栏分组（IA 的中间层）：一个使用场景 = 一段连续视图。
 
-    渲染层只按 :data:`NAV_SECTIONS` 排侧栏，不再假设 ``VIEWS`` 是平铺列表；
-    新增/调整视图时改这里一处，顺序、分组头、页头面包屑同时跟着变。
+    **这是 0.3.4 的 4 组基线**：0.3.5 起侧栏由 :mod:`djb_node.desktop.ia` 驱动
+    （``DJB_UI_IA=legacy`` 才回到本表），此处仅作回滚/对照保留，不要再往这里加视图。
     """
 
     #: 组 key（英文小写，给测试/样式用）
@@ -173,17 +198,38 @@ class Row:
 class Table:
     columns: tuple[str, ...]
     rows: tuple[Row, ...] = ()
+    #: 表格自称的名字（读屏进表格时念的第一句）。空 = 用「表格」兜底。
+    #: 压平后行是 ` | ` 拼接，这个名字 + 列序 + 总行数是唯一能补回列语义的地方。
+    title: str = ""
     note: str = ""
     empty: str = "暂无数据"
     #: 窄窗（E10 口径 390）下先让位的列；数据不丢，详情抽屉里仍是全字段
     narrow_hide: tuple[str, ...] = ()
     #: 窄窗下的表头短名（只改表头，不改数据）
     narrow_headers: tuple[tuple[str, str], ...] = ()
+    #: RC15-039 #17：回车/双击**激活**这一行时派发的动作（``""`` = 老行为：只看详情）。
+    #: 只给「行本身就是一个可执行选择」的表用（让路页的三档就是）；收据/日志这类
+    #: 行不是动作，保持默认空，回车仍然只是打开详情。
+    activate: str = ""
 
 
 @dataclass(frozen=True)
 class Field:
-    """一行「标签 / 值」；``secret`` 表示只显示掩码，``editable`` 表示可编辑输入。"""
+    """一行「标签 / 值」；``secret`` 表示只显示掩码，``editable`` 表示可编辑输入。
+
+    两个只影响**渲染**的开关（默认值 = 老行为，老调用方无需改）：
+
+    * ``advanced``：折叠进「高级（排障用）」区。用于「必须保留但客户平时不该动」的字段
+      （节点凭证 = 节点密钥，排障要用，可它绝不该占首屏）。
+    * ``prefill``：可编辑框是否预填 ``value``。``False`` 时输入框留空、``value`` 进 hint——
+      掩码值（如收款地址 ``TQn9Xa…7f3d``）若预填进输入框，客户直接点「保存并回读」就会把
+      掩码当地址写回配置（真机上会被 ``validate_address`` 拒，等于保存永远失败）。
+    * ``revealable``：密码框右侧给不给「显示 / 隐藏」按钮。``None``（默认）= 跟着
+      ``secret`` 走（**秘密字段默认可显示**）；显式 ``False`` 才关掉。理由：客户粘贴
+      长密钥时打错一个字符，保存后只看到「401 / 密钥被拒」，而输入框里是一串黑点，
+      除了整段重粘没有任何补救手段（RC14 客户反馈「看不见就改不了」）。
+      显示**只改输入框的 ``show`` 选项**：不复制到剪贴板、不写日志、不进快照。
+    """
 
     label: str
     value: str
@@ -192,6 +238,66 @@ class Field:
     secret: bool = False
     hint: str = ""
     tone: str = "default"
+    advanced: bool = False
+    prefill: bool = True
+    revealable: bool | None = None
+    #: 非空 ⇒ 渲染成**只读下拉**（``ttk.Combobox`` + ``state="readonly"``）。
+    #: 只影响渲染；校验仍在动作侧（下拉选不出非法值，但手改配置/老快照可能带别的值）。
+    choices: tuple[str, ...] = ()
+    #: 字段级错误（一句话）。非空 ⇒ 红字渲染在**该字段下方**并参与「聚焦首个错误」
+    #: （RC15-039 #1）。默认空 = 0.3.7 行为；错误不由投影层产生，由动作层回投
+    #: （见 :func:`with_field_errors`），所以 13 个视图的既有快照一字不变。
+    error: str = ""
+
+    def can_reveal(self) -> bool:
+        """是否画「显示 / 隐藏」：只有**可编辑**的秘密字段才有意义（只读值本就是掩码）。"""
+        if not (self.editable and self.secret):
+            return False
+        return True if self.revealable is None else bool(self.revealable)
+
+
+@dataclass(frozen=True)
+class Filter:
+    """表格上方的一条下拉筛选（RC15-039 #5：日志级别筛选的**真**入口）。
+
+    为什么单独一个类型而不是复用 ``Field``：``Field`` 会被 ``app._on_action`` 收成草稿
+    交给「保存配置」，而日志筛选是**本机只读视图状态**——混进草稿会写出「草稿字段不被支持」
+    的告警，甚至把 `log_level` 写进接入配置。筛选有自己的动作 key（``action``）。
+    """
+
+    key: str
+    label: str
+    #: (值, 显示文案)：值是内部契约（``all`` / ``debug`` …），文案是客户看到的
+    options: tuple[tuple[str, str], ...] = ()
+    value: str = ""
+    #: 选中后派发的动作 key；动作侧从草稿 ``key`` 读新值
+    action: str = ""
+    #: 一句话说明「筛选影响什么、不影响什么」
+    hint: str = ""
+
+    def current_text(self) -> str:
+        for value, text in self.options:
+            if value == self.value:
+                return text
+        return self.value or "—"
+
+
+@dataclass(frozen=True)
+class Toggle:
+    """一条开关（RC15-039 #4：自动刷新在「本机设置」里可以关掉）。
+
+    值来自 controller 的**本机界面状态**（不是服务端配置），投影层只负责说明它是什么。
+    """
+
+    key: str
+    label: str
+    value: bool = True
+    hint: str = ""
+    #: 选中后派发的动作 key（把值写成草稿再派发，与 ``Filter`` 同一条路）
+    action: str = ""
+
+    def text(self) -> str:
+        return "开" if self.value else "关"
 
 
 @dataclass(frozen=True)
@@ -208,6 +314,32 @@ class Action:
     reason: str = ""
     primary: bool = False
     nav: str = ""
+    #: 动作分组标题（D6，2026-11-18 客户要求「绑定节点」与「提交 USDT 地址」隔离成两块）。
+    #: 空串 = 不分组（0.3.11 行为：整页一条按钮栏）。渲染层按「分组变化」插一条小标题 +
+    #: 另起一行按钮，于是同一页也能有两个互不干扰的动作区。
+    group: str = ""
+
+
+#: D6（2026-11-18 客户要求）：账户页两个**互不干扰**的动作区标题。
+#: 「绑定节点」= 设备码/手输码；「提交 USDT 收款地址」= 单独一次 Payout 提交。
+GROUP_BIND = "① 绑定节点"
+GROUP_PAYOUT = "② 提交 USDT 收款地址（与绑定是两件事）"
+
+
+def action_groups(actions: Sequence[Action]) -> list[tuple[str, list[Action]]]:
+    """按 ``Action.group`` 把动作切成有序块（同组相邻的合在一块；空组名不插标题）。
+
+    D6：客户要求「绑定节点」和「提交 USDT 地址」是两个**互不干扰**的动作。此前整页
+    只有一条按钮栏，用户填完地址顺手点了「绑定网页端」，就会误以为地址一起提交了。
+    """
+    groups: list[tuple[str, list[Action]]] = []
+    for action in actions:
+        title = str(getattr(action, "group", "") or "")
+        if groups and groups[-1][0] == title:
+            groups[-1][1].append(action)
+        else:
+            groups.append((title, [action]))
+    return groups
 
 
 @dataclass(frozen=True)
@@ -297,6 +429,9 @@ class View:
     subtitle: str = ""
     cards: tuple[Card, ...] = ()
     table: Table | None = None
+    #: 附加表（RC14 D：模型与探针页要同时显示「探针事实」和「云端目录」两张表）。
+    #: 只加不改：``table`` 仍是主表，渲染顺序 = 主表 → 附加表；空元组时行为与 0.3.6 完全一致。
+    tables: tuple[Table, ...] = ()
     fields: tuple[Field, ...] = ()
     actions: tuple[Action, ...] = ()
     notes: tuple[str, ...] = ()
@@ -305,6 +440,13 @@ class View:
     hero: Hero | None = None
     chart: Chart | None = None
     rail: tuple[RailCard, ...] = ()
+    #: 表格上方的下拉筛选（RC15-039 #5）。默认空 = 0.3.7 行为（没有筛选控件）。
+    filters: tuple[Filter, ...] = ()
+    #: 开关（RC15-039 #4）。默认空 = 0.3.7 行为（页面上没有开关）。
+    switches: tuple[Toggle, ...] = ()
+    #: 渲染后要**获得键盘焦点**的字段 key（RC15-039 #1：校验失败聚焦首个错误字段）。
+    #: 空 = 不动焦点（0.3.7 行为）。由 :func:`with_field_errors` 填，投影层自己不产生。
+    focus_field: str = ""
 
     def plain_text(self) -> str:
         """文本快照（证据 / 无显示环境验收）：稳定顺序，无时间戳抖动。
@@ -326,24 +468,36 @@ class View:
             lines.extend(_chart_text(self.chart))
         if self.rail:
             lines.extend(_rail_text(self.rail))
-        if self.table is not None:
+        for item in self.switches:
+            lines.append("[" + item.label + "：" + item.text() + "]"
+                         + (("   " + item.hint) if item.hint else ""))
+        for item in self.filters:
             lines.append("")
-            lines.append(" | ".join(self.table.columns))
-            if not self.table.rows:
-                lines.append("（" + self.table.empty + "）")
-            for row in self.table.rows:
+            lines.append("筛选 " + item.label + "：" + item.current_text()
+                         + (("   " + item.hint) if item.hint else ""))
+        for table in ((self.table,) + self.tables if self.table is not None else self.tables):
+            lines.append("")
+            lines.append(" | ".join(table.columns))
+            if not table.rows:
+                lines.append("（" + table.empty + "）")
+            for row in table.rows:
                 prefix = "x " if row.disabled else "- "
                 line = prefix + " | ".join(row.cells)
                 if row.note:
                     line += "   " + row.note
                 lines.append(line)
-            if self.table.note:
-                lines.append("… " + self.table.note)
+            if table.note:
+                lines.append("… " + table.note)
         if self.fields:
             lines.append("")
             for item in self.fields:
-                lines.append(item.label + "：" + item.value
-                             + (("   " + item.hint) if item.hint else ""))
+                line = item.label + "：" + item.value
+                if item.hint:
+                    line += "   " + item.hint
+                if item.error:
+                    # 红字的文本形态：与屏幕上同一条文案（证据/读屏都靠它）
+                    line += "   ！" + item.error
+                lines.append(line)
         if self.actions:
             lines.append("")
             for action in self.actions:
@@ -352,6 +506,32 @@ class View:
         for note in self.notes:
             lines.append("· " + note)
         return "\n".join(lines)
+
+
+def with_field_errors(view: View, errors: Mapping[str, str] | None) -> View:
+    """把动作层回投的**字段级错误**贴到视图上（RC15-039 #1）。
+
+    为什么在这里而不是在 ``View`` 的构造里：错误是**一次动作的结果**，不是数据的投影。
+    投影层保持纯函数（13 个视图的快照不因错误而变），渲染层只在渲染前调用这一个纯函数。
+    ``errors`` 为空时原样返回同一个对象（``is`` 相等），老路径零开销、零行为变化。
+
+    只贴到**同名的可编辑字段**上：键不在本页的字段（例如在别的页保存）不许凭空造出红字。
+    """
+    if not errors:
+        return view
+    applied: list[Field] = []
+    focus = ""
+    for item in view.fields:
+        message = str(errors.get(item.key) or "") if item.key else ""
+        if not message:
+            applied.append(item)
+            continue
+        applied.append(replace(item, error=message))
+        if not focus:
+            focus = item.key
+    if not focus:                      # 本页没有这些字段：什么都没贴，别造空焦点
+        return view
+    return replace(view, fields=tuple(applied), focus_field=focus)
 
 
 def _hero_text(hero: Hero) -> list[str]:
@@ -473,6 +653,13 @@ def _empty_text(snapshot: Snapshot, name: str, text: str) -> str:
     return text if snapshot.ok(name) else UNAVAILABLE
 
 
+#: RC15-039 #34：结算口径的**唯一出处**（owner 2026-11-16 D-2 原文，逐字照抄，不许改写）。
+#: 全客户端只许引用这个名字，别处不许再手写同类句子（验收口径见票面 §0.1 D-2）。
+#: 为什么合成一句：走查里那两句（一句说「完成就结算」，一句说「不能提」）同屏出现，
+#: 客户读成两个互相打脸的承诺。现在只剩这一句，收益页四卡的去向都对得上它。
+SETTLE_NOTE = "结算币种：USDT（按 1 USDT = 1 USD 展示）；收益不等于可提现余额。"
+
+
 def _section(snapshot: Snapshot, name: str) -> Mapping[str, Any]:
     value = snapshot.get(name)
     return value if isinstance(value, Mapping) else {}
@@ -483,13 +670,59 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 
 # ─────────────────────────────────────────────── 总览：主卡 / 节奏图 / 右栏（设计样 v2.1）
-#: 让路模式的短说明（与 :func:`_yield` 的模式表同源，改文案只改这里）
+#: 让路模式的短说明（总览主卡/右栏用；改文案只改这里）。
+#: RC15-039 复核 M7（owner a′）：原来这三档写的是"只要接单就满载 / 工作时段实时算力 /
+#: 只在我不使用电脑时工作"——本版 daemon 不按档位改并发（`facts.PRESET_CONCURRENCY` 零消费），
+#: 这三句就是假承诺；统一改成"只记录偏好"。``paused`` 是**真**行为（停止接新任务），保留。
 YIELD_MODE_SUMMARY = {
-    "full": "只要接单就满载",
-    "balanced": "工作时段实时算力，其余慢任务",
-    "saver": "只在我不使用电脑时工作",
+    "full": "本版仅记录档位偏好",
+    "balanced": "本版仅记录档位偏好",
+    "saver": "本版仅记录档位偏好",
     "paused": "不接新任务；在途任务按护栏处理",
 }
+
+#: 「请求地址」统一口径（RC15-039 #37）：标签只叫「…请求地址」，填法提示**逐字一致**。
+#: 以前一页叫「请求链接」、一页叫「上行 OpenAI」、还有一页叫「OpenAI 请求地址」，
+#: 同一件事三种名字，客户以为是三个不同的字段。
+BASE_URL_HINT = "填到 /v1 就行（例如 https://api.openai.com/v1）；不要带 key 参数"
+
+#: CLI 命令的识别（RC15-039 #11）：`djb init` / `djb auth --bind <码>` / `djb start` …
+_CLI_CALL = re.compile(r"djb\s+[a-z][a-z0-9_-]*(?:\s+--?[a-z][\w-]*(?:\s+<[^>]*>)?)?")
+
+
+def terminalize(text: Any) -> str:
+    """渲染边界统一处理「这一步要去终端跑」（RC15-039 #11）。
+
+    客户端里 CLI 的 ``next_step`` 是从 daemon / envcheck 原样搬上屏的，客户手上没有终端，
+    看到「执行 djb init 会收紧到 0700」只会一脸问号。规矩：**要么做成界面内动作，要么
+    明说这条要去终端跑并给完整命令**。这里统一补一句，而不是逐页打补丁——逐页补的结果
+    就是复核抓到的「只扫了 4 页，接入页/基准页漏了」。
+    """
+    value = str(text or "")
+    if not value or "终端" in value:
+        return value
+    match = _CLI_CALL.search(value)
+    if match is None:
+        return value
+    return value + "（这条要在终端里跑：" + match.group(0) + "；桌面端没有对应入口，界面里点不到）"
+
+
+def _terminalize_tree(value: Any) -> Any:
+    """把 :func:`terminalize` 应用到整个视图树上（只改含 CLI 命令的字符串）。"""
+    if isinstance(value, str):
+        return terminalize(value)
+    if isinstance(value, tuple):
+        return tuple(_terminalize_tree(item) for item in value)
+    if isinstance(value, list):
+        return [_terminalize_tree(item) for item in value]
+    if isinstance(value, frozenset):
+        return frozenset(_terminalize_tree(item) for item in value)
+    if dataclass_is_instance(value):
+        return replace(value, **{
+            f.name: _terminalize_tree(getattr(value, f.name))
+            for f in dataclass_fields(value)})
+    return value
+
 
 #: 贡献节奏图的时间窗（小时）
 CHART_HOURS = 24
@@ -694,21 +927,32 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
     limits = _mapping(plan.get("limits"))
     receipts = _section(snapshot, "receipts")
     yield_state = _section(snapshot, "yield")
-    steps = (bool(config.get("node_secret") or config.get("node_id")), bool(config.get("price_mode")),
+    # RC15-039 #9：第一步「绑定」用**账户页同一个判定源**（服务端 binding），
+    # 不再拿「本机有没有节点凭据」冒充绑定——那正是「3 / 3 接入完成」与「未绑定」同屏的根因。
+    bound_ok, _bound_node_id = binding_state(snapshot)
+    steps = (bound_ok is True, bool(config.get("price_mode")),
              bool(config.get("usdt_address")))
     done = sum(1 for step in steps if step)
+    # E（RC14 IA 拆分）：总览右栏只做**只读摘要**，且把「去哪改」指到唯一入口——
+    # 价格/凭证 → 本机设置；绑定/收款 → 账户与安全（这里不再出现可编辑的 usdt_address 键，
+    # 否则又变成第二个「填了以为生效」的地方）。
     setup_fields = (
-        Field("节点凭证", str(config.get("node_secret") or "未设置"), key="node_secret", secret=True),
+        Field("节点凭证", str(config.get("node_secret") or "未设置"), key="node_secret",
+              secret=True),
         Field("价格", str(config.get("price_mode_label") or config.get("price_mode") or "未设置"),
               key="price_mode"),
-        Field("USDT 收款地址", str(config.get("usdt_address") or "未设置"), key="usdt_address"),
+        Field("USDT 收款地址", "已设置" if config.get("usdt_address") else "未设置",
+              key="usdt_state"),
     )
-    setup = RailCard(kicker="SETUP / 接入配置", title="三步，把节点接上。", kind="setup",
+    setup = RailCard(kicker="SETUP / 三步接上", title="三步，把节点接上。", kind="setup",
                      badge=("接入完成" if done == 3 else "待完成"), badge_tone=("mint" if done == 3
                                                                           else "amber"),
                      note=str(done) + " / 3", fields=setup_fields,
-                     actions=(Action("", "去接入配置", nav="access", primary=done < 3),),
-                     foot="编辑请到「接入配置」页。")
+                     actions=(Action("", "绑定与收款（账户与安全）", nav="account",
+                                     primary=done < 2),
+                              Action("", "价格与凭证（本机设置）", nav="access")),
+                     foot="绑定、解绑、USDT 收款地址只在「账户与安全」；价格模式与节点凭证在"
+                          "「本机设置」。")
     daily = None
     for item in plan.get("usage") or ():
         mapping = _mapping(item)
@@ -784,13 +1028,15 @@ def _overview(snapshot: Snapshot) -> View:
         Card("余额（可用）",
              ("暂不可用" if earnings.get("balance_note") and earnings.get("balance") is None
               else _num(earnings.get("balance") or status.get("balance"))),
-             ("账户预付款 · 不可提现" if earnings.get("balance") is not None
-              else str(earnings.get("balance_note") or "额度不可提现，仅抵扣推理")),
+             ("账户预付款 · 结算口径见「收益」页" if earnings.get("balance") is not None
+              else str(earnings.get("balance_note") or "余额暂不可用；结算口径见「收益」页")),
              "default"),
         Card("接单状态", state_text, str(reason or "无让路原因"), tone),
         Card("资源", _bytes(_section(snapshot, "bench").get("mem_available_bytes")) + " 可用内存",
              "CPU " + str(_section(snapshot, "bench").get("cpu_count") or "—") + " 核", "default"),
-        Card("让路 / 节能", str(yield_state.get("mode") or "未设置"),
+        Card("让路 / 节能",
+             YIELD_LABEL_BY_KEY.get(str(yield_state.get("mode") or ""),
+                                    str(yield_state.get("mode") or "未设置")),
              "暂停后与托盘一致", "muted"),
     )
     rows = _receipt_rows(receipts.get("rows"))
@@ -804,7 +1050,7 @@ def _overview(snapshot: Snapshot) -> View:
                     narrow_hide=("时间", "Tokens"),
                     narrow_headers=(("本机校验", "校验"),),
                     note=str(receipts.get("note") or ""),
-                    empty="还没有收据（完成后自动生成）"),
+                    empty="还没有收据（完成后自动生成）", title="最近收据"),
         # 设计样新增：左栏主卡 + 节奏图，右栏三卡（数据仍全部来自上面这些既有数据域）
         hero=_hero(snapshot),
         chart=_hourly_chart(snapshot),
@@ -933,7 +1179,7 @@ def _bench(snapshot: Snapshot) -> View:
         subtitle="环境检测 + CPU/内存/磁盘 + 可选 GPU",
         cards=cards,
         table=Table(("检查项", "结论", "下一步"), tuple(rows),
-                    note="检查项来自本机只读探测", empty="环境检测暂不可用"),
+                    note="检查项来自本机只读探测", empty="环境检测暂不可用", title="环境检测"),
         actions=(Action("bench.run", "开始跑分（≤10 秒）", primary=True),
                  Action("bench.copy", "复制结果")),
         unavailable=_missing(snapshot, ("bench",)),
@@ -941,33 +1187,153 @@ def _bench(snapshot: Snapshot) -> View:
     )
 
 
+#: 探针失败分类 → 客户能看懂的原因（``upstream.ProbeOutcome.error_class`` 的取值）。
+#:
+#: 设计 40-UX §3.3「原因」一行：映射表 + 「其余原样 + （未登记的原因）」。
+#: **不许**只显示英文错误码——客户看不懂 ``stream_failed`` 是什么意思。
+PROBE_REASON_TEXT = {
+    "timeout": "超时（上游没在时限内回话）",
+    "unauthorized": "密钥被拒（401；检查 Key 是否过期/权限）",
+    "http_5xx": "上游 5xx（对方服务异常，稍后重试）",
+    "stream_failed": "流式不可用（stream_failed）；仍按非流式公告",
+    "model_not_listed": "上游 /models 里没有这个模型（清单或模型名不对）",
+    "not_listed": "上游 /models 里没有这个模型（清单或模型名不对）",
+    "usage_missing": "上游没回 usage（用量对不上，报价会保守）",
+    "budget": "本轮探测预算用完（下一轮继续）",
+    "disabled": "模型已停用（不参与探测与公告）",
+    "network": "网络不通（DNS/连接被拒）",
+    "invalid_response": "上游返回的不是兼容格式（不是 OpenAI/Anthropic 形状）",
+}
+
+#: 探针「上次结论」的年龄 → 人话（设计 40-UX §3.3：相对时间 + 「从未」）
+def _short_url(text: str) -> str:
+    """``https://api.example.com/v1`` → ``api.example.com/v1``（列宽有限，去掉协议头）。"""
+    value = str(text or "").strip()
+    for prefix in ("https://", "http://"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+            break
+    return value.rstrip("/") or "—"
+
+
+def _ago(seconds: Any) -> str:
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        return "从未"
+    if value < 0:
+        return "刚刚（时钟回拨）"
+    if value < 60:
+        return str(value) + " 秒前"
+    if value < 3600:
+        return str(value // 60) + " 分钟前"
+    return str(value // 3600) + " 小时前"
+
+
+def _probe_state(row: Mapping[str, Any], *, fresh_window: int, quote_window: int) -> tuple[str, str]:
+    """探针行 →（状态标签, tone）。三态不许混：``None``（没探过）≠ ``False``（探过但失败）。"""
+    if not row.get("enabled", True):
+        return "已停用", "muted"
+    marked = [row.get("inference_ok"), row.get("stream_ok"), row.get("usage_ok")]
+    if all(item is None for item in marked):
+        return "未探测", "muted"
+    if row.get("announceable") is True:
+        return "可公告", "mint"
+    if row.get("inference_ok") is True:
+        if row.get("fresh") is False:
+            age = row.get("probe_age_s")
+            return ("结论过期（报价已停，公告还剩 " + str(max(0, int(fresh_window)
+                                                          - int(age or 0)) // 60)
+                    + " 分钟）" if isinstance(age, int) else "结论过期"), "amber"
+        if row.get("stream_ok") is False:
+            return "降级：流式不可用", "amber"
+        return "降级", "amber"
+    return "失败", "red"
+
+
 def _models(snapshot: Snapshot) -> View:
     models = _section(snapshot, "models")
+    probe = models.get("probe") if isinstance(models.get("probe"), Mapping) else {}
+    probe_rows = probe.get("rows") if isinstance(probe.get("rows"), list) else []
+    fresh_window = int(probe.get("fresh_window_s") or 900)
+    quote_window = int(probe.get("quote_window_s") or 600)
+
+    # ── 探针表（D 的主战场：纯投影 probe_details()，不重算门控）
+    rows: list[Row] = []
+    counts = {"announceable": 0, "failed": 0, "never": 0}
+    for item in probe_rows:
+        if not isinstance(item, Mapping):
+            continue
+        state_text, tone = _probe_state(item, fresh_window=fresh_window,
+                                        quote_window=quote_window)
+        # 三态渲染：True ✓ / False ✗ / None —（None **不是** False，设计 40-UX §3.3 硬要求）
+        def tri(value: Any) -> str:
+            return MARK_DONE if value is True else (MARK_FAIL if value is False else "—")
+        error_class = str(item.get("probe_error_class") or "")
+        reason = PROBE_REASON_TEXT.get(error_class)
+        if reason is not None:
+            # 人话在前、原值在后：客服照人话解释，排障还能按英文码搜日志
+            reason = reason + " [" + error_class + "]"
+        elif error_class:
+            reason = str(error_class) + "（未登记的原因）"
+        if state_text == "可公告":
+            counts["announceable"] += 1
+        elif state_text == "未探测":
+            counts["never"] += 1
+        elif state_text in ("失败", "已停用"):
+            counts["failed"] += 1
+        model_id = str(item.get("model") or "—")
+        upstream = str(item.get("base_url") or item.get("upstream_id") or "—")
+        rows.append(Row((model_id, _short_url(upstream), _ago(item.get("probe_age_s")),
+                         tri(item.get("inference_ok")), tri(item.get("stream_ok")),
+                         tri(item.get("usage_ok")), state_text, reason or "—"),
+                        key=str(item.get("upstream_id") or "") + "/" + model_id,
+                        tone=tone, note=("失败原因：" + reason) if reason else ""))
+    probe_table = Table(("模型", "上游", "最近探测", "L2", "L3", "用量", "状态", "原因"),
+                        tuple(rows),
+                        note=str(probe.get("unavailable") or ""),
+                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论", title="模型探测")
+
+    # ── 云端目录（原 4 列，保留为附加表：它是「云端认为该有哪些模型」，与探针事实互补）
     catalog = models.get("catalog") if isinstance(models.get("catalog"), list) else []
-    rows = []
+    catalog_rows: list[Row] = []
     for row in catalog:
         if not isinstance(row, Mapping):
             continue
         offerable = bool(row.get("offered", True))
         reason = str(row.get("reason") or "")
         mark = MARK_DONE + " 可提供" if offerable else MARK_FAIL + " 不兼容"
-        rows.append(Row((str(row.get("id") or "—"), _num(row.get("context")), mark,
-                         reason or ("按当前资源可提供" if offerable else "原因未下发")),
-                        key=str(row.get("id") or ""), disabled=not offerable))
+        catalog_rows.append(Row((str(row.get("id") or "—"), _num(row.get("context")), mark,
+                                 reason or ("按当前资源可提供" if offerable else "原因未下发")),
+                                key=str(row.get("id") or ""), disabled=not offerable))
     local = models.get("local") if isinstance(models.get("local"), list) else []
+    probe_actions = [Action("probe.run", "立即探测（全部上游）", primary=True,
+                            enabled=bool(probe_rows),
+                            reason="还没有接入上游" if not probe_rows else "")]
     return View(
-        key="models", title="可提供模型",
-        subtitle="逐模型开关 · 不兼容标灰并给原因",
-        cards=(Card("云端目录", _count(snapshot, "models", str(len(catalog)) + " 个"),
-                    "来自 /models 目录", "default"),
+        key="models", title="模型与探针",
+        subtitle="探针事实（L2/L3/用量/新鲜度/失败原因）· 云端目录",
+        cards=(Card("可公告", str(counts["announceable"]) + " 个",
+                    "探针通过且结论新鲜才会进容量", "mint" if counts["announceable"] else "muted"),
+               Card("探针失败 / 停用", str(counts["failed"]) + " 个",
+                    "看右列原因逐条修", "red" if counts["failed"] else "muted"),
+               Card("从未探测", str(counts["never"]) + " 个",
+                    "点「立即探测」补一次", "amber" if counts["never"] else "muted"),
                Card("本地已应用", _count(snapshot, "models", str(len(local)) + " 个"),
                     "model-sync 状态", "default")),
-        table=Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(rows),
-                    note=str(models.get("note") or ""), empty="云端目录暂不可用"),
-        actions=(Action("models.save", "保存并上报意向", enabled=bool(rows),
-                        reason="没有可编辑的模型目录"),),
+        table=probe_table,
+        tables=(Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(catalog_rows),
+                      note=str(models.get("note") or ""), empty="云端目录暂不可用", title="模型目录"),),
+        # G1-1（RC14 P0）：**摘掉**「保存并上报意向」这颗按钮（键名见 commit / NODE.md）。
+        # 表里根本没有开关控件，副标题却写「逐模型开关」，按钮点了又永远无声
+        # （云端意向上报接口未接线）——虚假承诺比缺按钮更伤。
+        # 等「一 Key 多模型 + 逐模型底价」把上报端点接上再加回（见「提供 Token Plan」页）。
+        actions=tuple(probe_actions),
         unavailable=_missing(snapshot, ("models",)),
-        notes=("开关变更只上报意向；服务端确认后才会真正分配任务。",),
+        notes=("容量公告只看 " + str(fresh_window // 60) + " 分钟内的探针结论；报价更严，只看 "
+               + str(quote_window // 60) + " 分钟内的（提前停报防半窗口）。",
+               "没有探针结论 / 结论过期的模型不会进容量、也不会报价——不是「设置没生效」。",
+               "模型开关与底价在「提供 Token Plan」页设置；本页只读探针事实。"),
     )
 
 
@@ -992,7 +1358,7 @@ def _gpu(snapshot: Snapshot) -> View:
                     str(gpu.get("note") or "—"), "mint" if present else "muted"),),
         table=Table(("型号", "厂商", "显存 已用/总", "温度", "利用率"), tuple(rows),
                     note=str(gpu.get("note") or ""),
-                    empty="本机无可用 GPU（nvidia-smi / rocm-smi 都没有输出）"),
+                    empty="本机无可用 GPU（nvidia-smi / rocm-smi 都没有输出）", title="显卡"),
         actions=(Action("gpu.refresh", "刷新"),),
         unavailable=_missing(snapshot, ("gpu",)),
         notes=("没有 GPU 不隐藏本页；显存/温度/利用率只在真读到时展示。",),
@@ -1034,7 +1400,7 @@ def _tasks(snapshot: Snapshot) -> View:
         table=Table(("任务", "状态", "耗时", "Tokens", "收据号"), tuple(rows),
                     narrow_hide=("耗时", "收据号"),
                     note=str(tasks.get("note") or ""),
-                    empty=_empty_text(snapshot, "tasks", "当前没有任务")),
+                    empty=_empty_text(snapshot, "tasks", "当前没有任务"), title="任务"),
         actions=(Action("tasks.refresh", "刷新"),),
         unavailable=_missing(snapshot, ("tasks",)),
         notes=("状态列给云端原词（recorded/settled/…）+ 中文；「进行中」来自 inflight 字段。",
@@ -1067,12 +1433,12 @@ def _receipts(snapshot: Snapshot) -> View:
                     note=str(receipts.get("note") or ""),
                     empty=_empty_text(snapshot, "receipts", "还没有收据"),
                     narrow_hide=("时间", "Tokens"),
-                    narrow_headers=(("本机校验", "校验"),)),
+                    narrow_headers=(("本机校验", "校验"),), title="收据明细"),
         actions=(Action("receipts.verify", "校验选中收据", enabled=bool(rows),
                         reason="没有可校验的收据"),),
         unavailable=_missing(snapshot, ("receipts",)),
         notes=("状态列是云端受理结果（accepted/rejected/expired）；「本机校验」列才是本机比对结论。",
-               "哈希 / seq 用等宽字体 + 弱化颜色；证据常驻但不发光。"),
+               "哈希与 seq 可以原样复制给对方核对；颜色只用来弱化，不承载信息。"),
     )
 
 
@@ -1096,9 +1462,11 @@ def _earnings(snapshot: Snapshot) -> View:
     currency = str(earnings.get("currency") or "USDT")
     return View(
         key="earnings", title="收益",
-        subtitle="按完成任务直接结算 " + currency,
+        # 副标题只做「这是哪一页」；结算口径统一引用常量（不再各处手写一句）
+        subtitle="收益明细 · " + SETTLE_NOTE,
         cards=(Card("今日", _money(snapshot, "earnings", earnings.get("today"), currency),
-                    _today_note(earnings.get("today")) or "完成即结算", "mint"),
+                    # 「完成即结算」会和「待结算」自相矛盾：今日只说「已经进了结算流程」
+                    _today_note(earnings.get("today")) or "今天完成，已进入结算流程", "mint"),
                Card("待结算", _money(snapshot, "earnings", earnings.get("pending")),
                     "结算中不代表到账", "amber"),
                Card("已结算", _money(snapshot, "earnings", earnings.get("settled")),
@@ -1107,11 +1475,12 @@ def _earnings(snapshot: Snapshot) -> View:
                     ("暂不可用" if earnings.get("balance_note") and
                      earnings.get("balance") is None
                      else _money(snapshot, "earnings", earnings.get("balance"))),
-                    "账户预付款 · 不可提现", "muted")),
+                    # 余额卡**不许**暗示可提现（owner D-2）：meta 只留「这一列是余额」
+                    "可用余额 · 口径见本页副标题", "muted")),
         table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
                     narrow_hide=("币种", "时间"),
                     note=str(earnings.get("note") or ""),
-                    empty=(UNAVAILABLE if not available else "暂无计费明细")),
+                    empty=(UNAVAILABLE if not available else "暂无计费明细"), title="计费明细"),
         actions=(Action("earnings.export", "导出明细", enabled=bool(rows),
                         reason=("暂不可用" if not available else "没有可导出的记录")),),
         unavailable=_missing(snapshot, ("earnings",)),
@@ -1134,10 +1503,10 @@ def _agent(snapshot: Snapshot) -> View:
                Card("下行", "已下发" if downlink.get("url") else "未设置",
                     "只读地址 + scoped token（掩码）", "muted")),
         fields=(
-            Field("上行 OpenAI", str(upstream.get("openai") or "未设置"),
-                  key="openai_base_url", editable=True, hint="Agent 把请求发到这里"),
-            Field("上行 Anthropic", str(upstream.get("anthropic") or "未设置"),
-                  key="anthropic_base_url", editable=True, hint="Anthropic 兼容协议"),
+            Field("OpenAI 请求地址", str(upstream.get("openai") or "未设置"),
+                  key="openai_base_url", editable=True, hint=BASE_URL_HINT),
+            Field("Anthropic 请求地址", str(upstream.get("anthropic") or "未设置"),
+                  key="anthropic_base_url", editable=True, hint=BASE_URL_HINT),
             Field("下行 本机入口", str(downlink.get("url") or "未设置"), key="agent_downlink_url",
                   hint="只读：由服务端下发"),
             Field("下行 scoped token", str(downlink.get("token") or "—"), key="scoped_token",
@@ -1230,6 +1599,52 @@ def _token_plan_usage(plan: Mapping[str, Any], window: str) -> Mapping[str, Any]
     return {}
 
 
+#: 底价列/卡片用的「生效来源」文案（RC14 J：客户得知道哪一层在起作用）
+BID_SOURCE_TEXT = {
+    "cloud": "云端覆盖",
+    "local": "本机底价",
+    "none": "未设价",
+}
+
+
+def _bid_rows(plan: Mapping[str, Any], bids: Mapping[str, Any]) -> list[Row]:
+    """逐模型底价表：``模型 | 上游 | 目录 | 探针 | 本机底价 | 生效来源``。
+
+    「生效来源」按「云端覆盖 > 本机底价 > 未设价」显示（云端没开通就给「待云端开通」，
+    这一列是客户判断「我填的价到底有没有生效」的唯一依据，不许留空也不许写「未知」）。
+    """
+    local = bids.get("rows") if isinstance(bids.get("rows"), Mapping) else {}
+    cloud = bids.get("cloud") if isinstance(bids.get("cloud"), Mapping) else {}
+    cloud_pending = str(cloud.get("state") or "") != "ok"
+    rows: list[Row] = []
+    for item in plan.get("models") or []:
+        if not isinstance(item, Mapping):
+            continue
+        model = str(item.get("model") or "")
+        if not model:
+            continue
+        entry = local.get(model)
+        price = str(entry.get("min_price") or "") if isinstance(entry, Mapping) else ""
+        if cloud_pending & bool(price):
+            source = "本机底价（云端未开通）"
+        elif price:
+            source = BID_SOURCE_TEXT["local"]
+        else:
+            source = BID_SOURCE_TEXT["none"]
+        probe = ("✓ 可公告" if item.get("announceable") else
+                 "✗ " + str(item.get("probe_error_class") or "未通过"))
+        rows.append(Row((model,
+                         _short_id(str(item.get("upstream_id") or ""), 10) or "—",
+                         "✓" if item.get("canonical") else "未映射",
+                         probe,
+                         (price + " 元/百万") if price else "未设价",
+                         source),
+                        key=model,
+                        tone="default" if price else "muted",
+                        narrow=(model, price or "未设价", source)))
+    return rows
+
+
 def _token_plan(snapshot: Snapshot) -> View:
     """共享 Token Plan：共享状态 + 我的上游 + 预算 + 今日用量 + 一个去配置的入口。"""
     plan = _section(snapshot, "token_plan")
@@ -1242,8 +1657,8 @@ def _token_plan(snapshot: Snapshot) -> View:
     status = _section(snapshot, "status")
     receipts = _section(snapshot, "receipts")
     receipt_rows = [row for row in (receipts.get("rows") or []) if isinstance(row, Mapping)]
-    # 绑定态直接复用账户/接入页的判定（服务端 binding → profile.bound → 本机凭据）
-    bound = _account_bound(profile, security, binding)
+    # 绑定态走**唯一判定源**（#9）：总览 / 账户页 / 这里三处必须同一个答案
+    bound, _plan_node_id = binding_state(snapshot)
     online = str(status.get("state") or "") == "online"
     state = str(status.get("state") or "")
     state_text, state_tone = (
@@ -1283,40 +1698,153 @@ def _token_plan(snapshot: Snapshot) -> View:
                    if snapshot.ok("receipts") else UNAVAILABLE)
     notes: list[str] = []
     if bound is False:
-        notes.append("节点还没绑定：先在「接入配置」用网页端一次性绑定码完成绑定，"
+        notes.append("节点还没绑定：先去「账户与安全」用网页端一次性绑定码完成绑定，"
                      "再把 Token Plan 共享出去。")
     if snapshot.ok("token_plan") and not rows:
         notes.append(TOKEN_PLAN_EMPTY + "（A1 直填 Key / A2 本机代理，都在「接入配置」里）。")
     notes.append("验证状态来自本机探针（L2 推理通过 + 结论新鲜）；"
                  "未验证 / 已过期的模型不进容量，也不会产生共享收益。")
     notes.append("「最大 QPS」是本机按并发上限分摊给已验证模型的数值（公告口径），不是实测吞吐。")
+    notes.append("逐模型底价最小 0.01（USD / 百万 token）：填 0 会被云端当「未申报」直接跳过，"
+                 "所以本机就先拦下。")
+    _ = None
     if not (snapshot.ok("access") and snapshot.ok("account")):
         notes.append("接入配置 / 账户数据暂不可用：绑定状态暂时无法确认，点「刷新」重试。")
     if plan.get("note"):
         notes.append(str(plan.get("note")))
+    # E（RC14 IA 拆分）：原来只有一颗「去接入配置（添加上游 / 绑定节点）」——两件事挤在
+    # 一句话里，跳到的是**本机设置**页，那里既不能添加上游也没有绑定按钮（死路）。
+    # 现在拆成两颗，各自跳到真正能做这件事的地方：
+    #   * 添加上游 → 本页「添加接入」（第 1 步就在下方，item 11 落地表单）
+    #   * 绑定节点 → 账户与安全（绑定的唯一位）
+    plan_actions = [Action("token_plan.add_upstream", "添加上游（填请求地址与密钥）",
+                           primary=True)]
+    if bound is True:
+        plan_actions.append(Action("token_plan.bind_node", "已绑定这台电脑", enabled=False,
+                                   reason="已绑定 · 解绑/换绑在「账户与安全」"))
+    else:
+        plan_actions.append(Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）"))
+    plan_actions.append(Action("token_plan.refresh", "刷新"))
+
+    # ── RC14 I/J：一 Key 多模型 + 逐模型底价（三步同页）
+    bids = plan.get("bids") if isinstance(plan.get("bids"), Mapping) else {}
+    bid_rows = _bid_rows(plan, bids)
+    cloud = bids.get("cloud") if isinstance(bids.get("cloud"), Mapping) else {}
+    cloud_pending = str(cloud.get("state") or "") != "ok"
+    cloud_text = (("来源 " + str(cloud.get("source"))
+                   + ("（回退自 " + str(cloud.get("fallback_from")) + "）"
+                      if cloud.get("fallback_from") else ""))
+                  if not cloud_pending else str(cloud.get("text") or "待云端开通"))
+    priced = sum(1 for row in bid_rows if row.cells[4] != "未设价")
+    report_blocker = str(bids.get("report_blocker") or "")
+    preview = bids.get("preview") if isinstance(bids.get("preview"), Mapping) else {}
+    preview_models = [item for item in (preview.get("models") or [])
+                      if isinstance(item, Mapping)]
+    discover_note = str(plan.get("discover_note") or "")
+    fields = (
+        Field("协议", str(plan.get("protocol") or ""), key="protocol", editable=True,
+              choices=tuple(facts.UPSTREAM_PROTOCOLS),
+              hint="默认 " + facts.UPSTREAM_PROTOCOL_LABELS.get(
+                  facts.DEFAULT_UPSTREAM_PROTOCOL, facts.DEFAULT_UPSTREAM_PROTOCOL)
+              + "；切换不会改已填的链接"),
+        Field("请求地址", str(plan.get("base_url") or ""), key="base_url", editable=True,
+              prefill=False, hint=BASE_URL_HINT),
+        # 密钥只存本机 0600；显示按钮由 Field.can_reveal 自动给（G7）
+        Field("密钥", str(plan.get("secret_seen") or "未保存"), key="upstream_secret",
+              editable=True, secret=True, prefill=False,
+              hint="只存本机（0600）；云端只收「已登记」这一个布尔"),
+        Field("最低申报价", str(plan.get("selected_price") or ""), key="min_price",
+              editable=True, prefill=False,
+              hint=((("当前选中的 " + str(plan.get("selected_model")) + " 已存 "
+                       + str(plan.get("selected_price")) + "；") if plan.get("selected_price")
+                      else (("当前选中：" + str(plan.get("selected_model")) + "（未设价）；")
+                            if plan.get("selected_model") else "先在上面的表格里选一行；"))
+                    + "单位 USD / 百万 token，最小 0.01（填 0 会被云端跳过，留空 = 不申报）")),
+        Field("云端覆盖", cloud_text, key="bid_cloud",
+              hint="生效顺序：云端覆盖 > 本机底价 > 未设价"),
+    )
+    if bid_rows:
+        planned = "已设价 " + str(priced) + " / " + str(len(bid_rows)) + " 个模型"
+    else:
+        planned = "还没有上游模型：先填链接与密钥 → 读取模型清单"
+    if cloud_pending:
+        notes.append("云端「按模型设价」接口还没开通（ask-settings / quotes.models[]）："
+                     "底价只保存在本机，上报按钮保持关闭，不会假成功。")
+    plan_actions.extend([
+        Action("token_plan.discover", "读取模型清单（第 2 步）"),
+        Action("token_plan.save_price", "保存这一行",
+               enabled=bool(bid_rows), reason="" if bid_rows else "还没有模型行"),
+        Action("token_plan.preview_report", "预览将上报的内容",
+               enabled=bool(preview_models),
+               reason="" if preview_models else "本地还没有任何底价"),
+        # 上报默认关闭（云端 ask-settings / quotes.models[] 未开通）：置灰 + 说清原因，
+        # 绝不点下去假成功
+        Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,
+               reason=report_blocker),
+    ])
     return View(
-        key="token_plan", title="共享 Token Plan",
-        subtitle="节点与绑定 · 我的上游 · 共享预算 · 今日用量",
+        key="token_plan", title="提供 Token Plan",
+        subtitle="接入 / 模型清单 / 逐模型底价 / 探针（本页可操作）",
         cards=(
             Card("共享状态", state_text, bound_text + " · 节点 " + node_id,
                  "amber" if bound is False else state_tone),
             Card("我的 Token Plan（上游）",
                  _count(snapshot, "token_plan", str(len(rows)) + " 条上游"),
                  (("已验证 " + str(verified_upstreams) + " 条 · 详见下表") if rows
-                  else "点下面「去接入配置」添加上游") if snapshot.ok("token_plan") else "",
+                  else "点下面「添加上游」填请求地址") if snapshot.ok("token_plan") else "",
                  "mint" if rows else "amber"),
             Card("共享预算", budget, budget_meta + "（本机限额设置）", "default"),
             Card("今日已共享", shared_value, shared_meta, "mint" if used else "muted"),
         ),
-        table=Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
-                    narrow_hide=("最近验证",),
-                    note="验证通过且新鲜的模型才会进入共享容量",
-                    empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE)),
-        actions=(Action("token_plan.open_access", "去接入配置（添加上游 / 绑定节点）", primary=True),
-                 Action("token_plan.refresh", "刷新")),
+        table=Table(("模型", "上游", "目录", "探针", "本机底价", "生效来源"), tuple(bid_rows),
+                    narrow_hide=("目录",),
+                    note=planned + ("｜" + discover_note if discover_note else ""),
+                    empty=("还没有模型行：填「请求地址」与「密钥」，再点「读取模型清单」。"
+                           if snapshot.ok("token_plan") else UNAVAILABLE), title="上游报价"),
+        tables=(Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
+                      narrow_hide=("最近验证",),
+                      note="验证通过且新鲜的模型才会进入共享容量",
+                      empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE), title="上游接入"),),
+        fields=fields,
+        actions=tuple(plan_actions),
         unavailable=_missing(snapshot, ("token_plan",)),
         notes=tuple(notes),
     )
+
+
+def _payout_state(access: Mapping[str, Any]) -> dict[str, Any]:
+    """USDT 收款地址的云端状态（**唯一**计算处：「账户与安全」页用）。
+
+    ok=True + 空 dict = 云端确实没登记过（尚未提交）；ok=False = 这一轮没读到。
+    两种都不能显示成「已生效」——收款地址写错就是钱打到别人账上。
+    """
+    payout = _mapping(access.get("payout"))
+    ok = payout.get("ok") is True
+    row = dict(_mapping(payout.get("data"))) if ok else None
+    disabled = payout.get("disabled") is True
+    state = "服务未开放" if disabled else payout_mod.short_state(row)
+    reason = str(payout.get("reason") or "").strip()
+    if disabled:
+        hint, meta = "服务未开放（等平台开启后再提交）", reason or "等平台开启"
+    elif ok:
+        hint = state
+        meta = mask_address(str(row.get("address") or "")) or "—"
+        # 2026-11-18 owner 纠正：`cooldown_until` 是「可出款时间」（新地址 72h 冷却），
+        # **不是**「可再改时间」；改地址看 `changed_at + 24h`。两个时间点分开写。
+        if payout_mod.cooldown_active(row):
+            meta += "．" + payout_mod.cooldown_notice(row)
+        change = payout_mod.change_notice(row)
+        if change:
+            meta += "．" + change
+    else:
+        hint = payout_mod.UNREADABLE
+        meta = reason or "完成节点绑定后重试"
+    tone = {"已生效": "mint", "待审核": "amber", "冷却中": "amber",
+            "已拒绝": "red", "已撤销": "red"}.get(state, "muted")
+    return {"ok": ok, "row": row, "disabled": disabled, "state": state, "hint": hint,
+            "meta": meta, "tone": tone,
+            "can_submit": payout.get("can_submit") is True,
+            "local": str(_mapping(access.get("config")).get("usdt_address") or "—")}
 
 
 def _access(snapshot: Snapshot) -> View:
@@ -1325,46 +1853,152 @@ def _access(snapshot: Snapshot) -> View:
     binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
     bound = _binding_bound(binding)
     valid = access.get("valid")
+    # 节点标识：数据层已按 access.json → 本机凭据 → 状态库 三级回退（datasource._resolve_node_id）。
+    # 只有用户手填的（source == "config"）才可编辑；服务端下发的一律只读——否则「保存并回读」
+    # 会把展示文案当值写回 access.json（动作执行前会把所有可编辑字段收成草稿）。
+    node_id = str(access.get("node_id") or "")
+    node_source = str(access.get("node_id_source") or "")
+    if not node_id:
+        # 老调用方（demo 数据 / FakeDataSource / 旧快照）没有新字段：退回 config 里的手填值，
+        # 保证行为与 0.3.2 一致；真数据源总会带 node_id（含三级回退结果）。
+        from_config = str(config.get("node_id") or "")
+        if from_config and from_config != "—":
+            node_id, node_source = from_config, "config"
+    diag = [row for row in (access.get("node_id_diag") or []) if isinstance(row, Mapping)]
+    daemon = access.get("daemon") if isinstance(access.get("daemon"), Mapping) else {}
+    if node_id:
+        node_hint = ("网页端绑定要填这个 ID（本机只读）" if node_source != "config"
+                     else "网页端绑定要填这个 ID")
+        node_field = Field("节点标识", node_id, key="node_id",
+                           editable=node_source == "config", hint=node_hint)
+    else:
+        # 旧文案「先启动一次」把三种完全不同的故障说成一句话，客户照做也没用。
+        # 现在按**已知原因**说下一步；原因不明时给可执行的排查入口。
+        daemon_reason = str(daemon.get("reason") or "").strip()
+        if not daemon.get("running") and daemon_reason:
+            node_value = "尚未生成（节点进程没起来）"
+            node_hint = daemon_reason
+        elif not daemon.get("running"):
+            node_value = "尚未生成（节点进程没起来）"
+            node_hint = "先看「节点进程」这一行的原因；启动失败时日志在 logs/djb.log"
+        else:
+            node_value = "尚未生成（节点进程在跑，注册没成功）"
+            node_hint = "看下面「注册状态」的原因；修好后点右上角「刷新」即可，不用重装"
+        node_field = Field("节点标识", node_value, key="node_id", hint=node_hint)
+    # 「节点绑定」卡的副标题也带节点 ID（云端口径优先；``display()`` 的占位「—」不算值）
+    card_node = str(binding.get("node_id") or "").strip()
+    for candidate in (config.get("node_id"), node_id):
+        text = str(candidate or "").strip()
+        if not card_node and text and text != "—":
+            card_node = text
+    # E（RC14 IA 拆分）：收款地址的**状态卡不再放本页**（唯一位在「账户与安全」，
+    # 计算收敛到 :func:`_payout_state`，避免两页各算一遍、说法不一致）。：本页退为「本机设置」——只放**本机**配置（价格模式 / 节点凭证 /
+    # 配置文件 / 只读诊断）。绑定与收款地址搬去「账户与安全」：同一件事只允许一个入口，
+    # 否则客户在两边填、两边都以为生效（报告 §E 的原始投诉）。
     return View(
-        key="access", title="接入配置",
-        subtitle="保存 → daemon reload → 回读一致",
+        key="access", title="本机设置",
+        subtitle="价格模式 · 节点凭证 · 配置文件（绑定与收款在「账户与安全」）",
         cards=(Card("配置有效性",
                     "尚未保存" if access.get("saved") is False
                     else _flag(valid, "通过校验", "有字段需修正"), "",
                     "amber" if access.get("saved") is False or not valid else "mint"),
                Card("节点绑定", _flag(bound if bound is not None else None, "已绑定", "未绑定"),
-                    str(binding.get("node_id") or config.get("node_id") or "—"), "default")),
+                    card_node or "—", "default"),
+               # 第三张卡给「本页能做什么」：客户在本页找不到绑定时，得知道去哪
+               Card("绑定与收款", "在「账户与安全」",
+                    "本页只存本机配置（0600）", "muted")),
         fields=(
-            Field("节点标识", str(config.get("node_id") or "—"), key="node_id", editable=True),
-            Field("节点凭证", str(config.get("node_secret") or "—"), key="node_secret",
-                  editable=True, secret=True, hint="掩码显示；粘贴新值才会覆盖"),
-            Field("API Key", str(config.get("api_key") or "—"), key="api_key",
-                  editable=True, secret=True, hint="djb_sk_… 形式，只显示尾 4 位"),
+            node_field,
+            # 只读排障字段：节点进程 / 注册状态（有则显示事实，无则写原因 + 下一步）
+            Field("节点进程",
+                  ("运行中" if daemon.get("running") else "未运行")
+                  + ("（" + str(daemon.get("state")) + "）" if daemon.get("state") else ""),
+                  key="daemon_state", hint=str(daemon.get("reason") or "—")),
+            Field("注册状态",
+                  ("已注册" if node_id else "未注册"),
+                  key="register_state",
+                  hint=(("节点 ID 来源：" + str(access.get("node_id_source") or "—"))
+                        if node_id else _diag_hint(diag))),
             Field("价格模式", str(config.get("price_mode") or "—"), key="price_mode",
                   editable=True,
                   hint="auto / manual；当前：" + str(config.get("price_mode_label") or "—")),
-            Field("USDT 收款地址", str(config.get("usdt_address") or "—"), key="usdt_address",
-                  editable=True, hint="TRC20（T 开头 34 位）或 EVM（0x + 40 位）"),
-            Field("OpenAI 请求地址", str(config.get("openai_base_url") or "未设置"),
-                  key="openai_base_url", editable=True),
-            Field("Anthropic 请求地址", str(config.get("anthropic_base_url") or "未设置"),
-                  key="anthropic_base_url", editable=True),
+            # 节点凭证 = 节点密钥（排障要用，绝不能占首屏）→ 折叠进「高级（排障用）」
+            Field("节点凭证", str(config.get("node_secret") or "—"), key="node_secret",
+                  editable=True, secret=True, advanced=True,
+                  hint="掩码显示；粘贴新值才会覆盖"),
         ),
+        # RC15-039 #4：自动刷新是**本机界面**设置（不是服务端配置），所以单独一条开关，
+        # 不进表单、不参与「保存并回读」（那会把界面偏好写进接入配置）。
+        switches=(Toggle("auto_refresh", "自动刷新",
+                         value=bool(access.get("auto_refresh", True)),
+                         action="access.toggle_auto_refresh",
+                         hint="页面可见时每 10 秒；最小化或空闲 60 秒；只读本机数据"),),
         actions=(Action("access.save", "保存并回读", primary=True),
-                 Action("access.reload", "请求 daemon 重载")),
+                 Action("access.copy_node_id", "复制节点标识", enabled=bool(node_id),
+                        reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
+                                + _diag_hint(diag) + "）") if not node_id else ""),
+                 Action("access.reload", "请求 daemon 重载"),
+                 # 搬走的两个入口在这里只留**指路**（不是按钮）：本页不能做，就别假装能做
+                 Action("access.goto_account", "绑定与收款在「账户与安全」")),
         unavailable=_missing(snapshot, ("access",)),
         notes=(str(access.get("note") or ""),
+               *(() if node_id else tuple(
+                   "节点 ID 三级回退：" + row.get("level", "?") + " → "
+                   + ("读到" if row.get("ok") else str(row.get("reason") or "读不到"))
+                   for row in diag)),
+               ("节点进程下一步：" + str(daemon.get("next_step"))) if daemon.get("next_step") else "",
                "配置文件：" + str(access.get("path") or "—") + "（0600，只在本机）",
-               "该文件只存本机接入配置（上游地址 / 收款地址 / 价格模式），"
+               ("收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
+                "（云端出款链只有 Polygon）—— 填地址与提交都在「账户与安全」。"),
+               "该文件只存本机接入配置（节点密钥 / 收款地址 / 价格模式），"
                "不含账号登录态；账户资料要等节点绑定后从云端读取。"),
     )
+
+
+def _diag_hint(diag: Sequence[Mapping[str, Any]]) -> str:
+    """三级回退里**第一条真故障**的原因（跳过「手填为空」这种常态，也跳过最末级的连带现象）。
+
+    「access.json 里没有手填值」是注册成功时的正常形态，不能当原因；
+    「状态库读不到」往往是前一级失败后的连带现象（库都没建）。所以取第一条**有意义的**
+    失败原因——它就是客户要动手的那一环。
+    """
+    for row in diag:
+        if not isinstance(row, Mapping) or row.get("ok"):
+            continue
+        if str(row.get("level") or "").startswith("access.json"):
+            continue
+        reason = str(row.get("reason") or "")
+        if reason:
+            step = str(row.get("next_step") or "")
+            return reason + ("（" + step + "）" if step else "")
+    return "原因未知：看 logs/djb.log"
 
 
 def _today_note(today: Any) -> str:
     """「今日」按 UTC 日界（服务端口径）；本地时区跨日时数字会看起来对不上，得写明。"""
     if today in (None, ""):
-        return "服务端未下发今日字段；不拿总计冒充今日"
+        return "服务端没有下发今天的数字（不是 0）"
     return "服务端下发值（UTC 日界）；本机不换算"
+
+
+#: RC15-039 #17：档位**只有三个**（owner 2026-11-16 D-1：``paused`` 是状态，不是第四档）。
+#: 每项 = (表内键, 档位文案, ``djb limits --preset`` 的取值)。
+#: 第三列是**写命令**的取值（「全速」在本机命令里叫「全力以赴」），必须一一对上，
+#: 否则切完回读永远不一致。前两列之外的地方不许再手写档位名。
+#:
+#: RC15-039 复核 M7（owner a′）：原来的第四列「一句话说明」写的是"只要接单就满载 /
+#: 工作时段实时算力 / 只在我不使用电脑时工作"——这三句描述的是**本版 daemon 不做**的事
+#: （`facts.PRESET_CONCURRENCY` 零消费），与页脚"本版不按档位调整"同屏矛盾，整列删掉。
+YIELD_TIERS: tuple[tuple[str, str, str], ...] = (
+    ("full", "全速", "全力以赴"),
+    ("balanced", "均衡", "均衡"),
+    ("saver", "省心", "省心"),
+)
+#: 表内键 → 写命令取值 / 档位文案 → 写命令取值（动作层按选中的**标签**查）
+YIELD_PRESET_BY_KEY: dict[str, str] = {key: preset for key, _l, preset in YIELD_TIERS}
+#: 键 → 中文档位名（复核 SHOULD-FIX 7：总览卡以前直接印原始键 `balanced`，中文界面里冒英文）
+YIELD_LABEL_BY_KEY: dict[str, str] = {key: label for key, label, _p in YIELD_TIERS}
+YIELD_PRESET_BY_LABEL: dict[str, str] = {label: preset for _k, label, preset in YIELD_TIERS}
 
 
 def _yield_state_text(state: str) -> str:
@@ -1391,31 +2025,65 @@ def _yield(snapshot: Snapshot) -> View:
     state = str(data.get("state") or "unknown")
     paused = state == "paused"
     reason = data.get("reason_label") or data.get("reason")
-    mode = str(data.get("mode") or "unknown")
-    modes = (("full", "全速", "只要接单就满载"),
-             ("balanced", "均衡", "工作时段实时算力，其余慢任务"),
-             ("saver", "省心", "只在我不使用电脑时工作"),
-             ("paused", "暂停", "不接新任务；在途任务按护栏处理"))
-    active = mode if mode != "unknown" else ("paused" if paused else "")
-    rows = tuple(Row((label, key, summary,
-                      (MARK_DONE + " 当前") if key == active else MARK_IDLE), key=key)
-                 for key, label, summary in modes)
+    # RC15-039 #17：当前档位以**本机配置里的 preset** 为准（``djb limits --preset`` 写的就是它），
+    # 不从 yield_mode 猜：以前那行「模式」读的是另一个键，跟切档根本不是一个东西。
+    preset = str(data.get("preset") or "")
+    # RC15-039 复核 M7：首屏**没有**任何回读动作（数据来自本机配置），所以只说「本机配置」；
+    # 「已回读」只在切档动作成功后出现（控制器注入 `readback_ok`）。
+    verified = bool(data.get("readback_ok"))
+    active_key = next((key for key, _l, value in YIELD_TIERS if value == preset), "")
+    rows = tuple(Row((label, key, (MARK_DONE + " 当前") if key == active_key else MARK_IDLE),
+                     key=key)
+                 for key, label, _value in YIELD_TIERS)
+    if active_key:
+        now_text = next(label for key, label, _v in YIELD_TIERS if key == active_key)
+        now_meta, now_tone = ("本机配置 · 已回读" if verified else "本机配置"), "mint"
+    else:
+        now_text = "未知（没有回读到）"
+        now_meta, now_tone = "读不到就不猜；点下面三档之一可重新写一次", "amber"
     return View(
         key="yield", title="让路 / 节能",
-        subtitle="四档模式 · 暂停后与托盘状态一致",
+        # 「暂停」是**状态**不是档位（owner D-1）：它只由下面两个按钮进出
+        subtitle="三档模式 · 暂停是状态，不占档位",
         cards=(Card("当前状态", _yield_state_text(state),
                     str(reason or data.get("reason_label") or "无让路原因"),
                     _yield_state_tone(state)),
                Card("接单", _flag(data.get("accepting"), "允许", "禁止"), "", "default"),
-               Card("模式", mode, "本机配置", "muted")),
-        table=Table(("模式", "键", "说明", "当前"), rows, empty="模式暂不可用"),
-        actions=(Action("yield.pause", "暂停接单", enabled=not paused,
+               Card("档位", now_text, now_meta, now_tone)),
+        table=Table(("档位", "键", "当前"), rows, empty="档位暂不可用",
+                    activate="yield.apply_mode", title="档位"),
+        actions=(Action("yield.apply_mode", "切到选中的档位", enabled=bool(rows),
+                        reason="当前没有可切换的档位", primary=True),
+                 Action("yield.pause", "暂停接单", enabled=not paused,
                         reason="已经是暂停状态"),
                  Action("yield.resume", "恢复接单", enabled=paused,
-                        reason="当前不是暂停状态", primary=True)),
+                        reason="当前不是暂停状态")),
         unavailable=_missing(snapshot, ("yield",)),
-        notes=("暂停只停止接新任务，不停止服务；托盘与窗口读同一份状态。",),
+        notes=("先选中一档（↑↓ 或点击），再点「切到选中的档位」或按回车："
+               "会先问一次，确认后写本机配置并回读 daemon。",
+               "切档不打断在跑的任务、不重启服务；暂停/恢复是另一个动作，"
+               "与托盘读同一份状态。",
+               # RC15-039 复核 M7（owner a′）：用**正面**口径说同一件事，别和上面的档位
+               # 描述互相打脸——"只记录偏好"是这版真实做的事，"后续版本生效"是真实计划。
+               "本版只记录档位偏好；并发与让路在后续版本生效。"),
     )
+
+
+def binding_state(snapshot: Snapshot) -> tuple[bool | None, str]:
+    """**绑定态的唯一判定源**（RC15-039 #9）：返回 ``(是否已绑定, 节点 ID)``。
+
+    总览「三步接上」与账户页「节点绑定」都从这里取，不许各算各的——以前总览看「本机有没有
+    节点凭据」、账户页看「服务端 binding」，于是同一屏同时出现「3 / 3 接入完成」和「未绑定」（#9），
+    还把「节点 ID 存在」读成「没注册」（#33）。
+    """
+    account = _section(snapshot, "account")
+    access = _section(snapshot, "access")
+    profile = _mapping(account.get("profile"))
+    security = _mapping(account.get("security"))
+    binding = _mapping(access.get("binding"))
+    bound = _account_bound(profile, security, binding)
+    node_id = str(profile.get("node_id") or security.get("node_id") or "")
+    return bound, node_id
 
 
 def _account_bound(profile: Mapping[str, Any], security: Mapping[str, Any],
@@ -1449,7 +2117,7 @@ def _account(snapshot: Snapshot) -> View:
     email = profile.get("email")
     identity = str(node_id or email or "—")
     identity_meta = str(profile.get("state") or profile.get("role") or "—")
-    bound = _account_bound(profile, security, binding)
+    bound, bound_node_id = binding_state(snapshot)
     # 绑定入口**不能**被「本域暂不可用」挡掉：未登录时账户域本来就取不到云端数据，
     # 而那正是最需要「绑定网页端」的时刻（2026-11-11 正式环境实测：账户页只剩一行
     # 「账户资料暂不可用」，按钮全被隐藏，用户没有任何可点的下一步）。
@@ -1462,8 +2130,13 @@ def _account(snapshot: Snapshot) -> View:
             for index, item in enumerate(unavailable))
     twofa = profile.get("twofa_enabled", profile.get("mfa_enabled"))
     if bound is not None:
+        # RC15-039 #33：「未绑定」只说**网页端账号**没绑到这个节点，不等于节点没注册。
+        binding_meta = ("服务端视图（只读）" if bound is True else
+                        ("本机已有节点凭据，只是网页端账号还没绑到它"
+                         if (bound_node_id or security.get("node_id")) else
+                         "服务端视图（只读）"))
         second = Card("节点绑定", _flag(bound, "已绑定", "未绑定"),
-                      "服务端视图（只读）", "mint" if bound is True else "amber")
+                      binding_meta, "mint" if bound is True else "amber")
     else:
         second = Card("双因素验证", _flag(twofa, "已开启", "未开启", "暂不可用"),
                       "登录保护的第二步", "mint" if twofa is True else "amber")
@@ -1488,32 +2161,146 @@ def _account(snapshot: Snapshot) -> View:
     if can_bind:
         fields.append(Field("网页端", facts.WEB_CONSOLE_URL, key="web_console",
                             hint="在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里"))
+    # E（RC14 IA 拆分）：USDT 收款地址**只在这里**（原来在「接入配置」，两处都能填、
+    # 两处都以为生效）。输入框不预填掩码（prefill=False），否则一点保存就把掩码写回配置。
+    payout = _payout_state(access)
+    fields.append(Field("USDT 收款地址", payout["local"], key="usdt_address", editable=True,
+                        prefill=False,
+                        hint=(payout_mod.CHAIN_HINT + "｜本机已存：" + payout["local"]
+                              + "｜云端：" + payout["hint"])))
+    # RC14 C 设备码状态（开关关 → 整段不渲染，连状态都不显示）
+    device = account.get("device_flow") if isinstance(account.get("device_flow"), Mapping) else {}
+    device_on = bool(device.get("enabled"))
+    device_state = str(device.get("state") or "idle")
+    if device_on and can_bind:
+        from .. import device_flow as flow_mod
+
+        state_text = flow_mod.STATE_TEXT.get(device_state, device_state)
+        detail = "｜".join(item for item in (
+            str(device.get("user_code") or ""),
+            "等待第 " + str(device.get("attempts") or 0) + " 次确认" if device_state == "pending" else "",
+            str(device.get("reason") or "")) if item)
+        fields.append(Field("设备码", detail or "未申请", key="device_state",
+                            hint=(("打开 " + str(device.get("verify_url") or "确认链接")
+                                   + " 并在网页里点「确认」；本机每 5/15/30 秒自动问一次，10 分钟停")
+                                  if device_state == "pending" else
+                                  "状态：" + state_text + "（"
+                                  + (str(device.get("hint") or "") or "点左边按钮开始") + "）")))
     fields.append(Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录"))
     actions: list[Action] = []
+    # RC14 C 设备码：主按钮 = 「在浏览器确认绑定」（开关关着 → 只保留老的手输码入口）
+    if device_on and can_bind:
+        actions.append(Action("account.bind_device", "在浏览器确认绑定", primary=True,
+                              enabled=device_state not in ("pending",), group=GROUP_BIND))
+        if device_state == "pending":
+            actions.append(Action("account.bind_device_cancel", "停止等待", group=GROUP_BIND))
+            if device.get("verify_url"):
+                actions.append(Action("account.copy_verify_url", "复制确认链接",
+                                      group=GROUP_BIND))
     if can_bind:
-        actions.append(Action("account.bind", "绑定网页端", primary=True))
-    actions.append(Action("account.enable_2fa", "启用双因素验证",
-                          enabled=twofa is not True,
-                          reason="已开启" if twofa is True else "登录后可用",
+        actions.append(Action("account.bind", "绑定网页端" if not device_on else "手输绑定码",
+                             primary=not device_on, group=GROUP_BIND))
+    # G1-2（RC14 P0）：2FA 不在本机做绑定 ⇒ ①禁用态 + 说清原因；②旁边给**真能点**的入口。
+    # 旧实现是一颗可点的按钮，点下去只回一句「暂不可用」——客户会以为客户端坏了。
+    actions.append(Action("account.enable_2fa", "启用双因素验证", enabled=False,
+                          reason=("已开启（服务端）：如需关闭或换设备，去网页控制台安全页"
+                                  if twofa is True else
+                                  "在网页控制台开启（TOTP）；本机不代理 2FA 绑定")))
+    # 已开启也要给入口：客户要关闭 / 换设备 / 重装 TOTP 时同样得去这一页
+    actions.append(Action("account.open_2fa_page",
+                          "去控制台管理 2FA" if twofa is True else "去控制台开启 2FA",
                           primary=not can_bind and twofa is not True))
-    actions.append(Action("account.logout", "登出", enabled=bool(security.get("node_id")),
+    # ── G4（RC14 P0）：更新检查入口 + 九状态下的可操作项
+    # 放在「账户与安全」而不是总览：低频操作，且本页已有「网页端」等外链字段。
+    update = account.get("update") if isinstance(account.get("update"), Mapping) else {}
+    update_unavailable = str(update.get("unavailable") or "")
+    checked_at = str(update.get("checked_at") or "")
+    verify_state = str(update.get("verify_state") or "")
+    state_text = UPDATE_STATE_TEXT.get(verify_state) or (
+        "尚未检查过" if not verify_state else verify_state)
+    # D2（2026-11-18 客户报障）：版本卡必须写**实际在跑的程序版本**。
+    # 旧实现读 ``current_version``（= 安装记录），手工解压换包不会写记录，于是
+    # 侧栏 v0.3.11 / 本条 0.3.0 自相矛盾。记录值只在提示里出现（并且明说已校正），
+    # 后端字段 ``package_version`` / ``install_record_version`` 见 ``update.status()``。
+    package_version = str(update.get("package_version") or update.get("current_version") or "")
+    recorded_version = str(update.get("install_record_version") or "")
+    record_stale = bool(package_version and recorded_version
+                        and recorded_version != package_version)
+    version_hint = (str(update.get("channel") or "") + " 渠道 · "
+                    + (str(update.get("edition") or "") or "本机"))
+    if record_stale:
+        version_hint += "（安装记录为 " + recorded_version + "，已按实际程序显示）"
+    fields.extend([
+        Field("当前版本", package_version or "暂不可用",
+              key="update_version",
+              hint=version_hint,
+              tone="amber" if record_stale else "muted"),
+        Field("上次检查", checked_at or "还没检查过", key="update_checked_at"),
+        Field("上次结果", (update_unavailable or state_text), key="update_state",
+              hint=str(update.get("hint") or ""),
+              tone="amber" if update_unavailable else "muted"),
+    ])
+    update_actions: list[Action] = [Action("update.check", "检查更新",
+                                           enabled=not update_unavailable,
+                                           reason=update_unavailable or "")]
+    if verify_state == "eligible":
+        update_actions.append(Action("update.apply", "安装更新（重启生效）", primary=True))
+    elif verify_state == "no_artifact":
+        # 只写「暂无安装包」客户会以为「没有更新」→ 必须给一条能点的路（G4-4）
+        update_actions.append(Action("update.download", "去下载页手动下载", primary=True))
+    actions.extend(update_actions)
+    actions.append(Action("account.submit_payout", "提交收款地址到云端",
+                          enabled=payout["can_submit"], group=GROUP_PAYOUT,
+                          reason="" if payout["can_submit"] else
+                          ("云端收款地址功能还没开放（等平台开启后再提交）"
+                           if payout["disabled"] else
+                           ("先填好 Polygon 收款地址再点这里提交"
+                            if bound is True else
+                            "节点还没绑定账户：先完成上面的绑定"))))
+    # RC14 B：引导重跑入口**永久**在本页（不是只在首次启动出现）；开关关 → 隐藏
+    onboarding = access.get("onboarding") if isinstance(access.get("onboarding"), Mapping) else {}
+    if onboarding.get("enabled"):
+        actions.append(Action("account.rerun_onboarding", "重新运行首次引导"))
+    # 解绑 = 原来「接入配置」页那颗「粘贴绑定码绑定」的对偶：绑定与解绑都只在本页。
+    # 键名保留 ``account.logout``（接口只加不改）：它就是「解绑 + 清本机密钥」那一个动作。
+    actions.append(Action("account.logout", "解绑这台电脑（登出并清本机密钥）",
+                          enabled=bool(security.get("node_id")),
                           reason=("尚未登录" if not node_id
-                                  else "本机无凭据（登出要清本机密钥）")))
+                                  else "本机无凭据（解绑要清本机密钥）")))
     if can_bind:
         actions.append(Action("account.open_web", "打开网页端"))
-    notes = [str(account.get("note") or "未登录时只显示本机信息。")]
+    notes = [str(account.get("note") or "未登录时只显示本机信息。"),
+             ("收款地址只支持 Polygon（ERC20，0x 开头 42 位）；TRC20 暂不支持"
+              "（云端出款链只有 Polygon）。"),
+             payout_mod.summarize(payout["row"]) if payout["ok"] else ""]
+    if verify_state == "failed_verify":
+        notes.insert(0, "上次更新校验失败，已拒装（安全拦截）；版本未变，请联系客服核查更新源。")
+    elif verify_state == "no_artifact":
+        notes.insert(0, "本平台暂无安装包——这不是「没有更新」，请点「去下载页手动下载」。")
+    elif verify_state == "not_eligible":
+        notes.insert(0, "上次未命中灰度桶（当前 " + str(update.get("bucket") or "?")
+                     + "%），本轮不更新；下一波会自动再检查。")
     if can_bind:
         notes = [
-            "绑定：在网页端 → 账户/节点 → 生成绑定码，然后点「绑定网页端」粘贴到这里"
-            "（或 djb auth --bind <码>）",
+            # RC15-039 #11：绑定是**界面内动作**（「手输绑定码」按钮弹输入框，界面自己调本机命令），
+            # 不再甩半条 CLI 命令当解决方案。
+            "绑定：在网页端 → 账户/节点 → 生成绑定码，回到这一页点「手输绑定码」"
+            "（或「绑定网页端」）把码粘进去。",
             "网页端：" + facts.WEB_CONSOLE_URL,
+        ] + notes
+    if bound is False and (bound_node_id or security.get("node_id")):
+        # RC15-039 #33：一句话说清三个状态的关系，别让「未绑定 / 在线 / 有凭据」互相打脸。
+        notes = [
+            "「未绑定」只说网页端账号还没绑到这个节点；节点本身是存在的"
+            "（节点 ID 见「账户」卡，本机凭据见「本机凭据」卡）。"
         ] + notes
     return View(
         key="account", title="账户与安全",
         subtitle="节点身份 · 绑定 · 双因素 · 登出",
         cards=(Card("账户", identity, identity_meta, "default"), second,
                Card("本机凭据", str(security.get("storage") or "—"),
-                    str(security.get("node_id") or "本机未保存"), "muted")),
+                    str(security.get("node_id") or "本机未保存"), "muted"),
+               Card("USDT 收款地址（云端）", payout["state"], payout["meta"], payout["tone"])),
         fields=tuple(fields),
         actions=tuple(actions),
         unavailable=unavailable,
@@ -1521,9 +2308,89 @@ def _account(snapshot: Snapshot) -> View:
     )
 
 
+# ─────────────────────────────────────────────────────────── RC14 B 首次引导（应用内面板）
+@dataclass(frozen=True)
+class OnboardingPanel:
+    """首启引导的**投影**（无 Tk）：标题 / 正文 / 步骤序号 / 动作。
+
+    应用层把它画成主界面上方的一条面板（**不是模态**：不遮挡、不拦点击），并直接复用
+    同一套 :class:`Action`（键名与其它页一致，点下去仍走 controller.action）。
+    """
+
+    step: int                  # 1..3；4 = 完成页
+    total: int
+    title: str
+    body: str
+    actions: tuple[Action, ...] = ()
+
+    @property
+    def done(self) -> bool:
+        return self.step > self.total
+
+
+def onboarding_panel(step: int, *, total: int = 3, bound: bool | None = None,
+                     upstream_count: int = 0) -> OnboardingPanel:
+    """按步骤给面板（跳过按钮在**每一步**都有：这是 owner 的硬要求）。"""
+    step = max(1, min(total + 1, int(step)))
+    from .. import onboarding as onboarding_mod
+
+    if step > total:
+        marks = []
+        marks.append("✓ 已绑定" if bound is True else
+                     "· 还没绑定（随时可在「账户与安全」绑定）")
+        marks.append("✓ 已提供 " + str(upstream_count) + " 个接入"
+                     if upstream_count else "· 还没提供上游（随时可在「提供 Token Plan」添加）")
+        return OnboardingPanel(
+            step=step, total=total, title=onboarding_mod.DONE_TITLE,
+            body="  ".join(marks),
+            actions=(Action("onboarding.finish", "进入主界面", primary=True),
+                     Action("onboarding.rerun", "重新运行引导")))
+    actions = [Action("onboarding.next", "开始" if step == 1 else "下一步", primary=True)]
+    if step == 2:
+        actions.append(Action("account.bind", "在浏览器确认绑定"))
+    if step == 3:
+        actions.append(Action("token_plan.add_upstream", "去填接入"))
+    actions.append(Action("onboarding.skip", "跳过这一步"))
+    if step == 1:
+        actions.append(Action("onboarding.skip_all", "跳过设置，直接进入"))
+    if step > 1:
+        actions.append(Action("onboarding.back", "上一步"))
+    return OnboardingPanel(
+        step=step, total=total, title=onboarding_mod.step_title(step),
+        body=onboarding_mod.step_body(step), actions=tuple(actions))
+
+
+#: 日志级别 → 客户看到的筛选文案（值仍是契约里的 ``debug``/``info``/…）
+LOG_LEVEL_TEXT = {"all": "全部级别", "debug": "debug（调试）", "info": "info（信息）",
+                  "warning": "warning（警告）", "error": "error（错误）",
+                  "critical": "critical（严重）"}
+
+
+def dataclass_is_instance(value: Any) -> bool:
+    """``is_dataclass`` 对**类**也回真；这里只认实例。"""
+    return not isinstance(value, type) and is_dataclass(value)
+
+
+def _content_key(prefix: str, parts: Any, seen: dict[str, int]) -> str:
+    """列表项的内容身份：``<prefix>-<内容哈希>``；**逐字相同**的行才补 ``#2``。
+
+    用途：Treeview 的 iid 必须唯一（撞了会 TclError 打死窗口），但 id 又不能用序号，
+    否则上面插一行、下面全变。两行内容逐字相同时它们本来不可区分，计数器是唯一选择。
+    """
+    digest = hashlib.sha1("\x1f".join(str(part) for part in parts).encode("utf-8")).hexdigest()[:10]
+    key = prefix + "-" + digest
+    if key in seen:
+        seen[key] += 1
+        return "%s#%d" % (key, seen[key])
+    seen[key] = 0
+    return key
+
+
 def _logs(snapshot: Snapshot) -> View:
     logs = _section(snapshot, "logs")
+    total = logs.get("total")
     rows = []
+    seen: dict[str, int] = {}
     for index, row in enumerate(logs.get("rows") if isinstance(logs.get("rows"), list) else []):
         if not isinstance(row, Mapping):
             continue
@@ -1534,23 +2401,61 @@ def _logs(snapshot: Snapshot) -> View:
         tone = ("red" if level in ("error", "critical") else
                 "amber" if level == "warning" else
                 "muted" if level == "unknown" else "default")
-        # key 必须唯一：日志里同一微秒可能被写两次（init 与 daemon 各写一遍同一事件），
-        # 用 ts 当 iid 会让 Treeview 抛 TclError「Item ... already exists」把整个窗口打死。
+        # RC15-039 #5：错误行自带的原因/下一步**原样上屏**（`_parse_log_line` 已把它们
+        # 摊在 row["fields"] 里）。没有就写「—」，绝不拿别的东西冒充一句原因。
+        payload = row.get("fields") if isinstance(row.get("fields"), Mapping) else {}
+        reason = str(payload.get("reason") or "").strip()
+        next_step = str(payload.get("next_step") or "").strip()
+        # key = **内容身份**，不许带序号（复核 MF-1：`logs-%04d-<ts>` 里的序号会让
+        # 顶部插一行时下面每行的 a11y 路径全变，读屏焦点跟着跳到别人身上）。
+        # 仍然必须唯一：同一微秒可能被写两遍（init 与 daemon 各写一遍同一事件），
+        # 完全相同的两行只能用「同内容计数器」区分——那是这类行唯一的不稳定点，已写进
+        # `a11y/tree._row_id` 的文档。
         rows.append(Row((mark + " " + level, str(row.get("ts") or "—"),
-                         str(row.get("event") or "—")),
-                        key="logs-%04d-%s" % (index, row.get("ts") or ""),
+                         str(row.get("event") or "—"),
+                         reason or "—", next_step or "—"),
+                        key=_content_key("logs", (level, str(row.get("ts") or ""),
+                                                  str(row.get("event") or ""),
+                                                  reason, next_step), seen),
                         tone=tone))
+    level = str(logs.get("level") or "all")
+    levels = [str(item) for item in (logs.get("levels") or []) if str(item)]
+    options = (("all", LOG_LEVEL_TEXT["all"]),) + tuple(
+        (item, LOG_LEVEL_TEXT.get(item, item)) for item in levels)
+    filtered = level != "all"
+    count_meta = ("共 " + str(total) + " 行 · 已筛选" if filtered and _is_number(total)
+                  else "共 " + str(total) + " 行" if _is_number(total) else "尾部 200 行")
+    # RC15-039 复核 M4：筛到 0 行时旧文案写「日志文件尚未生成」——同屏卡片却写着「共 N 行」，
+    # 屏幕上的事实性错误。行的有无有三种原因，文案必须分开说，不许拿「文件没生成」兜一切。
+    if rows:
+        empty_text = _empty_text(snapshot, "logs", "日志文件尚未生成")
+    elif filtered:
+        # 级别名用**裸名**（`LOG_LEVEL_TEXT` 里是「debug（调试）」，套进括号会变成套娃）
+        empty_text = ("当前筛选（" + level + "）下没有日志行；换一个级别，或选「"
+                      + LOG_LEVEL_TEXT["all"] + "」。")
+    elif _is_number(total) and int(total) > 0:
+        empty_text = "日志里有 " + str(total) + " 行，但没能解析出可显示的行（详情见日志文件）。"
+    else:
+        empty_text = "日志文件尚未生成（本机还没有任何日志行）。"
     return View(
         key="logs", title="日志",
-        subtitle="本地 ring buffer（最近 2000 行，按需筛选）",
-        cards=(Card("行数", _count(snapshot, "logs", str(len(rows))), "尾部 200 行", "default"),),
-        table=Table(("级别", "时间", "事件"), tuple(rows),
+        subtitle="本机日志 · 本页显示最近 200 行（级别筛选只改显示）",
+        cards=(Card("行数", _count(snapshot, "logs", str(len(rows))), count_meta, "default"),),
+        # 窄窗先让出「原因/下一步」（正文在下面详情抽屉里，点一行就能看全）
+        table=Table(("级别", "时间", "事件", "原因", "下一步"), tuple(rows),
                     note=str(logs.get("note") or ""),
-                    empty=_empty_text(snapshot, "logs", "日志文件尚未生成")),
+                    empty=empty_text,
+                    narrow_hide=("时间", "原因", "下一步"),
+                    narrow_headers=(("下一步", "下一步"),), title="日志"),
+        filters=(Filter("log_level", "级别", options=options, value=level,
+                        action="logs.filter",
+                        hint="只改本页显示；日志文件不动。"),) if levels else (),
         actions=(Action("logs.copy", "复制当前筛选", enabled=bool(rows), reason="没有日志行"),
                  Action("logs.open_dir", "打开日志目录")),
         unavailable=_missing(snapshot, ("logs",)),
-        notes=("级别筛选：all / debug / info / warning / error；不改日志文件。",),
+        # 旧页脚许诺「级别筛选：all / debug / …」却**没有**任何筛选控件（走查原话：
+        # 「页脚承诺的功能根本不存在」）。现在筛选是真的，页脚只说它真做了什么。
+        notes=("筛选只改本页显示；日志文件本身一个字都不动。",),
     )
 
 
@@ -1564,13 +2469,17 @@ _BUILDERS = {
 
 
 def build_view(key: str, snapshot: Snapshot) -> View:
-    """构建单个视图；未知 key 抛 ``ValueError``（拼错不静默给空页）。"""
+    """构建单个视图；未知 key 抛 ``ValueError``（拼错不静默给空页）。
+
+    出口处统一过一遍 :func:`terminalize`（RC15-039 #11）：CLI 的 ``next_step`` 无论从哪个
+    域来（access / bench / daemon…），上屏前都会带上「这条要在终端里跑」。
+    """
     builder = _BUILDERS.get(str(key or ""))
     if builder is None:
         raise ValueError("未知视图：" + str(key))
-    return builder(snapshot)
+    return _terminalize_tree(builder(snapshot))
 
 
 def build_views(snapshot: Snapshot) -> dict[str, View]:
     """一次构建 13 个视图（顺序同 :data:`VIEWS`）。"""
-    return {key: _BUILDERS[key](snapshot) for key in VIEW_KEYS}
+    return {key: build_view(key, snapshot) for key in VIEW_KEYS}

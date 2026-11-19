@@ -24,6 +24,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any, Callable, Iterable, Protocol
 
 from . import facts
+from .platform.no_window import subprocess_window_kwargs
 from .state import NEXT_STEP
 from .store import ProfileRecord, Store, next_window_start, window_key, utc_window_start
 from .util import human_duration, iso, parse_iso, utcnow
@@ -147,7 +148,8 @@ class SessionProbe:
             return Signal(self.name, "error", "有图形会话但无空闲检测工具（xprintidle）")
         try:
             completed = subprocess.run([binary], capture_output=True, text=True,
-                                       timeout=POLL_TIMEOUT_S, check=False)
+                                       timeout=POLL_TIMEOUT_S, check=False,
+                                       **subprocess_window_kwargs())
         except (OSError, subprocess.SubprocessError):
             return Signal(self.name, "error", "空闲检测工具执行失败")
         try:
@@ -271,7 +273,8 @@ class ResourceMonitor:
         try:
             completed = subprocess.run(
                 [binary, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=POLL_TIMEOUT_S, check=False)
+                capture_output=True, text=True, timeout=POLL_TIMEOUT_S, check=False,
+                **subprocess_window_kwargs())
             first = completed.stdout.strip().splitlines()[0]
             return max(0.0, min(100.0, float(first.strip())))
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
