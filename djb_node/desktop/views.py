@@ -1778,7 +1778,14 @@ def _token_plan(snapshot: Snapshot) -> View:
                        + str(plan.get("selected_price")) + "；") if plan.get("selected_price")
                       else (("当前选中：" + str(plan.get("selected_model")) + "（未设价）；")
                             if plan.get("selected_model") else "先在上面的表格里选一行；"))
-                    + "单位 USD / 百万 token，最小 0.01（填 0 会被云端跳过，留空 = 不申报）")),
+                    + "单位 USD / 百万 token，最小 0.01（填 0 会被云端跳过，留空 = 不申报）"
+                    # 2026-11-20 owner：设价必须让人看见「这是最低价 + 平台费 15%」。
+                    # 成交口径（原始设计）：撮合到的最优价 ≥ 这个最低价就成交。
+                    + "；**成交规则**：低于此价不成交，高于时按最优价成交"
+                    + "；平台服务费 " + format(facts.service_fee_percent(), "g") + "%"
+                    + "（客户实付 = 你的报价 × "
+                    + format(1 + facts.SERVICE_FEE_BPS / 10000.0, "g")
+                    + "，费率以成交时服务端快照为准）")),
         Field("云端覆盖", cloud_text, key="bid_cloud",
               hint="生效顺序：云端覆盖 > 本机底价 > 未设价"),
     )

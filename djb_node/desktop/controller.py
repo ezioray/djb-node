@@ -833,6 +833,14 @@ class DesktopController:
     def _act_account_bind_device(self, *, confirm=None) -> ActionResult:
         """「在浏览器确认绑定」：开关默认关；关着就只指向老的手输码路径。"""
         from .. import device_flow as flow_mod
+        # 2026-11-20：这条动作原来**一行日志都不写**，真机「点了没反应」时无从判断
+        # 是没触发、被开关挡住、还是网络卡住。入口先落一条事件（只记事实，不记凭据）。
+        try:
+            from ..log import event as _event
+            _event("desktop.device_flow.request", level="info",
+                   enabled=bool(self.device_flow_enabled()))
+        except Exception:                                  # pragma: no cover - 日志不可用
+            pass
 
         if not self.device_flow_enabled():
             # RC15-039 #11：以前甩半条 CLI（`djb auth --bind`）当解决方案——客户没有终端
@@ -1138,6 +1146,24 @@ class DesktopController:
         price = str(self.drafts.get("min_price") or "").strip()
         if not model:
             return ActionResult("先在上面的表格里选一行模型", ok=False)
+        # 2026-11-20 owner：**设价时必须提醒 15% 分成**。
+        # 这里把三件事一次说清：最低价的含义（低于不成交）、高于时按最优价成交、
+        # 平台费加在客户侧（你按报价结算）。费率来自 facts（服务端策略快照口径）。
+        if confirm is not None and str(price or "").strip():
+            fee = facts.SERVICE_FEE_BPS
+            text = ("保存「" + model + "」的最低申报价 " + str(price).strip() + " USD / 百万 token？\n\n"
+                    "成交规则：低于这个价不成交；撮合到更高价时按**最优价**成交（你按成交价结算）。\n\n"
+                    "平台服务费 " + format(facts.service_fee_percent(), "g") + "%"
+                    "（fee_mode=add，" + str(fee) + "bp，以成交时服务端快照为准）：\n"
+                    "    客户实付 = 你的报价 × " + format(1 + fee / 10000.0, "g") + "\n"
+                    "    例：报价 " + str(price).strip() + " → 客户实付约 "
+                    + facts.customer_pay_text(str(price).strip()) + "\n\n"
+                    "平台费不从你的报价里倒扣。")
+            try:
+                if not confirm(text):
+                    return ActionResult("已取消保存（价格未变）", ok=False, effect="cancelled")
+            except TypeError:                      # 测试里的 confirm 可能只收位置参数
+                pass
         try:
             saved = self._bids().set_price(model, price)
         except ValueError as exc:

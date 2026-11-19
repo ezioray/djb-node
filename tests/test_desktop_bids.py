@@ -224,14 +224,14 @@ def test_save_price_writes_local_book_and_never_reports():
     controller.show("token_plan")
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0.42")
-    result = controller.action("token_plan.save_price")
+    result = controller.action("token_plan.save_price", confirm=lambda _m: True)
     assert result.ok and "0.42" in result.message and "未上报" in result.message
     assert bids_mod.BidBook(store).load()["gpt-4o-mini"]["min_price"] == "0.42"
 
 
 def test_save_price_requires_a_selected_row():
     controller = _controller(_Source(_Store()))
-    result = controller.action("token_plan.save_price")
+    result = controller.action("token_plan.save_price", confirm=lambda _m: True)
     assert not result.ok and "选一行" in result.message
 
 
@@ -240,7 +240,7 @@ def test_zero_price_is_refused_before_it_reaches_the_cloud():
     controller = _controller(_Source(store))
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0")
-    result = controller.action("token_plan.save_price")
+    result = controller.action("token_plan.save_price", confirm=lambda _m: True)
     assert not result.ok and "0.01" in result.message
     assert bids_mod.BidBook(store).load() == {}
 
@@ -249,7 +249,7 @@ def test_report_with_flag_off_says_nothing_was_sent():
     controller = _controller(_Source(_Store()))
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0.5")
-    controller.action("token_plan.save_price")
+    controller.action("token_plan.save_price", confirm=lambda _m: True)
     result = controller.action("token_plan.report")
     assert not result.ok and "未发送" in result.message
 
@@ -258,7 +258,7 @@ def test_preview_lists_what_would_be_reported():
     controller = _controller(_Source(_Store()))
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0.5")
-    controller.action("token_plan.save_price")
+    controller.action("token_plan.save_price", confirm=lambda _m: True)
     result = controller.action("token_plan.preview_report")
     assert result.ok and "gpt-4o-mini=0.5" in result.message
     assert result.payload["payload"]["models"] == [{"model": "gpt-4o-mini",

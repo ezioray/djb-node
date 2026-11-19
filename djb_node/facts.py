@@ -790,6 +790,30 @@ FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
     "description": "逐模型底价上报到云端（RC14 I/J）；云端接口未开通前保持关闭",
 }
 UPSTREAM_BID_FLAG = "client.upstream.bid_report.enabled"
+
+#: 平台服务费（**报价口径**）：``fee_mode=add`` 时「客户实付 = 供方 ask × (1 + fee_bps/10000)」。
+#: 1500 = 15%，与云端服务费率策略的默认值一致（云端上限 2000 = 20%）。
+#:
+#: 重要：**费率是服务端事实**（契约 `fee_bps` 由服务端在报价时快照，客户端不能自报）。
+#: 这里的常量只用于「设价前的告知弹窗」与界面说明；成交时以服务端快照为准。
+SERVICE_FEE_BPS = 1500
+SERVICE_FEE_SOURCE = "service_policy_default"
+
+
+def service_fee_percent() -> float:
+    """费率百分比（15.0）。界面上用 ``{:.4g}`` 打印，别写死「15%」两处。"""
+    return SERVICE_FEE_BPS / 100.0
+
+
+def customer_pay_text(ask: object) -> str:
+    """给一个供方报价，算出「客户实付」的展示文本（两位小数，算不出就给「—」）。"""
+    try:
+        from decimal import Decimal, ROUND_HALF_UP
+        base = Decimal(str(ask))
+        paid = (base * (Decimal(10000 + SERVICE_FEE_BPS) / Decimal(10000)))
+        return str(paid.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except Exception:                                     # pragma: no cover - 坏输入
+        return "—"
 UPSTREAM_BID_REPORT_PATHS: tuple[str, ...] = (
     "/api/v1/user/provider/ask-settings",
     "/api/v1/schedule/quotes",

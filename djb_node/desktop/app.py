@@ -3463,7 +3463,11 @@ class DesktopApp:
         from .. import facts
         message = ("在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里。\n\n"
                    + facts.WEB_CONSOLE_URL)
-        value = simpledialog.askstring("DJB / 绑定网页端", message, parent=self._root)
+        # 2026-11-20：**显式给空初始值**。之前没传 initialvalue，客户看到输入框里
+        # 预填着网页端地址（URL 其实在 message 里），以为「绑定码就是那个地址」，
+        # 点 OK 就把 URL 当码提交了（真机复现，报 binding_code_unknown）。
+        value = simpledialog.askstring("DJB / 绑定网页端", message, parent=self._root,
+                                       initialvalue="")
         return str(value).strip() if value else None
 
     def _open_url(self, url: str) -> None:

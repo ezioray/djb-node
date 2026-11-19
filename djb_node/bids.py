@@ -26,6 +26,12 @@ from . import facts
 BIDS_KV_KEY = "rc14/model_bids"
 BIDS_SCHEMA_VERSION = 1
 
+#: 成交模式（原始设计）：设一个**最低价**，撮合到的最优价 ≥ 最低价就成交。
+#: 账本里显式记下来，方便以后加别的模式（如封顶价 ``fixed``）而不改历史数据。
+MODE_AUTO_BEST = "auto_best"
+#: 缺 mode 的老账本按这个解释（向后兼容，不迁移数据）。
+DEFAULT_MODE = MODE_AUTO_BEST
+
 #: 最小申报价（USD / 百万 token）。``0`` 会被云端 ``SKIP_ZERO_PRICE`` 静默丢掉。
 MIN_PRICE = Decimal("0.01")
 #: 整数位上限（云端 ``ask_min`` 口径：整数 ≤ 7 位）
@@ -120,6 +126,21 @@ class BidBook:
     def price_of(self, model: str) -> str:
         return str((self.load().get(str(model)) or {}).get("min_price") or "")
 
+    def mode_of(self, model: str) -> str:
+        """这一行的成交模式；老账本没有 mode 就是 ``auto_best``。
+
+        刻意**不放进** :meth:`load` 的返回形状：``load()`` 是对外契约（UI/测试都按
+        ``{model: {"min_price": str}}`` 读），mode 是后加的旁路信息，从原始 kv 读。
+        """
+        if self.store is None:
+            return DEFAULT_MODE
+        raw = self.store.get_kv(BIDS_KV_KEY, None)
+        bids = raw.get("bids") if isinstance(raw, Mapping) else None
+        item = bids.get(str(model)) if isinstance(bids, Mapping) else None
+        if not isinstance(item, Mapping):
+            return DEFAULT_MODE
+        return str(item.get("mode") or DEFAULT_MODE)
+
     # ── 写
     def set_price(self, model: str, text: Any) -> str:
         """设一行的底价；返回规范化后的价格文本。空串 = 移除这一行。"""
@@ -131,7 +152,7 @@ class BidBook:
             self._save(bids)
             return ""
         price = parse_price(raw)
-        bids[model_id] = {"min_price": format_price(price)}
+        bids[model_id] = {"min_price": format_price(price), "mode": DEFAULT_MODE}
         self._save(bids)
         return bids[model_id]["min_price"]
 
@@ -151,7 +172,8 @@ class BidBook:
             raise RuntimeError("本机数据库不可用（没有 store）：底价无法保存")
         self.store.set_kv(BIDS_KV_KEY, {
             "version": BIDS_SCHEMA_VERSION,
-            "bids": {str(model): {"min_price": str(item["min_price"])}
+            "bids": {str(model): {"min_price": str(item["min_price"]),
+                                  "mode": str(item.get("mode") or DEFAULT_MODE)}
                      for model, item in bids.items()},
         })
 
