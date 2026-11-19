@@ -1771,12 +1771,14 @@ def _token_plan(snapshot: Snapshot) -> View:
         notes.append("云端「按模型设价」接口还没开通（ask-settings / quotes.models[]）："
                      "底价只保存在本机，上报按钮保持关闭，不会假成功。")
     plan_actions.extend([
-        Action("token_plan.discover", "读取模型清单（第 2 步）"),
-        Action("token_plan.save_price", "保存这一行",
-               enabled=bool(bid_rows), reason="" if bid_rows else "还没有模型行"),
-        Action("token_plan.preview_report", "预览将上报的内容",
-               enabled=bool(preview_models),
-               reason="" if preview_models else "本地还没有任何底价"),
+        # CR-20261119-CLIENT-TOKENPLAN-NOOP：读清单同时**保存接入**（第 1 步与第 2 步
+        # 合成一颗按钮）——旧文案只写「读取模型清单」，客户以为读完就完事，实际上
+        # 桌面端根本没落盘，模型表永远空。
+        Action("token_plan.discover", "读取模型清单并保存接入"),
+        # F4：「点了没反应」是缺陷。这两颗不再置灰（置灰的按钮点了不播报），
+        # 前提不满足时由动作回一句人话（「先在上面的表格里选一行模型」…）。
+        Action("token_plan.save_price", "保存这一行"),
+        Action("token_plan.preview_report", "预览将上报的内容"),
         # 上报默认关闭（云端 ask-settings / quotes.models[] 未开通）：置灰 + 说清原因，
         # 绝不点下去假成功
         Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,

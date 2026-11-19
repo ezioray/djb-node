@@ -206,6 +206,9 @@ class DesktopController:
     discover_via: Callable[[str, str, str], Any] | None = None
     #: 最近一次「读取模型清单」的结果（``datasource.discover_upstream_models`` 原样）
     last_discover: Mapping[str, Any] | None = None
+    #: CR-20261119-CLIENT-TOKENPLAN-NOOP F3：最近一次「读取模型清单」的**人话结论**
+    #: （读到几个 + 有没有落成上游）。写进视图 note，不再依赖会被下一次刷新播报覆盖的状态条。
+    discover_message: str = ""
     #: 造 UpdateManager 的工厂（默认按本机 home 装；单测注入假管理器）
     update_factory: Callable[[], Any] | None = None
     #: 最近一次检查结果（``check()`` 原样 payload；界面/日志都用它）
@@ -261,7 +264,10 @@ class DesktopController:
                     merged_plan["selected_price"] = self._bids().price_of(selected_model)
                 except Exception:
                     merged_plan["selected_price"] = ""
-            if self.last_discover is not None:
+            if self.discover_message:
+                # F3：发现结论（含「已添加上游 / 未保存」）优先，且**常驻页面**
+                merged_plan["discover_note"] = self.discover_message
+            elif self.last_discover is not None:
                 merged_plan["discover_note"] = str(
                     (self.last_discover or {}).get("note") or "")
                 merged_plan["base_url"] = str(
@@ -963,27 +969,106 @@ class DesktopController:
         return self.run_discover(base_url, protocol, secret)
 
     def run_discover(self, base_url: str, protocol: str, secret: str) -> ActionResult:
-        """同步执行「读取模型清单」（worker 与无事件循环环境共用这一段）。"""
+        """读取模型清单，**并把读到的清单落成一条 A1 上游**（worker 与无事件循环环境共用）。
+
+        CR-20261119-CLIENT-TOKENPLAN-NOOP F1：0.3.10–0.3.13 只把清单放进内存
+        （``datasource.discover_upstream_models`` 明写「不写盘」），桌面端从来没有调用过
+        ``djb upstream add`` —— 于是模型表永远是空的、「保存这一行」永远置灰、客户点完
+        只看到页面被清空。这里补上落地这一跳：密钥只走 stdin（``--secret-stdin``），
+        不进 argv / 不进日志 / 不进报告。
+        """
         fn = getattr(self.source, "discover_upstream_models", None)
         if not callable(fn):
+            self.discover_message = ""
             return ActionResult("暂不可用（当前数据源不支持读取模型清单）", ok=False)
         try:
             result = fn(base_url, protocol, secret)
         except ProviderError as exc:
+            self.discover_message = ""
             return ActionResult("读取失败：" + exc.reason, ok=False)
         except Exception as exc:
+            self.discover_message = ""
             return ActionResult("读取失败（" + type(exc).__name__ + "）；未保存任何配置。",
                                 ok=False)
         self.last_discover = result
         error = str((result or {}).get("error_class") or "")
         if error:
+            self.discover_message = ""
             return ActionResult("读取失败：" + str((result or {}).get("note") or error), ok=False)
-        return ActionResult("读到 " + str((result or {}).get("total") or 0) + " 个模型（能对上目录 "
-                            + str((result or {}).get("mapped") or 0) + " 个）。",
-                            effect="refresh",
-                            payload={"state": "done",
-                                     "models": [row.get("model") for row
-                                                in (result or {}).get("models") or []]})
+        total = int((result or {}).get("total") or 0)
+        models = [str(row.get("model") or "") for row in (result or {}).get("models") or []
+                  if str(row.get("model") or "")]
+        head = ("读到 " + str(total) + " 个模型（能对上目录 "
+                + str((result or {}).get("mapped") or 0) + " 个）。")
+        if not models:
+            self.discover_message = head + " 上游没有返回任何模型，未创建接入。"
+            return ActionResult(self.discover_message, effect="refresh",
+                                payload={"state": "done", "models": [], "forget": []})
+        saved, forget = self._save_discovered_upstream(
+            str((result or {}).get("base_url") or base_url),
+            str((result or {}).get("protocol") or protocol), secret, models)
+        self.discover_message = head + " " + saved
+        return ActionResult(self.discover_message, effect="refresh",
+                            payload={"state": "done", "models": models, "forget": forget})
+
+    # ── CR-20261119-CLIENT-TOKENPLAN-NOOP：把「读到的清单」落成一条 A1 上游
+    def _upstream_endpoints(self) -> dict[str, str] | None:
+        """本机已有上游的 ``base_url → id``；拿不到就 ``None``（宁可不动，也不重复添加）。"""
+        if self.cli is None:
+            return None
+        try:
+            payload = self.cli(["upstream", "list"])
+        except Exception:                              # noqa: BLE001 - 读不到就当不可用
+            return None
+        rows = payload.get("upstreams") if isinstance(payload, Mapping) else None
+        endpoints: dict[str, str] = {}
+        for row in rows or []:
+            if not isinstance(row, Mapping):
+                continue
+            base = str(row.get("base_url") or "").strip().rstrip("/")
+            if base:
+                endpoints[base] = str(row.get("id") or "")
+        return endpoints
+
+    def _cli_with_stdin(self, argv: Sequence[str], stdin_text: str) -> Mapping[str, Any]:
+        """跑一条**需要 stdin** 的本机命令（密钥因此不出现在 argv 里）。"""
+        runner = self.cli
+        if runner is None:
+            raise ProviderError("本机命令通道未接通")
+        try:
+            payload = runner(argv, stdin_text=stdin_text)
+        except TypeError as exc:
+            # 老注入点只收一个参数：**绝不**退化成把密钥塞进 argv。
+            raise ProviderError("本机命令通道不支持安全写入密钥（不会把密钥放进命令行）") from exc
+        return payload if isinstance(payload, Mapping) else {}
+
+    def _save_discovered_upstream(self, base_url: str, protocol: str, secret: str,
+                                  models: Sequence[str]) -> tuple[str, list[str]]:
+        """把清单落成 A1 上游；返回（人话结论, 成功后要从表单里忘掉的字段）。"""
+        base = str(base_url or "").strip().rstrip("/")
+        existing = self._upstream_endpoints()
+        if existing is None:
+            return ("本机命令通道不可用：模型清单只显示，没有被保存（未创建上游）。", [])
+        if base and base in existing:
+            return ("这个请求地址已经接入过（" + existing[base]
+                    + "），没有重复添加。", ["upstream_secret"])
+        argv = ["upstream", "add", "--access", "A1", "--base-url", base,
+                "--models", ",".join(str(item) for item in models),
+                "--protocol", str(protocol or "openai-chat"),
+                "--secret-stdin"]
+        try:
+            payload = self._cli_with_stdin(argv, str(secret or "") + "\n")
+        except ProviderError as exc:
+            return ("清单读到了，但保存接入失败：" + str(exc.reason)
+                    + "（没有创建上游）。", [])
+        upstream = payload.get("upstream")
+        identifier = str(upstream.get("id") or "") if isinstance(upstream, Mapping) else ""
+        declared = payload.get("declare")
+        declared = declared if isinstance(declared, Mapping) else {}
+        tail = ("已申报到云端" if declared.get("declared") else
+                "暂未申报（" + str(declared.get("reason") or "服务端未确认") + "）")
+        return ("已添加上游 " + (identifier or "（新）") + "（A1 · " + base + "）；"
+                + tail + "。", ["upstream_secret"])
 
     def _act_token_plan_save_price(self, *, confirm=None) -> ActionResult:
         """第 3 步：把「最低申报价」写进选中那一行（本地账本，不上报）。"""

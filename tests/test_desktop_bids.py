@@ -175,12 +175,19 @@ def test_report_action_is_disabled_with_a_reason_while_the_cloud_is_closed():
     assert report.enabled is False and "上报开关关闭" in report.reason
 
 
-def test_preview_action_enables_only_when_something_is_priced():
+def test_save_and_preview_stay_clickable_so_a_click_is_never_silent():
+    """CR-20261119-CLIENT-TOKENPLAN-NOOP F4：置灰按钮点了不播报 = 「点了没反应」。
+
+    前提不满足时由**动作**回一句人话（下面两条单测验话术），界面不再靠置灰静音。
+    """
     empty = _plan_snapshot(bids={"rows": {}, "cloud": {"state": "pending"},
                                  "report_blocker": "关", "preview": {"models": []}})
     view = vw.build_view("token_plan", empty)
-    preview = next(action for action in view.actions if action.key == "token_plan.preview_report")
-    assert preview.enabled is False and "还没有" in preview.reason
+    for key in ("token_plan.save_price", "token_plan.preview_report"):
+        action = next(item for item in view.actions if item.key == key)
+        assert action.enabled is True
+    assert "保存接入" in next(item for item in view.actions
+                              if item.key == "token_plan.discover").label
 
 
 # ─────────────────────────────────────────────── 动作（本地保存 / 预览 / 上报）
@@ -271,6 +278,92 @@ def test_discover_runs_through_the_source_and_reports_counts():
     assert result.ok and "1 个模型" in result.message and "目录 1 个" in result.message
     assert source.calls == 1
     assert controller.last_discover["total"] == 1
+
+
+class _Cli:
+    """假本机命令通道：记录 argv / stdin（**密钥绝不出现在 argv 里**由下面的断言验）。"""
+
+    def __init__(self, *, upstreams=(), add_payload=None, add_error=None):
+        self._upstreams = [dict(item) for item in upstreams]
+        self._add_payload = add_payload
+        self._add_error = add_error
+        self.calls: list[tuple[list[str], str | None]] = []
+
+    def __call__(self, argv, stdin_text=None):
+        words = list(argv)
+        self.calls.append((words, stdin_text))
+        if words[:2] == ["upstream", "list"]:
+            return {"upstreams": [dict(item) for item in self._upstreams], "count": len(self._upstreams)}
+        if words[:2] == ["upstream", "add"]:
+            if self._add_error is not None:
+                raise ctrl_mod.ProviderError(self._add_error)
+            payload = dict(self._add_payload or {})
+            record = {"id": "up_new01", "access_type": "A1",
+                      "base_url": words[words.index("--base-url") + 1]}
+            payload.setdefault("upstream", record)
+            payload.setdefault("declare", {"declared": False, "reason": "daemon 未运行"})
+            self._upstreams.append(record)
+            return payload
+        raise AssertionError("意外的本机命令：" + " ".join(words))
+
+
+def _discovered_model_list():
+    return lambda base, proto, secret: {
+        "base_url": base, "protocol": proto, "error_class": None, "http_status": 200,
+        "latency_ms": 20, "mapped": 2,
+        "models": [{"model": "gpt-4o-mini", "canonical": "gpt-4o-mini", "state": "mapped"},
+                   {"model": "deepseek-chat", "canonical": None, "state": "unmapped"}],
+        "rejected": [], "total": 2, "note": ""}
+
+
+def test_discover_saves_the_upstream_and_keeps_the_secret_out_of_argv():
+    """F1：读完清单要真的落成一条 A1 上游；密钥只走 stdin。"""
+    cli = _Cli()
+    controller = ctrl_mod.DesktopController(_Source(_Store(), discover=_discovered_model_list()),
+                                            cli=cli)
+    controller.set_draft("base_url", "https://api.example.com/v1")
+    controller.set_draft("protocol", "openai-chat")
+    controller.set_draft("upstream_secret", "sk-unit-test-123456")
+    result = controller.action("token_plan.discover")
+
+    assert result.ok and "2 个模型" in result.message
+    assert "已添加上游 up_new01" in result.message
+    add = [call for call in cli.calls if call[0][:2] == ["upstream", "add"]]
+    assert len(add) == 1
+    words, stdin_text = add[0]
+    assert "sk-unit-test-123456" not in " ".join(words)        # 密钥不进 argv
+    assert "--secret-stdin" in words
+    assert stdin_text.strip() == "sk-unit-test-123456"         # 只经 stdin
+    assert words[words.index("--models") + 1] == "gpt-4o-mini,deepseek-chat"
+    assert words[words.index("--protocol") + 1] == "openai-chat"
+    assert result.payload["forget"] == ["upstream_secret"]     # 存好之后密钥框回空
+    assert controller.discover_message in result.message       # F3：结论常驻页面
+
+
+def test_discover_does_not_add_the_same_endpoint_twice():
+    cli = _Cli(upstreams=[{"id": "up_old", "base_url": "https://api.example.com/v1/"}])
+    controller = ctrl_mod.DesktopController(_Source(_Store(), discover=_discovered_model_list()),
+                                            cli=cli)
+    controller.set_draft("base_url", "https://api.example.com/v1")
+    result = controller.action("token_plan.discover")
+    assert "已经接入过" in result.message and "up_old" in result.message
+    assert not [call for call in cli.calls if call[0][:2] == ["upstream", "add"]]
+
+
+def test_discover_without_a_cli_channel_says_the_list_was_not_saved():
+    controller = ctrl_mod.DesktopController(_Source(_Store(), discover=_discovered_model_list()))
+    controller.set_draft("base_url", "https://api.example.com/v1")
+    result = controller.action("token_plan.discover")
+    assert result.ok and "没有被保存" in result.message
+
+
+def test_discover_reports_a_failed_save_without_claiming_success():
+    cli = _Cli(add_error="B 类接入必须显式 --kind")
+    controller = ctrl_mod.DesktopController(_Source(_Store(), discover=_discovered_model_list()),
+                                            cli=cli)
+    controller.set_draft("base_url", "https://api.example.com/v1")
+    result = controller.action("token_plan.discover")
+    assert "保存接入失败" in result.message and "没有创建上游" in result.message
 
 
 def test_discover_without_a_link_asks_for_it_first():

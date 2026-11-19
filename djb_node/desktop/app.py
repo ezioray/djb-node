@@ -337,6 +337,16 @@ class DesktopApp:
         self._detail: Any = None
         self._detail_columns: tuple[str, ...] = ()
         self._vars: dict[str, Any] = {}
+        #: CR-20261119-CLIENT-TOKENPLAN-NOOP F2：**本页**输入框上次的值（view key → {字段: 文本}）。
+        #: 每个动作都会整页重建，``prefill=False``/secret 的框一律从空串起 → 客户刚填的
+        #: 请求地址/密钥/价格在点击瞬间消失（「清空页面」）。重画前把本页的值留在这里，重画时带回。
+        self._form_keep: dict[str, dict[str, str]] = {}
+        #: 本轮动作要求「已经落盘、重画时别再带回」的字段（F5，密钥即用即清）
+        self._forget_keys: set[str] = set()
+        #: 下一次性渲染不许走「内容没变就跳过」（动作刚落地的结论必须上屏）
+        self._force_next_render: bool = False
+        #: 正在渲染的 view key（``_render`` 里钉住；``_render_field`` 取本页暂存值用）
+        self._render_view_key: str = ""
         #: RC15-039 #1：动作回投的字段级错误（key → 一句话）。切页/保存成功即清空——
         #: 上一页的红字绝不能跟到下一页（走查原话「跨页面残留」）。
         self._field_errors: dict[str, str] = {}
@@ -1523,7 +1533,27 @@ class DesktopApp:
             self._toast(str(getattr(result, "message", "") or "读取完成"),
                         ok=bool(getattr(result, "ok", False)))
             if bool(getattr(result, "ok", False)):
+                self._absorb_forget(result)
                 self._request_refresh_async(("token_plan",))
+
+    def _absorb_forget(self, result: Any) -> None:
+        """动作说「这些字段已经落盘」→ 立刻清框，并让下一次重画把结论画出来（F5/F3）。
+
+        异步通道（worker）的结果不走 ``_on_action``，这里补同一套处理：否则密钥会一直
+        留在框里，客户以为没保存。
+        """
+        payload = getattr(result, "payload", None)
+        forget = payload.get("forget") if isinstance(payload, Mapping) else None
+        self._forget_keys = {str(name) for name in (forget or [])}
+        for name in self._forget_keys:
+            variable = self._vars.get(name)
+            try:
+                if variable is not None:
+                    variable.set("")
+            except Exception:                      # noqa: BLE001 - 控件已销毁
+                continue
+        if self._forget_keys:
+            self._force_next_render = True
 
     # ── 双主题（day / night）
     def _theme_button_text(self, narrow: bool | None = None) -> str:
@@ -1914,6 +1944,29 @@ class DesktopApp:
         except Exception:                              # pragma: no cover - 控件已销毁
             pass
 
+    def _remember_form_values(self) -> None:
+        """把**当前页**输入框里的值存进 ``_form_keep``（重画前调用；CR-20261119 F2）。
+
+        只存本页可编辑字段；控件已销毁/值读不到就跳过。``_forget_keys`` 里的字段
+        （例如刚保存成功的密钥）**不存**，等于下次重画就清空。空串照存：客户主动清空
+        就是清空，不许被配置里的旧值顶回来。
+        """
+        view_key = getattr(self, "_render_view_key", "") or ""
+        entries = getattr(self, "_entries", None) or {}
+        if not view_key or not entries:
+            return
+        skip = getattr(self, "_forget_keys", set()) or set()
+        values: dict[str, str] = {}
+        for key, entry in entries.items():
+            if key in skip:
+                continue
+            try:
+                values[str(key)] = str(entry.get())
+            except Exception:                      # noqa: BLE001 - 控件已销毁
+                continue
+        # 整页覆盖（不是 update）：被 skip 的字段因此从暂存里消失。
+        self._form_keep[view_key] = values
+
     def _clear(self) -> None:
         for child in self._content.winfo_children():
             child.destroy()
@@ -1996,6 +2049,11 @@ class DesktopApp:
                 return False
         except Exception:                                  # pragma: no cover - 无窗口
             return False
+        # 有密码框被点成「显示」时**不许跳过**：跳过就等于没有人把掩码装回去，
+        # 上一次点开的明文会一直留在屏幕上（tests/test_desktop_reveal.py 的红用例）。
+        for button in getattr(self, "_reveal_buttons", {}).values():
+            if str(getattr(button, "text", "")) == "隐藏":
+                return False
         return True
 
     def _render(self, view: View, *, force: bool = False) -> None:
@@ -2009,10 +2067,13 @@ class DesktopApp:
         tk = self._tk
         kit = self._kit
         patched = with_field_errors(view, self._field_errors)
-        if not force and self._should_skip_render(patched):
+        if not force and not self._force_next_render and self._should_skip_render(patched):
             return
+        self._force_next_render = False
         view = patched
+        self._remember_form_values()                 # F2：先把客户已经打好的字留住
         self._last_view = view
+        self._render_view_key = view.key
         self._in_render = True
         self._rendered_narrow = self._is_narrow()
         self._rendered_two_col = self._two_col()
@@ -3093,7 +3154,11 @@ class DesktopApp:
         if field.editable:
             # 秘密与「只给掩码」的字段都不预填：输入框里的空串 = 不改（_config_for_save 口径）
             empty = field.secret or not getattr(field, "prefill", True)
-            variable = tk.StringVar(value="" if empty else field.value)
+            # F2：**本页**刚刚填过的值优先（客户点按钮/等刷新都不该把它抹掉）；
+            # 只认本页暂存，不读配置、不跨页串值。
+            kept = (self._form_keep.get(self._render_view_key) or {})
+            initial = kept[field.key] if field.key in kept else ("" if empty else field.value)
+            variable = tk.StringVar(value=initial)
             # RC14 I：协议用**只读下拉**（枚举值不可能非法；也免得客户手打错协议名）。
             if getattr(field, "choices", ()):
                 entry = ttk.Combobox(block, textvariable=variable,
@@ -3203,6 +3268,19 @@ class DesktopApp:
             except Exception:                            # 变量随旧视图销毁：跳过，不让动作静默不执行
                 continue
         result = self._controller.action(key, confirm=self._confirm)
+        # CR-20261119 F5：动作说「这些字段已经落盘了」→ 本轮重画就不再带回（密钥框回空）
+        payload = getattr(result, "payload", None)
+        forget = payload.get("forget") if isinstance(payload, Mapping) else None
+        self._forget_keys = {str(name) for name in (forget or [])}
+        # 即用即清：密钥已经落盘，框里不再留着（不靠「等下一次重画」——视图没变时
+        # ``_render`` 会跳过重画，那样客户会以为没生效）
+        for name in self._forget_keys:
+            variable = self._vars.get(name)
+            try:
+                if variable is not None:
+                    variable.set("")
+            except Exception:                      # noqa: BLE001 - 控件已销毁
+                continue
         # RC15-039 #1：动作带回**字段级错误**时，先落到本页再重画（保存成功后为空 = 清残留）。
         # 只有「表单类」动作会改这份状态：复制/打开目录之类的动作不许把红字顺手抹掉。
         fields = dict(getattr(result, "fields", {}) or {})
@@ -3229,12 +3307,16 @@ class DesktopApp:
             # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
             self._start_payout_submit(str(result.payload), result.message)
         elif result.effect in ("refresh", "access", "bench", "control", "reload", "filter"):
+            # 动作刚落地（有 forget ⇒ 真的写了盘）时强制重画：视图内容没变也得把新结论
+            # （「读到 N 个模型 / 已添加上游 …」）画出来，否则客户还是看到「没反应」。
+            self._force_next_render = bool(self._forget_keys)
             self._render(self._controller.current())
         elif fields:
             # 表单错误回来了，但这个 effect 自己不重画（例如收款提交）：补一次，
             # 否则「红字在数据里、屏幕上没有」——那还是 0.3.7 的「点了没反应」。
             self._render(self._controller.current())
         self._update_status()
+        self._forget_keys = set()
         # "copy" 漏在名单外 = 复制成功/失败都零反馈（S4：客户说「点了没反应」）
         if result.effect == "copy" and not copied:
             self._toast("复制失败：剪贴板写入被拒绝（可能有别的程序占着剪贴板），请再点一次",
@@ -3768,7 +3850,13 @@ def _make_cli_runner(home):
         home = resolve_home()
     home = os.fspath(home)
 
-    def run(argv):
+    def run(argv, stdin_text=None):
+        """跑一条本机命令。
+
+        ``stdin_text``：需要**安全投喂**的内容（上游密钥走 ``--secret-stdin``）。
+        有它就不接 DEVNULL，直接把文本写进子进程 stdin——密钥因此不进 argv、
+        不进 shell 历史、不进进程列表。
+        """
         import subprocess
         import sys
 
@@ -3781,12 +3869,16 @@ def _make_cli_runner(home):
             # 与 datasource._cli_runner 同一条规矩：子进程是我们自己的 CLI，它按 UTF-8
             # 写 stdout（cli.main()._enable_utf8_stdio），这里必须显式按 UTF-8 解，
             # 否则中文 Windows 上按 cp936 解会 UnicodeDecodeError → 动作区报错。
+            # 带 stdin 的那条是 ``upstream add``：它还要联网申报，20 s 常常不够。
+            timeout = 60 if stdin_text is not None else 20
             completed = subprocess.run(command, capture_output=True,
-                                       encoding="utf-8", errors="replace", timeout=20,
-                                       env=env, stdin=subprocess.DEVNULL, check=False,
+                                       encoding="utf-8", errors="replace", timeout=timeout,
+                                       env=env, input=stdin_text, check=False,
+                                       **({} if stdin_text is not None
+                                          else {"stdin": subprocess.DEVNULL}),
                                        **subprocess_window_kwargs())
         except subprocess.TimeoutExpired:
-            raise ProviderError("本地命令超时（20s）") from None
+            raise ProviderError("本地命令超时（" + str(timeout) + "s）") from None
         except OSError as exc:
             raise ProviderError("本地命令无法执行（" + type(exc).__name__ + "）") from None
         if completed.returncode != 0:

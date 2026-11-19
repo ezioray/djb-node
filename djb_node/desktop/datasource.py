@@ -1094,17 +1094,24 @@ class LocalDataSource:
                              "model_count": row.get("models"),
                              "verified_models": None, "max_qps": None,
                              "last_probe_at": None})
+        # CR-20261119-CLIENT-TOKENPLAN-NOOP F5：第 1 步回显**已保存**的那条接入。
+        # 只回显请求地址与协议（配置里本来就能读）；密钥永不回显，只报「本机已存」。
+        # 多于一条上游时不猜（留空 + 客户自己选），避免把 A 家的地址贴到 B 家的行上。
+        saved = [item for item in detail.values() if str(item.get("base_url") or "")]
+        saved_base = str(saved[0].get("base_url") or "") if len(saved) == 1 else ""
+        saved_protocol = str(saved[0].get("protocol") or "") if len(saved) == 1 else ""
         return {"upstreams": rows, "limits": dict(limits), "usage": usage,
                 "preset": str(profile.get("preset") or ""),
                 "node": {"node_id": node.get("node_id"), "bound": node.get("bound")},
                 "models": self._bid_models(detail),
                 "bids": self._bids_block(),
-                # 第 1 步的输入初值：协议默认 openai-chat（与 facts 一致）；链接/密钥留空，
-                # 密钥输入框永不预填（空 = 不改），这里只报「本机是否已存」。
-                "protocol": facts_mod.DEFAULT_UPSTREAM_PROTOCOL,
-                "base_url": "",
+                # 第 1 步的输入初值：协议默认 openai-chat（与 facts 一致）；链接回显已保存的
+                # 那条（没有就留空），密钥输入框永不预填（空 = 不改），只报「本机是否已存」。
+                "protocol": saved_protocol or facts_mod.DEFAULT_UPSTREAM_PROTOCOL,
+                "base_url": saved_base,
+                # 旧实现只看 ``status`` 里的行（它没有 protocol 字段）→ 存了也永远显示「未保存」
                 "secret_seen": "本机已存（不显示）" if any(
-                    row.get("protocol") for row in rows) else "未保存",
+                    item.get("protocol") for item in detail.values()) else "未保存",
                 "discover_note": "",
                 "note": note}
 
