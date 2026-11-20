@@ -1152,6 +1152,15 @@ class LocalDataSource:
             block["preview"] = payload
         except Exception as exc:            # 库坏了：底价区降级，不影响整页
             block["unavailable"] = "本地底价读不到（" + type(exc).__name__ + "）"
+            # 2026-11-20 真机：界面上只看到「未设价」，账本里明明有价 —— 就是因为
+            # 这里把异常吞成空 dict，界面上没有任何痕迹。事件里留下类型和首行原因，
+            # 视图再把 unavailable 显示出来，两处一起定位。
+            try:
+                from ..logging_setup import event as _event
+                _event("desktop.bids.unavailable", error=type(exc).__name__,
+                       detail=str(exc).splitlines()[0][:160] if str(exc) else "")
+            except Exception:
+                pass
             block["preview"] = {"models": [], "reason": "unavailable"}
             return block
         try:

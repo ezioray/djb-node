@@ -1793,6 +1793,16 @@ def _token_plan(snapshot: Snapshot) -> View:
         planned = "已设价 " + str(priced) + " / " + str(len(bid_rows)) + " 个模型"
     else:
         planned = "还没有上游模型：先填链接与密钥 → 读取模型清单"
+    # 2026-11-20：底价区不许再「静默为空」。两种真实现象都必须说出来：
+    #   ① 账本读不到（异常被吞）→ 直接显示原因；
+    #   ② 账本里有价、但一条都没对上模型表（id 不一致）→ 说明是映射问题，不是没设价。
+    ledger_rows = bids.get("rows") if isinstance(bids.get("rows"), Mapping) else {}
+    bid_unavailable = str(bids.get("unavailable") or "")
+    if bid_unavailable:
+        notes.append(bid_unavailable + "：底价区已降级；这一栏的「未设价」不代表你没设过价。")
+    elif ledger_rows and priced == 0:
+        notes.append("本机账本里有 " + str(len(ledger_rows)) + " 条底价，但没对上当前模型表"
+                     "（模型 id 不一致）：底价仍保存在本机，不会丢。")
     if cloud_pending:
         notes.append("云端「按模型设价」接口还没开通（ask-settings / quotes.models[]）："
                      "底价只保存在本机，上报按钮保持关闭，不会假成功。")
