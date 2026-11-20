@@ -369,7 +369,7 @@ def apply_theme(root, ttk, *, available_families=None):
     style.configure("PillPink.TLabel", background=PINK3, foreground=PINK_TEXT,
                     font=small, padding=(10, 4))
     # ── 按钮（命中区 ≥40）
-    style.configure("TButton", padding=(16, 10), focusthickness=2, font=body,
+    style.configure("TButton", padding=(18, 12), focusthickness=2, font=body,
                     background=TOKENS["surface"], foreground=TOKENS["ink"],
                     bordercolor=BORDER, lightcolor=TOKENS["surface"],
                     darkcolor=TOKENS["surface"])
@@ -380,7 +380,7 @@ def apply_theme(root, ttk, *, available_families=None):
               # hover 转紫（§2.1-2）；focus 优先，否则回落到控件边界色
               bordercolor=[("focus", TOKENS["focus"]), ("active", VIOLET_TEXT),
                            ("!focus", BORDER)])
-    style.configure("Primary.TButton", padding=(16, 10), font=body,
+    style.configure("Primary.TButton", padding=(18, 12), font=body,
                     background=TOKENS["mint"], foreground=TOKENS["white"],
                     bordercolor=TOKENS["mint"], lightcolor=TOKENS["mint"],
                     darkcolor=TOKENS["mint"])
@@ -394,7 +394,7 @@ def apply_theme(root, ttk, *, available_families=None):
               bordercolor=[("disabled", TOKENS["line2"]), ("focus", TOKENS["focus"])],
               lightcolor=[("disabled", TOKENS["line2"]), ("active", MINT_HOVER)],
               darkcolor=[("disabled", TOKENS["line2"]), ("active", MINT_HOVER)])
-    style.configure("Violet.TButton", padding=(16, 10), font=body,
+    style.configure("Violet.TButton", padding=(18, 12), font=body,
                     background=VIOLET, foreground=ON_VIOLET,
                     bordercolor=VIOLET, lightcolor=VIOLET, darkcolor=VIOLET)
     style.map("Violet.TButton",
@@ -404,7 +404,7 @@ def apply_theme(root, ttk, *, available_families=None):
               bordercolor=[("disabled", TOKENS["line2"]), ("focus", TOKENS["focus"])],
               lightcolor=[("disabled", TOKENS["line2"]), ("active", VIOLET_TEXT)],
               darkcolor=[("disabled", TOKENS["line2"]), ("active", VIOLET_TEXT)])
-    style.configure("Ghost.TButton", padding=(12, 8), font=small,
+    style.configure("Ghost.TButton", padding=(14, 9), font=small,
                     background=TOKENS["bg"], foreground=MINT_TEXT, bordercolor=TOKENS["bg"])
     style.map("Ghost.TButton",
               background=[("active", VIOLET3)],
