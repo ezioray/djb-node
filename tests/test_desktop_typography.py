@@ -305,7 +305,7 @@ def test_treeview_row_holds_the_glyphs_without_clipping():
 
 @needs_tk
 def test_default_font_option_points_at_the_named_body_font():
-    """§2.4：``option_add("*Font")`` 指向 ``DJB.Body``（**14px**，0.3.5 设计值），不再是 11pt 点值。"""
+    """§2.4：``option_add("*Font")`` 指向 ``DJB.Body``（**15px**，0.5.6 起；0.3.5 为 14px），不再是 11pt 点值。"""
     import tkinter as tk
     from tkinter import ttk
 

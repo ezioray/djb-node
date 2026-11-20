@@ -25,7 +25,7 @@
    （:func:`assert_text_ok` 会抛 :class:`TypographyError`，不做静默降级）。
 
 行高口径：``line`` 是**行盒高度**（px@96dpi，实际乘 ``scale``）；``table`` 这一档的 ``line``
-（28）同时就是 ``ttk.Treeview`` 的 ``rowheight``（01-FONT-TYPO §2.3，0.3.4 写死 26）。
+（30）同时就是 ``ttk.Treeview`` 的 ``rowheight``（01-FONT-TYPO §2.3，0.3.4 写死 26）。
 渲染层取它只有一处：``ui_kit.table_rowheight(scale)``（= :func:`scaled_line`），
 所以字号与行高同源、同一取整规则，缩放档下不会出现「字涨行不涨」。
 """
