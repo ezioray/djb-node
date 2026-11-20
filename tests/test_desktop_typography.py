@@ -40,11 +40,15 @@ def test_ui_kit_has_no_font_size_of_its_own():
 
 
 def test_cjk_min_size_is_eleven():
-    """§2.2：CJK 下限 11px（0.3.4 是 10px；8px 中文是 F1 的根因）。"""
+    """§2.2：CJK 下限仍是 11px（0.3.4 是 10px；8px 中文是 F1 的根因）。
+
+    2026-11-20 全档 +1px 后，最小的 sans 档 ``micro`` = 12，**高于**下限 1px；
+    下限本身不动（它是最低可读线，不是字阶的一档）。
+    """
     from djb_node.desktop import typography, ui_kit
 
     assert typography.CJK_MIN_PX == 11
-    assert ui_kit.px("micro") == 11        # 最小的 sans 档正好踩在下限上
+    assert ui_kit.px("micro") == 12        # 最小的 sans 档：12 > 下限 11
 
 
 @pytest.mark.parametrize("platform,head", [
