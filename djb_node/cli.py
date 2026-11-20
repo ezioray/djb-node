@@ -2424,7 +2424,13 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common(handler: Callable[[argparse.Namespace], int], name: str,
                    help_text: str) -> argparse.ArgumentParser:
         item = sub.add_parser(name, help=help_text, description=help_text)
-        item.add_argument("--home", help=argparse.SUPPRESS)
+        # 2026-11-20 真机：每个子命令都带一个同名 --home，且默认 None，会**覆盖**
+        # 全局 `djb --home X <cmd>` 解析出来的值（argparse 子解析器用自身默认值
+        # 写回 namespace）→ `--home` 被静默忽略，数据写到平台默认目录。
+        # 现象：CLI 与 GUI 各自读不同的 state.db（一个 %APPDATA%\DJB、一个 --home 指向的
+        # 目录），GUI 永远看不到 CLI 写的底价。SUPPRESS = 没显式给就不写这个属性，
+        # 全局值得以保留。
+        item.add_argument("--home", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
         item.add_argument("--json", action="store_true", help="输出 JSON")
         item.set_defaults(handler=handler)
         return item
