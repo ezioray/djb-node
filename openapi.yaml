@@ -2,7 +2,7 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: DJB Protocol API
-  version: 1.15.0
+  version: 1.16.0
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面 + S4 TokenRouter 加性字段（覆盖 M01–M14、M16–M18）
   description: "DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、\n契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。\n\n- 命名空间：`/v1/*` 为 OpenAI\
     \ 兼容网关面；`/api/v1/*` 为控制面（节点/用方/协议/后台）。\n- 可用性：`x-djb-availability` 标记「不是所有部署都提供」的面；`m03` = 仅 M03 网关装配\n  （`DJB_GATEWAY_M03=1`）时挂载，默认部署返回\
@@ -6694,6 +6694,50 @@ paths:
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/schedule/quotes/batch:
+    post:
+      tags:
+      - node
+      summary: 供方批量区间报价（节点侧，加性）
+      operationId: createQuoteBatch
+      description: '1.16.0 加性：一次提交多条 `(model, unit, 区间)` 报价，逐条独立成败。
+
+        与单条端点同一套校验与幂等语义；**部分失败不回滚已成功条目**（报价是短 TTL 数据，
+        失败条目客户端可重试）。总闸 `scheduling.model_bid` 关闭时本端点返回 404。
+
+        '
+      security:
+      - nodeClientKey: []
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/ProtocolVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteBatchRequest'
+      responses:
+        '200':
+          description: 批量结果（逐条 `ok`，HTTP 200 表示批次已处理）
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuoteBatchAck'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
   /api/v1/schedule/bids:
@@ -15399,17 +15443,23 @@ components:
           description: 该行来源的模型同步 bundle 版本（C17/M18）；缺省表示未同步。
         available:
           type: boolean
-          description: '当前是否可服务（C9，1.2.8）。服务端按「容量公告 + 已验证上游（state=verified）
+          description: '当前是否可服务（C9，1.2.8）。服务端按「容量公告 + 已验证上游（state=verified）」
 
-            且 verified_at 在新鲜窗口内」判定；字段缺省表示未计算/降级镜像，客户端不得推断为可用。
+            判定；首次探针通过后持续为 true，**不再**因 verified_at 超过新鲜窗口而变成 false。
+
+            复检只更新 probe.level（L2 新鲜 / L1 超窗），不改变可用性；字段缺省表示未计算/降级
+
+            镜像，客户端不得推断为可用。
 
             '
         probe:
           type: object
           additionalProperties: false
-          description: '可用性依据（C9，1.2.8）；只在服务端能给出时返回。reason 为 no_capacity / unverified /
+          description: '可用性依据（C9，1.2.8）；只在服务端能给出时返回。reason 只在 available=false
 
-            stale，available=true 时为 null。
+            时出现（no_capacity / unverified；stale 仅为旧服务端兼容）；available=true 时 reason 为 null。
+
+            fresh=false 只表示复检证据已超窗、level 降为 L1，不代表模型不可用。
 
             '
           properties:
@@ -15417,7 +15467,9 @@ components:
               type:
               - string
               - 'null'
-              description: 服务端已知的证明等级；S2 仅回传可用性，暂不宣称 L3+。
+              description: '证据等级（S2 暂不宣称 L3+）：L2=复检新鲜；L1=曾通过但复检超窗
+
+                （降级不摘除）。available=false 时可为 null。'
             verified_at:
               type:
               - string
@@ -15425,7 +15477,7 @@ components:
               format: date-time
             fresh:
               type: boolean
-              description: verified_at 是否在服务端新鲜窗口内（默认 900s）。
+              description: verified_at 是否在服务端新鲜窗口内（与 M02 同值，CHG-20261121-PROBE-DAILY 起 25h）；只影响 level，不影响 available。
             reason:
               type:
               - string
@@ -20151,6 +20203,88 @@ components:
             云端「报价设置」命中时以云端申报的模式为准（供方在门户的选择优先于节点自报）。
 
             '
+    QuoteBatchRequest:
+      type: object
+      additionalProperties: true
+      required:
+      - access
+      - models
+      - ttl_s
+      description: '1.16.0 加性：供方批量区间报价。`access`/`ttl_s` 对整个批次生效；
+        每条 `models[]` 自带 `model`/`unit` 与可选区间。'
+      properties:
+        node_id:
+          type: string
+          description: 可选；缺省按当前 `X-Client-Key` 对应节点。
+        access:
+          type: string
+          enum:
+          - A1
+          - A2
+          - B
+        ttl_s:
+          type: integer
+          minimum: 1
+          maximum: 86400
+        fee_mode:
+          type: string
+          enum:
+          - none
+          - add
+        models:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/QuoteBatchItemRequest'
+    QuoteBatchItemRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - model
+      - unit
+      properties:
+        model:
+          type: string
+        unit:
+          type: string
+        price_min:
+          $ref: '#/components/schemas/Amount'
+        price_max:
+          $ref: '#/components/schemas/Amount'
+    QuoteBatchItem:
+      type: object
+      additionalProperties: true
+      required:
+      - model
+      - ok
+      properties:
+        model:
+          type: string
+        ok:
+          type: boolean
+        quote:
+          $ref: '#/components/schemas/QuoteAck'
+        error:
+          $ref: '#/components/schemas/Error'
+    QuoteBatchAck:
+      type: object
+      additionalProperties: true
+      required:
+      - results
+      - created
+      - failed
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuoteBatchItem'
+        created:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
     QuoteAck:
       type: object
       additionalProperties: true
