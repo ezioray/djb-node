@@ -819,6 +819,72 @@ class DesktopController:
     def _act_access_reload(self, *, confirm=None) -> ActionResult:
         return self.probe_reload()
 
+    # ── R2-8：测试机遗留的 RC 云端地址 → 一键恢复生产（**必须客户确认**，绝不静默改）
+    def _act_gateway_restore_production(self, *, confirm=None) -> ActionResult:
+        """把 ``config.json`` 的 ``gateway_url`` 写回生产地址，然后重启节点让新地址生效。
+
+        为什么单独做一颗按钮而不是塞进首启自举：``ensure_ready`` 只修**占位符**，
+        客户机器上写过 RC 地址的不会被覆盖（这是有意为之——自建/内网部署也是合法配置）。
+        所以「切回生产」只能是**客户明确要**的动作：弹确认框写明「现在 → 改成」与影响，
+        取消则一个字节都不改。
+
+        写入顺序刻意如此：**先**确认、**再**写配置、**最后**重启；任何一步失败都把
+        「配置改没改」说清楚（改了一半不能让客户以为没动）。
+        """
+        from ..bootstrap import default_gateway, is_placeholder
+        from ..config import Paths, load_config, save_config
+
+        home = getattr(self.source, "_home", None)
+        if not home:
+            return ActionResult("本机配置目录不可用：没有改任何东西", ok=False)
+        paths = Paths(str(home))
+        try:
+            config = load_config(paths)
+        except Exception as exc:                        # noqa: BLE001 - 配置坏了别打崩 UI
+            return ActionResult("读不到本机配置（" + type(exc).__name__
+                                + "）：没有改任何东西", ok=False)
+        production = default_gateway()
+        current = str(getattr(config, "gateway_url", "") or "").strip()
+        if current.rstrip("/") == production.rstrip("/"):
+            return ActionResult("当前已经是生产地址（" + production + "），不需要恢复。",
+                                effect="refresh")
+        shown = current or "（空）"
+        if is_placeholder(current):
+            shown = "（占位符）" + shown
+        asked = ("把云端地址从 " + shown + " 改成生产地址 " + production + "？\n\n"
+                 "影响：只改本机 config.json 的 gateway_url，然后重启节点进程一次"
+                 "（约 5–10 秒断连）。本机凭据与网页端绑定都不变；"
+                 "改完如果连不上，可以在同一页把地址改回去。")
+        if not confirm(asked):
+            return ActionResult("已取消恢复（云端地址未改动，仍是 " + shown + "）。",
+                                ok=False, effect="cancelled")
+        try:
+            config.gateway_url = production
+            config.validate()
+            save_config(paths, config)
+        except Exception as exc:                        # noqa: BLE001
+            return ActionResult("写入云端地址失败（" + type(exc).__name__
+                                + "）：配置未改动，仍连 " + shown, ok=False)
+        # 配置已改：从这里开始所有失败都必须说「地址已改，只是没重启成功」。
+        if self.cli is None:
+            return ActionResult("云端地址已改成 " + production
+                                + "；本机命令通道未接通，没能重启节点——"
+                                "重启客户端后生效（绑定不受影响）。", effect="refresh")
+        try:
+            self.cli(["stop"])
+            self.cli(["start"])
+        except ProviderError as exc:
+            return ActionResult("云端地址已改成 " + production + "，但重启节点失败："
+                                + exc.reason + "；重启客户端后生效（看 logs/djb.log 排查）。",
+                                ok=False, effect="refresh")
+        except Exception as exc:                        # noqa: BLE001
+            return ActionResult("云端地址已改成 " + production + "，但重启节点失败（"
+                                + type(exc).__name__ + "）；重启客户端后生效。",
+                                ok=False, effect="refresh")
+        self.request_refresh(None)
+        return ActionResult("云端地址已恢复成生产地址（" + production
+                            + "），节点已重启；刷新一次看绑定与收益是否回来。", effect="refresh")
+
     # 共享 Token Plan 页：主操作只是「换视图 + 复用接入配置页的保存/回读」，
     # 不发新请求、不写真机配置 —— 真正的写入仍走 access.save 的那条老路。
     def _act_token_plan_open_access(self, *, confirm=None) -> ActionResult:

@@ -2076,8 +2076,51 @@ def _payout_state(access: Mapping[str, Any]) -> dict[str, Any]:
             "local": str(_mapping(access.get("config")).get("usdt_address") or "—")}
 
 
+#: R2-8：云端地址（``config.json`` 的 ``gateway_url``）的展示口径。
+#: 只读展示 + 明确确认后才改（改地址 = 换云端身份，静默改等于悄悄搬走客户的数据源）。
+GATEWAY_RESTORE_LABEL = "恢复生产地址"
+
+
+def _gateway_value(gateway: Mapping[str, Any]) -> str:
+    if not gateway.get("readable"):
+        return "暂不可用"
+    current = str(gateway.get("current") or "").strip()
+    if gateway.get("placeholder") or not current:
+        return "还没配置（占位符）"
+    return current
+
+
+def _gateway_tone(gateway: Mapping[str, Any]) -> str:
+    if not gateway.get("readable"):
+        return "muted"
+    if gateway.get("is_production"):
+        return "mint"
+    return "amber"
+
+
+def _gateway_hint(gateway: Mapping[str, Any]) -> str:
+    production = str(gateway.get("production") or "")
+    if not gateway.get("readable"):
+        return (str(gateway.get("error") or "本机配置读不到")
+                + "；地址不会被自动改动，修好配置后再看这里")
+    if gateway.get("is_production"):
+        return "生产地址 · 与官方一致（本机 config.json 的 gateway_url）"
+    if gateway.get("placeholder") or not str(gateway.get("current") or "").strip():
+        return ("还没配置过云端地址：首启会自动写成 " + production
+                + "；也可以点下面「" + GATEWAY_RESTORE_LABEL + "」立刻写成生产地址")
+    return ("与生产不一致（测试机/预发环境遗留）：官方生产地址是 " + production
+            + "。确认要切回生产就点下面「" + GATEWAY_RESTORE_LABEL + "」"
+            "——会改本机 config.json 并重启节点一次（约 5–10 秒断连），本机绑定不受影响")
+
+
+def _gateway_restorable(gateway: Mapping[str, Any]) -> bool:
+    """只有「读到了且不是生产地址」才给按钮：生产地址上没有可恢复的东西。"""
+    return bool(gateway.get("readable")) and not bool(gateway.get("is_production"))
+
+
 def _access(snapshot: Snapshot) -> View:
     access = _section(snapshot, "access")
+    gateway = access.get("gateway") if isinstance(access.get("gateway"), Mapping) else {}
     config = access.get("config") if isinstance(access.get("config"), Mapping) else {}
     binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
     bound = _binding_bound(binding)
@@ -2140,6 +2183,10 @@ def _access(snapshot: Snapshot) -> View:
                     "本页只存本机配置（0600）", "muted")),
         fields=(
             node_field,
+            # R2-8：云端地址是**只读事实**（客户要能看见「我这台在连哪」）。
+            # 与生产不一致时标琥珀色 + 一句「怎么改」，改法在下面的按钮里（要确认）。
+            Field("当前网关", _gateway_value(gateway), key="gateway_url",
+                  hint=_gateway_hint(gateway), tone=_gateway_tone(gateway)),
             # 只读排障字段：节点进程 / 注册状态（有则显示事实，无则写原因 + 下一步）
             Field("节点进程",
                   ("运行中" if daemon.get("running") else "未运行")
@@ -2180,6 +2227,11 @@ def _access(snapshot: Snapshot) -> View:
                               else "只有节点被云端清退后才需要（当前原因："
                                    + str(daemon.get("reason") or "—") + "）")),
                  Action("access.reload", "请求 daemon 重载"),
+                 # R2-8：只在不一致时出现；改地址会换云端身份，所以必须点开确认框再看一遍。
+                 *((Action("gateway.restore_production",
+                           "恢复生产地址（" + str(gateway.get("production") or "") + "）",
+                           group=GROUP_IDENTITY),)
+                   if _gateway_restorable(gateway) else ()),
                  # 搬走的两个入口在这里只留**指路**（不是按钮）：本页不能做，就别假装能做
                  Action("access.goto_account", "绑定与收款在「账户与安全」")),
         unavailable=_missing(snapshot, ("access",)),

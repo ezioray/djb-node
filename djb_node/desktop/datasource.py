@@ -1290,6 +1290,30 @@ class LocalDataSource:
                 return value, "store"
         return "", ""
 
+    def _gateway_block(self) -> Mapping[str, Any]:
+        """当前云端地址（``config.json`` 的 ``gateway_url``）与生产地址的对比（R2-8）。
+
+        背景：既有测试机把 RC/预发地址写进 config 后，``ensure_ready`` 只修**占位符**，
+        于是那台机器永远连 RC。界面必须让客户**看见**当前地址，并给一条「恢复生产」的
+        明确入口——但**绝不自动改**（改地址会换云端身份，必须人确认）。
+        """
+        from ..bootstrap import default_gateway, is_placeholder
+        from ..config import Paths, load_config
+
+        production = default_gateway()
+        block: dict[str, Any] = {"production": production, "current": "", "readable": False,
+                                 "placeholder": False, "is_production": False, "error": ""}
+        try:
+            config = load_config(Paths(str(self._home)))
+        except Exception as exc:                  # 配置坏了不该让整页降级
+            block["error"] = "本机配置读不到（" + type(exc).__name__ + "）"
+            return block
+        current = str(getattr(config, "gateway_url", "") or "").strip()
+        block.update({"current": current, "readable": True,
+                      "placeholder": bool(is_placeholder(current)),
+                      "is_production": current.rstrip("/") == production.rstrip("/")})
+        return block
+
     def _access_section(self) -> Mapping[str, Any]:
         config = self._access.load()
         binding: Mapping[str, Any] | None = None
@@ -1329,6 +1353,9 @@ class LocalDataSource:
         info: Mapping[str, Any] = status if isinstance(status, Mapping) else {}
         return {"config": config.display(), "valid": _valid(config) if saved else None,
                 "saved": saved, "binding": binding,
+                # R2-8：**只读**展示 config.json 里的云端地址（客户要能看见「我这台在连哪」）。
+                # 纯本地读、不改任何东西；恢复生产是单独的动作，必须客户明确确认。
+                "gateway": self._gateway_block(),
                 # 只增字段：``config`` 投影保持原样（秘密仍掩码），供旧调用方无痛
                 "node_id": resolved, "node_id_source": source,
                 # 三级回退每一级的可观测结论 + 节点进程状态：空 ID 时客户能自己看出卡在哪
