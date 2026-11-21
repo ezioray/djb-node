@@ -202,56 +202,49 @@ def test_probe_models_stops_at_deadline(clock):
         stub.stop()
 
 
-def test_periodic_interval_shape_before_cap(monkeypatch):
-    """退避曲线的**形状**没变（模型数分档 + 失败翻倍 + 6 h 上限），只是外面多了钳制。
+def test_daily_interval_ignores_model_count_and_failures():
+    """CHG-20261121-PROBE-DAILY：间隔恒为**一天**，与模型数/失败次数都无关。
 
-    把钳制上限临时放到 6 h，验的仍然是修前的公式；钳制本身由下一条用例钉。
+    修前这里锁的是退避曲线的**形状**（每 8 个模型一档 + 失败翻倍 + 6 h 上限）。
+    形状本身没错，错的是量级：450 s 基数上翻倍一次就回到 15 min，一轮失败当天仍会
+    再打十几次推理请求 —— 额度就是这样被打空的。日探针只有「今天/明天」两个答案，
+    稀疏度交给**跨天轮换**（每轮只探 1 个代表模型，见 tests/test_probe_daily.py）。
     """
-    monkeypatch.setattr(facts, "PROBE_PERIODIC_CAP_S", facts.PROBE_PERIODIC_MAX_S)
-    assert probe_mod.periodic_interval_s(0, 0) == facts.PROBE_PERIODIC_DEFAULT_S
-    assert probe_mod.periodic_interval_s(1, 0) == facts.PROBE_PERIODIC_DEFAULT_S
-    # 模型越多越稀疏（每 8 个一档）
-    assert probe_mod.periodic_interval_s(8, 0) == 2 * facts.PROBE_PERIODIC_DEFAULT_S
-    assert probe_mod.periodic_interval_s(20, 0) == 3 * facts.PROBE_PERIODIC_DEFAULT_S
-    # 失败指数退避
-    assert probe_mod.periodic_interval_s(1, 1) == 2 * facts.PROBE_PERIODIC_DEFAULT_S
-    assert probe_mod.periodic_interval_s(1, 2) == 4 * facts.PROBE_PERIODIC_DEFAULT_S
-    # 上限截断
-    assert probe_mod.periodic_interval_s(100, 9) == facts.PROBE_PERIODIC_MAX_S
-    assert probe_mod.periodic_interval_s(-3, -1) == facts.PROBE_PERIODIC_DEFAULT_S
+    assert facts.PROBE_DAILY_INTERVAL_S == 24 * 3600
+    for models, failures in ((0, 0), (1, 0), (8, 0), (20, 0),
+                             (1, 1), (1, 2), (100, 9), (-3, -1)):
+        assert probe_mod.periodic_interval_s(models, failures) \
+            == facts.PROBE_DAILY_INTERVAL_S, (models, failures)
+    # 入参保留只是为了不惊动状态渲染（failures 计数仍要显示），**不再参与**计算
+    assert probe_mod.periodic_interval_s(1000, 1000) == facts.PROBE_DAILY_INTERVAL_S
 
 
-def test_periodic_interval_never_crosses_half_fresh_window():
-    """P6 / E2E-12 不变式：任何组合都不得把下一轮推到新鲜度窗口的一半之外。
+def test_daily_interval_fits_inside_fresh_window():
+    """新的不变式：**一轮间隔 + 抖动上限 < 新鲜窗口**（修前是「间隔 ≤ 窗口一半」）。
 
-    修前实测：一次失败 → 1200 s > 窗口 900 s ⇒ 每周期固定掉 5 分钟容量；
-    两次失败 → 2400 s ⇒ 永久 0 容量，而客户端与云端都不报错（E2E-12）。
+    日探针把间隔顶到 24 h，所以唯一还能掉容量的情况是「计划没跑到」；只要
+    24 h + 30 min < 25 h，任何一轮失败/重启都不会让下一轮落在新鲜窗之外 ——
+    容量只会「下降」不会「静默归零」（E2E-12 的教训换了个形状仍在守）。
     """
-    cap = facts.PROBE_FRESH_S // 2
-    assert facts.PROBE_PERIODIC_CAP_S == cap
-    combos = ((0, 0), (1, 0), (8, 0), (20, 0), (1, 1), (1, 2), (100, 9), (-3, -1))
-    for models, failures in combos:
-        interval = probe_mod.periodic_interval_s(models, failures)
-        assert 60 <= interval <= cap, (models, failures, interval)
-    # C-01b：基础周期已改为 half-fresh(450 s) 本身，所以默认配置下每一档都等于 cap；
-    # 「基础值不得大于 cap」这条不变式由 test_periodic_base_never_exceeds_cap 钉住。
-    assert facts.PROBE_PERIODIC_DEFAULT_S <= cap
-    assert probe_mod.periodic_interval_s(0, 0) == cap
-    assert probe_mod.periodic_interval_s(1, 2) == cap
-    assert probe_mod.periodic_interval_s(100, 9) < facts.PROBE_PERIODIC_MAX_S
+    assert facts.PROBE_DAILY_INTERVAL_S + facts.PROBE_DAILY_JITTER_S < facts.PROBE_FRESH_S
+    assert facts.PROBE_DAILY_MIN_GAP_S <= facts.PROBE_DAILY_INTERVAL_S
+    # 报价窗口比公告窗口**更保守 300 s** 的老关系不变（只是两侧一起放大）
+    assert facts.PROBE_FRESH_S - facts.PROBE_FRESH_AFTER_S == 300
+    assert facts.PROBE_FRESH_AFTER_S < facts.PROBE_FRESH_S
 
 
 def test_periodic_base_never_exceeds_cap():
-    """C-01b：基础周期必须 ≤ half-fresh（修前 600 > 450，常量与实际行为自相矛盾）。
+    """D-R3-02 显示不变式仍在：基础周期 ≤ cap（否则状态行会渲染出越过上限的周期）。
 
-    这条不变式一旦破：状态行会渲染出「每 8 分钟」而 cap 是 7.5 分钟（显示值越过上限），
-    且「模型数缩放 / 失败退避」两个维度全被常量本身吃掉（永远只看到钳制后的同一个数）。
+    CHG-20261121-PROBE-DAILY：两侧同为一天（86400 s），且**不得超过新鲜窗口**。
     """
     assert facts.PROBE_PERIODIC_DEFAULT_S <= facts.PROBE_PERIODIC_CAP_S
-    assert facts.PROBE_PERIODIC_DEFAULT_S == facts.PROBE_FRESH_S // 2 == 450
-    assert facts.PROBE_PERIODIC_CAP_S == 450
+    assert facts.PROBE_PERIODIC_DEFAULT_S == facts.PROBE_PERIODIC_CAP_S \
+        == facts.PROBE_DAILY_INTERVAL_S
+    assert facts.PROBE_PERIODIC_CAP_S < facts.PROBE_FRESH_S
     for models, failures in ((0, 0), (8, 0), (1, 1), (100, 9)):
-        assert probe_mod.periodic_interval_s(models, failures) <= 450
+        assert probe_mod.periodic_interval_s(models, failures) \
+            <= facts.PROBE_PERIODIC_CAP_S
 
 
 def test_probe_deadline_is_clock_injected(clock):

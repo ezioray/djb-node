@@ -838,8 +838,9 @@ class LocalDataSource:
         fresh / announceable`` 摊平，并补上 ``upstream_id`` 与 ``base_url``（``probe_details``
         只有模型维度，页面要按上游分组，也才能说清「哪个 Key 的哪个模型不行」）。
 
-        两个新鲜窗口都带上（E16）：``PROBE_FRESH_S``=900 s 管容量公告，
-        ``PROBE_FRESH_AFTER_S``=600 s 管报价——页脚那句解释的数字只能来自 facts。
+        两个新鲜窗口都带上（E16）：``PROBE_FRESH_S`` 管容量公告、
+        ``PROBE_FRESH_AFTER_S`` 管报价——页脚那句解释的数字只能来自 facts
+        （CHG-20261121-PROBE-DAILY 起是 25 h / 24 h55m，**别在这里写死数字**）。
         """
         from .. import facts as facts_mod
         from ..config import Paths

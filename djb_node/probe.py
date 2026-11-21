@@ -31,16 +31,19 @@ L1（``GET /models``）的 URL 不随协议变化（Anthropic 也有 ``/v1/model
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Iterable
 
 from . import facts
 from . import upstream_protocols as up
 from .httpclient import HttpClient, join_url
 from .util import utcnow
+
+_EPOCH_DATE = date(1970, 1, 1)
 
 
 @dataclass
@@ -414,23 +417,94 @@ def probe_models(base_url: str, models: Iterable[str], *, credential: str | None
     return outcomes
 
 
-def periodic_interval_s(model_count: int, failures: int) -> int:
-    """周期复探间隔（秒）：基础 7.5 min（= 新鲜度一半）；模型越多越稀疏；连续失败指数退避。
+def periodic_interval_s(model_count: int = 0, failures: int = 0) -> int:
+    """到下一次日探针的秒数（CHG-20261121-PROBE-DAILY）。
 
-    **上界 = ``facts.PROBE_PERIODIC_CAP_S``（新鲜度的一半，450 s）**（P6 / E2E-12）：
-    退避与模型数缩放都不得把下一轮推到新鲜度窗口之外，否则「探针失败一次」就等于
-    「公告窗口必然过期」——实测 Windows 上一次失败退避到 1200 s（窗口 900 s），
-    每个周期固定掉 5 分钟容量；两次失败 2400 s 后永久 0 容量，且两侧都不报错。
+    **语义已变**：修前是「周期复探间隔」——基础 7.5 min、按模型数缩放、按失败指数退避，
+    上界钳到新鲜度一半（450 s）。现在只有「今天」和「明天」两个答案：
+    每链接每天 1 轮，所以这里恒返回 :data:`facts.PROBE_DAILY_INTERVAL_S`（86400）。
 
-    钳制后行为：常规配置下一律 ≤ 450 s（= 900//2，ROUND3 起基础值也取 450，见
-    ``facts.PROBE_PERIODIC_DEFAULT_S``），所以一次抖动也只会掉一次、下一轮必然在窗口内
-    复探回来；上限仍受 ``PROBE_PERIODIC_MAX_S`` 约束（仅当 ``PROBE_PERIODIC_CAP_S``
-    被放大时，模型数缩放与退避才可能生效）。
-    回滚：把最后一行改回上界 ``facts.PROBE_PERIODIC_MAX_S`` 即恢复旧退避曲线。
+    为什么把退避整段删掉而不是留个下限：额度是被**周期**烧掉的（450 s × 全模型 ≈ 2 000+
+    请求/天，见 `changes/CHG-20261121-PROBE-QUOTA-BURN.md`）。退避在「分钟级」和「小时级」
+    之间抖动，仍然是同一个量级；日探针的失败处理只有「当天补一次、然后等次日」
+    （``facts.PROBE_DAILY_MAX_ATTEMPTS`` + ``PROBE_DAILY_RETRY_DELAY_S``），由 daemon 的
+    调度器负责，不在本函数里做曲线。
+
+    ``model_count`` / ``failures`` 保留在签名里只为了不惊动调用方与状态渲染
+    （``djb status`` 会显示 ``failures`` 计数）；两者**不再影响**返回值 —— 票面要求
+    「每链接每天 1 次」与「模型越多越稀疏」互斥，后者是旧额度模型下的产物。
+    回滚：恢复修前的 ``DEFAULT * scale * 2**shift`` 曲线并把 CAP 改回 half-fresh。
     """
-    count = max(0, int(model_count or 0))
-    scale = 1 + count // max(1, int(facts.PROBE_MODELS_PER_STEP))
-    shift = min(max(0, int(failures or 0)), int(facts.PROBE_MAX_BACKOFF_SHIFT))
-    raw = int(min(facts.PROBE_PERIODIC_MAX_S,
-                  facts.PROBE_PERIODIC_DEFAULT_S * scale * (2 ** shift)))
-    return max(60, min(raw, int(facts.PROBE_PERIODIC_CAP_S)))
+    del model_count, failures                  # 显式声明「入参不再参与调度」
+    return int(facts.PROBE_DAILY_INTERVAL_S)
+
+
+def day_index(moment: datetime) -> int:
+    """``moment`` 所在 UTC 日的序号（1970-01-01 起算的天数）。
+
+    日探针的「日期轮换」用它当游标：同一天内重试/重启游标不变 ⇒ 代表模型不变；
+    跨天 +1 ⇒ 换下一个模型。用 UTC 日（不是本地日）是因为节点内部时钟全是 UTC
+    （``util.utcnow``），时区只在渲染层处理。
+    """
+    return (moment.date() - _EPOCH_DATE).days
+
+
+def seconds_of_day(moment: datetime) -> int:
+    """``moment`` 在当天的秒数（0–86399）。"""
+    return moment.hour * 3600 + moment.minute * 60 + moment.second
+
+
+def daily_offset_s(material: str, span: int = facts.PROBE_DAILY_JITTER_S) -> int:
+    """从稳定材料派生 [0, ``span``) 的稳定偏移（秒）。
+
+    用 ``sha256`` 而不是内置 ``hash()``：后者对 str 加了进程随机盐（``PYTHONHASHSEED``），
+    重启就变 —— 而「重启不换时刻」是票面不变量。也不引 ``random``：测试要可复现，
+    且同一份配置在两次部署之间应当落到同一个时刻（可预测地分散，而不是每次重抽）。
+    """
+    limit = max(1, int(span))
+    digest = hashlib.sha256(material.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % limit
+
+
+def daily_slot_offset(moment: datetime, material: str) -> int:
+    """该链接**固定的每天探针时刻**（当天的秒数）= 首启时刻 + 0–30 min 稳定抖动。
+
+    首启那一刻决定之后每天的时刻（``PROBE_DAILY_JITTER_S`` 只用来把同一批次安装的
+    客户端摊开，避免同一把上游 key 在同一分钟被打成尖峰）；落盘后不再重算，
+    所以「当天固定、下一天同一时刻」与「重启不换时刻」同时成立。
+    """
+    jitter = daily_offset_s(material, facts.PROBE_DAILY_JITTER_S)
+    return (seconds_of_day(moment) + jitter) % (24 * 3600)
+
+
+def next_daily_at(moment: datetime, offset_s: int, *,
+                  min_gap_s: float | None = None) -> datetime:
+    """下一个 ≥ ``moment`` 且满足最小间隔的「当天 ``offset_s`` 秒」时刻。
+
+    * 严格**晚于** ``moment``（等于也不算到点，避免刚探完又立刻重排）；
+    * 与 ``moment`` 的间隔不得小于 ``min_gap_s``（默认 ``PROBE_DAILY_MIN_GAP_S`` = 20 h）：
+      首启时当天槽位可能只差几分钟，本下限把计划轮推到次日 ⇒ 当日只有一轮；
+    * 跨度上限由调用方保证：槽位 = 首启时刻 ± 抖动，所以相邻两轮间隔
+      ∈ (24 h − 30 min, 24 h + 30 min) < ``PROBE_FRESH_S``(25 h)。
+    """
+    gap = facts.PROBE_DAILY_MIN_GAP_S if min_gap_s is None else float(min_gap_s)
+    candidate = moment.replace(hour=0, minute=0, second=0, microsecond=0) \
+        + timedelta(seconds=int(offset_s) % (24 * 3600))
+    step = timedelta(days=1)
+    if candidate <= moment:
+        candidate += step
+    while (candidate - moment).total_seconds() < gap:
+        candidate += step
+    return candidate
+
+
+def pick_daily_model(models: Iterable[str], day: int) -> str | None:
+    """按日期轮换取**一个**代表模型（票面「每轮每链接只探 1 个模型」）。
+
+    排序后再取模：同一份清单在同一 ``day`` 上永远选出同一个模型（重启/重试不换），
+    跨天 +1 换下一个。输入为空返回 ``None``（调用方据此跳过该链接，不算失败）。
+    """
+    ordered = sorted({str(model) for model in models if str(model)})
+    if not ordered:
+        return None
+    return ordered[int(day) % len(ordered)]

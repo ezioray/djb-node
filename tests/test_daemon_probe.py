@@ -28,6 +28,15 @@ def _chat_count(mock) -> int:
                 if item.get("path") == "/v1/chat/completions"])
 
 
+def _due(daemon, clock) -> None:
+    """把注入时钟推到日计划的「下一轮」之后一格（CHG-20261121-PROBE-DAILY）。
+
+    修前各处直接 ``advance(PROBE_PERIODIC_CAP_S + 1)``；日探针下这个数（450 s）已经不是
+    「一个周期」，下一轮由落盘计划给出 —— 测试跟着计划走，才不会把常量抄第二遍。
+    """
+    clock.advance(max(0.0, (daemon._next_probe_at - clock()).total_seconds()) + 1)
+
+
 # ─────────────────────────────────────────────────────────── 开关三字段（C-01b）
 def _clean_config(mock) -> ClientConfig:
     """干净 home 的配置：**不写** feature_flags，走登记表默认值（真机客户就是这个形态）。"""
@@ -48,10 +57,16 @@ def test_status_exposes_flag_with_three_fields(paths, store, credentials, mock, 
         assert flag["expire_at"] == "2027-06-30T00:00:00+08:00"
         assert flag["rollback_rule"]
         assert status["probe"]["periodic_enabled"] is True
-        # P6 + C-01b：基础周期已降到 half-fresh ⇒ 间隔 == cap == 450，且**永不越过 cap**
-        assert status["probe"]["interval_s"] == facts.PROBE_PERIODIC_CAP_S == 450
+        # CHG-20261121-PROBE-DAILY：周期从 half-fresh(450 s) 改成**一天**，
+        # 间隔 == cap == 86400，且**永不越过 cap**（显示值与上限仍是同一条不变式）。
+        assert facts.PROBE_PERIODIC_CAP_S == facts.PROBE_DAILY_INTERVAL_S
+        assert status["probe"]["interval_s"] == facts.PROBE_PERIODIC_CAP_S
         assert status["probe"]["cap_s"] == facts.PROBE_PERIODIC_CAP_S
         assert status["probe"]["next_at"]
+        # 日计划可见：固定时刻 + 当天已用轮次（「一天只探一次」可审计）
+        daily = status["probe"]["daily"]
+        assert 0 <= daily["slot_offset_s"] < 24 * 3600
+        assert daily["max_attempts"] == facts.PROBE_DAILY_MAX_ATTEMPTS
     finally:
         daemon.stop()
 
@@ -65,9 +80,10 @@ def test_default_on_reprobes_without_any_flag_setting(paths, store, credentials,
     daemon.start()
     try:
         baseline = _chat_count(mock)
-        clock.advance(facts.PROBE_PERIODIC_CAP_S + 1)        # 越过一个周期
+        _due(daemon, clock)                                  # 到日计划的下一轮
         daemon.tick(clock())
-        assert _chat_count(mock) > baseline
+        # 日探针：**一个链接一天一轮、一轮一个模型** ⇒ 恰好 +1 次推理请求
+        assert _chat_count(mock) == baseline + 1
         assert daemon._last_probe["reason"] == "periodic"
     finally:
         daemon.stop()
@@ -179,9 +195,9 @@ def test_periodic_on_reprobes_when_due(paths, store, credentials, mock, clock):
     daemon.start()
     try:
         baseline = _chat_count(mock)
-        clock.advance(facts.PROBE_PERIODIC_DEFAULT_S + 1)
+        _due(daemon, clock)
         daemon.tick(clock())
-        assert _chat_count(mock) > baseline
+        assert _chat_count(mock) == baseline + 1
         assert daemon._last_probe["reason"] == "periodic"
         assert daemon._probe_failures == 0
         assert daemon.status()["probe"]["next_at"] is not None
@@ -189,40 +205,58 @@ def test_periodic_on_reprobes_when_due(paths, store, credentials, mock, clock):
         daemon.stop()
 
 
-def test_periodic_failure_backoff_never_crosses_half_fresh(paths, store, credentials,
-                                                            mock, clock):
-    """失败仍然计数（退避语义在），但**间隔不得越过新鲜度的一半**（P6 / E2E-12）。
+def test_failure_retries_once_per_day_then_waits_for_next_day(paths, store, credentials,
+                                                             mock, clock):
+    """失败**不缩到分钟级**：当日只补 1 次（默认 1 h 后），之后等次日（票面不变量）。
 
-    修前这里断言 1200 / 2400 s：那正是「每周期掉 5 分钟容量 → 永久 0 容量」的根因。
+    CHG-20261121-PROBE-DAILY 之前这里断言的是「指数退避但不越过 half-fresh」——
+    那正是额度燃烧的另一半：450 s 周期下 1200 / 2400 s 的重试仍落在**同一天**，
+    一轮失败当天就能再打十几次推理请求。日探针的失败处理只有「今天补一次、明天见」。
     """
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock, clock=clock,
                      config=_flag_config(mock, True))
-    cap = facts.PROBE_FRESH_S // 2
     daemon.start()
     try:
         mock.chat_status = 500                          # L1 可达、推理失败
-        clock.advance(facts.PROBE_PERIODIC_DEFAULT_S + 1)
+        _due(daemon, clock)
         daemon.tick(clock())
         assert daemon._probe_failures == 1
-        assert daemon._probe_interval_s <= cap
-        # 下一轮：失败继续计数，但间隔仍被钳住（不再翻倍到 1200/2400 s）
-        clock.advance(daemon._probe_interval_s + 1)
+        plan = daemon.status()["probe"]["daily"]
+        assert plan["next_kind"] == "retry" and plan["attempts"] == 1
+        # 重试排在 1 h 后（既不是 5 s 空转，也不是下一个分钟级周期），且**仍当天**
+        delta = (daemon._next_probe_at - clock()).total_seconds()
+        assert abs(delta - facts.PROBE_DAILY_RETRY_DELAY_S) < 2
+        assert daemon._next_probe_at.date() == clock().date()
+        # 到点重试：当天额度（2）用尽 ⇒ 下一轮直接排到次日同一时刻
+        clock.advance(delta + 1)
         daemon.tick(clock())
         assert daemon._probe_failures == 2
-        assert daemon._probe_interval_s <= cap
-        # 上游恢复后失败计数归零，间隔仍在 half-fresh 之内
+        assert daemon.status()["probe"]["daily"]["next_kind"] == "daily"
+        assert daemon._next_probe_at.date() > clock().date()
+        # 当天不再有第三轮（把时钟再推 3 h 也不会发请求）
+        settled = _chat_count(mock)
+        clock.advance(3 * 3600)
+        daemon.tick(clock())
+        assert _chat_count(mock) == settled
+        # 次日恢复：失败计数归零（正常轮次）
         mock.chat_status = 200
-        clock.advance(daemon._probe_interval_s + 1)
+        _due(daemon, clock)
         daemon.tick(clock())
         assert daemon._probe_failures == 0
-        assert daemon._probe_interval_s <= cap
+        assert daemon.status()["probe"]["daily"]["attempts"] == 1
     finally:
         daemon.stop()
 
 
-def test_periodic_interval_scales_with_model_count(paths, store, credentials, mock,
-                                                   clock):
+def test_interval_is_one_day_and_one_model_per_round(paths, store, credentials, mock,
+                                                     clock):
+    """日探针两条不变量：间隔恒为一天；**模型再多，一轮也只有 1 次推理请求**。
+
+    修前这条锁的是「10 个模型 ⇒ 间隔按 PROBE_MODELS_PER_STEP 放大」：模型越多越稀疏，
+    但 450 s 基数下仍是分钟级请求量（10 个模型 × 每天 192 轮 ≈ 1920 请求/天），
+    正是额度被打空的直接原因。现在稀疏度体现在**跨天轮换**，不体现在日内间隔。
+    """
     models = ["mock-model"] + ["m%d" % index for index in range(9)]   # 共 10 个
     store.add_upstream(upstream_id="u1", access_type="A2",
                        base_url=mock.upstream_base_url,
@@ -232,12 +266,17 @@ def test_periodic_interval_scales_with_model_count(paths, store, credentials, mo
                      config=_flag_config(mock, True))
     daemon.start()
     try:
-        clock.advance(facts.PROBE_PERIODIC_DEFAULT_S * 2 + 1)
+        assert periodic_interval_s(10, 0) == periodic_interval_s(1, 0) \
+            == facts.PROBE_DAILY_INTERVAL_S
+        assert periodic_interval_s(10, 3) == facts.PROBE_DAILY_INTERVAL_S  # 失败不再退避
+        baseline = _chat_count(mock)
+        _due(daemon, clock)
         daemon.tick(clock())
-        expected = periodic_interval_s(10, daemon._probe_failures)
-        assert daemon._probe_interval_s == expected
-        # P6：模型数缩放与退避一起被钳在 half-fresh 之内（修前这里是 ≥ 2×默认 600）
-        assert expected <= facts.PROBE_FRESH_S // 2
+        assert _chat_count(mock) == baseline + 1, "10 个模型 enabled 也只许 1 次推理请求"
+        # 另外 9 个模型按日期轮换没探 ⇒ **不是** backlog（记 budget 会 5 s 续跑，
+        # 又把额度烧回去）。轮换原因串在 tests/test_probe_daily.py 里对 not_probed 断言。
+        assert daemon._last_probe["backlog"] == 0, "轮换不是 backlog（不许 5 s 续跑）"
+        assert daemon._last_probe["probed"] == 1
     finally:
         daemon.stop()
 
@@ -250,7 +289,7 @@ def test_failed_reprobe_zeroes_announced_capacity(paths, store, credentials, moc
     try:
         assert mock.heartbeats[-1]["capacity"][0]["max_qps"] > 0
         mock.chat_status = 500
-        clock.advance(facts.PROBE_PERIODIC_DEFAULT_S + 1)
+        _due(daemon, clock)
         daemon.tick(clock())
         assert store.upstream("u1").state == "rejected"
         assert mock.heartbeats[-1]["capacity"][0]["max_qps"] == 0.0
@@ -266,7 +305,9 @@ def test_flag_off_keeps_manual_probe_path(paths, store, credentials, mock, clock
     daemon.start()
     try:
         assert daemon.status()["probe"]["periodic_enabled"] is False
-        clock.advance(16 * 60)                           # 超过 15 min 新鲜窗口
+        # CHG-20261121-PROBE-DAILY：本地新鲜窗口同步放到 25 h（云端同值），
+        # 所以「过期」不能再拿 15 min 当界；越过窗口才该掉容量。
+        clock.advance(facts.PROBE_FRESH_S + 60)
         daemon.tick(clock())                             # 心跳刷新容量：已过期
         assert mock.heartbeats[-1]["capacity"][0]["max_qps"] == 0.0
         result = daemon.probe_now(reason="manual")       # 手动 probe 仍可用

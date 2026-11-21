@@ -112,6 +112,65 @@ class ModelEntry:
         return self.enabled and self.verified() and self.fresh(now)
 
 
+def record_age_s(record: UpstreamRecord, now: Any) -> float | None:
+    """上游**最近一轮**探针距今秒数；从未探过返回 ``None``。"""
+    stamp = parse_iso(record.last_probe_at or "")
+    if stamp is None:
+        return None
+    return (now - stamp).total_seconds()
+
+
+def covered(record: UpstreamRecord, entry: ModelEntry, now: Any, *,
+            ttl: int | None = None) -> bool:
+    """模型级证据是否仍可采信（日探针口径；CHG-20261121-PROBE-DAILY）。
+
+    每链接每天只探 **1 个代表模型**（``probe.pick_daily_model``），所以「模型自己今天被实探过」
+    这件事不再天天成立。门控因此有两条来源，任一成立即算「有新鲜证据」：
+
+    1. **实探新鲜且通过**：模型自己的 ``last_probe_at`` 在 ``ttl``（默认 ``PROBE_FRESH_S``）内
+       **且**该次结论是 L2 通过（``inference_ok is True``）；
+    2. **链接级覆盖**：上游本轮通过（``state != rejected`` 且上游 ``last_probe_at`` 在
+       ``ttl`` 内）**且**该模型上次结论是 L2 通过（``inference_ok is True``）
+       **且**那份结论不超过 ``PROBE_MODEL_MAX_AGE_S``（7 天）。
+
+    第 2 条与云端同口径：云端 ``verified_at`` 是**按上游**存的，``_verified_pairs`` 会把
+    ``node_upstreams.models``（申报清单）整条展开 —— 「上游今天通过」对云端等于
+    「申报的每个模型都新鲜」。本地若坚持只认模型级时间戳，就会出现
+    「云端认（容量还在）而节点自己不发（max_qps=0）」的单边掉档，且**没有任何自动恢复路径**。
+
+    第 3 条（7 天上限，lead 2026-11-21 复核补充）是这条继承的刹车：没有它，一个**已经坏掉
+    但没轮到**的模型会被「上游健康」永久带住，用户看到「可公告」、实际打过去 4xx。
+    超过 7 天未被实探的模型自然掉容量 —— 这是日频采样换额度的明示代价（票面 §3 风险）。
+
+    注意本函数**不伪造新鲜度**：它不改 ``last_probe_at``，只在读取侧决定「这条证据还算不算数」；
+    ``probe_details()`` 同时给出忠实的 ``fresh`` 与本口径的 ``covered``/``announceable``。
+    """
+    window = int(facts.PROBE_FRESH_S if ttl is None else ttl)
+    # 注意 ``verified()`` 不能省（lead 2026-11-21 复核阻断）：L2 失败/未知**也会**写
+    # ``last_probe_at``，只判 ``fresh()`` 会把「刚探过但推理失败/没结论」的模型算成
+    # 「有新鲜证据」⇒ 公告/报价误放行（比 CHG 之前的 ``ModelEntry.announceable()`` 还松，
+    # 是本次改动引入的回归）。两条分支都必须以「L2 通过」为前提。
+    if entry.verified() and entry.fresh(now, ttl=window):
+        return True
+    if not entry.verified():                       # inference_ok is not True：没有正面证据
+        return False
+    if record.state == "rejected":                 # 本轮整条被拒（含不可达）
+        return False
+    age = entry.probe_age_s(now)
+    if age is None or age > facts.PROBE_MODEL_MAX_AGE_S:
+        return False                               # 模型自身结论太旧：不再继承链接级健康
+    record_age = record_age_s(record, now)
+    if record_age is None or record_age > window:
+        return False                               # 上游这一轮也过期了
+    return True
+
+
+def coverage_announceable(record: UpstreamRecord, entry: ModelEntry, now: Any,
+                          *, ttl: int | None = None) -> bool:
+    """``covered()`` + 「模型启用」：公告/报价共用的唯一门控出口。"""
+    return bool(entry.enabled) and covered(record, entry, now, ttl=ttl)
+
+
 def _optional_bool(value: Any) -> bool | None:
     return bool(value) if isinstance(value, bool) else None
 
@@ -464,7 +523,8 @@ class UpstreamManager:
 
     def probe(self, upstream_id: str, *, timeout: float | None = None,
               level: str | None = None, now: Any = None,
-              deadline: Any = None, clock: Callable[[], Any] | None = None
+              deadline: Any = None, clock: Callable[[], Any] | None = None,
+              daily_day: int | None = None
               ) -> dict[str, Any]:
         """L1（/models）+ 逐模型 L2/L3，结论写回本地模型 JSON。
 
@@ -475,6 +535,13 @@ class UpstreamManager:
         ``not_probed[]{model, reason}``（没探的及原因）；旧服务端忽略未知字段。
         L2/L3 细节（inference_ok / stream_ok / usage_ok / token_usage /
         probe_version / last_probe_at）只落本地：`probe_details()` 可读。
+
+        ``daily_day``（CHG-20261121-PROBE-DAILY）：传了就是一个**日探针轮次** ——
+        L1（一次 ``GET /models``，不计推理额度）照旧覆盖全部 enabled 模型，
+        L2/L3 只打 **1 个代表模型**（``probe.pick_daily_model`` 按日期从 L1 清单里轮换）。
+        没轮到的模型进 ``not_probed[]`` 且原因记 ``rotation``（**不是** ``budget``）：
+        否则 daemon 会把它当 backlog 每 5 s 续跑一次，退回额度燃烧。
+        传 ``None``（默认）= 旧行为（``djb upstream probe`` 手动路径），随时可用、全模型实探。
         """
         moment = now or utcnow()
         seconds = float(timeout if timeout is not None else facts.PROBE_TIMEOUT_S)
@@ -494,12 +561,23 @@ class UpstreamManager:
         checks: list[dict[str, Any]] = [dict(item) for item in result.model_checks]
         outcomes: dict[str, probe_mod.ProbeOutcome] = {}
         reused: set[str] = set()
+        daily_pick: str | None = None
+        deferred: set[str] = set()
         if result.reachable:
             listed = [str(item.get("model")) for item in checks if item.get("ok")]
             # 0.3.9 / D-RCA P1-b：排定探测顺序（没轮到的先探、已知失败排最后），并在
             # 预算受限的轮次里复用「刚探过且 ok」的结论 —— 5s backlog 续跑只补缺口。
             targets, reused = self._order_probe_targets(
                 record, listed, moment, budgeted=deadline is not None)
+            # CHG-20261121-PROBE-DAILY：日探针**只探 1 个代表模型**。
+            # 代表模型从 L1 清单里挑（``listed``）：清单是上游此刻真实的模型集合，
+            # 从这里挑就不会把「本地记着、上游已下架」的幽灵模型当代表 —— 那会让整轮
+            # 判 rejected（``model_not_listed`` 在 upstream 侧算显式失败），一天都白探。
+            # 清单为空（L1 通过但模型全不在清单 / 无 enabled 模型）时退回 enabled 集合。
+            if daily_day is not None:
+                daily_pick = probe_mod.pick_daily_model(listed or probe_models, daily_day)
+                deferred = {model for model in probe_models if model != daily_pick}
+                targets = [model for model in targets if model == daily_pick]
             outcomes = probe_mod.probe_models(
                 record.base_url, targets, credential=secret,
                 level=level or facts.PROBE_DEFAULT_LEVEL, timeout=seconds,
@@ -574,8 +652,12 @@ class UpstreamManager:
                    # RC14 §2.3 加性字段（只加不改）：明确「这一轮探了哪些 / 哪些没探」。
                    # 云端据此判「至少一个 enabled 模型通过即 ok」；旧服务端忽略未知字段。
                    "models": [str(item.get("model")) for item in checks],
+                   # 注意：本轮**实际发了推理请求**的模型数**不进**这里 —— payload 只允许
+                   # ``NodeProbeReport`` 已定义的字段（tests/test_upstream_gating 钉着
+                   # 「不许多字段」）。daemon 侧用 passed + real_failures 计数代替
+                   # （日探针下每链接正好 1），见 `_probe_upstreams`。
                    "not_probed": self._not_probed(record, checks, outcomes,
-                                                reused=reused)}
+                                                reused=reused, deferred=deferred)}
         return payload
 
     @staticmethod
@@ -638,14 +720,18 @@ class UpstreamManager:
     @staticmethod
     def _not_probed(record: UpstreamRecord, checks: list[dict[str, Any]],
                     outcomes: dict[str, probe_mod.ProbeOutcome],
-                    reused: set[str] | None = None) -> list[dict[str, Any]]:
+                    reused: set[str] | None = None,
+                    deferred: Iterable[str] = ()) -> list[dict[str, Any]]:
         """``not_probed[]``：本地记录里有、但这一轮**没探到结论**的模型（原因可读）。
 
-        三种原因（与 W6 的口径一致，不再让「一个没探到」拖垮整条上游）：
+        四种原因（与 W6 的口径一致，不再让「一个没探到」拖垮整条上游）：
 
         * ``disabled``：模型被停用（本轮本来就不探，见 :meth:`probe` 的 W6-FIX 注释）；
         * ``budget``：enabled 且进了 L1 清单，但本轮预算/期限到了（``PROBE_PASS_BUDGET_S``），
           L2/L3 没轮到，留给下一轮，**不算失败**；
+        * ``rotation``：**日探针**下按日期轮换没选中的模型（CHG-20261121-PROBE-DAILY）。
+          与 ``budget`` 分开记的原因：daemon 只把 ``budget`` 当 backlog 去 5 s 续跑，
+          轮换是**设计如此**，若也记 ``budget`` 就会每 5 s 重探一轮 —— 又回到烧额度。
         * ``not_listed``：enabled，但这一轮连 L1 请求都没进（记录在探针过程中被改写等边界）。
           正常路径上「上游清单没列某模型」会落在 ``model_checks`` 里（``ok=False`` +
           ``model_not_listed``），不在这里。
@@ -655,6 +741,7 @@ class UpstreamManager:
         """
         rows: list[dict[str, Any]] = []
         checked = {str(item.get("model")): item for item in checks}
+        rotated = {str(model) for model in deferred}
         for raw in record.models:
             entry = ModelEntry.from_dict(raw)
             if not entry.id:
@@ -665,6 +752,8 @@ class UpstreamManager:
                 rows.append({"model": entry.id, "reason": "not_listed"})
             elif entry.id in (reused or ()):
                 continue                      # P1-b：刚 ok 且复用证据，不算缺口
+            elif entry.id in rotated:
+                rows.append({"model": entry.id, "reason": "rotation"})
             elif outcomes.get(entry.id) is None:
                 # 已有明确结论（如 model_not_listed / L2 失败）的模型属于**失败**，
                 # 不能重复记成 backlog；只有「L1 通过但预算没轮到」才算 budget。
@@ -719,18 +808,26 @@ class UpstreamManager:
                             # P6：失败分类 + 已过秒数（「X 分钟后掉容量」的唯一来源）
                             "probe_error_class": entry.probe_error_class,
                             "probe_age_s": entry.probe_age_s(moment),
+                            # 忠实字段：这个模型自己多久前被**实探**过
                             "fresh": entry.fresh(moment),
-                            "announceable": entry.announceable(moment)})
+                            # 加性字段（CHG-20261121-PROBE-DAILY）：日轮换下「本轮没轮到，
+                            # 但链接级覆盖仍算数」的模型在这里为 True —— 渲染层据此把
+                            # 「结论过期」与「没轮到但被上游带住」区分开。
+                            "covered": covered(record, entry, moment),
+                            "announceable": coverage_announceable(record, entry, moment)})
         return details
 
     # ── 公告 / 目录 / 路由
     def announceable_models(self, now: Any = None) -> list[tuple[UpstreamRecord, ModelEntry]]:
-        """可**真正**进容量的模型（>0 QPS）：模型级 L2 证据 + 新鲜 + 启用。
+        """可**真正**进容量的模型（>0 QPS）：模型级 L2 证据 + 新鲜/覆盖 + 启用。
 
-        门控口径（C7）：
+        门控口径（C7 + CHG-20261121-PROBE-DAILY）：
 
-        * 模型级：`inference_ok is True`（L2 通过）且 `last_probe_at` 在
-          `facts.PROBE_FRESH_S`（默认 15 min）内；从未探过 / 过期 / L2 失败一律不算；
+        * 模型级：`inference_ok is True`（L2 通过过）；
+        * 新鲜度：走 :func:`covered` —— 要么模型自己 ``last_probe_at`` 在
+          `facts.PROBE_FRESH_S`（25 h）内（实探过），要么「上游本轮通过 + 该模型上次结论
+          L2 通过且不超过 7 天」（日探针的链接级覆盖，与云端 ``verified_at`` 同口径）；
+          从未探过 / L2 失败 / 模型结论超过 7 天一律不算；
         * 上游级：`state=rejected` 一票否决；`declared` / `probing` / `verified`
           的差别只在聚合标签上（`djb upstream declare` 会把 state 写回 declared，
           所以判定以**模型级证据**为准，避免申报一次就把体检结论抹掉）；
@@ -743,7 +840,7 @@ class UpstreamManager:
                 continue
             for raw in record.models:
                 entry = ModelEntry.from_dict(raw)
-                if entry.announceable(moment):
+                if coverage_announceable(record, entry, moment):
                     out.append((record, entry))
         return out
 
@@ -843,7 +940,8 @@ class UpstreamManager:
                               "probe_version": entry.probe_version,
                               "last_probe_at": entry.last_probe_at,
                               "fresh": entry.fresh(moment),
-                              "announceable": entry.announceable(moment)},
+                              "covered": covered(record, entry, moment),
+                              "announceable": coverage_announceable(record, entry, moment)},
                 })
         return entries
 
