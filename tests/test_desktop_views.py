@@ -369,11 +369,14 @@ def test_token_plan_lists_upstreams_with_state_models_and_qps():
 
 
 def test_token_plan_empty_state_tells_customer_what_to_do():
+    """UX-E2E-20261121 P1-4：空态给**三步**（填 → 存 → 测），不是只说「暂无」。"""
     snapshot = _token_plan_snapshot(upstreams=[])
     view = vw.build_view("token_plan", snapshot)
     text = view.plain_text()
-    assert "你还没有接入任何 Token Plan" in text
-    assert "读取模型清单" in text                               # 空态必须给下一步，不是只说暂无
+    assert "还没有接入上游" in text
+    for marker in ("①", "②", "③", "请求地址", "读取模型清单并保存接入", "测试联通"):
+        assert marker in text, marker
+    assert "去接入配置" not in text              # 那颗按钮 2026-11-19 已拆掉，不能再指它
     assert view.table is not None and not view.table.rows
     assert not view.tables[0].rows
 

@@ -1293,8 +1293,12 @@ class DesktopController:
         """E（RC14 IA 拆分）：「添加上游」不再跳到「本机设置」（那里根本不能加）。
 
         第 1 步就在本页下方「添加接入」（协议 / 请求地址 / 密钥 → 读取模型清单）。
+
+        UX-E2E-20261121 P1-4：这句要和页面空态的三步**同一顺序**（填 → 存 → 测），
+        否则客户照着做会先点「测试联通」——那条不保存，等于白填。
         """
-        return ActionResult("在下方「添加接入」填：协议 → 请求地址 → 密钥，再点「读取模型清单」。",
+        return ActionResult("在下方「添加接入」填：① 协议 → ② 请求地址 → ③ 密钥，"
+                            "再点「读取模型清单并保存接入」；最后点「测试联通」确认能通。",
                             effect="goto", payload="token_plan")
 
     def _act_token_plan_enable_relay(self, *, confirm=None) -> ActionResult:

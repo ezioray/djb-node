@@ -376,6 +376,12 @@ GROUP_IDENTITY = "① 本机与身份"
 GROUP_BIND = "② 绑定节点"
 GROUP_PAYOUT = "③ 提交 USDT 收款地址（与绑定是两件事）"
 
+#: UX-E2E-20261121 P1-4：「提供 Token Plan」页 9 颗按钮平铺，客户不知道从哪开始。
+#: 三块按**做事的顺序**排，块标题自带步骤号；每块内也照流程排（填 → 测 → 存 / 设价 → 预览 → 上报）。
+GROUP_TP_ACCESS = "① 接入上游（填 → 测 → 存）"
+GROUP_TP_OPS = "② 绑定与排查"
+GROUP_TP_PRICE = "③ 模型底价与上报"
+
 
 def action_groups(actions: Sequence[Action]) -> list[tuple[str, list[Action]]]:
     """按 ``Action.group`` 把动作切成有序块（同组相邻的合在一块；空组名不插标题）。
@@ -1621,8 +1627,14 @@ _TOKEN_STATE = {
     "rejected": (MARK_FAIL, "验证未通过", "red"),
 }
 
-#: 空态文案（客户投诉的正是「找不到入口」，所以这句必须给出下一步而不是只说「暂无数据」）
-TOKEN_PLAN_EMPTY = "你还没有接入任何 Token Plan，点下面「去接入配置」开始"
+#: 空态文案（客户投诉的正是「找不到入口」，所以这句必须给出下一步而不是只说「暂无数据」）。
+#: UX-E2E-20261121 P1-4：走查要求空态直接给「填 → 保存 → 测一次」三步（原句指的
+#: 「去接入配置」这颗按钮 2026-11-19 已经拆掉了，客户根本找不到，等于死路）。
+TOKEN_PLAN_EMPTY = ("还没有接入上游：① 填下面的「请求地址」与「密钥」 → "
+                    "② 点「读取模型清单并保存接入」 → ③ 点「测试联通」确认能通")
+
+#: 费率示例里用的报价（USD / 百万 token）。示例值集中在这里，界面与测试引用同一个常量。
+FEE_EXAMPLE_ASK = "100"
 
 
 def _token_plan_rate(value: Any) -> str:
@@ -1795,14 +1807,22 @@ def _token_plan(snapshot: Snapshot) -> View:
     # 现在拆成两颗，各自跳到真正能做这件事的地方：
     #   * 添加上游 → 本页「添加接入」（第 1 步就在下方，item 11 落地表单）
     #   * 绑定节点 → 账户与安全（绑定的唯一位）
-    plan_actions = [Action("token_plan.add_upstream", "添加上游（填请求地址与密钥）",
-                           primary=True)]
+    #
+    # UX-E2E-20261121 P1-4：9 颗按钮平铺在一行里，客户不知道从哪颗开始（走查原文
+    # 「8 个并列按钮，没有主操作」）。现在按**做事的顺序**分三块，块标题就是顺序：
+    # ① 接入上游（三步）→ ② 绑定与排查 → ③ 模型底价与上报。
+    # 块内顺序也照流程排：填/测/存，然后绑定/刷新，最后设价/预览/上报。
+    # 三块分开建、最后按 ①②③ 拼起来：``action_groups()`` 只把**相邻**同组并成一块，
+    # 建的时候混着放会在屏幕上出现两个「① 接入上游」标题。
+    access_actions = [Action("token_plan.add_upstream", "添加上游（填请求地址与密钥）",
+                             primary=True, group=GROUP_TP_ACCESS)]
+    ops_actions = [Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）",
+                          group=GROUP_TP_OPS)]
     if bound is True:
-        plan_actions.append(Action("token_plan.bind_node", "已绑定这台电脑", enabled=False,
-                                   reason="已绑定 · 解绑/换绑在「账户与安全」"))
-    else:
-        plan_actions.append(Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）"))
-    plan_actions.append(Action("token_plan.refresh", "刷新"))
+        ops_actions[0] = Action("token_plan.bind_node", "已绑定这台电脑", enabled=False,
+                                reason="已绑定 · 解绑/换绑在「账户与安全」",
+                                group=GROUP_TP_OPS)
+    ops_actions.append(Action("token_plan.refresh", "刷新", group=GROUP_TP_OPS))
 
     # ── RC14 I/J：一 Key 多模型 + 逐模型底价（三步同页）
     bids = plan.get("bids") if isinstance(plan.get("bids"), Mapping) else {}
@@ -1828,9 +1848,13 @@ def _token_plan(snapshot: Snapshot) -> View:
         Field("请求地址", str(plan.get("base_url") or ""), key="base_url", editable=True,
               prefill=False, hint=BASE_URL_HINT),
         # 密钥只存本机 0600；显示按钮由 Field.can_reveal 自动给（G7）
+        # UX-E2E-20261121 P1-4：原句「云端只收「已登记」这一个布尔」是病句（走查原文
+        # 「云侧只收「已登记」这个布」），客户读不出云端到底拿走了什么。改成两件具体的事：
+        # 密钥留在本机（0600、不进日志）；云端只知道「这台机器登记过上游」。
         Field("密钥", str(plan.get("secret_seen") or "未保存"), key="upstream_secret",
               editable=True, secret=True, prefill=False,
-              hint="只存本机（0600）；云端只收「已登记」这一个布尔"),
+              hint="只存本机（文件权限 0600、不写日志、不回显）；云端只记「这台机器"
+                   "登记过上游」，拿不到密钥本身"),
         Field("最低申报价", str(plan.get("selected_price") or ""), key="min_price",
               editable=True, prefill=False,
               hint=((("当前选中的 " + str(plan.get("selected_model")) + " 已存 "
@@ -1841,10 +1865,15 @@ def _token_plan(snapshot: Snapshot) -> View:
                     # 2026-11-20 owner：设价必须让人看见「这是最低价 + 平台费 15%」。
                     # 成交口径（原始设计）：撮合到的最优价 ≥ 这个最低价就成交。
                     + "；**成交规则**：低于此价不成交，高于时按最优价成交"
+                    # UX-E2E-20261121 P1-4：走查说原句「客户实付 = 你的报价 ÷ 1.15」算不出来、
+                    # 也看不出钱从哪边出。这里改成一个**能自己验算**的例子，且数字由 facts
+                    # 现算（示例报价 = FEE_EXAMPLE_ASK，客户实付 = facts.customer_pay_text），
+                    # 不手写第二份口径。
                     + "；平台服务费 " + format(facts.service_fee_percent(), "g") + "%"
-                    + "（客户实付 = 你的报价 × "
-                    + format(1 + facts.SERVICE_FEE_BPS / 10000.0, "g")
-                    + "，费率以成交时服务端快照为准）")),
+                    + "**加在客户那边**：你报价 " + FEE_EXAMPLE_ASK + " → 客户实付 "
+                    + facts.customer_pay_text(FEE_EXAMPLE_ASK) + "，你到手 "
+                    + FEE_EXAMPLE_ASK + "（不从你的报价里倒扣）"
+                    + "；费率以成交时服务端快照为准")),
         Field("云端覆盖", cloud_text, key="bid_cloud",
               hint="生效顺序：云端覆盖 > 本机底价 > 未设价"),
     )
@@ -1865,26 +1894,29 @@ def _token_plan(snapshot: Snapshot) -> View:
     if cloud_pending:
         notes.append("云端「按模型设价」接口还没开通（ask-settings / quotes.models[]）："
                      "底价只保存在本机，上报按钮保持关闭，不会假成功。")
-    plan_actions.extend([
-        # CR-20261119-CLIENT-TOKENPLAN-NOOP：读清单同时**保存接入**（第 1 步与第 2 步
-        # 合成一颗按钮）——旧文案只写「读取模型清单」，客户以为读完就完事，实际上
-        # 桌面端根本没落盘，模型表永远空。
-        # 2026-11-20：「测试联通」独立成一步 —— 先探活（只读、不写盘），
-        # 拿到「N 个模型 / X ms」再决定要不要保存接入。
-        Action("token_plan.test_connectivity", "测试联通（不保存）"),
-        Action("token_plan.discover", "读取模型清单并保存接入"),
+    # ① 组的后半段（顺序 = 空态那三步，也与主操作的阶段一致）：
+    #   读清单同时**保存接入** —— CR-20261119-CLIENT-TOKENPLAN-NOOP：旧文案只写
+    #   「读取模型清单」，客户以为读完就完事，实际上桌面端根本没落盘，模型表永远空。
+    #   然后才是「测试联通」（只读、不写盘，拿到「N 个模型 / X ms」确认真的能用）。
+    access_actions.extend([
+        Action("token_plan.discover", "读取模型清单并保存接入", group=GROUP_TP_ACCESS),
+        Action("token_plan.test_connectivity", "测试联通（不保存）", group=GROUP_TP_ACCESS),
         # relay 接入开关默认关闭；以前只在 CLI 报错可见，GUI 表现为「点了没反应」。
         # 这里给一键开启（flag 自带 owner/expire/rollback，失败会回话）。
-        Action("token_plan.enable_relay", "开启中继接入（一次）"),
+        Action("token_plan.enable_relay", "开启中继接入（一次）", group=GROUP_TP_ACCESS),
+    ])
+    price_actions = [
         # F4：「点了没反应」是缺陷。这两颗不再置灰（置灰的按钮点了不播报），
         # 前提不满足时由动作回一句人话（「先在上面的表格里选一行模型」…）。
-        Action("token_plan.save_price", "保存这一行"),
-        Action("token_plan.preview_report", "预览将上报的内容"),
+        Action("token_plan.save_price", "保存这一行", group=GROUP_TP_PRICE),
+        Action("token_plan.preview_report", "预览将上报的内容", group=GROUP_TP_PRICE),
         # 上报默认关闭（云端 ask-settings / quotes.models[] 未开通）：置灰 + 说清原因，
         # 绝不点下去假成功
         Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,
-               reason=report_blocker),
-    ])
+               reason=report_blocker, group=GROUP_TP_PRICE),
+    ]
+    # 屏幕上从上到下的顺序 = 做事的顺序（① 接入 → ② 绑定/排查 → ③ 底价/上报）
+    plan_actions = access_actions + ops_actions + price_actions
     # 2026-11-19（全功能 UX 复查）：七颗按钮同一视觉权重，客户不知道「下一步是哪颗」。
     # 主操作随阶段走：没上游 → 添加上游；有上游没清单 → 读取清单；有清单 → 上报（不可用时退预览）。
     _has_upstream = bool(str(plan.get("base_url") or "").strip()) and \
@@ -1917,8 +1949,9 @@ def _token_plan(snapshot: Snapshot) -> View:
         table=Table(("模型", "上游", "目录", "探针", "本机底价", "生效来源"), tuple(bid_rows),
                     narrow_hide=("目录",),
                     note=planned + ("｜" + discover_note if discover_note else ""),
-                    empty=("还没有模型行：填「请求地址」与「密钥」，再点「读取模型清单」。"
-                           if snapshot.ok("token_plan") else UNAVAILABLE), title="上游报价"),
+                    # 空态与页面顶部同一句话（三步）：客户在哪一块看到都知道下一步点哪
+                    empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE),
+                    title="上游报价"),
         tables=(Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
                       narrow_hide=("最近验证",),
                       note="验证通过且新鲜的模型才会进入共享容量",
