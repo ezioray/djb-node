@@ -190,7 +190,7 @@ def test_models_page_projects_probe_details_with_three_state_columns():
     """D（RC14）：探针表纯投影 probe_details()，三态不混（None ≠ False）。"""
     view = vw.build_view("models", demo_snapshot())
     assert view.title == "模型与探针"
-    assert view.table.columns[:3] == ("模型", "上游", "最近探测")
+    assert view.table.columns[:3] == ("模型", "上游", "最近探针")
     assert set(view.table.columns[3:6]) == {"L2", "L3", "用量"}
     rows = {row.cells[0]: row for row in view.table.rows}
     assert len(rows) == 4, "演示数据的四行探针结论都该出现"
@@ -206,16 +206,16 @@ def test_models_page_projects_probe_details_with_three_state_columns():
     failed = rows["claude-3-7-sonnet"]
     assert failed.cells[3] == "✕" and failed.cells[6] == "失败"
     assert "密钥被拒" in failed.cells[7]
-    # 从未探测：三列全是「—」（不是 ✗），最近探测「从未」
+    # 没跑过：三列全是「—」（不是 ✗），最近探针「从未」
     never = rows["gpt-4o-mini"]
     assert never.cells[3:6] == ("—", "—", "—")
-    assert never.cells[2] == "从未" and never.cells[6] == "未探测"
+    assert never.cells[2] == "从未" and never.cells[6] == "未跑过"
 
 
 def test_models_page_counts_and_probe_action():
     view = vw.build_view("models", demo_snapshot())
     cards = {card.title: card.value for card in view.cards}
-    assert cards["可公告"] == "1 个" and cards["从未探测"] == "1 个"
+    assert cards["可公告"] == "1 个" and cards["还没跑过"] == "1 个"
     actions = {action.key: action for action in view.actions}
     assert actions["probe.run"].enabled is True
     # 两个新鲜窗口的数字只能来自 facts（900 / 600）
@@ -224,7 +224,7 @@ def test_models_page_counts_and_probe_action():
 
 
 def test_models_page_without_upstreams_says_where_to_start():
-    """没有上游时：探针表空态指路「提供 Token Plan」，且「立即探测」置灰带原因。"""
+    """没有上游时：探针表空态指路「提供 Token Plan」，且「跑一次探针」置灰带原因。"""
     sections = dict(demo_snapshot().sections)
     sections["models"] = {"catalog": [], "local": [], "online": True, "note": ""}
     view = vw.build_view("models", Snapshot(sections=sections))
@@ -369,11 +369,14 @@ def test_token_plan_lists_upstreams_with_state_models_and_qps():
 
 
 def test_token_plan_empty_state_tells_customer_what_to_do():
+    """UX-E2E-20261121 P1-4：空态给**三步**（填 → 存 → 测），不是只说「暂无」。"""
     snapshot = _token_plan_snapshot(upstreams=[])
     view = vw.build_view("token_plan", snapshot)
     text = view.plain_text()
-    assert "你还没有接入任何 Token Plan" in text
-    assert "读取模型清单" in text                               # 空态必须给下一步，不是只说暂无
+    assert "还没有接入上游" in text
+    for marker in ("①", "②", "③", "请求地址", "读取模型清单并保存接入", "测试联通"):
+        assert marker in text, marker
+    assert "去接入配置" not in text              # 那颗按钮 2026-11-19 已拆掉，不能再指它
     assert view.table is not None and not view.table.rows
     assert not view.tables[0].rows
 

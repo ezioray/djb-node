@@ -59,6 +59,22 @@ SECTIONS: tuple[str, ...] = (
 #: 日志级别（与 :data:`djb_node.facts.LOG_LEVELS` 一致 + warning/error）
 LOG_LEVELS: tuple[str, ...] = ("debug", "info", "warning", "error", "critical")
 
+#: 「本机未初始化」时界面内那颗主按钮的名字（与 ``desktop.views.INIT_RECOVERY_LABEL`` 同字）。
+#: 这里不 import views（views 依赖本模块，反向 import 会成环），字面重复一次由
+#: ``tests/test_desktop_bootstrap_action.py`` 的断言锁住（两处必须逐字相等）。
+INIT_RECOVERY_LABEL = "初始化并连接"
+
+
+def actionable_init_hint(detail: str) -> str:
+    """CLI 原话「本机未初始化：先执行 djb init」→ 客户能照做的一句（UX-E2E-20261121 P1-3）。
+
+    改的是**指令**而不是内容：原因照原样留着（客服/日志要靠它），把「你先去开终端」换成
+    「点界面里的按钮」。终端命令降为备选——打包缺 CLI 时自举会失败，那时它才是唯一出路。
+    """
+    head = str(detail or "").split("：")[0].strip() or "本机还没初始化"
+    return (head + "（点「" + INIT_RECOVERY_LABEL + "」就能建好本机目录并启动节点；"
+            "想手动来也可以在终端跑 djb init）")
+
 
 class ProviderError(RuntimeError):
     """某个数据域取数失败；消息只放**短中文原因**，不带 URL / 令牌 / 原始异常文本。"""
@@ -488,11 +504,13 @@ class LocalDataSource:
             lines = [line.strip() for line in (stderr or stdout or "").splitlines()
                      if line.strip() and not line.strip().startswith("details=")]
             detail = lines[0].removeprefix("djb: ") if lines else ""
-            # RC15-039 #11：CLI 的「先执行 djb init」被原样搬到界面上，客户却没有终端入口。
-            # 客户端的规矩：**要么做成界面内动作，要么明说这条要去终端跑并给完整命令**。
+            # RC15-039 #11 + UX-E2E-20261121 P1-3：CLI 的「先执行 djb init」不再原样甩给客户，
+            # 也**不再自认**「界面里点不到」——首屏横幅右侧就有可点的「初始化并连接」
+            # （controller 动作 ``bootstrap``，内部调 bootstrap.ensure_ready + start_daemon）。
+            # 原话里的「：先执行 djb init」尾巴去掉（那是给终端的指令），只留原因；
+            # 终端命令降为**备选**：打包缺 CLI 时自举会失败，那时它才是唯一出路。
             if "djb init" in detail:
-                detail = (detail[:160] + "（这条要在终端里跑：djb init；"
-                          "桌面端没有初始化入口，界面里点不到）")
+                detail = actionable_init_hint(detail)
             raise ProviderError(detail[:260] or "本地命令退出码 " + str(returncode))
         try:
             payload = json.loads(stdout or "{}")

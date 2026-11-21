@@ -99,14 +99,24 @@ def test_beta_badge_is_only_on_gpu():
 
 
 def test_share_kickers_follow_the_new_sections():
-    assert desktop_app.nav_kicker(SHARE, "token_plan") == "SHARE / TOKEN PLAN"
-    assert desktop_app.nav_kicker(SHARE, "models") == "SHARE / MODELS"
-    assert desktop_app.nav_kicker(SHARE, "gpu") == "SYSTEM / GPU"
-    assert desktop_app.nav_kicker(SHARE, "agent") == "CONNECT / AGENT"
+    """UX-E2E-20261121 P1-6：页头眉标改中文后，只剩「所属组」这一层。
+
+    原来写的是两级拉丁微标（``SHARE / TOKEN PLAN``）：客户读到的是一串英文大写，
+    而页面标题就在下一行（中文）——同一件事说了两遍。
+    """
+    assert desktop_app.nav_kicker(SHARE, "token_plan") == "共享"
+    assert desktop_app.nav_kicker(SHARE, "models") == "共享"
+    assert desktop_app.nav_kicker(SHARE, "gpu") == "系统"
+    assert desktop_app.nav_kicker(SHARE, "agent") == "接入"
     # 与 0.3.4 相比确实变了（证明新表真的生效，而不是回滚表）
     changed = [key for key in VIEW_KEYS
                if desktop_app.nav_kicker(SHARE, key) != desktop_app.nav_kicker(LEGACY, key)]
     assert "token_plan" in changed and "gpu" in changed
+    # 眉标里不许再有 ASCII 大写串（P1-6 的验收：中文或去掉）
+    for key in VIEW_KEYS:
+        kicker = desktop_app.nav_kicker(SHARE, key)
+        assert kicker and kicker == kicker.strip()
+        assert not any("A" <= ch <= "Z" for ch in kicker), (key, kicker)
 
 
 def test_shortcuts_follow_the_active_order():

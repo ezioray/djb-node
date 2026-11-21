@@ -33,7 +33,7 @@ __all__ = [
     "VIEWS",
     "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
     "YIELD_PRESET_BY_KEY", "YIELD_PRESET_BY_LABEL", "YIELD_TIERS",
-    "Filter", "with_field_errors",
+    "Filter", "with_field_errors", "Recovery", "INIT_RECOVERY_LABEL", "init_recovery",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -324,6 +324,48 @@ class Action:
     group: str = ""
 
 
+@dataclass(frozen=True)
+class Recovery:
+    """首屏「死路」的**可点出口**（UX-E2E-20261121 P1-3）。
+
+    走查原文：首启整屏「暂不可用」，唯一指引是让客户敲 ``djb init``，横幅自己还写着
+    「桌面端没有初始化入口，界面里点不到」——客户手上没有终端 ⇒ 首启是死路。
+
+    :attr:`View.recovery` 非空时，渲染层在横幅下面画一颗**主按钮**；点击走
+    ``controller.action(key)``（与普通动作同一条通道，所以「点了没反应」也会被播报）。
+    """
+    key: str
+    label: str
+    hint: str = ""
+
+
+#: 「初始化并连接」：本机未初始化时首屏唯一的主操作（也是 :func:`terminalize` 给 `djb init`
+#: 补的那条出路）。名字只在这里写一次——文案改动只改这一处。
+INIT_RECOVERY_LABEL = "初始化并连接"
+INIT_RECOVERY_HINT = ("建好本机数据目录、启动节点并自动连上云端；不用填任何东西，"
+                      "也不用开终端")
+
+#: 「本机还没初始化」的判定词（P1-3）：只有**状态库/安装记录缺失**才是死路。
+#: **不含**「目录权限过宽」这类环境项——那类挂上「初始化并连接」会跑错动作（客户点了没变化，
+#: 比没有按钮更糟），它们各自有 next_step。
+_INIT_REASON_MARKERS = ("未初始化", "状态库不存在", "安装记录缺失", "未安装")
+
+
+def init_recovery(snapshot: Snapshot) -> Recovery | None:
+    """本机未初始化 ⇒ 给一条可点的出路；其它原因（权限/超时/网络）**一律不给**（不猜）。
+
+    判定源只有一个：``status`` 域不可用且原因是「没初始化」。``status`` 是 13 页里 5 个域的
+    共同依赖，任何一轮快照都会取到它，所以这判据在**每一页**都成立（不像逐页打补丁会漏页）。
+    """
+    missing = snapshot.missing("status")
+    if missing is None:
+        return None
+    reason = str(missing.reason or "")
+    if not any(marker in reason for marker in _INIT_REASON_MARKERS):
+        return None
+    return Recovery("bootstrap", INIT_RECOVERY_LABEL, INIT_RECOVERY_HINT)
+
+
 #: D6（2026-11-18 客户要求）：账户页两个**互不干扰**的动作区标题。
 #: 「绑定节点」= 设备码/手输码；「提交 USDT 收款地址」= 单独一次 Payout 提交。
 #:
@@ -333,6 +375,12 @@ class Action:
 GROUP_IDENTITY = "① 本机与身份"
 GROUP_BIND = "② 绑定节点"
 GROUP_PAYOUT = "③ 提交 USDT 收款地址（与绑定是两件事）"
+
+#: UX-E2E-20261121 P1-4：「提供 Token Plan」页 9 颗按钮平铺，客户不知道从哪开始。
+#: 三块按**做事的顺序**排，块标题自带步骤号；每块内也照流程排（填 → 测 → 存 / 设价 → 预览 → 上报）。
+GROUP_TP_ACCESS = "① 接入上游（填 → 测 → 存）"
+GROUP_TP_OPS = "② 绑定与排查"
+GROUP_TP_PRICE = "③ 模型底价与上报"
 
 
 def action_groups(actions: Sequence[Action]) -> list[tuple[str, list[Action]]]:
@@ -456,6 +504,9 @@ class View:
     #: 渲染后要**获得键盘焦点**的字段 key（RC15-039 #1：校验失败聚焦首个错误字段）。
     #: 空 = 不动焦点（0.3.7 行为）。由 :func:`with_field_errors` 填，投影层自己不产生。
     focus_field: str = ""
+    #: 首屏死路的可点出口（UX-E2E-20261121 P1-3）。空 = 本页没有死路（0.3.7 行为）。
+    #: 由 :func:`build_view` 统一填（判据只看 ``status`` 域，见 :func:`init_recovery`）。
+    recovery: Recovery | None = None
 
     def plain_text(self) -> str:
         """文本快照（证据 / 无显示环境验收）：稳定顺序，无时间戳抖动。
@@ -466,6 +517,10 @@ class View:
         lines = ["# " + self.title + (("  ·  " + self.subtitle) if self.subtitle else "")]
         for item in self.unavailable:
             lines.append("! " + item)
+        if self.recovery is not None:
+            # 死路的出口也要进文本快照（--export-text / 读屏 / 证据都靠它）
+            lines.append("[" + self.recovery.label + "]"
+                         + (("   " + self.recovery.hint) if self.recovery.hint else ""))
         if self.cards:
             lines.append("")
             for card in self.cards:
@@ -706,14 +761,24 @@ def terminalize(text: Any) -> str:
     看到「执行 djb init 会收紧到 0700」只会一脸问号。规矩：**要么做成界面内动作，要么
     明说这条要去终端跑并给完整命令**。这里统一补一句，而不是逐页打补丁——逐页补的结果
     就是复核抓到的「只扫了 4 页，接入页/基准页漏了」。
+
+    UX-E2E-20261121 P1-3：**删掉自贬句**（原来是「桌面端没有对应入口，界面里点不到」——
+    客户读到的是「这软件没做完」）。``djb init`` 有界面内动作（「初始化并连接」，见
+    :class:`Recovery`），所以在命令后面直接给出这条出路；其它命令只给命令本身。
     """
     value = str(text or "")
     if not value or "终端" in value:
         return value
+    if INIT_RECOVERY_LABEL in value:
+        # 数据层已经把界面内动作写进这句了（「点「初始化并连接」…」）：不再叠第二层括号。
+        return value
     match = _CLI_CALL.search(value)
     if match is None:
         return value
-    return value + "（这条要在终端里跑：" + match.group(0) + "；桌面端没有对应入口，界面里点不到）"
+    command = match.group(0)
+    tail = ("；也可以在客户端点「" + INIT_RECOVERY_LABEL + "」") \
+        if command.startswith("djb init") else ""
+    return value + "（这条要在终端里跑：" + command + tail + "）"
 
 
 def _terminalize_tree(value: Any) -> Any:
@@ -814,7 +879,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
         anchor = max(moment for moment, _ in samples)
     title, caption = "每小时用量", "近 " + str(hours) + " 小时 · 每小时 tokens"
     if anchor is None:
-        return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+        return Chart(kicker="贡献节奏", title=title, caption=caption,
                      empty="暂不可用（当前没有收据时间戳）")
     end = anchor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     start = end - timedelta(hours=hours)
@@ -829,7 +894,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
             inside += 1
     total = sum(totals)
     if total <= 0:
-        return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+        return Chart(kicker="贡献节奏", title=title, caption=caption,
                      empty="暂不可用（当前没有收据时间戳）")
     peak_value = max(totals)
     peak_index = totals.index(peak_value)
@@ -839,7 +904,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
     labels = tuple((start + timedelta(hours=step * position)).strftime("%H:00")
                    for position in range(4)) + ("现在",)
     peak_at = (start + timedelta(hours=peak_index)).strftime("%H:00")
-    return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+    return Chart(kicker="贡献节奏", title=title, caption=caption,
                  values=values, labels=labels,
                  peak="峰值 " + f"{peak_value:,}" + " tokens · " + peak_at,
                  foot="近 " + str(hours) + " 小时合计 " + f"{total:,}" + " tokens · "
@@ -862,9 +927,11 @@ def _hero(snapshot: Snapshot) -> Hero:
     titles = {"online": "正在接单", "starting": "正在启动",
               "paused": "已暂停接单", "updating": "正在更新",
               "stopped": "还没开始接单", "error": "有异常，需要处理"}
-    chips = {"online": ("● LIVE", "mint"), "starting": ("◐ STARTING", "amber"),
-             "paused": ("● PAUSED", "amber"), "updating": ("◐ UPDATING", "amber"),
-             "stopped": ("○ STOPPED", "muted"), "error": ("✕ ERROR", "red")}
+    # UX-E2E-20261121 P1-6：这颗 pill 原来写英文（LIVE / PAUSED / UPDATING…），
+    # 与旁边的中文标题（正在接单 / 已暂停接单）说的是同一件事的两种语言。
+    chips = {"online": ("● 接单中", "mint"), "starting": ("◐ 启动中", "amber"),
+             "paused": ("● 已暂停", "amber"), "updating": ("◐ 更新中", "amber"),
+             "stopped": ("○ 未运行", "muted"), "error": ("✕ 异常", "red")}
     chip, chip_tone = chips.get(state, ("? 状态未知", "muted"))
     node_id = str(profile.get("node_id") or binding.get("node_id") or "—")
     mode = str(yield_state.get("mode") or "")
@@ -919,7 +986,7 @@ def _hero(snapshot: Snapshot) -> Hero:
         hint = "还没有客户端授权"
     else:
         hint = "授权状态暂不可用"
-    return Hero(kicker="NODE STATUS / " + node_id, title=titles.get(state, "状态未知"),
+    return Hero(kicker="节点状态 / " + node_id, title=titles.get(state, "状态未知"),
                 chip=chip, chip_tone=chip_tone, body=body,
                 runtime=_runtime_text(status.get("uptime_s")), gauge=gauge, metrics=metrics,
                 actions=actions, hint=hint)
@@ -963,7 +1030,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
         Field("USDT 收款地址", "已设置" if config.get("usdt_address") else "未设置",
               key="usdt_state"),
     )
-    setup = RailCard(kicker="SETUP / 接入进度", title="接入分三步", kind="setup",
+    setup = RailCard(kicker="接入进度", title="接入分三步", kind="setup",
                      badge=("接入完成" if done == 3 else "待完成"), badge_tone=("mint" if done == 3
                                                                           else "amber"),
                      note=str(done) + " / 3", fields=setup_fields,
@@ -984,7 +1051,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
                    in ("verified", "accepted"))
     total_receipts = len([1 for row in receipts.get("rows") or () if _mapping(row)])
     today = RailCard(
-        kicker="TODAY / 今日算力", title="今日收益",
+        kicker="今日算力", title="今日收益",
         badge="进行中" if str(yield_state.get("state") or "") == "online" else "",
         badge_tone="mint",
         # 四宫格只留「标签 + 数值」：口径写进卡脚一行，格子高度才装得进一屏（G-16）
@@ -1012,7 +1079,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
     if ratio is not None:
         progress = ("今日 tokens 已用", ratio,
                     f"{used_today:,} / {int(float(daily_cap)):,}（{ratio * 100:.0f}%）")
-    throttle = RailCard(kicker="PAUSE / 自动暂停", title="自动暂停",
+    throttle = RailCard(kicker="自动暂停", title="自动暂停",
                         badge="生效中" if yield_state.get("yield_enabled") else "已关闭",
                         badge_tone="mint" if yield_state.get("yield_enabled") else "muted",
                         kind="throttle", rows=throttle_rows,
@@ -1198,7 +1265,7 @@ def _bench(snapshot: Snapshot) -> View:
         subtitle="环境检测 + CPU/内存/磁盘 + 可选 GPU",
         cards=cards,
         table=Table(("检查项", "结论", "下一步"), tuple(rows),
-                    note="检查项来自本机只读探测", empty="环境检测暂不可用", title="环境检测"),
+                    note="检查项由本机直接读取（不联网）", empty="环境检测暂不可用", title="环境检测"),
         actions=(Action("bench.run", "开始跑分（≤10 秒）", primary=True),
                  Action("bench.copy", "复制结果")),
         unavailable=_missing(snapshot, ("bench",)),
@@ -1218,8 +1285,8 @@ PROBE_REASON_TEXT = {
     "model_not_listed": "上游 /models 里没有这个模型（清单或模型名不对）",
     "not_listed": "上游 /models 里没有这个模型（清单或模型名不对）",
     "usage_missing": "上游没回 usage（用量对不上，报价会保守）",
-    "budget": "本轮探测预算用完（下一轮继续）",
-    "disabled": "模型已停用（不参与探测与公告）",
+    "budget": "本轮探针预算用完（下一轮继续）",
+    "disabled": "模型已停用（不参与探针与公告）",
     "network": "网络不通（DNS/连接被拒）",
     "invalid_response": "上游返回的不是兼容格式（不是 OpenAI/Anthropic 形状）",
 }
@@ -1255,7 +1322,7 @@ def _probe_state(row: Mapping[str, Any], *, fresh_window: int, quote_window: int
         return "已停用", "muted"
     marked = [row.get("inference_ok"), row.get("stream_ok"), row.get("usage_ok")]
     if all(item is None for item in marked):
-        return "未探测", "muted"
+        return "未跑过", "muted"
     if row.get("announceable") is True:
         return "可公告", "mint"
     if row.get("inference_ok") is True:
@@ -1299,7 +1366,7 @@ def _models(snapshot: Snapshot) -> View:
             reason = str(error_class) + "（未登记的原因）"
         if state_text == "可公告":
             counts["announceable"] += 1
-        elif state_text == "未探测":
+        elif state_text == "未跑过":
             counts["never"] += 1
         elif state_text in ("失败", "已停用"):
             counts["failed"] += 1
@@ -1310,10 +1377,10 @@ def _models(snapshot: Snapshot) -> View:
                          tri(item.get("usage_ok")), state_text, reason or "—"),
                         key=str(item.get("upstream_id") or "") + "/" + model_id,
                         tone=tone, note=("失败原因：" + reason) if reason else ""))
-    probe_table = Table(("模型", "上游", "最近探测", "L2", "L3", "用量", "状态", "原因"),
+    probe_table = Table(("模型", "上游", "最近探针", "L2", "L3", "用量", "状态", "原因"),
                         tuple(rows),
                         note=str(probe.get("unavailable") or ""),
-                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论", title="模型探测")
+                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论", title="模型探针")
 
     # ── 云端目录（原 4 列，保留为附加表：它是「云端认为该有哪些模型」，与探针事实互补）
     catalog = models.get("catalog") if isinstance(models.get("catalog"), list) else []
@@ -1328,7 +1395,7 @@ def _models(snapshot: Snapshot) -> View:
                                  reason or ("按当前资源可提供" if offerable else "原因未下发")),
                                 key=str(row.get("id") or ""), disabled=not offerable))
     local = models.get("local") if isinstance(models.get("local"), list) else []
-    probe_actions = [Action("probe.run", "立即探测（全部上游）", primary=True,
+    probe_actions = [Action("probe.run", "跑一次探针（全部上游）", primary=True,
                             enabled=bool(probe_rows),
                             reason="还没有接入上游" if not probe_rows else "")]
     return View(
@@ -1338,8 +1405,8 @@ def _models(snapshot: Snapshot) -> View:
                     "探针通过且结论新鲜才会进容量", "mint" if counts["announceable"] else "muted"),
                Card("探针失败 / 停用", str(counts["failed"]) + " 个",
                     "看右列原因逐条修", "red" if counts["failed"] else "muted"),
-               Card("从未探测", str(counts["never"]) + " 个",
-                    "点「立即探测」补一次", "amber" if counts["never"] else "muted"),
+               Card("还没跑过", str(counts["never"]) + " 个",
+                    "点「跑一次探针」补上", "amber" if counts["never"] else "muted"),
                Card("本地已应用", _count(snapshot, "models", str(len(local)) + " 个"),
                     "model-sync 状态", "default")),
         table=probe_table,
@@ -1564,8 +1631,14 @@ _TOKEN_STATE = {
     "rejected": (MARK_FAIL, "验证未通过", "red"),
 }
 
-#: 空态文案（客户投诉的正是「找不到入口」，所以这句必须给出下一步而不是只说「暂无数据」）
-TOKEN_PLAN_EMPTY = "你还没有接入任何 Token Plan，点下面「去接入配置」开始"
+#: 空态文案（客户投诉的正是「找不到入口」，所以这句必须给出下一步而不是只说「暂无数据」）。
+#: UX-E2E-20261121 P1-4：走查要求空态直接给「填 → 保存 → 测一次」三步（原句指的
+#: 「去接入配置」这颗按钮 2026-11-19 已经拆掉了，客户根本找不到，等于死路）。
+TOKEN_PLAN_EMPTY = ("还没有接入上游：① 填下面的「请求地址」与「密钥」 → "
+                    "② 点「读取模型清单并保存接入」 → ③ 点「测试联通」确认能通")
+
+#: 费率示例里用的报价（USD / 百万 token）。示例值集中在这里，界面与测试引用同一个常量。
+FEE_EXAMPLE_ASK = "100"
 
 
 def _token_plan_rate(value: Any) -> str:
@@ -1738,14 +1811,22 @@ def _token_plan(snapshot: Snapshot) -> View:
     # 现在拆成两颗，各自跳到真正能做这件事的地方：
     #   * 添加上游 → 本页「添加接入」（第 1 步就在下方，item 11 落地表单）
     #   * 绑定节点 → 账户与安全（绑定的唯一位）
-    plan_actions = [Action("token_plan.add_upstream", "添加上游（填请求地址与密钥）",
-                           primary=True)]
+    #
+    # UX-E2E-20261121 P1-4：9 颗按钮平铺在一行里，客户不知道从哪颗开始（走查原文
+    # 「8 个并列按钮，没有主操作」）。现在按**做事的顺序**分三块，块标题就是顺序：
+    # ① 接入上游（三步）→ ② 绑定与排查 → ③ 模型底价与上报。
+    # 块内顺序也照流程排：填/测/存，然后绑定/刷新，最后设价/预览/上报。
+    # 三块分开建、最后按 ①②③ 拼起来：``action_groups()`` 只把**相邻**同组并成一块，
+    # 建的时候混着放会在屏幕上出现两个「① 接入上游」标题。
+    access_actions = [Action("token_plan.add_upstream", "添加上游（填请求地址与密钥）",
+                             primary=True, group=GROUP_TP_ACCESS)]
+    ops_actions = [Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）",
+                          group=GROUP_TP_OPS)]
     if bound is True:
-        plan_actions.append(Action("token_plan.bind_node", "已绑定这台电脑", enabled=False,
-                                   reason="已绑定 · 解绑/换绑在「账户与安全」"))
-    else:
-        plan_actions.append(Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）"))
-    plan_actions.append(Action("token_plan.refresh", "刷新"))
+        ops_actions[0] = Action("token_plan.bind_node", "已绑定这台电脑", enabled=False,
+                                reason="已绑定 · 解绑/换绑在「账户与安全」",
+                                group=GROUP_TP_OPS)
+    ops_actions.append(Action("token_plan.refresh", "刷新", group=GROUP_TP_OPS))
 
     # ── RC14 I/J：一 Key 多模型 + 逐模型底价（三步同页）
     bids = plan.get("bids") if isinstance(plan.get("bids"), Mapping) else {}
@@ -1771,9 +1852,13 @@ def _token_plan(snapshot: Snapshot) -> View:
         Field("请求地址", str(plan.get("base_url") or ""), key="base_url", editable=True,
               prefill=False, hint=BASE_URL_HINT),
         # 密钥只存本机 0600；显示按钮由 Field.can_reveal 自动给（G7）
+        # UX-E2E-20261121 P1-4：原句「云端只收「已登记」这一个布尔」是病句（走查原文
+        # 「云侧只收「已登记」这个布」），客户读不出云端到底拿走了什么。改成两件具体的事：
+        # 密钥留在本机（0600、不进日志）；云端只知道「这台机器登记过上游」。
         Field("密钥", str(plan.get("secret_seen") or "未保存"), key="upstream_secret",
               editable=True, secret=True, prefill=False,
-              hint="只存本机（0600）；云端只收「已登记」这一个布尔"),
+              hint="只存本机（文件权限 0600、不写日志、不回显）；云端只记「这台机器"
+                   "登记过上游」，拿不到密钥本身"),
         Field("最低申报价", str(plan.get("selected_price") or ""), key="min_price",
               editable=True, prefill=False,
               hint=((("当前选中的 " + str(plan.get("selected_model")) + " 已存 "
@@ -1784,10 +1869,15 @@ def _token_plan(snapshot: Snapshot) -> View:
                     # 2026-11-20 owner：设价必须让人看见「这是最低价 + 平台费 15%」。
                     # 成交口径（原始设计）：撮合到的最优价 ≥ 这个最低价就成交。
                     + "；**成交规则**：低于此价不成交，高于时按最优价成交"
+                    # UX-E2E-20261121 P1-4：走查说原句「客户实付 = 你的报价 ÷ 1.15」算不出来、
+                    # 也看不出钱从哪边出。这里改成一个**能自己验算**的例子，且数字由 facts
+                    # 现算（示例报价 = FEE_EXAMPLE_ASK，客户实付 = facts.customer_pay_text），
+                    # 不手写第二份口径。
                     + "；平台服务费 " + format(facts.service_fee_percent(), "g") + "%"
-                    + "（客户实付 = 你的报价 × "
-                    + format(1 + facts.SERVICE_FEE_BPS / 10000.0, "g")
-                    + "，费率以成交时服务端快照为准）")),
+                    + "**加在客户那边**：你报价 " + FEE_EXAMPLE_ASK + " → 客户实付 "
+                    + facts.customer_pay_text(FEE_EXAMPLE_ASK) + "，你到手 "
+                    + FEE_EXAMPLE_ASK + "（不从你的报价里倒扣）"
+                    + "；费率以成交时服务端快照为准")),
         Field("云端覆盖", cloud_text, key="bid_cloud",
               hint="生效顺序：云端覆盖 > 本机底价 > 未设价"),
     )
@@ -1808,26 +1898,29 @@ def _token_plan(snapshot: Snapshot) -> View:
     if cloud_pending:
         notes.append("云端「按模型设价」接口还没开通（ask-settings / quotes.models[]）："
                      "底价只保存在本机，上报按钮保持关闭，不会假成功。")
-    plan_actions.extend([
-        # CR-20261119-CLIENT-TOKENPLAN-NOOP：读清单同时**保存接入**（第 1 步与第 2 步
-        # 合成一颗按钮）——旧文案只写「读取模型清单」，客户以为读完就完事，实际上
-        # 桌面端根本没落盘，模型表永远空。
-        # 2026-11-20：「测试联通」独立成一步 —— 先探活（只读、不写盘），
-        # 拿到「N 个模型 / X ms」再决定要不要保存接入。
-        Action("token_plan.test_connectivity", "测试联通（不保存）"),
-        Action("token_plan.discover", "读取模型清单并保存接入"),
+    # ① 组的后半段（顺序 = 空态那三步，也与主操作的阶段一致）：
+    #   读清单同时**保存接入** —— CR-20261119-CLIENT-TOKENPLAN-NOOP：旧文案只写
+    #   「读取模型清单」，客户以为读完就完事，实际上桌面端根本没落盘，模型表永远空。
+    #   然后才是「测试联通」（只读、不写盘，拿到「N 个模型 / X ms」确认真的能用）。
+    access_actions.extend([
+        Action("token_plan.discover", "读取模型清单并保存接入", group=GROUP_TP_ACCESS),
+        Action("token_plan.test_connectivity", "测试联通（不保存）", group=GROUP_TP_ACCESS),
         # relay 接入开关默认关闭；以前只在 CLI 报错可见，GUI 表现为「点了没反应」。
         # 这里给一键开启（flag 自带 owner/expire/rollback，失败会回话）。
-        Action("token_plan.enable_relay", "开启中继接入（一次）"),
+        Action("token_plan.enable_relay", "开启中继接入（一次）", group=GROUP_TP_ACCESS),
+    ])
+    price_actions = [
         # F4：「点了没反应」是缺陷。这两颗不再置灰（置灰的按钮点了不播报），
         # 前提不满足时由动作回一句人话（「先在上面的表格里选一行模型」…）。
-        Action("token_plan.save_price", "保存这一行"),
-        Action("token_plan.preview_report", "预览将上报的内容"),
+        Action("token_plan.save_price", "保存这一行", group=GROUP_TP_PRICE),
+        Action("token_plan.preview_report", "预览将上报的内容", group=GROUP_TP_PRICE),
         # 上报默认关闭（云端 ask-settings / quotes.models[] 未开通）：置灰 + 说清原因，
         # 绝不点下去假成功
         Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,
-               reason=report_blocker),
-    ])
+               reason=report_blocker, group=GROUP_TP_PRICE),
+    ]
+    # 屏幕上从上到下的顺序 = 做事的顺序（① 接入 → ② 绑定/排查 → ③ 底价/上报）
+    plan_actions = access_actions + ops_actions + price_actions
     # 2026-11-19（全功能 UX 复查）：七颗按钮同一视觉权重，客户不知道「下一步是哪颗」。
     # 主操作随阶段走：没上游 → 添加上游；有上游没清单 → 读取清单；有清单 → 上报（不可用时退预览）。
     _has_upstream = bool(str(plan.get("base_url") or "").strip()) and \
@@ -1860,8 +1953,9 @@ def _token_plan(snapshot: Snapshot) -> View:
         table=Table(("模型", "上游", "目录", "探针", "本机底价", "生效来源"), tuple(bid_rows),
                     narrow_hide=("目录",),
                     note=planned + ("｜" + discover_note if discover_note else ""),
-                    empty=("还没有模型行：填「请求地址」与「密钥」，再点「读取模型清单」。"
-                           if snapshot.ok("token_plan") else UNAVAILABLE), title="上游报价"),
+                    # 空态与页面顶部同一句话（三步）：客户在哪一块看到都知道下一步点哪
+                    empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE),
+                    title="上游报价"),
         tables=(Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
                       narrow_hide=("最近验证",),
                       note="验证通过且新鲜的模型才会进入共享容量",
@@ -2587,11 +2681,20 @@ def build_view(key: str, snapshot: Snapshot) -> View:
 
     出口处统一过一遍 :func:`terminalize`（RC15-039 #11）：CLI 的 ``next_step`` 无论从哪个
     域来（access / bench / daemon…），上屏前都会带上「这条要在终端里跑」。
+
+    再挂一次 :func:`init_recovery`（UX-E2E-20261121 P1-3）：本机没初始化时，**每一页**都带
+    同一条可点出路。放在出口处而不是 13 个 builder 里，理由与 :func:`terminalize` 相同——
+    逐页打补丁一定会漏页（走查已经抓到过「只扫了 4 页」）。
     """
     builder = _BUILDERS.get(str(key or ""))
     if builder is None:
         raise ValueError("未知视图：" + str(key))
-    return _terminalize_tree(builder(snapshot))
+    view = _terminalize_tree(builder(snapshot))
+    if view.recovery is None:
+        recovery = init_recovery(snapshot)
+        if recovery is not None:
+            view = replace(view, recovery=recovery)
+    return view
 
 
 def build_views(snapshot: Snapshot) -> dict[str, View]:
