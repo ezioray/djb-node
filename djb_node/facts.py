@@ -416,10 +416,15 @@ UPSTREAM_KINDS: tuple[str, ...] = (
 RELAY_KIND = "third_party_relay"
 
 RELAY_FRESH_S = 900
-"""C9 接线：relay 发现结论的新鲜度窗口（秒），与服务端 ``PROBE_FRESH_S=900`` 同口径。
+"""C9 接线：relay 发现结论的新鲜度窗口（秒），**本次刻意不动**（仍是 900）。
 
-口径来源：`app/supply/facts.py` 的「容量公告只认 ≥ now-900s 的 verified」；
-relay 以「最近一次成功发现」代替 L2 探针，过期即 ``max_qps=0``（保留条目，便于审计）。
+口径来源：`app/supply/facts.py` 的 verified_at 窗口。relay 以「最近一次成功发现」代替
+L2 探针，过期即 ``max_qps=0``（保留条目，便于审计）。
+
+**与 PROBE_FRESH_S 已不同源**（CHG-20261121-PROBE-DAILY）：日探针只改 L2/L3 周期探针，
+relay 发现走的是 ``djb upstream discover``（CLI / 桌面手动触发），节奏没变，所以窗口
+保持 900 s 才是对的；把它一起放大等于让「手动才发现一次」的中转站按 25 h 继续按旧结论
+供容量 —— 方向是**更不安全**。若将来 relay 也改周期发现，两个常量必须一起裁决。
 """
 
 RELAY_AUTH_SCHEMES: tuple[str, ...] = ("bearer", "x-api-key", "api-key", "custom")
@@ -542,33 +547,121 @@ PROBE_TIMEOUT_S = _float_env("DJB_NODE_PROBE_TIMEOUT_S", 20.0)
 上游永远停在 ``rejected``，家庭/办公机供方在默认配置下**不可能通过验证**（E2E-11）。
 回滚：``DJB_NODE_PROBE_TIMEOUT_S=5`` 即恢复旧超时，无需改代码。
 """
-PROBE_FRESH_S = 15 * 60
-"""last_probe_at 新鲜窗口：超过即不进容量公告（默认 15 min）。"""
-PROBE_PERIODIC_DEFAULT_S = PROBE_FRESH_S // 2
-"""周期复探的**基础**间隔（秒）= 新鲜度一半 = 450 s（7.5 min）。ROUND3 / C-01b。
+PROBE_FRESH_S = 25 * 3600
+"""last_probe_at 新鲜窗口（秒）：超过即不进容量公告（默认 **25 h**）。
 
-修前是 ``10 * 60`` = 600 s，本身就 > ``PROBE_PERIODIC_CAP_S``(450) ⇒ 常规配置下**恒被钳制**，
-600 这个值一次都没真正生效过（ROUND2 client README §4.5 记为待收敛项）。这里按不变式
-直接取 half-fresh：**不改 P6 的新鲜度语义**（``PROBE_FRESH_S`` 仍是 900），只让常量与
-``periodic_interval_s`` 的钳制上界一致。于是「模型数缩放 / 失败退避」两个维度只在
-``PROBE_PERIODIC_CAP_S`` 被放大时才生效，默认配置下每 450 s 必复探一次。
-回滚：改回 ``10 * 60``（行为等价，仍被钳到 450）。
+CHG-20261121-PROBE-DAILY（owner 2026-11-21 裁决「纯日探针 + 云端新鲜度放到 25h」）：
+周期探针从「450 s × 全模型」改成「**每链接每天 1 次 × 1 个代表模型**」，两次探针之间的
+间隔本身就是 24 h（见 :data:`PROBE_DAILY_INTERVAL_S`）。窗口若仍是 900 s，则每轮探针之后
+15 分钟容量必然归零 —— 那不是「探针失败」而是「采样节奏」，等于把日探针做成全天 0 容量。
+
+**与云端对齐**：``repos/djb-cloud/app/supply/facts.py`` 的 ``PROBE_FRESH_S`` 同值 90000，
+两侧同口径（云端不认得客户端常量，改动必须成对发布；只改一侧 = 半窗口掉档）。
+**已接受的风险**（owner 明示）：容量最多**陈旧 24 h** —— 上游在两次探针之间坏掉，
+云端与本地都会继续按上一次结论公告/报价，直到下一轮探针才降档。
+新鲜度 ≠ 证据：模型能否公告仍要 ``inference_ok is True``（L2 真通过过）。
+回滚：改回 ``15 * 60`` 并把云端同值改回 900（见 CHG 票 §5）。
+"""
+PROBE_DAILY_INTERVAL_S = 24 * 3600
+"""日探针基准间隔（秒）：一个链接一天一轮。
+
+CHG-20261121-PROBE-DAILY 的核心常数。为什么是「日」：官方特供客户端用同一把上游 key
+做 L2 探针（``max_tokens=1``，但按**请求**计额度），450 s × 全模型 ≈ 2 000–2 400 请求/天，
+把测试额度打空之后上游对推理统一 401（`changes/CHG-20261121-PROBE-QUOTA-BURN.md`）。
+日探针把上限压到「链接数 × 1 请求/天」（含一次失败重试也 ≤ 链接数 × 2）。
+
+**不变式**：``PROBE_DAILY_INTERVAL_S + PROBE_DAILY_JITTER_S < PROBE_FRESH_S``
+（24 h + 30 min < 25 h）—— 任何一轮失败/重启都不会让下一轮落在新鲜窗之外，
+容量只会「下降」不会「静默归零」。
+"""
+PROBE_DAILY_JITTER_S = 30 * 60
+"""日探针时刻的**稳定抖动**上限（秒）：首启时刻 + 0–30 min 的哈希抖动 = 该链接此后固定的
+每天探针时刻（「当天固定、下一天同一时刻」）。
+
+为什么要抖动：全量客户端若都按「首启那一刻」整齐划一地探，同一把上游 key 会在同一分钟
+被打成尖峰。抖动由 ``probe.daily_offset_s()`` 从稳定材料（链接 id 集合）派生的 sha256 决定，
+**不是**每轮重新随机 —— 同日重试/重启都不换时刻（票面不变量）。
+"""
+PROBE_DAILY_MIN_GAP_S = 20 * 3600
+"""两次**计划轮**之间的最小间隔（秒）：防止「刚探完又排一个当日槽」造成一天两轮。
+
+首启时当天槽位可能只差几分钟（槽位 = 首启时刻 + 抖动），本下限把下一次计划轮推到次日，
+当日实际只发生一次计划轮。日重试/backlog 续跑不受本值约束（它们按 ``PROBE_DAILY_MAX_ATTEMPTS`` 限次）。
+"""
+PROBE_DAILY_MAX_ATTEMPTS = 2
+"""单个链接**每天**最多几轮：1 次计划轮 + 1 次重试（票面「当日重试不超过 1 次」）。
+
+重试既覆盖「探针失败」（延迟 :data:`PROBE_DAILY_RETRY_DELAY_S`），也覆盖「单轮预算没收完」
+（延迟 :data:`PROBE_BACKLOG_RETRY_S`）—— 两者共用同一个当日额度，否则预算不足会退化成
+5 s 一轮的空转（那正是要消灭的额度燃烧模式）。额度用尽 ⇒ 等次日槽位。
+"""
+PROBE_DAILY_PLAN_KEY = "probe_daily"
+"""日探针计划在本机 store kv 里的键名（daemon 唯一读写方）。
+
+内容：``{"next_at", "slot_offset_s", "day", "attempts", "last_at", "last_reason",
+"next_kind", "last_failed", "last_backlog"}``。落盘的意义：``next_at`` 跨重启仍有效
+（重启不重复探、不换时刻）。**只加字段不改既有键**：旧版本读到未知键会忽略。
+"""
+PROBE_MODEL_MAX_AGE_S = 7 * 86400
+"""**单个模型**自身快照的最长采信年龄（秒）= 7 天（lead 2026-11-21 复核补充）。
+
+日探针每链接每天只探 1 个代表模型 ⇒ 一个链接若有 N 个 enabled 模型，某个模型平均 N 天
+才被实探一次。`upstream.covered()` 允许「模型没被实探、但上游本轮通过」时继续采信
+模型自己的上一次结论（与云端 ``verified_at`` 按上游展开同口径）；本常量是这条继承的
+**上限**：模型自己的 ``last_probe_at`` 超过 7 天后，即使上游天天通过也不再公告/报价。
+
+为什么必须有上限：没有它，一个**已经坏掉但没轮到**的模型会被「上游健康」永久带住，
+用户看到的是「可公告」，实际打过去 4xx —— 陈旧结论伪装成新鲜证据。
+为什么是 7 天：≥ 一个每周巡检周期；把「日频采样」的代价（7 天内一定轮到每个模型）
+与额度预算放在同一张牌上（链接数 × 1 请求/天）。**这是 owner 接受的代价**：
+7 天内没轮到的模型自然掉容量（见 CHG-20261121-PROBE-DAILY §3 风险条）。
+"""
+
+PROBE_DAILY_RETRY_DELAY_S = _float_env("DJB_NODE_PROBE_DAILY_RETRY_DELAY_S", 3600.0,
+                                       minimum=300.0)
+"""当日失败重试的延迟（秒），默认 **1 h**，下限 5 min。
+
+硬约束「失败不缩到分钟级」：修前的指数退避在 450 s 周期下会退到 1200/2400 s 反复重试，
+一轮失败立刻变成本小时的多次请求。日探针口径下**一天只补一次**、且至少隔 5 min
+（``DJB_NODE_PROBE_DAILY_RETRY_DELAY_S`` 低于 300 直接回落默认值，防止把额度重新烧起来）。
+"""
+PROBE_PERIODIC_DEFAULT_S = PROBE_DAILY_INTERVAL_S
+"""周期复探的**基础**间隔（秒）= 一天（``PROBE_DAILY_INTERVAL_S``）。
+
+CHG-20261121-PROBE-DAILY 起语义从「新鲜度一半（450 s）」改成「一天一次」。名字保留：
+``djb status`` / 离线状态下 `probe.interval_s` 读的就是它（见 ``cli._offline_status``），
+改名会让旧渲染层整行消失（ROUND3 真机取证的坑），值才是要改的东西。
+回滚：改回 ``PROBE_FRESH_S // 2`` 并恢复 ``probe.periodic_interval_s`` 的退避曲线。
 """
 PROBE_PERIODIC_MAX_S = 6 * 3600
-PROBE_PERIODIC_CAP_S = PROBE_FRESH_S // 2
-"""周期复探（含失败退避、模型数缩放）的**硬上界** = 新鲜度窗口的一半（P6 / E2E-12）。
+"""**历史遗留**：指数退避的原始上界（6 h）。
 
-修前上界是 ``PROBE_PERIODIC_MAX_S``(6 h)：一次失败退避到 1200 s 就已经越过 900 s 的
-新鲜度窗口 ⇒ **每周期固定掉 5 分钟容量**；两次失败 2400 s ⇒ 供方永久 0 容量，
-而客户端 ``status`` 全程显示「接单=是」，云端只说 ``no_candidates``（无人知晓）。
-钳到 half-fresh 的不变式：任何一次复探失败，下一轮都必然落在新鲜度窗口内，
-容量只会「下降」不会「静默归零」。回滚：把 ``probe.periodic_interval_s`` 的返回值
-改回 ``min(PROBE_PERIODIC_MAX_S, ...)`` 即回旧行为。
+CHG-20261121-PROBE-DAILY 起 ``probe.periodic_interval_s`` 不再做退避（日探针只有「今天」和
+「明天」两个答案），本值仅供旧读方 / 回滚路径参考，不再参与调度计算。
+"""
+PROBE_PERIODIC_CAP_S = PROBE_DAILY_INTERVAL_S
+"""周期复探的**硬上界**（D-R3-02 的显示不变式：渲染出的周期不得越过它）。
+
+CHG-20261121-PROBE-DAILY 起与 ``PROBE_PERIODIC_DEFAULT_S`` 同为一天：日探针没有
+「比一天更密」的合法档位，cap 若还停在 450 s 就会渲染成「每 24 小时 ≤ 每 7.5 分钟」，
+上限看起来像个笑话。仍守住老不变式的形状（``interval ≤ cap``），只是量级跟着周期走。
+
+修前的历史（保留作背景）：上界曾是 ``PROBE_PERIODIC_MAX_S``(6 h)，一次失败退避到
+1200 s 就越过 900 s 的新鲜度窗口 ⇒ 每周期固定掉 5 分钟容量。回滚：两值一起改回
+``PROBE_FRESH_S // 2``。
 """
 PROBE_MODELS_PER_STEP = 8
-"""模型数退避：每多 8 个模型，周期复探间隔再加一档。"""
+"""**历史遗留**：修前「每多 8 个模型，周期复探间隔再加一档」。
+
+CHG-20261121-PROBE-DAILY 起日探针间隔恒为一天（``probe.periodic_interval_s`` 不再读它）：
+模型数带来的稀疏度改由「每轮只探 1 个代表模型 + 跨天轮换」承担。保留常量只为不打断
+旧读方 / 回滚路径。
+"""
 PROBE_MAX_BACKOFF_SHIFT = 5
-"""失败指数退避上限：2**5 = 32 倍（再乘上限截断）。"""
+"""失败退避计数上限（``daemon._probe_failures`` 的封顶值 = 2**5 = 32 倍）。
+
+日探针下间隔不再按失败翻倍，但**计数本身还在**（``status.probe.failures`` 与看板要看
+「连续失败几轮」）；封顶只是防止计数器无限增长。"""
 PROBE_PASS_BUDGET_S = _float_env("DJB_NODE_PROBE_PASS_BUDGET_S", 20.0, minimum=5.0)
 """单轮探针预算（秒）：启动校验与周期复探共用，超出即把剩余模型留到下一轮。
 
@@ -649,7 +742,7 @@ PROBE_REUSE_OK_S = _float_env("DJB_NODE_PROBE_REUSE_OK_S", 20.0, minimum=0.0)
 会把预算重新吃光，缺口（例如排最后的 qwen）依旧轮不到 —— 与 0.3.4 的 635s 逐模型 stale
 是同一类「没轮到」的累积。
 
-窗口必须**远小于** ``PROBE_FRESH_AFTER_S``(600)：复用期间的 ok 行仍然进报价，
+窗口必须**远小于** ``PROBE_FRESH_AFTER_S``(89700)：复用期间的 ok 行仍然进报价，
 窗口一旦接近新鲜度窗口，就会把模型拖成逐模型 ``stale_probe``（0.3.4 事故模式 5 行→1 行）。
 默认 20s（= 一个 ``PROBE_PASS_BUDGET_S``）：跨过一轮预算就没有复用价值了。
 
@@ -693,11 +786,17 @@ QUOTE_CURRENCY = "USD"
 QUOTES_STOP_JOIN_S = 5.0
 """停报价线程时 join 的上限（秒），与其它子系统同口径。"""
 
-PROBE_FRESH_AFTER_S = 600
-"""报价门控的探针新鲜窗口（秒），**比 `PROBE_FRESH_S`(900) 更保守**。
+PROBE_FRESH_AFTER_S = PROBE_FRESH_S - 300
+"""报价门控的探针新鲜窗口（秒）= ``PROBE_FRESH_S - 300`` = 89700（≈ 24 h 55 min）。
 
-云侧候选门控是 900 s（`app/supply/facts.py` 的 verified_at 口径）。客户端提前 300 s
-就停止为该模型报价，避免「本地算新鲜、云侧已判过期」的半窗口掉档（P4：探针失败即停发）。
+**比 `PROBE_FRESH_S` 更保守 300 s** 这条关系不变（修前是 900 / 600），只是两侧一起
+随 CHG-20261121-PROBE-DAILY 放大到日频：云侧候选门控读 `app/supply/facts.py` 的
+``verified_at`` 口径，客户端提前 300 s 就停止为该模型报价，避免「本地算新鲜、云侧已判过期」
+的半窗口掉档（P4：探针失败即停发）。
+
+**不能只放宽 `PROBE_FRESH_S`**：报价行由本窗口单独门控（`quotes.plan_quotes`），
+日探针下若它还是 600 s，则每轮探针之后 10 分钟就停发报价 ⇒ 一天 99% 的时间 `rows=0`
+（官方特供的「目录为空」就是这条链）。回滚：两值一起改回 900 / 600。
 """
 
 # ─────────────────────────────────────────────────────────── 注册唯一键冲突（P5 一机一节点）

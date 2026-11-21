@@ -767,6 +767,11 @@ def _minutes(seconds: Any) -> str:
         return "?"
     if value < 90:
         return str(max(1, value)) + " 秒"
+    # CHG-20261121-PROBE-DAILY：窗口从 15 min 变成 25 h，再有 `//60` 就会打出
+    # 「约 1500 分钟后掉容量」——数字对，但没人能一口读出量级。整小时向下取整：
+    # 「25 小时」比「1500 分钟」少说 0 s、多一分可读性（DOWN 原则不变）。
+    if value >= 3600:
+        return str(int(value // 3600)) + " 小时"
     return str(int(value // 60)) + " 分钟"
 
 
@@ -783,6 +788,11 @@ def _duration_exact(seconds: Any) -> str:
         return "?"
     if value < 90:
         return str(max(1, int(round(value)))) + " 秒"
+    # CHG-20261121-PROBE-DAILY：周期从 450 s 变成一天，再按分钟渲染就是「每 1440 分钟」
+    # —— 数值正确但读不出量级（运维要心算 1440/60）。整小时的就直接说小时。
+    hours = value / 3600.0
+    if value >= 3600 and abs(hours - round(hours)) < 0.01:
+        return str(int(round(hours))) + " 小时"
     minutes = value / 60.0
     if abs(minutes - round(minutes)) < 0.05:
         return str(int(round(minutes))) + " 分钟"
@@ -854,8 +864,9 @@ def _capacity_lines(value: dict[str, Any]) -> list[str]:
             lines.append("周期复探：关（client.probe.periodic.enabled）→ 探针一过期就掉容量，"
                          "只能手动 djb upstream probe")
         elif isinstance(probe.get("interval_s"), int):
-            # D-R3-02：周期是**承诺值**，必须精确（450 s → 7.5 分钟）；上限一并印出来，
-            # 让「显示值 ≤ 上限」肉眼可核（round() 曾把 450 s 说成「每 8 分钟」越过 cap）。
+            # D-R3-02：周期是**承诺值**，必须精确（修前例：450 s → 7.5 分钟，不是 8 分钟）；
+            # 上限一并印出来，让「显示值 ≤ 上限」肉眼可核。CHG-20261121-PROBE-DAILY 起
+            # 量级是一天（「每 24 小时」），这条不变式的形状没变。
             interval = int(probe.get("interval_s"))
             cap = probe.get("cap_s")
             parts = ["周期复探：每 " + _duration_exact(interval) + "（" + str(interval) + " 秒）"]

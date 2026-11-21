@@ -1274,8 +1274,10 @@ def _models(snapshot: Snapshot) -> View:
     models = _section(snapshot, "models")
     probe = models.get("probe") if isinstance(models.get("probe"), Mapping) else {}
     probe_rows = probe.get("rows") if isinstance(probe.get("rows"), list) else []
-    fresh_window = int(probe.get("fresh_window_s") or 900)
-    quote_window = int(probe.get("quote_window_s") or 600)
+    # 兜底值必须来自 facts：写死 900/600 的话，旧快照（没有这两个键）会渲染出
+    # 「公告还剩 3 分钟」这种与新窗口（25 h）不符的话（CHG-20261121-PROBE-DAILY）。
+    fresh_window = int(probe.get("fresh_window_s") or facts.PROBE_FRESH_S)
+    quote_window = int(probe.get("quote_window_s") or facts.PROBE_FRESH_AFTER_S)
 
     # ── 探针表（D 的主战场：纯投影 probe_details()，不重算门控）
     rows: list[Row] = []

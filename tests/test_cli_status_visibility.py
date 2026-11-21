@@ -93,9 +93,10 @@ def test_capacity_lines_explain_why_each_model_dropped():
     assert "slow —— 探针未通过（timeout）" in text
     assert "stale —— 探针过期" in text
     assert "off —— 上游已停用" in text
-    # D-R3-02：450 s 必须说成「7.5 分钟」而不是 round() 出来的「8 分钟」（越过自己的上限）
-    assert "周期复探：每 7.5 分钟" in text
-    assert "每 8 分钟" not in text
+    # D-R3-02 仍然成立（显示值不得越过上限），只是量级换成一天：
+    # CHG-20261121-PROBE-DAILY 起周期 = 86400 s ⇒ 「每 24 小时」（不是「每 1440 分钟」）
+    assert "周期复探：每 24 小时" in text
+    assert "每 1440 分钟" not in text
 
 
 def test_capacity_lines_periodic_display_never_exceeds_cap():
@@ -104,7 +105,7 @@ def test_capacity_lines_periodic_display_never_exceeds_cap():
     修前 `_minutes()` 用 round()：450 s → 「8 分钟」，而同一行还写着「上限=新鲜度一半」
     （7.5 分钟）—— 用户看到的是「8 ≤ 7.5」，凭空一个矛盾。
     """
-    for interval in (60, 90, 120, 450, 600, 1200, 3600, 21600):
+    for interval in (60, 90, 120, 450, 600, 1200, 3600, 21600, 86400):
         cap = facts.PROBE_PERIODIC_CAP_S if interval <= facts.PROBE_PERIODIC_CAP_S \
             else facts.PROBE_PERIODIC_MAX_S
         text = "\n".join(cli_module._capacity_lines({
@@ -112,6 +113,8 @@ def test_capacity_lines_periodic_display_never_exceeds_cap():
         shown = text.split("每 ", 1)[1].split("（", 1)[0]
         if shown.endswith("秒"):
             shown_s = float(shown[:-1])
+        elif shown.endswith("小时"):
+            shown_s = float(shown.replace(" 小时", "")) * 3600
         else:
             shown_s = float(shown.replace(" 分钟", "")) * 60
         assert shown_s <= interval + 0.01, (interval, shown)
@@ -179,7 +182,7 @@ def test_offline_status_keeps_periodic_line_with_planned_rhythm(tmp_path):
     assert value["probe"]["interval_s"] == facts.PROBE_PERIODIC_DEFAULT_S
     assert value["probe"]["planned"] is True
     text = "\n".join(cli_module._capacity_lines(value))
-    assert "周期复探：每 7.5 分钟" in text
+    assert "周期复探：每 24 小时" in text                 # 日探针（CHG-20261121-PROBE-DAILY）
     assert "daemon 未运行，启动后生效" in text
     # 空闲状态下没有模型 → 不该凭空编出容量行
     assert "容量：" not in text

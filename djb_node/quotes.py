@@ -38,7 +38,7 @@ from typing import Any
 from . import facts
 from .errors import (AuthError, ConflictError, ForbiddenError, NetworkError,
                      RateLimitError, UsageError, VerifyError)
-from .upstream import ModelEntry, UpstreamManager, capacity_unit
+from .upstream import ModelEntry, UpstreamManager, capacity_unit, covered
 from .util import utcnow
 
 __all__ = [
@@ -59,7 +59,11 @@ SKIP_INVALID_PRICE = "invalid_price"
 SKIP_NOT_PROBED = "not_probed"
 """探针从未通过（`inference_ok is not True`）——P4：探针失败即停发。"""
 SKIP_STALE = "stale_probe"
-"""`last_probe_at` 超出 `facts.PROBE_FRESH_AFTER_S`（比云侧 900 s 更保守）。"""
+"""探针证据过期（`upstream.covered()` 为假，窗口 `facts.PROBE_FRESH_AFTER_S` ≈ 25 h）。
+
+CHG-20261121-PROBE-DAILY：日探针下「这个模型今天没被实探」是常态，所以这一关不再只看
+模型自己的 `last_probe_at`，而是同一出口 `upstream.covered()`（含链接级覆盖 + 7 天模型年龄上限）。
+与容量公告共用一处口径，避免「公告说可发、报价说停发」的双口径。"""
 SKIP_UPSTREAM = "upstream_gated"
 """上游整体被门控（`enabled=false` 或 `state=rejected`）。"""
 SKIP_DUPLICATE = "duplicate"
@@ -293,7 +297,9 @@ def plan_quotes(upstreams: UpstreamManager, *, now: Any = None,
     1. 上游：``enabled=false`` / ``state=rejected`` → ``upstream_gated``；
     2. 模型：``enabled=false`` → ``disabled``；
     3. 探针：``inference_ok is not True`` → ``not_probed``（P4：失败即停发）；
-    4. 新鲜度：``last_probe_at`` 超过 ``PROBE_FRESH_AFTER_S``（600 s）→ ``stale_probe``；
+    4. 新鲜度：``covered()`` 不成立 → ``stale_probe``（CHG-20261121-PROBE-DAILY：
+       模型自己的 ``last_probe_at`` 在 ``PROBE_FRESH_AFTER_S``(89700 s ≈ 25 h) 内 **或**
+       「上游本轮通过 + 该模型上次结论 L2 通过且 ≤ 7 天」的链接级覆盖；两关都不成立才停发）；
     5. 价格：未定价 / 换算后 ≤0 分 → ``zero_price``（P1）；非法十进制 → ``invalid_price``；
     6. 去重：同一 ``(access, model, unit)`` 只留**最便宜**的一条（同价取上游 id 较小的），
        其余记 ``duplicate`` —— 云端按 ``(node, access, model, unit)`` 只认最新一条，
@@ -318,7 +324,7 @@ def plan_quotes(upstreams: UpstreamManager, *, now: Any = None,
             if entry.inference_ok is not True:
                 plan.skip(SKIP_NOT_PROBED)
                 continue
-            if not entry.fresh(moment, ttl=facts.PROBE_FRESH_AFTER_S):
+            if not covered(record, entry, moment, ttl=facts.PROBE_FRESH_AFTER_S):
                 plan.skip(SKIP_STALE)
                 continue
             if entry.min_price is None:

@@ -42,14 +42,15 @@ from .logging_setup import event, setup_logging
 from .model_sync import ModelSyncClient, model_sync_enabled, verifier_from_env
 from .notifications import NotificationStore, notifications_enabled
 from .outbox import ReceiptFactory, SealedReceiptBuffer
-from .probe import periodic_interval_s
+from .probe import (daily_slot_offset, day_index, next_daily_at,
+                    periodic_interval_s)
 from .relay import RelayManager, capacity_targets
 from .secure import CredentialStore
 from .server import Admission, LocalApiServer, RouteTarget
 from .state import StateMachine, Snapshot, reason_label
 from .store import Store, UpstreamRecord
 from .update import UpdateManager
-from .upstream import ModelEntry, UpstreamManager
+from .upstream import ModelEntry, UpstreamManager, covered
 from .util import (iso, new_request_id, new_token, parse_iso, sha256_hex, utcnow)
 
 #: D-POLICY-01：剩余租约不足该值即主动拉策略（TTL 默认 3600，留 10 分钟提前量）
@@ -326,7 +327,12 @@ class Daemon:
         # C7 探针调度（全部走注入时钟，测试不 sleep）
         self._probe_failures = 0
         self._probe_interval_s = facts.PROBE_PERIODIC_DEFAULT_S
-        self._next_probe_at = self._now()
+        # CHG-20261121-PROBE-DAILY：日探针计划**落盘**。为什么必须持久化：
+        # 「同一天内重试/重启不换时刻」是票面不变量，而进程内的 `_next_probe_at`
+        # 一重启就没了。旧行为更糟 —— 每次 start 都无条件做一次启动校验，
+        # 一天重启 5 次就是 5 轮探针（额度燃烧的另一半）。读盘后 `next_at` 就是权威。
+        self._probe_plan = self._load_probe_plan()
+        self._next_probe_at = self._restore_next_probe_at(self._now())
         self._last_probe: dict[str, Any] = {}
         # F14 热重载：SIGHUP 只置位，实际加载在主循环里做（信号上下文不碰锁）
         self._reload_requested = False
@@ -544,9 +550,16 @@ class Daemon:
                 self._persist()
                 return
         self.api.client_key = self.credentials.client_key()
-        # 3) 公告门控前置：启动做一次 L1–L3 校验（预算内），未验证的模型不进容量
-        #    （C7）。这是「公告前校验」，与周期复探开关解耦：开关关闭时它只发生一次。
-        self._probe_upstreams(self._now(), reason="startup")
+        # 3) 公告门控前置：**到点才**做 L1–L3 校验（预算内），未验证的模型不进容量（C7）。
+        #    CHG-20261121-PROBE-DAILY：修前是「每次启动无条件探一轮」——一天重启 5 次
+        #    就是 5 轮探针（额度燃烧的进程侧那一半）。现在「到没到点」由落盘的日计划回答：
+        #    首次安装（无计划）⇒ next_at = 现在 ⇒ 立刻校验，容量不留空窗；
+        #    同日重启（next_at 在未来）⇒ 跳过，等计划轮（结论已由上次探针写进本地库）。
+        if self._now() >= self._next_probe_at:
+            self._probe_upstreams(self._now(), reason="startup")
+        else:
+            event("upstream.probe_startup_skipped", next_at=iso(self._next_probe_at),
+                  reason="daily_plan")
         # 4) 首次心跳 + 策略
         self._heartbeat(self._now(), initial=True)
         if self._policy_updated:
@@ -1464,6 +1477,76 @@ class Daemon:
             self._persist()
 
     # ── 探针调度（C7：L1–L3 + 公告门控前置 + 周期复探）
+    def _load_probe_plan(self) -> dict[str, Any]:
+        """读日探针计划（store kv ``probe_daily``）；坏值一律当「没有计划」。"""
+        try:
+            raw = self.store.get_kv(facts.PROBE_DAILY_PLAN_KEY, default={})
+        except Exception:                                  # pragma: no cover - 防御
+            return {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _restore_next_probe_at(self, moment: datetime) -> datetime:
+        """从计划恢复「下一轮时刻」；没有计划 ⇒ ``moment``（首次运行立刻做启动校验）。
+
+        重启语义：``next_at`` 在未来 ⇒ **不探**（哪怕刚启动）；已到期 ⇒ 立刻补一轮。
+        这样「一天重启 N 次」既不重复探，也不会因为跳过启动校验而一整天没有容量。
+        """
+        stamp = parse_iso(str(self._probe_plan.get("next_at") or ""))
+        return stamp if stamp is not None else moment
+
+    def _probe_slot_offset(self, moment: datetime) -> int:
+        """该安装**固定的每天探针时刻**（当天秒数）。计划里有就复用，没有就从链接集合派生。
+
+        时刻一旦落盘就不再重算：链接增删、进程重启、当日重试都不换时刻（票面不变量）。
+        派生材料用**已排序的上游 id 集合**：同一份接入配置在任何机器上落到同一时刻
+        （可复现），同时不同安装之间被 sha256 摊开（避免同一分钟打尖峰）。
+        """
+        stored = self._probe_plan.get("slot_offset_s")
+        if isinstance(stored, int) and not isinstance(stored, bool) \
+                and 0 <= stored < 24 * 3600:
+            return stored
+        material = "|".join(sorted(item.id for item in self.upstreams.list()))
+        return daily_slot_offset(moment, material or "djb-probe-daily")
+
+    def _schedule_next_probe(self, moment: datetime, *, reason: str,
+                             failed: int = 0, backlog: int = 0) -> None:
+        """算出并落盘「下一轮」——日探针的唯一调度出口。
+
+        三种结果：
+
+        * ``backlog``：本轮预算没收完（还有 enabled 模型没探到）⇒ ``PROBE_BACKLOG_RETRY_S``
+          后接着跑（5 s，只补缺口，不是新一轮采样）；
+        * ``retry``：本轮有失败 ⇒ ``PROBE_DAILY_RETRY_DELAY_S``（默认 1 h）后补一次；
+        * ``daily``：其余情况 ⇒ 次日**同一时刻**（``next_daily_at``，最小间隔 20 h）。
+
+        后两者共用 ``PROBE_DAILY_MAX_ATTEMPTS``（= 2）的**当天额度**：额度用尽就等次日，
+        绝不允许「失败 → 5 s 一轮」把额度重新烧起来（`CHG-20261121-PROBE-QUOTA-BURN` 的根因）。
+        重试还必须落在**同一个 UTC 日**内，跨日就放弃（那是次日的计划轮，不是重试）。
+        """
+        offset = self._probe_slot_offset(moment)
+        today = moment.date().isoformat()
+        attempts = int(self._probe_plan.get("attempts") or 0) \
+            if self._probe_plan.get("day") == today else 0
+        attempts += 1
+        slot = next_daily_at(moment, offset)
+        next_at, kind = slot, "daily"
+        if (backlog or failed) and attempts < facts.PROBE_DAILY_MAX_ATTEMPTS:
+            delay = (facts.PROBE_BACKLOG_RETRY_S if backlog
+                     else facts.PROBE_DAILY_RETRY_DELAY_S)
+            retry_at = moment + timedelta(seconds=float(delay))
+            if retry_at < slot and retry_at.date() == moment.date():
+                next_at, kind = retry_at, ("backlog" if backlog else "retry")
+        self._probe_plan = {"next_at": iso(next_at), "slot_offset_s": offset,
+                            "day": today, "attempts": attempts,
+                            "last_at": iso(moment), "last_reason": reason,
+                            "next_kind": kind,
+                            "last_failed": int(failed), "last_backlog": int(backlog)}
+        self._next_probe_at = next_at
+        self._probe_interval_s = periodic_interval_s()
+        self.store.set_kv(facts.PROBE_DAILY_PLAN_KEY, dict(self._probe_plan))
+        event("upstream.probe_scheduled", reason=reason, next_kind=kind,
+              next_at=iso(next_at), attempts=attempts)
+
     def _periodic_probe_enabled(self) -> bool:
         """开关 `client.probe.periodic.enabled`（**0.2.5 起默认开启**；见 facts.FEATURE_FLAGS）。
 
@@ -1474,12 +1557,19 @@ class Daemon:
         """
         return feature_flag(self.config, facts.PROBE_FLAG_PERIODIC)
 
-    def _probe_upstreams(self, now: datetime, *, reason: str) -> dict[str, Any]:
+    def _probe_upstreams(self, now: datetime, *, reason: str,
+                         schedule: bool = True) -> dict[str, Any]:
         """对启用中的上游做一轮探针（L1→L2/L3），结论写回本地模型。
 
         永不抛异常：`facts.PROBE_PASS_BUDGET_S` 是单轮预算，
         超预算的模型留到下一轮（`not_probed`，不算失败）。
-        失败按指数退避拉长下一轮间隔（`probe.periodic_interval_s`）。
+
+        **日探针**（CHG-20261121-PROBE-DAILY）：每链接每轮只 L2 探 **1 个代表模型**
+        （``daily_day`` 传当天的 ``probe.day_index``，由 ``UpstreamManager.probe`` 轮换），
+        L1 ``GET /models`` 仍覆盖全部 enabled 模型（不计推理额度）。
+
+        ``schedule=False``（手动补探）：只探、**不动**日计划 —— 手动是运维动作，
+        既不该把「下一轮」推到明天，也不该占掉当天的重试额度。
         """
         # 0.3.8（RC14 复盘 P0-2）：预算可配，但**不得超过一个心跳周期** ——
         # 探针内联在主循环里，超一个心跳就会让节点 presence 掉档（见 facts 注释）。
@@ -1488,7 +1578,9 @@ class Daemon:
         verified = 0
         failed = 0
         models = 0
+        probed = 0
         backlog = 0
+        day = day_index(now)          # 日轮换游标（同日重试/重启不变 ⇒ 代表模型不变）
         per_upstream: list[dict[str, Any]] = []
         for record in self.upstreams.list():
             if not record.enabled:
@@ -1499,7 +1591,8 @@ class Daemon:
                 payload = self.upstreams.probe(
                     record.id, timeout=facts.PROBE_TIMEOUT_S,
                     level=facts.PROBE_PERIODIC_LEVEL,
-                    now=now, deadline=deadline, clock=self._now)
+                    now=now, deadline=deadline, clock=self._now,
+                    daily_day=day)
             except DjbError as exc:
                 failed += 1
                 event("upstream.probe_failed", level="warning", reason=reason,
@@ -1543,6 +1636,11 @@ class Daemon:
             not_probed = len([item for item in (payload.get("not_probed") or [])
                               if isinstance(item, dict) and item.get("reason") == "budget"])
             backlog += not_probed
+            # 本轮真的打了几次推理：payload 只允许 spec 字段（多一个都会被
+            # tests/test_upstream_gating 的 SPEC_PROBE_REPORT_FIELDS 拦住），所以这里按
+            # 「有明确 L2 结论的模型数」计：日探针下每链接正好 1，手动全量探时 = 模型数。
+            # 验收口径「请求数 = 链接数」看的就是这个数。
+            probed += passed + len(real_failures)
             if passed:
                 verified += 1
                 # D-PROBE-03：**周期探针的结论必须上报**，否则云端 verified_at 不动。
@@ -1563,24 +1661,33 @@ class Daemon:
                                  "per_model": per_model})
         self._probe_failures = min(self._probe_failures + 1, facts.PROBE_MAX_BACKOFF_SHIFT) \
             if failed else 0
-        self._probe_interval_s = periodic_interval_s(self._upstream_model_count(),
-                                                     self._probe_failures)
-        # 有 backlog（预算没轮到）⇒ 很快续跑，几轮内清空；否则回常规周期。
-        self._next_probe_at = now + timedelta(
-            seconds=facts.PROBE_BACKLOG_RETRY_S if backlog else self._probe_interval_s)
+        self._probe_interval_s = periodic_interval_s()
+        # CHG-20261121-PROBE-DAILY：下一轮由日计划决定（落盘）。旧公式
+        # ``now + (5s if backlog else 退避间隔)`` 正是额度燃烧的调度器那一半：
+        # 一有 backlog 就 5 s 续跑、失败退避又永远落在分钟级。
+        if schedule:
+            self._schedule_next_probe(now, reason=reason, failed=failed, backlog=backlog)
         self._last_probe = {"at": iso(now), "reason": reason, "verified": verified,
-                            "failed": failed, "models": models,
+                            "failed": failed, "models": models, "probed": probed,
                             "failures": self._probe_failures,
                             "backlog": backlog,
                             "interval_s": self._probe_interval_s,
+                            "next_at": iso(self._next_probe_at),
+                            "scheduled": bool(schedule),
                             # 逐模型结论（本地排障用；上行仍走 model_checks，不重复发）
                             "per_upstream": per_upstream}
         event("upstream.probe_pass", reason=reason, verified=verified, failed=failed,
-              models=models, failures=self._probe_failures, backlog=backlog,
-              interval_s=self._probe_interval_s)
+              models=models, probed=probed, failures=self._probe_failures,
+              backlog=backlog, interval_s=self._probe_interval_s,
+              next_at=iso(self._next_probe_at), scheduled=bool(schedule))
         return self._last_probe
 
     def _upstream_model_count(self) -> int:
+        """enabled 模型总数（**不再**参与调度，见 ``facts.PROBE_MODELS_PER_STEP``）。
+
+        留着是因为它是最省事的口径来源：日探针下「一个链接要几天才轮到某个模型」=
+        ``ceil(模型数 / 1)`` 天，排障时仍要拿它跟 ``PROBE_MODEL_MAX_AGE_S``(7 天) 对账。
+        """
         return sum(len(item.model_ids()) for item in self.upstreams.list() if item.enabled)
 
     def _report_probe(self, record: Any, payload: dict[str, Any], *, reason: str) -> None:
@@ -1620,8 +1727,14 @@ class Daemon:
               server_upstream_id=server_id)
 
     def probe_now(self, *, reason: str = "manual") -> dict[str, Any]:
-        """手动触发一轮探针（控制通道 / 测试用；不受周期开关影响）。"""
-        return self._probe_upstreams(self._now(), reason=reason)
+        """手动触发一轮探针（控制通道 / 测试用；不受日计划与开关影响）。
+
+        ``reason="manual"``（默认）**不动日计划**：运维随手补一次不该把明天的计划轮
+        提前/推后，也不该吃掉当天的失败重试额度。``reason="periodic"`` 等内部值
+        仍按日计划排下一轮（旧测试与内部重入路径需要这个语义）。
+        """
+        return self._probe_upstreams(self._now(), reason=reason,
+                                     schedule=(reason != "manual"))
 
     # ── 策略
     # ── 策略租约（D-POLICY-01）
@@ -2015,10 +2128,14 @@ class Daemon:
                          "verified_models": sum(
                              1 for item in upstreams for raw in item.models
                              if ModelEntry.from_dict(raw).verified()),
+                         # CHG-20261121-PROBE-DAILY：这里的「stale」是**该掉容量了**
+                         # （= 证据不再可采信），所以走与公告/报价同一个出口 covered()；
+                         # 模型自己今天没被实探但上游本轮通过 ⇒ 不算 stale（否则健康页
+                         # 会在日探针下天天报「5 个模型过期」的红灯，掩盖真故障）。
                          "stale_models": sum(
                              1 for item in upstreams for raw in item.models
                              if ModelEntry.from_dict(raw).verified()
-                             and not ModelEntry.from_dict(raw).fresh(self._now()))},
+                             and not covered(item, ModelEntry.from_dict(raw), self._now()))},
             "policy": {"present": policy_summary.get("present"),
                        "usable": policy_summary.get("usable"),
                        "policy_version": policy_summary.get("policy_version"),
@@ -2085,9 +2202,19 @@ class Daemon:
                       "interval_s": self._probe_interval_s,
                       # ROUND3 / D-R3-02：把「上限」一并给渲染层，status 才能证明
                       # 「显示的周期 ≤ 上限」，而不是让用户自己猜 half-fresh 是多少。
+                      # CHG-20261121-PROBE-DAILY：日探针下 interval 与 cap 同为一天。
                       "cap_s": facts.PROBE_PERIODIC_CAP_S,
                       "next_at": iso(self._next_probe_at),
                       "failures": self._probe_failures,
+                      # 日计划（可见才可审计）：固定时刻 + 当天已用轮次 + 下一轮类型。
+                      # 「一天只探一次」不是靠谁记得住，而是这三个值能对上。
+                      "daily": {"slot_offset_s": self._probe_slot_offset(self._now()),
+                                "day": self._probe_plan.get("day"),
+                                "attempts": self._probe_plan.get("attempts"),
+                                "max_attempts": facts.PROBE_DAILY_MAX_ATTEMPTS,
+                                "next_kind": self._probe_plan.get("next_kind"),
+                                "last_at": self._probe_plan.get("last_at"),
+                                "last_reason": self._probe_plan.get("last_reason")},
                       "last_pass": dict(self._last_probe),
                       "fresh_window_s": facts.PROBE_FRESH_S,
                       "models": [entry for item in self.upstreams.list()
