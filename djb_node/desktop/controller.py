@@ -126,7 +126,7 @@ def _cooldown_suffix(controller: Any, exc: Any) -> str:
     return ("；云端记录：" + notice) if notice else ""
 
 
-#: 「这台节点已经绑在**别的**账户上」→ 必须先解绑（云端 INV-08）。2026-11-18 owner 要求
+#: 「这台节点已经绑在「别的」账户上」→ 必须先解绑（云端 INV-08）。2026-11-18 owner 要求
 #: 这类失败要说清「下一步是什么」，而不是把 409 原文丢给客户。
 _BIND_OTHER_ACCOUNT_REASONS = ("node_already_bound", "already_bound", "account_mismatch",
                                "绑定其它账户", "已绑定其它账户")
@@ -135,7 +135,7 @@ _BIND_OTHER_ACCOUNT_REASONS = ("node_already_bound", "already_bound", "account_m
 #: ``available_at``）时，老客户端也不需要再升级就能显示可再绑时间。
 _BIND_COOLDOWN_REASONS = ("rebind_cooldown", "binding_cooldown", "switch_cooldown",
                           "换绑冷却", "更换账户冷却")
-BIND_SWITCH_HINT = ("；这台节点已经绑在**别的**账户上：先在网页端「节点」页解绑（或用本页"
+BIND_SWITCH_HINT = ("；这台节点已经绑在「别的」账户上：先在网页端「节点」页解绑（或用本页"
                     "「解绑这台电脑」），再用新账户生成新的绑定码；解绑后可以立即重绑，"
                     "当前平台对更换账户没有等待期")
 
@@ -775,7 +775,7 @@ class DesktopController:
         if reason != "retired":
             return ActionResult("这台节点没有被清退，不需要重新注册。", ok=False,
                                 effect="noop")
-        if not confirm("这台节点已被云端清退（不可逆）。重新注册会用**同一台机器**开一个"
+        if not confirm("这台节点已被云端清退（不可逆）。重新注册会用同一台机器开一个"
                        "新节点 ID（旧节点保留为档案，不会复活），之后要重新绑定网页端才能"
                        "接单。现在重启节点并重新注册？"):
             return ActionResult("已取消重新注册（节点进程未改动）。", ok=False,
@@ -1228,7 +1228,7 @@ class DesktopController:
         if confirm is not None and str(price or "").strip():
             fee = facts.SERVICE_FEE_BPS
             text = ("保存「" + model + "」的最低申报价 " + str(price).strip() + " USD / 百万 token？\n\n"
-                    "成交规则：低于这个价不成交；撮合到更高价时按**最优价**成交（你按成交价结算）。\n\n"
+                    "成交规则：低于这个价不成交；撮合到更高价时按「最优价」成交（你按成交价结算）。\n\n"
                     "平台服务费 " + format(facts.service_fee_percent(), "g") + "%"
                     "（fee_mode=add，" + str(fee) + "bp，以成交时服务端快照为准）：\n"
                     "    客户实付 = 你的报价 × " + format(1 + fee / 10000.0, "g") + "\n"
@@ -1416,7 +1416,7 @@ class DesktopController:
                   else "「" + label + "」（" + preset + "）")
         rollback = ("切完会回读 daemon 确认，回读不一致就退回原来的档位。"
                     if before else
-                    "切完会回读 daemon 确认；现在读不到原来的档位，回读不一致时**不会**替你"
+                    "切完会回读 daemon 确认；现在读不到原来的档位，回读不一致时不会替你"
                     "回写（需要你手动再选一次）。")
         if not confirm("把档位切到" + target + "？\n\n"
                        "写的是本机配置里的档位；在跑的任务不会被打断、daemon 不会重启。"
@@ -1568,7 +1568,7 @@ class DesktopController:
         # D6（2026-11-18）：绑定**不含**收款地址。客户把地址填在同一页，绑定成功后以为
         # 地址也一起提交了，结果云端仍是「尚未提交」。绑定成功的这句话必须把两件事分开。
         return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。"
-                            "（USDT 收款地址是**另一件事**：在本页「③ 提交 USDT 收款地址」"
+                            "（USDT 收款地址是另一件事：在本页「③ 提交 USDT 收款地址」"
                             "里单独点一次「提交收款地址到云端」才生效）", effect="refresh")
 
     def _bound_before_bind(self) -> tuple[bool, str]:

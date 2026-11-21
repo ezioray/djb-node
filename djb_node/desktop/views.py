@@ -34,6 +34,7 @@ __all__ = [
     "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
     "YIELD_PRESET_BY_KEY", "YIELD_PRESET_BY_LABEL", "YIELD_TIERS",
     "Filter", "with_field_errors", "Recovery", "INIT_RECOVERY_LABEL", "init_recovery",
+    "CLOUD_RECOVERY_LABEL", "cloud_recovery",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -46,9 +47,12 @@ MARK_IDLE = "·"
 #: 上次更新检查的结果（``Store.update_state().verify_state``）→ 客户能看懂的一句话。
 #:
 #: 九状态全覆盖（``update.STATE_GUIDANCE`` 是权威表，这里只是**短标签**用于表格单元格；
-#: 详细「下一步」由 toast 用的 ``update.guidance()`` 给）。缺失的状态退回显示状态码，
+#: 详细「下一步」由 toast 用的 ``update.guidance()`` 给）。缺失的状态显示
+#: 「未知状态（原码）」（R2-11：原样上屏会让客户读到 `unchecked` 这种枚举名），
 #: 绝不显示成「已是最新」。
 UPDATE_STATE_TEXT = {
+    # R2-11：真机 0.5.7 的「上次结果」直接印 `unchecked`——客户读到的是一个英文枚举名。
+    "unchecked": "还没有检查过",
     "offline": "网络不通，没拿到清单",
     "invalid": "更新源异常，不要安装",
     "no_source": "本渠道暂无更新源",
@@ -59,6 +63,31 @@ UPDATE_STATE_TEXT = {
     "no_artifact": "本平台暂无安装包",
     "eligible": "有可用更新",
 }
+
+#: 发布渠道的枚举值 → 客户能看懂的名字（R2-11：`stable 渠道` 原样上屏）。
+CHANNEL_TEXT = {
+    "stable": "稳定版",
+    "beta": "内测版",
+    "rc": "候选版",
+    "dev": "开发版",
+}
+
+#: 凭据存储后端（``CredentialStore.describe()["storage"]``）→ 中文 + 必要说明（R2-11）。
+#: 真机 0.5.7 的「本机凭据」卡直接印 `file-0600`：客户看到的是一个存储 ID，不是「我的密钥在哪」。
+CREDENTIAL_STORAGE_TEXT = {
+    "file": "本机文件（权限 0600，仅本人可读写）",
+    "file-0600": "本机文件（权限 0600，仅本人可读写）",
+    "keyring": "系统钥匙串",
+    "dpapi": "Windows 凭据管理",
+}
+
+
+def credential_storage_text(raw: Any) -> str:
+    """存储后端上屏文案：认识的走词表，不认识的**中文包一层**并保留原值。"""
+    value = str(raw or "")
+    if not value:
+        return "—"
+    return CREDENTIAL_STORAGE_TEXT.get(value) or ("其他方式（" + value + "）")
 
 
 class Mark:
@@ -331,12 +360,16 @@ class Recovery:
     走查原文：首启整屏「暂不可用」，唯一指引是让客户敲 ``djb init``，横幅自己还写着
     「桌面端没有初始化入口，界面里点不到」——客户手上没有终端 ⇒ 首启是死路。
 
-    :attr:`View.recovery` 非空时，渲染层在横幅下面画一颗**主按钮**；点击走
-    ``controller.action(key)``（与普通动作同一条通道，所以「点了没反应」也会被播报）。
+    :attr:`View.recovery` 非空时，渲染层在横幅下面画一颗**主按钮**：``key`` 非空就走
+    ``controller.action(key)``（与普通动作同一条通道，所以「点了没反应」也会被播报）；
+    ``nav`` 非空则**跳页**（下一步在别的页时用它，例如 R2-10 的「去绑定」）。
     """
     key: str
     label: str
     hint: str = ""
+    #: 不为空时点击 = **跳页**（值是 ``show_view`` 的页面键），不走 ``controller.action``。
+    #: 用于「结论对、但下一步在别的页」的情形（R2-10 云端未接通 → 账户与安全）。
+    nav: str = ""
 
 
 #: 「初始化并连接」：本机未初始化时首屏唯一的主操作（也是 :func:`terminalize` 给 `djb init`
@@ -364,6 +397,45 @@ def init_recovery(snapshot: Snapshot) -> Recovery | None:
     if not any(marker in reason for marker in _INIT_REASON_MARKERS):
         return None
     return Recovery("bootstrap", INIT_RECOVERY_LABEL, INIT_RECOVERY_HINT)
+
+
+#: R2-10：云端未接通时横幅里那颗主操作。绑定是**界面内动作**，入口在「账户与安全」页
+#: （「在浏览器确认绑定」/「手输绑定码」），所以这里只跳页，不自己发请求、不替客户重试。
+CLOUD_RECOVERY_LABEL = "去绑定"
+CLOUD_RECOVERY_NAV = "account"
+CLOUD_RECOVERY_HINT = ("绑定这台电脑才能看到云端数据：在「账户与安全」点「在浏览器确认绑定」，"
+                       "或用网页端生成的绑定码点「手输绑定码」")
+CLOUD_RECOVERY_HINT_UNREGISTERED = ("这台机器还没注册成节点：先在「本机设置」点"
+                                    "「重新注册这台机器」，再回「账户与安全」绑定")
+#: 「没登录节点」两条原因的共同词（``datasource._no_cloud_reason``）。
+#: 只认这一条，**不认**网络/证书错误：那些给「去绑定」等于让客户白跑一趟（绑定救不了断网）。
+_CLOUD_REASON_MARKERS = ("云端未接通", "未登录节点")
+
+#: 会因「云端未接通」整域降级的域（顺序 = 判据优先级，只影响提示文案，不影响能否触发）。
+_CLOUD_DOMAINS = ("account", "earnings", "receipts", "tasks", "token_plan", "models")
+
+
+def cloud_recovery(snapshot: Snapshot) -> Recovery | None:
+    """云端未接通 ⇒ 给一颗「去绑定」跳页按钮（R2-10）。
+
+    走查原文：横幅只有结论「暂不可用（云端未接通（未登录节点：…））」——客户知道坏了，
+    却不知道下一步在哪；而真正能解决它的地方是「账户与安全」（绑定这台电脑）。
+
+    判定：任一云端域不可用，且原因是「未登录节点」（本机没注册 / 注册了没绑定）。
+    网络类失败（``云端连不上…``）**不**给这颗按钮——绑定救不了断网，重试是「刷新」的职责，
+    而且离线时自动重试只会再等一次超时，等于骗客户。
+    """
+    for name in _CLOUD_DOMAINS:
+        missing = snapshot.missing(name)
+        if missing is None:
+            continue
+        reason = str(missing.reason or "")
+        if not all(marker in reason for marker in _CLOUD_REASON_MARKERS):
+            continue
+        hint = (CLOUD_RECOVERY_HINT_UNREGISTERED if "尚未注册" in reason
+                else CLOUD_RECOVERY_HINT)
+        return Recovery("", CLOUD_RECOVERY_LABEL, hint, nav=CLOUD_RECOVERY_NAV)
+    return None
 
 
 #: D6（2026-11-18 客户要求）：账户页两个**互不干扰**的动作区标题。
@@ -1400,7 +1472,7 @@ def _models(snapshot: Snapshot) -> View:
                             reason="还没有接入上游" if not probe_rows else "")]
     return View(
         key="models", title="模型与探针",
-        subtitle="探针事实（L2/L3/用量/新鲜度/失败原因）· 云端目录",
+        subtitle="探针事实（L2 推理 / L3 流式 / 用量 / 新鲜度 / 失败原因）· 云端目录",
         cards=(Card("可公告", str(counts["announceable"]) + " 个",
                     "探针通过且结论新鲜才会进容量", "mint" if counts["announceable"] else "muted"),
                Card("探针失败 / 停用", str(counts["failed"]) + " 个",
@@ -1408,7 +1480,7 @@ def _models(snapshot: Snapshot) -> View:
                Card("还没跑过", str(counts["never"]) + " 个",
                     "点「跑一次探针」补上", "amber" if counts["never"] else "muted"),
                Card("本地已应用", _count(snapshot, "models", str(len(local)) + " 个"),
-                    "model-sync 状态", "default")),
+                    "模型同步（model-sync）状态", "default")),
         table=probe_table,
         tables=(Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(catalog_rows),
                       note=str(models.get("note") or ""), empty="云端目录暂不可用", title="模型目录"),),
@@ -1418,7 +1490,9 @@ def _models(snapshot: Snapshot) -> View:
         # 等「一 Key 多模型 + 逐模型底价」把上报端点接上再加回（见「提供 Token Plan」页）。
         actions=tuple(probe_actions),
         unavailable=_missing(snapshot, ("models",)),
-        notes=("容量公告只看 " + str(fresh_window // 60) + " 分钟内的探针结论；报价更严，只看 "
+        notes=("L2 = 一次真实推理能不能通；L3 = 流式输出能不能通。两项都通过、且结论新鲜，"
+               "才会进容量。",
+               "容量公告只看 " + str(fresh_window // 60) + " 分钟内的探针结论；报价更严，只看 "
                + str(quote_window // 60) + " 分钟内的（提前停报防半窗口）。",
                "没有探针结论 / 结论过期的模型不会进容量、也不会报价——不是「设置没生效」。",
                "模型开关与底价在「提供 Token Plan」页设置；本页只读探针事实。"),
@@ -1868,13 +1942,13 @@ def _token_plan(snapshot: Snapshot) -> View:
                     + "单位 USD / 百万 token，最小 0.01（填 0 会被云端跳过，留空 = 不申报）"
                     # 2026-11-20 owner：设价必须让人看见「这是最低价 + 平台费 15%」。
                     # 成交口径（原始设计）：撮合到的最优价 ≥ 这个最低价就成交。
-                    + "；**成交规则**：低于此价不成交，高于时按最优价成交"
+                    + "；成交规则：低于此价不成交，高于时按最优价成交"
                     # UX-E2E-20261121 P1-4：走查说原句「客户实付 = 你的报价 ÷ 1.15」算不出来、
                     # 也看不出钱从哪边出。这里改成一个**能自己验算**的例子，且数字由 facts
                     # 现算（示例报价 = FEE_EXAMPLE_ASK，客户实付 = facts.customer_pay_text），
                     # 不手写第二份口径。
                     + "；平台服务费 " + format(facts.service_fee_percent(), "g") + "%"
-                    + "**加在客户那边**：你报价 " + FEE_EXAMPLE_ASK + " → 客户实付 "
+                    + "，加在客户那边：你报价 " + FEE_EXAMPLE_ASK + " → 客户实付 "
                     + facts.customer_pay_text(FEE_EXAMPLE_ASK) + "，你到手 "
                     + FEE_EXAMPLE_ASK + "（不从你的报价里倒扣）"
                     + "；费率以成交时服务端快照为准")),
@@ -2413,8 +2487,10 @@ def _account(snapshot: Snapshot) -> View:
     update_unavailable = str(update.get("unavailable") or "")
     checked_at = str(update.get("checked_at") or "")
     verify_state = str(update.get("verify_state") or "")
-    state_text = UPDATE_STATE_TEXT.get(verify_state) or (
-        "尚未检查过" if not verify_state else verify_state)
+    # R2-11：映射表里没有的状态码**不再原样上屏**（`unchecked` 就是这么漏出来的）；
+    # 保留原码但用中文包一层，客户知道是「没识别」，工程师仍能按码排查。
+    state_text = (UPDATE_STATE_TEXT.get(verify_state)
+                  or ("尚未检查过" if not verify_state else "未知状态（" + verify_state + "）"))
     # D2（2026-11-18 客户报障）：版本卡必须写**实际在跑的程序版本**。
     # 旧实现读 ``current_version``（= 安装记录），手工解压换包不会写记录，于是
     # 侧栏 v0.3.11 / 本条 0.3.0 自相矛盾。记录值只在提示里出现（并且明说已校正），
@@ -2423,8 +2499,11 @@ def _account(snapshot: Snapshot) -> View:
     recorded_version = str(update.get("install_record_version") or "")
     record_stale = bool(package_version and recorded_version
                         and recorded_version != package_version)
-    version_hint = (str(update.get("channel") or "") + " 渠道 · "
-                    + (str(update.get("edition") or "") or "本机"))
+    # R2-11：`stable` / `beta` 是发布渠道的枚举值，别原样印给客户。
+    channel = str(update.get("channel") or "")
+    channel_text = (CHANNEL_TEXT[channel] + "渠道" if channel in CHANNEL_TEXT
+                    else (("渠道 " + channel) if channel else "渠道未知"))
+    version_hint = channel_text + " · " + (str(update.get("edition") or "") or "本机")
     if record_stale:
         version_hint += "（安装记录为 " + recorded_version + "，已按实际程序显示）"
     fields.extend([
@@ -2507,7 +2586,7 @@ def _account(snapshot: Snapshot) -> View:
         # 2026-11-19：首排只留**身份**三张卡。USDT 云端状态挪进「收款区」（见上），
         # 否则收款信息又和身份并排出现，等于把刚分开的两件事重新混在一屏。
         cards=(Card("账户", identity, identity_meta, "default"), second,
-               Card("本机凭据", str(security.get("storage") or "—"),
+               Card("本机凭据", credential_storage_text(security.get("storage")),
                     str(security.get("node_id") or "本机未保存"), "muted")),
         fields=tuple(fields),
         actions=tuple(actions),
@@ -2691,7 +2770,8 @@ def build_view(key: str, snapshot: Snapshot) -> View:
         raise ValueError("未知视图：" + str(key))
     view = _terminalize_tree(builder(snapshot))
     if view.recovery is None:
-        recovery = init_recovery(snapshot)
+        # 优先级：本机没初始化（先能跑）> 云端未接通（再去绑定）。两颗按钮不同时出现。
+        recovery = init_recovery(snapshot) or cloud_recovery(snapshot)
         if recovery is not None:
             view = replace(view, recovery=recovery)
     return view

@@ -2427,8 +2427,12 @@ class DesktopApp:
         ground = dual.color("bg")
         row = tk.Frame(parent, background=ground)
         row.pack(fill="x", pady=(0, 2))
-        button = kit.Button(row, recovery.label,
-                            (lambda key: (lambda: self._on_action(key)))(recovery.key),
+        # 两种出口：``nav`` 非空 = 跳页（下一步在别的页，如「去绑定」→ 账户与安全）；
+        # 否则走 controller 动作键（如「初始化并连接」）。跳页失败也要出声（R2-10 不静默）。
+        nav = str(getattr(recovery, "nav", "") or "")
+        command = ((lambda target: (lambda: self._recovery_nav(target)))(nav) if nav
+                   else (lambda key: (lambda: self._on_action(key)))(recovery.key))
+        button = kit.Button(row, recovery.label, command,
                             kind="primary", ground=ground, px=kit.px("small"),
                             height=30, pad=14)
         self._a11y_name(button, recovery.label + "（" + (recovery.hint or "点一下开始") + "）")
@@ -2440,6 +2444,24 @@ class DesktopApp:
                                 foreground=dual.color("muted_text"), background=ground,
                                 anchor="w", justify="left",
                                 wraplength=self._wrap_hint())).pack(anchor="w", pady=(0, 6))
+
+    def _recovery_nav(self, target: str) -> None:
+        """恢复按钮的「跳页」路径：跳不过去要**说出来**（R2-10：失败态不静默）。
+
+        跳页本身不改任何数据，所以失败只需一句人话 + 不影响当前页。
+        """
+        # ``show_view`` 对未知 key 是**静默回当前页**（0.3.4 的老行为）；恢复按钮不能借这条
+        # 路静默失败，所以先自己判定一次，再兜异常。
+        route, _payload = route_for(str(target), VIEW_TITLES)
+        if route == "unknown":
+            self._toast("没能切到「" + str(target) + "」：界面里没有这一页；"
+                        "可以用左侧导航手动打开", ok=False)
+            return
+        try:
+            self.show_view(target)
+        except Exception as exc:                     # 视图构建失败（数据域炸了）
+            self._toast("没能切到「" + str(target) + "」（" + type(exc).__name__ + "）："
+                        + str(exc)[:100] + "；可以用左侧导航手动打开", ok=False)
 
     def _render_hero(self, parent: Any, hero: Hero) -> None:
         """状态主卡：左「标题 + 说明 + 运行时长 + 动作」，右 125px 仪表环，下面四指标。"""
