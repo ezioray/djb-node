@@ -133,7 +133,9 @@ def test_detector_disabled_and_probe_exception():
 
     detector = limits.YieldDetector([Boom()])
     result = detector.evaluate()
-    assert result.in_use is True
+    # 2026-11-22：检测器异常只降级为 unknown，不再当成「用户在用」永久暂停。
+    assert result.in_use is False
+    assert result.source == "degraded"
     assert result.signals[0].state == "error"
     disabled = limits.YieldDetector([Boom()], enabled=False)
     assert disabled.evaluate().in_use is False
