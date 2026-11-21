@@ -879,7 +879,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
         anchor = max(moment for moment, _ in samples)
     title, caption = "每小时用量", "近 " + str(hours) + " 小时 · 每小时 tokens"
     if anchor is None:
-        return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+        return Chart(kicker="贡献节奏", title=title, caption=caption,
                      empty="暂不可用（当前没有收据时间戳）")
     end = anchor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     start = end - timedelta(hours=hours)
@@ -894,7 +894,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
             inside += 1
     total = sum(totals)
     if total <= 0:
-        return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+        return Chart(kicker="贡献节奏", title=title, caption=caption,
                      empty="暂不可用（当前没有收据时间戳）")
     peak_value = max(totals)
     peak_index = totals.index(peak_value)
@@ -904,7 +904,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
     labels = tuple((start + timedelta(hours=step * position)).strftime("%H:00")
                    for position in range(4)) + ("现在",)
     peak_at = (start + timedelta(hours=peak_index)).strftime("%H:00")
-    return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+    return Chart(kicker="贡献节奏", title=title, caption=caption,
                  values=values, labels=labels,
                  peak="峰值 " + f"{peak_value:,}" + " tokens · " + peak_at,
                  foot="近 " + str(hours) + " 小时合计 " + f"{total:,}" + " tokens · "
@@ -927,9 +927,11 @@ def _hero(snapshot: Snapshot) -> Hero:
     titles = {"online": "正在接单", "starting": "正在启动",
               "paused": "已暂停接单", "updating": "正在更新",
               "stopped": "还没开始接单", "error": "有异常，需要处理"}
-    chips = {"online": ("● LIVE", "mint"), "starting": ("◐ STARTING", "amber"),
-             "paused": ("● PAUSED", "amber"), "updating": ("◐ UPDATING", "amber"),
-             "stopped": ("○ STOPPED", "muted"), "error": ("✕ ERROR", "red")}
+    # UX-E2E-20261121 P1-6：这颗 pill 原来写英文（LIVE / PAUSED / UPDATING…），
+    # 与旁边的中文标题（正在接单 / 已暂停接单）说的是同一件事的两种语言。
+    chips = {"online": ("● 接单中", "mint"), "starting": ("◐ 启动中", "amber"),
+             "paused": ("● 已暂停", "amber"), "updating": ("◐ 更新中", "amber"),
+             "stopped": ("○ 未运行", "muted"), "error": ("✕ 异常", "red")}
     chip, chip_tone = chips.get(state, ("? 状态未知", "muted"))
     node_id = str(profile.get("node_id") or binding.get("node_id") or "—")
     mode = str(yield_state.get("mode") or "")
@@ -984,7 +986,7 @@ def _hero(snapshot: Snapshot) -> Hero:
         hint = "还没有客户端授权"
     else:
         hint = "授权状态暂不可用"
-    return Hero(kicker="NODE STATUS / " + node_id, title=titles.get(state, "状态未知"),
+    return Hero(kicker="节点状态 / " + node_id, title=titles.get(state, "状态未知"),
                 chip=chip, chip_tone=chip_tone, body=body,
                 runtime=_runtime_text(status.get("uptime_s")), gauge=gauge, metrics=metrics,
                 actions=actions, hint=hint)
@@ -1028,7 +1030,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
         Field("USDT 收款地址", "已设置" if config.get("usdt_address") else "未设置",
               key="usdt_state"),
     )
-    setup = RailCard(kicker="SETUP / 接入进度", title="接入分三步", kind="setup",
+    setup = RailCard(kicker="接入进度", title="接入分三步", kind="setup",
                      badge=("接入完成" if done == 3 else "待完成"), badge_tone=("mint" if done == 3
                                                                           else "amber"),
                      note=str(done) + " / 3", fields=setup_fields,
@@ -1049,7 +1051,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
                    in ("verified", "accepted"))
     total_receipts = len([1 for row in receipts.get("rows") or () if _mapping(row)])
     today = RailCard(
-        kicker="TODAY / 今日算力", title="今日收益",
+        kicker="今日算力", title="今日收益",
         badge="进行中" if str(yield_state.get("state") or "") == "online" else "",
         badge_tone="mint",
         # 四宫格只留「标签 + 数值」：口径写进卡脚一行，格子高度才装得进一屏（G-16）
@@ -1077,7 +1079,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
     if ratio is not None:
         progress = ("今日 tokens 已用", ratio,
                     f"{used_today:,} / {int(float(daily_cap)):,}（{ratio * 100:.0f}%）")
-    throttle = RailCard(kicker="PAUSE / 自动暂停", title="自动暂停",
+    throttle = RailCard(kicker="自动暂停", title="自动暂停",
                         badge="生效中" if yield_state.get("yield_enabled") else "已关闭",
                         badge_tone="mint" if yield_state.get("yield_enabled") else "muted",
                         kind="throttle", rows=throttle_rows,
@@ -1263,7 +1265,7 @@ def _bench(snapshot: Snapshot) -> View:
         subtitle="环境检测 + CPU/内存/磁盘 + 可选 GPU",
         cards=cards,
         table=Table(("检查项", "结论", "下一步"), tuple(rows),
-                    note="检查项来自本机只读探测", empty="环境检测暂不可用", title="环境检测"),
+                    note="检查项由本机直接读取（不联网）", empty="环境检测暂不可用", title="环境检测"),
         actions=(Action("bench.run", "开始跑分（≤10 秒）", primary=True),
                  Action("bench.copy", "复制结果")),
         unavailable=_missing(snapshot, ("bench",)),
@@ -1283,8 +1285,8 @@ PROBE_REASON_TEXT = {
     "model_not_listed": "上游 /models 里没有这个模型（清单或模型名不对）",
     "not_listed": "上游 /models 里没有这个模型（清单或模型名不对）",
     "usage_missing": "上游没回 usage（用量对不上，报价会保守）",
-    "budget": "本轮探测预算用完（下一轮继续）",
-    "disabled": "模型已停用（不参与探测与公告）",
+    "budget": "本轮探针预算用完（下一轮继续）",
+    "disabled": "模型已停用（不参与探针与公告）",
     "network": "网络不通（DNS/连接被拒）",
     "invalid_response": "上游返回的不是兼容格式（不是 OpenAI/Anthropic 形状）",
 }
@@ -1320,7 +1322,7 @@ def _probe_state(row: Mapping[str, Any], *, fresh_window: int, quote_window: int
         return "已停用", "muted"
     marked = [row.get("inference_ok"), row.get("stream_ok"), row.get("usage_ok")]
     if all(item is None for item in marked):
-        return "未探测", "muted"
+        return "未跑过", "muted"
     if row.get("announceable") is True:
         return "可公告", "mint"
     if row.get("inference_ok") is True:
@@ -1362,7 +1364,7 @@ def _models(snapshot: Snapshot) -> View:
             reason = str(error_class) + "（未登记的原因）"
         if state_text == "可公告":
             counts["announceable"] += 1
-        elif state_text == "未探测":
+        elif state_text == "未跑过":
             counts["never"] += 1
         elif state_text in ("失败", "已停用"):
             counts["failed"] += 1
@@ -1373,10 +1375,10 @@ def _models(snapshot: Snapshot) -> View:
                          tri(item.get("usage_ok")), state_text, reason or "—"),
                         key=str(item.get("upstream_id") or "") + "/" + model_id,
                         tone=tone, note=("失败原因：" + reason) if reason else ""))
-    probe_table = Table(("模型", "上游", "最近探测", "L2", "L3", "用量", "状态", "原因"),
+    probe_table = Table(("模型", "上游", "最近探针", "L2", "L3", "用量", "状态", "原因"),
                         tuple(rows),
                         note=str(probe.get("unavailable") or ""),
-                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论", title="模型探测")
+                        empty="还没有接入任何中转站：去「提供 Token Plan」接入后这里才有探针结论", title="模型探针")
 
     # ── 云端目录（原 4 列，保留为附加表：它是「云端认为该有哪些模型」，与探针事实互补）
     catalog = models.get("catalog") if isinstance(models.get("catalog"), list) else []
@@ -1391,7 +1393,7 @@ def _models(snapshot: Snapshot) -> View:
                                  reason or ("按当前资源可提供" if offerable else "原因未下发")),
                                 key=str(row.get("id") or ""), disabled=not offerable))
     local = models.get("local") if isinstance(models.get("local"), list) else []
-    probe_actions = [Action("probe.run", "立即探测（全部上游）", primary=True,
+    probe_actions = [Action("probe.run", "跑一次探针（全部上游）", primary=True,
                             enabled=bool(probe_rows),
                             reason="还没有接入上游" if not probe_rows else "")]
     return View(
@@ -1401,8 +1403,8 @@ def _models(snapshot: Snapshot) -> View:
                     "探针通过且结论新鲜才会进容量", "mint" if counts["announceable"] else "muted"),
                Card("探针失败 / 停用", str(counts["failed"]) + " 个",
                     "看右列原因逐条修", "red" if counts["failed"] else "muted"),
-               Card("从未探测", str(counts["never"]) + " 个",
-                    "点「立即探测」补一次", "amber" if counts["never"] else "muted"),
+               Card("还没跑过", str(counts["never"]) + " 个",
+                    "点「跑一次探针」补上", "amber" if counts["never"] else "muted"),
                Card("本地已应用", _count(snapshot, "models", str(len(local)) + " 个"),
                     "model-sync 状态", "default")),
         table=probe_table,

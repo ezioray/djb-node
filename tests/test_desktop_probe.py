@@ -43,7 +43,7 @@ def _row(**overrides) -> dict:
 
 def test_probe_table_has_every_column_the_report_asked_for():
     view = vw.build_view("models", _snapshot({"rows": [_row()]}))
-    assert view.table.columns == ("模型", "上游", "最近探测", "L2", "L3", "用量", "状态", "原因")
+    assert view.table.columns == ("模型", "上游", "最近探针", "L2", "L3", "用量", "状态", "原因")
 
 
 def test_three_state_mark_never_confuses_none_with_false():
@@ -57,7 +57,7 @@ def test_three_state_mark_never_confuses_none_with_false():
     table = {row.cells[0]: row for row in view.table.rows}
     assert table["never"].cells[3:6] == ("—", "—", "—")
     assert table["never"].cells[2] == "从未"
-    assert table["never"].cells[6] == "未探测"
+    assert table["never"].cells[6] == "未跑过"
     assert table["failed"].cells[3] == "✕"
     assert table["failed"].cells[4:6] == ("—", "—")
 
@@ -242,13 +242,13 @@ def test_models_page_renders_two_tables_and_probe_can_be_probed():
         app.show_view("models")
         app._root.update()
         primary, tree = app._tables[0]
-        assert primary.columns[:3] == ("模型", "上游", "最近探测")
+        assert primary.columns[:3] == ("模型", "上游", "最近探针")
         assert len(app._tables) == 2, "云端目录应该是第二张表"
         assert app._table is primary, "主表必须是探针表（详情抽屉/窄窗文案只服务主表）"
         assert tree.winfo_exists()
         # 演示数据里 4 行探针结论都进树
         assert len(tree.get_children()) == 4
-        # 「立即探测」在演示模式不联网：点下去只播报，不派 worker
+        # 「跑一次探针」在演示模式不联网：点下去只播报，不派 worker
         assert app._controller.probe_via is not None
     finally:
         app.stop()
@@ -256,7 +256,7 @@ def test_models_page_renders_two_tables_and_probe_can_be_probed():
 
 @needs_tk
 def test_probe_action_from_the_page_reports_through_the_worker():
-    """点「立即探测」→ 走 probe_via（不冻窗口）→ 结果回投后重画探针表。"""
+    """点「跑一次探针」→ 走 probe_via（不冻窗口）→ 结果回投后重画探针表。"""
     cli = FakeCli(listing={"upstreams": [{"id": "u1"}]},
                   probes={"u1": {"model_checks": [{"ok": True}]}})
     controller = DesktopController(FakeDataSource(dict(desktop_app.demo_snapshot().sections),
@@ -266,7 +266,7 @@ def test_probe_action_from_the_page_reports_through_the_worker():
         app.show_view("models")
         began = time.monotonic()
         app._on_action("probe.run")
-        assert time.monotonic() - began < 0.2, "点「立即探测」被网络阻塞了"
+        assert time.monotonic() - began < 0.2, "点「跑一次探针」被网络阻塞了"
         for _ in range(600):
             app._root.update()
             if not app._probe_worker.busy:

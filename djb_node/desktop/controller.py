@@ -584,7 +584,7 @@ class DesktopController:
 
     # ── 探针（RC14 D）：手动补一次体检，明细回「模型与探针」页
     def _act_probe_run(self, *, confirm=None) -> ActionResult:
-        """「立即探测」：逐上游跑 ``djb upstream probe``（**网络 + 服务端回报，必须走 worker**）。
+        """「跑一次探针」：逐上游跑 ``djb upstream probe``（**网络 + 服务端回报，必须走 worker**）。
 
         与「检查更新」同一套通道（``probe_via``）：主线程只负责派发与播报。
         """
@@ -595,20 +595,20 @@ class DesktopController:
             except Exception:                      # 异步通道坏了 → 回落同步
                 started = False
             if started:
-                return ActionResult("正在探测上游（L1 列表 + L2 推理 / L3 流式，通常 10 秒内）…",
+                return ActionResult("正在跑探针（L1 列表 + L2 推理 / L3 流式，通常 10 秒内）…",
                                     effect="probe", payload={"state": "probing"})
         return self.run_probe()
 
     def run_probe(self) -> ActionResult:
-        """worker 侧：逐个上游探测，并把结论翻成一条人话（不碰控件）。"""
+        """worker 侧：逐个上游跑探针，并把结论翻成一条人话（不碰控件）。"""
         if self.cli is None:
-            return ActionResult("暂不可用（本机命令通道未接通）；没有发起探测。", ok=False)
+            return ActionResult("暂不可用（本机命令通道未接通）；没有发起探针。", ok=False)
         try:
             listing = self.cli(["upstream", "list"])
         except ProviderError as exc:
-            return ActionResult("探测未开始：" + exc.reason, ok=False)
+            return ActionResult("探针没开始：" + exc.reason, ok=False)
         except Exception as exc:
-            return ActionResult("探测未开始（" + type(exc).__name__ + "）", ok=False)
+            return ActionResult("探针没开始（" + type(exc).__name__ + "）", ok=False)
         rows = listing.get("upstreams") if isinstance(listing, Mapping) else None
         ids = [str(item.get("id")) for item in (rows or [])
                if isinstance(item, Mapping) and item.get("id")]
@@ -633,7 +633,7 @@ class DesktopController:
                 failed += 1
                 error = str(payload.get("error_class") or "") if isinstance(payload, Mapping) else ""
                 reasons.append(identifier + ("：" + error if error else "：没有模型通过"))
-        parts = ["探测完成：" + str(verified) + " 个上游有模型通过"]
+        parts = ["探针完成：" + str(verified) + " 个上游有模型通过"]
         if failed:
             parts.append(str(failed) + " 个没通过（" + "；".join(reasons[:3])
                          + ("…" if len(reasons) > 3 else "") + "）"

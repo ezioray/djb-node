@@ -110,10 +110,21 @@ def nav_order(decision: ia.IaDecision) -> tuple[str, ...]:
 
 
 def nav_kicker(decision: ia.IaDecision, key: str) -> str:
-    """页头眉标「组名 / 页名」：组名取**当前生效表**里的所属组（回滚时自然是旧组名）。"""
-    spec = ia.page(key)
+    """页头眉标：**所属组的中文名**（UX-E2E-20261121 P1-6）。
+
+    原来是「组名 / 页名」两级拉丁微标（``SHARE / TOKEN PLAN``）——客户读到的是一串
+    英文大写字母，而页面标题就在下面一行（中文），两级眉标等于把同一件事说两遍。
+    现在只留「我在哪一组」这一层，且用中文；组名取**当前生效表**（回滚时自然是旧组名）。
+
+    ``DJB_UI_IA=legacy`` 例外：回滚必须与 0.3.4 **逐字相等**（审计要求），所以回滚态仍返回
+    老的两级拉丁眉标（``RUN / OVERVIEW``，来自 :func:`views.page_kicker`）。
+    """
     section = next((part for part in decision.sections if key in part.keys), None)
-    return (section.micro + " / " + spec.kicker) if section is not None else spec.kicker
+    if section is None:
+        return ia.page(key).title
+    if getattr(decision, "mode", "") == "legacy":
+        return page_kicker(key)                    # 0.3.4 的 "RUN / OVERVIEW"，逐字相等
+    return section.title
 
 
 def nav_plan(decision: ia.IaDecision) -> tuple[tuple[ia.SectionSpec, tuple[tuple[str, str, str, str], ...]], ...]:
@@ -681,11 +692,14 @@ class DesktopApp:
                                        px=kit.px("small"), height=self._px(26), pad=self._px(12))
         # 头里的固定按钮：读屏要念得出「这是什么按钮」（#31①）
         for widget, name in ((self._refresh_button, "刷新本页数据（也可按 F5）"),
-                             (self._theme_button, self._theme_button_text()),
+                             (self._theme_button, self._theme_button_a11y()),
                              (self._log_button, "打开日志"),
                              (self._tune_button, "调整贡献（去让路/节能页）")):
             self._a11y_name(widget, name)
-        self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.px("micro")),
+        # P1-6 同类：顶栏 "SYNC —" 也是英文微标，一并中文化（等宽族只承载 ASCII，
+        # 中文必须走 for_text/正文族，否则 Windows 上会掉字）
+        self._sync_label = tk.Label(right, text="同步 —",
+                                    font=fonts.for_text("同步 —", kit.px("micro")),
                                     foreground=dual.color("muted_text"),
                                     background=dual.color("surface"))
         self._pack_header_right(narrow=False)
@@ -714,7 +728,9 @@ class DesktopApp:
         ident = tk.Frame(side, background=ground)
         ident.pack(fill="x", padx=16, pady=(14, 10))
         self._ident = ident
-        tk.Label(ident, text="NODE / EDGE", font=fonts.mono(kit.px("micro")),
+        # UX-E2E-20261121 P1-6：眉标原来是 "NODE / EDGE"（等宽拉丁微标），客户读不出
+        # 这是什么地方。改成中文，字阶/字重不变（micro 档，字族仍是正文族）。
+        tk.Label(ident, text="本机节点", font=fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground, anchor="w").pack(fill="x")
         self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.px("h2"), bold=True),
                                     foreground=dual.color("ink"), background=ground, anchor="w")
@@ -801,12 +817,12 @@ class DesktopApp:
         ground = dual.color("surface3")
         head = tk.Frame(self._nav_inner, background=ground)
         head.pack(fill="x", padx=6, pady=(0 if first else 10, 2))
-        tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.px("micro")),
-                 foreground=dual.color("muted_text"), background=ground,
-                 anchor="w").pack(side="left")
+        # UX-E2E-20261121 P1-6：组头原来画「SHARE 共享」（拉丁微标 + 中文组名），客户看到
+        # 两个名字指同一个地方。**只留中文组名**——拉丁微标仍留在 ia.SectionSpec.micro 里
+        # （IA 规格要求它纯 ASCII，测试也在守），只是不渲染。
         tk.Label(head, text=section.title, font=self._fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground,
-                 anchor="w").pack(side="left", padx=(6, 0))
+                 anchor="w").pack(side="left")
         self._nav_section_headers[section.key] = head
         for key, label, icon, badge in items:
             item = kit.NavItem(self._nav_inner, text=label, icon=icon, count=badge,
@@ -1398,7 +1414,7 @@ class DesktopApp:
         else:
             self._refresh_deferred = ("access",)
 
-    # ── 探针（RC14 D）：「立即探测」也要在 worker 里跑（网络 10 s 级）
+    # ── 探针（RC14 D）：「跑一次探针」也要在 worker 里跑（网络 10 s 级）
     def _ensure_probe_worker(self) -> Any:
         """惰性建探针 worker：与刷新/更新同一个 :class:`RefreshWorker` 模板。"""
         worker = getattr(self, "_probe_worker", None)
@@ -1430,19 +1446,19 @@ class DesktopApp:
         return bool(worker.start())
 
     def _probe_started(self) -> None:
-        self._toast("正在探测上游（L1 列表 + L2 推理 / L3 流式，通常 10 秒内）…", ok=True)
+        self._toast("正在跑探针（L1 列表 + L2 推理 / L3 流式，通常 10 秒内）…", ok=True)
 
     def _probe_busy(self) -> None:
-        self._toast("上一次探测还没结束，已忽略这次点击", ok=True)
+        self._toast("上一次探针还没结束，已忽略这次点击", ok=True)
 
     def _apply_probe(self, result: Any, error: BaseException | None,
                      sections: Any = None) -> None:
         if error is not None:
-            self._toast("探测失败（" + type(error).__name__ + "）：" + str(error)[:120], ok=False)
+            self._toast("探针失败（" + type(error).__name__ + "）：" + str(error)[:120], ok=False)
         elif result is None:
-            self._toast("探测失败：没有拿到结果", ok=False)
+            self._toast("探针失败：没有拿到结果", ok=False)
         else:
-            self._toast(str(getattr(result, "message", "") or "探测完成"),
+            self._toast(str(getattr(result, "message", "") or "探针完成"),
                         ok=bool(getattr(result, "ok", False)))
         # 结论落库后再取一次数（探针表/容量卡片要立刻反映新结论）；GET 也不在主线程
         refresh = getattr(self, "_refresh_worker", None)
@@ -1658,13 +1674,27 @@ class DesktopApp:
 
     # ── 双主题（day / night）
     def _theme_button_text(self, narrow: bool | None = None) -> str:
-        """窄窗只留图标（390 宽时顶栏放不下四个带字的控件）。"""
+        """顶栏「主题」按钮的文案：**写它是什么**，而不是只写「日间/夜间」。
+
+        UX-E2E-20261121 P1-6 走查把工具栏那颗读成「6 日新」——证据（
+        ``reports/UX-E2E-20261121/evidence/20261121T1006-C03-client-overview.png``）
+        表明那其实是 ``◐ 日间``：一个纯符号 + 当前主题名，客户看不出它是**按钮**、
+        更看不出点它会换主题。所以文案前面加上「主题：」这个类目词。
+        （走查建议把它改名「检查更新」——那是另一件事的按钮，照改会让客户点主题变检查更新；
+        「检查更新」在「账户与安全」页，见 ``views`` 的 ``update.check``。）
+        窄窗只留一个字（390 宽时顶栏放不下四个带字的控件），靠读屏名补全语义。
+        """
         if narrow is None:
             narrow = bool(getattr(self, "_narrow", False))
         day = getattr(self, "_theme_name", dual.DEFAULT_THEME) == "day"
         if narrow:
             return "日" if day else "夜"
-        return "◐ 日间" if day else "☾ 夜间"
+        return "主题：日间" if day else "主题：夜间"
+
+    def _theme_button_a11y(self) -> str:
+        """读屏名：说清「当前是哪个主题 + 点一下会变成哪个」。"""
+        day = getattr(self, "_theme_name", dual.DEFAULT_THEME) == "day"
+        return "当前日间主题，点一下切到夜间" if day else "当前夜间主题，点一下切回日间"
 
     def toggle_theme(self, *, animate: bool = True, persist: bool = True) -> str:
         """顶栏那个按钮：day ↔ night。返回切换后的主题名。"""
@@ -1684,6 +1714,8 @@ class DesktopApp:
             # 外壳（头/侧栏/页头/状态条）是普通 tk 控件：换肤直接整块重建
             self._rebuild_chrome()
             self._set_widget_text(self._theme_button, self._theme_button_text())
+            # 读屏名说的是「当前什么主题 + 点一下会变成什么」，换主题后必须跟着换
+            self._a11y_name(self._theme_button, self._theme_button_a11y())
             view = getattr(self, "_last_view", None)
             if view is not None:
                 # 表格 tag 颜色、卡片 tone 都是渲染时取的：重画一次才真正换色
@@ -1984,7 +2016,7 @@ class DesktopApp:
     def _update_clock(self) -> None:
         """页头/头上的「数据截至」：只用 ``Snapshot.fetched_at``，没有就写「—」。"""
         stamp = short_clock(self._controller.snapshot.fetched_at)
-        self._sync_label.configure(text="SYNC " + stamp)
+        self._sync_label.configure(text="同步 " + stamp)
         self._snapshot_label.configure(text="数据截至 " + stamp)
 
     def _status_line(self) -> str:

@@ -519,11 +519,16 @@ def test_content_width_follows_canvas_across_views_and_resizes(tmp_path):
         root.destroy()
 
 
-def test_page_kicker_label_shows_two_level_ascii_for_account(tmp_path):
+def test_page_kicker_label_shows_the_chinese_section_for_account(tmp_path):
+    """UX-E2E-20261121 P1-6：页头眉标从两级拉丁（``SYSTEM / ACCOUNT``）改成中文组名。
+
+    修前这条断言的是 ``SYSTEM / ACCOUNT``，而代码里 account 早已归到 CONNECT 组 ——
+    断言本身就过期了（基线红）。现在锁的是「中文 + 只一层」。
+    """
     app, root = _window_app(tmp_path, 1440)
     try:
         app.show_view("account")
         root.update()
-        assert app._page_kicker.cget("text") == "SYSTEM / ACCOUNT"
+        assert app._page_kicker.cget("text") == "接入"
     finally:
         root.destroy()
