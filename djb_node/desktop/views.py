@@ -33,7 +33,7 @@ __all__ = [
     "VIEWS",
     "VIEW_KEYS", "VIEW_TITLES", "View", "build_view", "build_views", "page_kicker",
     "YIELD_PRESET_BY_KEY", "YIELD_PRESET_BY_LABEL", "YIELD_TIERS",
-    "Filter", "with_field_errors",
+    "Filter", "with_field_errors", "Recovery", "INIT_RECOVERY_LABEL", "init_recovery",
 ]
 
 #: 三冗余状态前缀（文字通道；颜色通道由 tone 决定）
@@ -324,6 +324,48 @@ class Action:
     group: str = ""
 
 
+@dataclass(frozen=True)
+class Recovery:
+    """首屏「死路」的**可点出口**（UX-E2E-20261121 P1-3）。
+
+    走查原文：首启整屏「暂不可用」，唯一指引是让客户敲 ``djb init``，横幅自己还写着
+    「桌面端没有初始化入口，界面里点不到」——客户手上没有终端 ⇒ 首启是死路。
+
+    :attr:`View.recovery` 非空时，渲染层在横幅下面画一颗**主按钮**；点击走
+    ``controller.action(key)``（与普通动作同一条通道，所以「点了没反应」也会被播报）。
+    """
+    key: str
+    label: str
+    hint: str = ""
+
+
+#: 「初始化并连接」：本机未初始化时首屏唯一的主操作（也是 :func:`terminalize` 给 `djb init`
+#: 补的那条出路）。名字只在这里写一次——文案改动只改这一处。
+INIT_RECOVERY_LABEL = "初始化并连接"
+INIT_RECOVERY_HINT = ("建好本机数据目录、启动节点并自动连上云端；不用填任何东西，"
+                      "也不用开终端")
+
+#: 「本机还没初始化」的判定词（P1-3）：只有**状态库/安装记录缺失**才是死路。
+#: **不含**「目录权限过宽」这类环境项——那类挂上「初始化并连接」会跑错动作（客户点了没变化，
+#: 比没有按钮更糟），它们各自有 next_step。
+_INIT_REASON_MARKERS = ("未初始化", "状态库不存在", "安装记录缺失", "未安装")
+
+
+def init_recovery(snapshot: Snapshot) -> Recovery | None:
+    """本机未初始化 ⇒ 给一条可点的出路；其它原因（权限/超时/网络）**一律不给**（不猜）。
+
+    判定源只有一个：``status`` 域不可用且原因是「没初始化」。``status`` 是 13 页里 5 个域的
+    共同依赖，任何一轮快照都会取到它，所以这判据在**每一页**都成立（不像逐页打补丁会漏页）。
+    """
+    missing = snapshot.missing("status")
+    if missing is None:
+        return None
+    reason = str(missing.reason or "")
+    if not any(marker in reason for marker in _INIT_REASON_MARKERS):
+        return None
+    return Recovery("bootstrap", INIT_RECOVERY_LABEL, INIT_RECOVERY_HINT)
+
+
 #: D6（2026-11-18 客户要求）：账户页两个**互不干扰**的动作区标题。
 #: 「绑定节点」= 设备码/手输码；「提交 USDT 收款地址」= 单独一次 Payout 提交。
 #:
@@ -456,6 +498,9 @@ class View:
     #: 渲染后要**获得键盘焦点**的字段 key（RC15-039 #1：校验失败聚焦首个错误字段）。
     #: 空 = 不动焦点（0.3.7 行为）。由 :func:`with_field_errors` 填，投影层自己不产生。
     focus_field: str = ""
+    #: 首屏死路的可点出口（UX-E2E-20261121 P1-3）。空 = 本页没有死路（0.3.7 行为）。
+    #: 由 :func:`build_view` 统一填（判据只看 ``status`` 域，见 :func:`init_recovery`）。
+    recovery: Recovery | None = None
 
     def plain_text(self) -> str:
         """文本快照（证据 / 无显示环境验收）：稳定顺序，无时间戳抖动。
@@ -466,6 +511,10 @@ class View:
         lines = ["# " + self.title + (("  ·  " + self.subtitle) if self.subtitle else "")]
         for item in self.unavailable:
             lines.append("! " + item)
+        if self.recovery is not None:
+            # 死路的出口也要进文本快照（--export-text / 读屏 / 证据都靠它）
+            lines.append("[" + self.recovery.label + "]"
+                         + (("   " + self.recovery.hint) if self.recovery.hint else ""))
         if self.cards:
             lines.append("")
             for card in self.cards:
@@ -706,14 +755,24 @@ def terminalize(text: Any) -> str:
     看到「执行 djb init 会收紧到 0700」只会一脸问号。规矩：**要么做成界面内动作，要么
     明说这条要去终端跑并给完整命令**。这里统一补一句，而不是逐页打补丁——逐页补的结果
     就是复核抓到的「只扫了 4 页，接入页/基准页漏了」。
+
+    UX-E2E-20261121 P1-3：**删掉自贬句**（原来是「桌面端没有对应入口，界面里点不到」——
+    客户读到的是「这软件没做完」）。``djb init`` 有界面内动作（「初始化并连接」，见
+    :class:`Recovery`），所以在命令后面直接给出这条出路；其它命令只给命令本身。
     """
     value = str(text or "")
     if not value or "终端" in value:
         return value
+    if INIT_RECOVERY_LABEL in value:
+        # 数据层已经把界面内动作写进这句了（「点「初始化并连接」…」）：不再叠第二层括号。
+        return value
     match = _CLI_CALL.search(value)
     if match is None:
         return value
-    return value + "（这条要在终端里跑：" + match.group(0) + "；桌面端没有对应入口，界面里点不到）"
+    command = match.group(0)
+    tail = ("；也可以在客户端点「" + INIT_RECOVERY_LABEL + "」") \
+        if command.startswith("djb init") else ""
+    return value + "（这条要在终端里跑：" + command + tail + "）"
 
 
 def _terminalize_tree(value: Any) -> Any:
@@ -2585,11 +2644,20 @@ def build_view(key: str, snapshot: Snapshot) -> View:
 
     出口处统一过一遍 :func:`terminalize`（RC15-039 #11）：CLI 的 ``next_step`` 无论从哪个
     域来（access / bench / daemon…），上屏前都会带上「这条要在终端里跑」。
+
+    再挂一次 :func:`init_recovery`（UX-E2E-20261121 P1-3）：本机没初始化时，**每一页**都带
+    同一条可点出路。放在出口处而不是 13 个 builder 里，理由与 :func:`terminalize` 相同——
+    逐页打补丁一定会漏页（走查已经抓到过「只扫了 4 页」）。
     """
     builder = _BUILDERS.get(str(key or ""))
     if builder is None:
         raise ValueError("未知视图：" + str(key))
-    return _terminalize_tree(builder(snapshot))
+    view = _terminalize_tree(builder(snapshot))
+    if view.recovery is None:
+        recovery = init_recovery(snapshot)
+        if recovery is not None:
+            view = replace(view, recovery=recovery)
+    return view
 
 
 def build_views(snapshot: Snapshot) -> dict[str, View]:

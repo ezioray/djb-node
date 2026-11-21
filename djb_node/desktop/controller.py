@@ -218,6 +218,14 @@ class DesktopController:
     update_factory: Callable[[], Any] | None = None
     #: 最近一次检查结果（``check()`` 原样 payload；界面/日志都用它）
     last_update: Mapping[str, Any] | None = None
+    #: UX-E2E-20261121 P1-3：首启初始化（「初始化并连接」）。
+    #: 工厂由装配层注入，返回 ``{"boot": ensure_ready(...), "daemon": start_daemon(...)}``；
+    #: None = 本进程没有本机初始化通道（demo / 单测）→ 动作只回「暂不可用」，绝不假装成功。
+    #: **home 的解析留在装配层**（S3 根因：controller 自己找 home 会写出第三份口径）。
+    bootstrap_factory: Callable[[], Any] | None = None
+    #: 自举异步通道（GUI 注入 worker）：返回 True = 已派给 worker。
+    #: 建目录 + 起进程 + 等控制口（真机数秒）**不许**压在 Tk 主线程上。
+    bootstrap_via: Callable[[], Any] | None = None
     _snapshot: Snapshot | None = None
 
     # ── 快照 / 视图
@@ -505,6 +513,74 @@ class DesktopController:
         if self.request_refresh(None):
             return ActionResult("正在刷新…", effect="refresh")
         return ActionResult(self.message, effect="refresh")
+
+    # ── 首启初始化（UX-E2E-20261121 P1-3）：本机没初始化时首屏唯一的主操作
+    def _act_bootstrap(self, *, confirm=None) -> ActionResult:
+        """「初始化并连接」：把走查里的**首启死路**变成一次点击。
+
+        为什么要有：P1-3 实测首启整屏「暂不可用」，唯一指引是让客户敲 ``djb init``，
+        而客户手上没有终端 ⇒ 装完就是死的。这里调的是**既有**自举路径
+        （``bootstrap.ensure_ready`` + ``bootstrap.start_daemon``，与 ``main()`` 首启同一条），
+        不复制 CLI 逻辑、不自己发网络请求：节点注册仍由 daemon 走它原本的路径。
+
+        走异步通道（``bootstrap_via``）时主线程只负责派发；没有通道（单测/无 Tk）就同步跑。
+        """
+        hook = self.bootstrap_via
+        if hook is not None:
+            try:
+                started = hook()
+            except Exception:                      # 异步通道坏了 → 回落同步（动作不许被打崩）
+                started = False
+            if started:
+                return ActionResult("正在初始化并连接…（建本机目录 + 启动节点，通常 10 秒内）",
+                                    effect="bootstrap", payload={"state": "running"})
+        return self.run_bootstrap()
+
+    def run_bootstrap(self) -> ActionResult:
+        """worker 侧：跑自举、把人话翻出来（**不碰控件**；失败必须给下一步）。
+
+        成功判据只有一条：节点**真的**起来了（``started`` 或 ``already-running``）。
+        ``no-cli`` / ``timeout`` 这类失败由 :func:`djb_node.bootstrap.daemon_reason_text`
+        翻成可执行文案（缺 ``djb-node.exe`` / 启动超时），不再只回一句「失败」。
+        """
+        factory = self.bootstrap_factory
+        if factory is None:
+            return ActionResult("暂不可用（本机初始化通道未接通）；本机没有任何改动。", ok=False)
+        try:
+            raw = factory()
+        except Exception as exc:                   # 自举自己失败：说清 + 给下一步，不静默
+            return ActionResult("初始化没做成（" + type(exc).__name__ + "）；本机没有改动。"
+                                "下一步：重试一次，或在终端跑 djb init 看具体报错。", ok=False)
+        result: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+        boot = dict(result.get("boot") or {}) if isinstance(result.get("boot"), Mapping) else {}
+        daemon = (dict(result.get("daemon") or {})
+                  if isinstance(result.get("daemon"), Mapping) else {})
+        from ..bootstrap import daemon_reason_text, summary_text
+
+        if boot.get("enabled") is False or daemon.get("enabled") is False:
+            # 自举被 DJB_BOOTSTRAP_DISABLE / enabled=False 关掉：不许谎报「已初始化」
+            return ActionResult("初始化没有执行：本机自举被关掉了（DJB_BOOTSTRAP_DISABLE）；"
+                                "要装起来请在终端跑 djb init。", ok=False)
+        errors = list(boot.get("errors") or []) + list(daemon.get("errors") or [])
+        running = bool(daemon.get("started")) or daemon.get("reason") == "already-running"
+        summary = summary_text(boot, daemon)
+        payload = {"boot": boot, "daemon": daemon}
+        if running and not errors:
+            # 节点在跑 ≠ 已连上：注册/取密钥由 daemon 自己走，下一轮刷新才看得到
+            return ActionResult((summary or "已初始化并连接")
+                                + "；下一轮刷新就能看到节点状态（点「刷新」立即看）",
+                                ok=True, effect="refresh", payload=payload)
+        hint = daemon_reason_text(str(daemon.get("reason") or ""),
+                                  str(daemon.get("log") or ""))
+        message = summary or "初始化没做成"
+        if hint:
+            # summary_text 已经把 no-cli / timeout 翻成可执行文案：别重复第二遍
+            if hint not in message:
+                message += "；下一步：" + hint
+        else:
+            message += ("；下一步：重试一次；还不行就看「日志」页末尾的报错，"
+                        "或在终端跑 djb init")
+        return ActionResult(message, ok=False, effect="bootstrap", payload=payload)
 
     # ── 探针（RC14 D）：手动补一次体检，明细回「模型与探针」页
     def _act_probe_run(self, *, confirm=None) -> ActionResult:

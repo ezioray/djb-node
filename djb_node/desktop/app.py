@@ -394,6 +394,10 @@ class DesktopApp:
         self._ensure_update_worker()
         self._ensure_probe_worker()
         self._ensure_discover_worker()
+        # UX-E2E-20261121 P1-3：首启「初始化并连接」也必须一开窗就接上 worker——
+        # 否则第一次点它会因为 ``bootstrap_via`` 还是 None 而在**主线程**起子进程 + 等控制口
+        # （最长 8 s 的窗口假死，正是 S2 修过的那个坑）。
+        self._ensure_bootstrap_worker()
         self._controller.device_via = self._start_device_flow
         self._controller.device_notify = self._device_state_changed
         bind = getattr(self._root, "bind", None)
@@ -1445,6 +1449,64 @@ class DesktopApp:
         if refresh is None or not getattr(refresh, "busy", False):
             self._request_refresh_async(("models", "token_plan"))
 
+    # ── UX-E2E-20261121 P1-3：首启「初始化并连接」（建目录 + 起进程，绝不在主线程）
+    def _ensure_bootstrap_worker(self) -> Any:
+        """惰性建自举 worker：与刷新/更新/探针同一个 :class:`RefreshWorker` 模板。
+
+        为什么必须异步：``bootstrap.start_daemon`` 会起子进程并等本机控制口（默认最多 8 s）。
+        压在 Tk 主线程上就是 S2 修过的「点一下整窗卡死」——同一个坑不踩第二次。
+        """
+        worker = getattr(self, "_bootstrap_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(lambda sections=None: self._controller.run_bootstrap(),
+                               apply=self._apply_bootstrap, on_start=self._bootstrap_started,
+                               on_busy=self._bootstrap_busy,
+                               schedule=schedule, cancel=cancel)
+        self._bootstrap_worker = worker
+        self._controller.bootstrap_via = self._start_bootstrap
+        return worker
+
+    def _start_bootstrap(self) -> bool:
+        worker = self._ensure_bootstrap_worker()
+        if worker is None:
+            return False                   # 无事件循环 → controller 回落同步
+        return bool(worker.start())
+
+    def _bootstrap_started(self) -> None:
+        self._toast("正在初始化并连接…（建本机目录 + 启动节点，通常 10 秒内）", ok=True)
+
+    def _bootstrap_busy(self) -> None:
+        self._toast("初始化还没结束，已忽略这次点击", ok=True)
+
+    def _apply_bootstrap(self, result: Any, error: BaseException | None,
+                         sections: Any = None) -> None:
+        """主线程：先把节点结论回填给数据层（「节点进程」字段靠它说真因），再播报 + 重画。"""
+        if error is not None:
+            self._toast("初始化失败（" + type(error).__name__ + "）：" + str(error)[:120], ok=False)
+        elif result is None:
+            self._toast("初始化失败：没有拿到结果", ok=False)
+        else:
+            payload = getattr(result, "payload", None)
+            daemon = payload.get("daemon") if isinstance(payload, Mapping) else None
+            if isinstance(daemon, Mapping) and daemon:
+                self._controller.set_boot(daemon)
+            self._toast(str(getattr(result, "message", "") or "初始化完成"),
+                        ok=bool(getattr(result, "ok", False)))
+        # 成/败都要重取一次数：成功要看到节点状态，失败要看到真因（都不在主线程）
+        self._request_refresh_async(None)
+
     # ── RC14 C 设备码绑定（轮询在后台线程；主线程只播报 + 重画）
     def _ensure_device_runner(self) -> bool:
         """首点建线程；轮询节奏由 ``device_flow`` 决定（5/15/30 秒，10 分钟停）。"""
@@ -2138,6 +2200,9 @@ class DesktopApp:
                               foreground=dual.color("amber_text"), background=dual.color("bg"),
                               anchor="w", justify="left", wraplength=self._wrap_hint())).pack(
                                   anchor="w", pady=(0, 4))
+        if view.recovery is not None:
+            # UX-E2E-20261121 P1-3：横幅下面必须有**能点的下一步**（首启不再是死路）
+            self._render_recovery(body, view.recovery)
         if view.hero is not None or view.chart is not None or view.rail:
             self._render_dashboard(view)
         else:
@@ -2318,6 +2383,31 @@ class DesktopApp:
             row.pack(fill="x")
             for action in members:
                 self._render_action(row, action)
+
+    def _render_recovery(self, parent: Any, recovery: Any) -> None:
+        """首屏死路的可点出口（UX-E2E-20261121 P1-3）：一颗主按钮 + 一句「点了会发生什么」。
+
+        为什么画在横幅下面而不是状态栏：走查里客户在这一屏**找不到任何**能点的东西，
+        所以出口必须和红字同屏、在同一个视线落点内。按钮走 ``_on_action``（与普通动作
+        同一条通道），失败会照常播报，不会「点了没反应」。
+        """
+        tk, kit = self._tk, self._kit
+        ground = dual.color("bg")
+        row = tk.Frame(parent, background=ground)
+        row.pack(fill="x", pady=(0, 2))
+        button = kit.Button(row, recovery.label,
+                            (lambda key: (lambda: self._on_action(key)))(recovery.key),
+                            kind="primary", ground=ground, px=kit.px("small"),
+                            height=30, pad=14)
+        self._a11y_name(button, recovery.label + "（" + (recovery.hint or "点一下开始") + "）")
+        button.pack(side="left")
+        self._recovery_button = button
+        if recovery.hint:
+            self._wrap(tk.Label(parent, text=recovery.hint,
+                                font=self._fonts.sans(kit.px("micro")),
+                                foreground=dual.color("muted_text"), background=ground,
+                                anchor="w", justify="left",
+                                wraplength=self._wrap_hint())).pack(anchor="w", pady=(0, 6))
 
     def _render_hero(self, parent: Any, hero: Hero) -> None:
         """状态主卡：左「标题 + 说明 + 运行时长 + 动作」，右 125px 仪表环，下面四指标。"""
@@ -3405,6 +3495,11 @@ class DesktopApp:
         elif result.effect == "update":
             # G4-3：九状态逐个翻译成「发生了什么 + 下一步」，下载类动作顺手打开下载页
             self._apply_update(result.payload, ok=result.ok, message=result.message)
+        elif result.effect == "bootstrap":
+            # UX-E2E-20261121 P1-3：「已派发」由 _bootstrap_started 播报；只有同步回落时
+            # 这里才拿到最终结论（否则 worker 结束时 _apply_bootstrap 播报，两条路只播一次）
+            if str((result.payload or {}).get("state") or "") != "running":
+                self._apply_bootstrap(result, None)
         elif result.effect == "goto" and result.payload:
             self.show_view(str(result.payload))       # 例如「共享 Token Plan」→「接入配置」
         elif result.effect == "payout_submit":
@@ -4087,11 +4182,20 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
         def factory() -> Any:              # noqa: ANN401 - 惰性构造（worker 线程里调用）
             from ..update import open_manager
             return open_manager(home)
+    # UX-E2E-20261121 P1-3：首启「初始化并连接」走**既有**自举路径（与 main() 首启同一条）。
+    # home 的解析留在装配层（S3 教训：controller 自己找 home 会写出第三份口径）；
+    # demo / 无本机目录时不给工厂 → 动作只回「暂不可用」，不会假装初始化成功。
+    bootstrap_factory = None
+    if not demo:
+        def bootstrap_factory() -> Any:    # noqa: ANN401 - 惰性构造（worker 线程里调用）
+            from ..bootstrap import ensure_ready, start_daemon
+            return {"boot": ensure_ready(home=home), "daemon": start_daemon(home=home)}
     return DesktopController(source, access=access, control=LocalControlChannel(home), bus=bus,
                              cli=_make_cli_runner(home) if not demo else None,
                              # G4：更新检查要 UpdateManager（本机 paths/store/config），
                              # 由装配层注入，controller 不自己找 home（S3 教训）
-                             update_factory=factory)
+                             update_factory=factory,
+                             bootstrap_factory=bootstrap_factory)
 
 
 def _default_home() -> str:

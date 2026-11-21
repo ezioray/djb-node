@@ -7,7 +7,10 @@
 
 * ``云端未接通``  —— 默认云端地址还是**占位符** ``https://api.example.invalid``
   （:data:`djb_node.config.GATEWAY_PLACEHOLDER`），没人会去改 `config.json`；
-* ``本机未初始化`` —— 没跑过 ``djb init``，而**桌面端没有初始化入口**。
+* ``本机未初始化`` —— 没跑过 ``djb init``，当时**桌面端没有初始化入口**
+  （UX-E2E-20261121 P1-3 已补：首屏横幅下有「初始化并连接」按钮 →
+  ``controller.action("bootstrap")`` → 本模块的 :func:`ensure_ready` + :func:`start_daemon`，
+  与 ``main()`` 首启同一条路）。
 
 结果：客户端发出去就是死的，必须由我们口头/文档教三条命令才能用。
 
