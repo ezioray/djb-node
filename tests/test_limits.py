@@ -57,11 +57,12 @@ def test_l1_yield_wins_over_quota_and_resources(store):
     assert decision.next_step
 
 
-def test_detection_failure_is_conservative(store):
+def test_detection_failure_is_degraded_not_user_active(store):
+    # 2026-11-22：检测器异常只记 degraded，继续接单；不再永久 paused(yield)。
     limiter = _limiter(store, probes=[FakeProbe("error", "session")])
     decision = limiter.evaluate(profile=ProfileRecord(), policy=None)
-    assert decision.reason == "yield_paused"
-    assert decision.detail["source"] == "session"
+    assert decision.accept is True
+    assert decision.reason == "ok"
 
 
 def test_yield_disabled_by_profile(store):
