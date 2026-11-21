@@ -167,8 +167,10 @@ class DeviceFlowRunner:
     def __init__(self, post: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
                  *, sleep: Callable[[float], None], clock: Callable[[], float],
                  on_update: Callable[[DeviceFlow], None] | None = None,
-                 stop: Callable[[], bool] | None = None) -> None:
+                 stop: Callable[[], bool] | None = None,
+                 node_id: str = "") -> None:
         self._post = post
+        self._node_id = str(node_id or "").strip()
         self._sleep = sleep
         self._clock = clock
         self._on_update = on_update
@@ -206,8 +208,9 @@ class DeviceFlowRunner:
         return flow
 
     def start(self) -> DeviceFlow:
+        body = {"node_id": self._node_id} if self._node_id else {}
         try:
-            payload = self._post(DEVICE_PATH, {})
+            payload = self._post(DEVICE_PATH, body)
         except Exception as exc:                           # 404 / 超时 / 连不上
             return unavailable(_error_text(exc))
         return parse_start(payload)

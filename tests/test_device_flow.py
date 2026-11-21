@@ -94,6 +94,22 @@ def test_poll_body_uses_the_agreed_field_name():
     assert df.poll_body(df.DeviceFlow(device_code="dc_9")) == {"device_code": "dc_9"}
 
 
+def test_start_sends_node_id_when_runner_has_one():
+    clock = _Clock()
+    calls = []
+
+    def post(path, body):
+        calls.append((path, dict(body)))
+        if path.endswith("/device"):
+            return {"user_code": "U1", "device_code": "dc",
+                    "verify_url": "https://x/activate", "expires_in": 600}
+        return {"state": "approved"}
+
+    df.DeviceFlowRunner(post, sleep=clock.sleep, clock=clock.clock,
+                        node_id="node-1").run()
+    assert calls[0][1] == {"node_id": "node-1"}
+
+
 # ─────────────────────────────────────────────── 端到端（假 post + 假时钟）
 def _runner(script, clock, *, stop=None):
     calls: list[tuple[str, dict]] = []

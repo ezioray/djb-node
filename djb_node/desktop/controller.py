@@ -795,10 +795,21 @@ class DesktopController:
         def post(path: str, body: Mapping[str, Any]) -> Mapping[str, Any]:
             if path.endswith("/poll"):
                 return client.device_poll(str(body.get("device_code") or ""))
-            return client.device_start()
+            node_id = str(body.get("node_id") or "")
+            try:
+                return client.device_start(node_id)
+            except TypeError:            # 旧测试桩/旧客户端不接收参数
+                return client.device_start()
 
+        access = self.snapshot.get("access")
+        node_id = str(access.get("node_id") or "") if isinstance(access, Mapping) else ""
+        if not node_id:
+            account = self.snapshot.get("account")
+            security = account.get("security") if isinstance(account, Mapping) else None
+            node_id = str((security or {}).get("node_id") or "")
         runner = flow_mod.DeviceFlowRunner(post, sleep=time.sleep, clock=time.monotonic,
-                                          on_update=self._device_update, stop=stop)
+                                          on_update=self._device_update, stop=stop,
+                                          node_id=node_id)
         flow = runner.run()
         self.device_flow = flow
         return self._device_result(flow)

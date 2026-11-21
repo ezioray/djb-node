@@ -396,10 +396,17 @@ class NodeCloudClient:
         return dict(data) if isinstance(data, Mapping) else {}
 
     # ── RC14 C 设备码绑定（只发两个 POST；不自动重试，节奏由 device_flow 决定）
-    def device_start(self) -> dict[str, Any]:
-        """``POST /node/binding/device`` → ``{user_code, verify_url, expires_in, device_code}``。"""
+    def device_start(self, node_id: str = "") -> dict[str, Any]:
+        """``POST /node/binding/device`` → ``{user_code, verify_url, expires_in, device_code}``。
+
+        ``node_id``（0.5.9 起）：建码时把本机节点带上，网页确认后云端才能把账户绑到该节点；
+        旧云端不认该字段时忽略（``additionalProperties``），不会破坏旧行为。
+        """
+        body: dict[str, Any] = {}
+        if str(node_id or "").strip():
+            body["node_id"] = str(node_id).strip()
         return dict(self._request("POST", PATHS["device_start"], kind="device_start",
-                                  json_body={}, idempotency_key=new_request_id()))
+                                  json_body=body, idempotency_key=new_request_id()))
 
     def device_poll(self, device_code: str) -> dict[str, Any]:
         """``POST /node/binding/device/poll`` → ``{state: pending|approved|denied|expired}``。"""

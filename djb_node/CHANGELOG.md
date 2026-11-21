@@ -6,6 +6,16 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.5.9 · 2026-11-22
+
+**设备码绑定闭环（离线，零生产写入）**（CHG-20261122-BIND-CLAIM）。`__version__` /
+`pyproject.toml` 同源升到 `0.5.9`；无协议契约变更，无新增依赖。
+
+- `POST /api/v1/node/binding/device` 建码时带本机 `node_id`（注册后已有）；云端确认时才能把账户
+  绑到这台节点。旧云端忽略该字段；旧客户端不传仍走原行为。
+- 修 `DeviceFlowRunner` 的 start 请求体：只有拿到 node_id 才发，避免空字段污染旧云端。
+- 仍不存 `device_code` 到磁盘、不自动重试；10 分钟过期与 5/15/30 秒退避不变。
+
 ## 0.3.6 · 2026-11-13
 
 **接入页精简 + 收款地址提交云端**（owner 2026-11-13 三条客户端指令）。`__version__` /
