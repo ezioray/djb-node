@@ -218,6 +218,25 @@ def test_cli_init_reads_packaged_config_on_first_run(home, tmp_path, monkeypatch
     assert config.update_channel == "stable"
 
 
+def test_cli_init_ignores_placeholder_packaged_gateway(home, tmp_path, monkeypatch, capsys) -> None:
+    from djb_node.cli import main
+
+    app = tmp_path / "packaged-placeholder"
+    app.mkdir()
+    (app / "config.json").write_text(json.dumps({
+        "gateway_url": "https://api.example.invalid",
+        "update_source": update_source.MANIFEST_URL,
+        "edition": "consumer",
+    }), encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "djb-node.exe"))
+    assert main(["init", "--no-env"]) == 0
+    capsys.readouterr()
+    config = load_config(Paths(str(home)))
+    assert config.gateway_url != "https://api.example.invalid"
+    assert config.update_source == update_source.MANIFEST_URL
+
+
 def test_cli_init_explicit_args_beat_packaged_config(home, tmp_path, monkeypatch, capsys) -> None:
     from djb_node.cli import main
 

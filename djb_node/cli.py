@@ -139,7 +139,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     elif _gateway_is_placeholder(config.gateway_url):
         # 没显式给地址：优先包内载体（测试栈包可以带自己的地址），否则用构建默认。
         packaged_gateway = str(packaged.get("gateway_url") or "").strip()
-        if packaged_gateway:
+        if packaged_gateway and not _gateway_is_placeholder(packaged_gateway):
             config.gateway_url = packaged_gateway
             packaged_note = "已读取包内 config.json 的首启地址"
         else:
