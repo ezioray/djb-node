@@ -234,6 +234,25 @@ def test_cli_init_explicit_args_beat_packaged_config(home, tmp_path, monkeypatch
     assert config.update_channel == "beta"
 
 
+def test_cli_init_fills_empty_existing_update_source(home, tmp_path, monkeypatch, capsys) -> None:
+    """0.5.9 遗留：home 已存在但 update_source 为空；再 init 应补上包内默认。"""
+    from djb_node.cli import main
+
+    paths = Paths(str(home))
+    paths.prepare()
+    save_config(paths, ClientConfig(gateway_url="https://existing.example.com",
+                                    update_source="", edition=""))
+    app = _fake_packaged_app(tmp_path)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "djb-node.exe"))
+    assert main(["init", "--no-env"]) == 0
+    capsys.readouterr()
+    config = load_config(paths)
+    assert config.gateway_url == "https://existing.example.com"
+    assert config.update_source == update_source.MANIFEST_URL
+    assert config.edition == "consumer"
+
+
 def test_cli_init_existing_config_ignores_packaged_config(home, tmp_path, monkeypatch, capsys) -> None:
     from djb_node.cli import main
 

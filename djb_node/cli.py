@@ -131,7 +131,7 @@ def _packaged_config() -> dict[str, Any]:
 def cmd_init(args: argparse.Namespace) -> int:
     paths = _paths(args)
     fresh = not os.path.exists(paths.config_file)
-    packaged = _packaged_config() if fresh else {}
+    packaged = _packaged_config()
     config = load_config(paths)
     packaged_note = ""
     if getattr(args, "gateway", None):
@@ -152,21 +152,23 @@ def cmd_init(args: argparse.Namespace) -> int:
         config.update_channel = args.channel
     edition = getattr(args, "edition", None)
     edition_note = packaged_note
-    if (fresh and edition is None
-            and getattr(args, "update_source", None) is None):
-        # 首装且没有显式更新源：包内 config.json 是构建时的显式载体。
+    if (edition is None
+            and getattr(args, "update_source", None) is None
+            and not config.update_source.strip()):
+        # 首装或 0.5.9 遗留的空更新源：包内 config.json 是构建时的显式载体。
+        # 已有非空源（自定义镜像 / 运维设置）一律不覆盖。
         packaged_source = str(packaged.get("update_source") or "").strip()
         packaged_edition = str(packaged.get("edition") or "").strip()
         if packaged_source or packaged_edition:
             if packaged_source:
                 config.update_source = packaged_source
-            if packaged_edition in update_source.editions():
+            if packaged_edition in update_source.editions() and not config.edition.strip():
                 config.edition = packaged_edition
             packaged_channel = str(packaged.get("update_channel") or "").strip()
-            if (not getattr(args, "channel", None)
+            if (fresh and not getattr(args, "channel", None)
                     and packaged_channel in facts.UPDATE_CHANNELS):
                 config.update_channel = packaged_channel
-            edition_note = "已读取包内 config.json 的更新源/档位（首启默认）"
+            edition_note = "已读取包内 config.json 的更新源/档位（首启/空源默认）"
     if edition:
         # 0.3.1（RC8.3-C）：显式给档位 = 明确要该通道的签名更新源。
         # 已有**自定义**源（内网镜像 / 本地目录）不覆盖 —— 那是运维刻意的选择。
