@@ -55,13 +55,16 @@ class DeviceFlow:
     hint: str = ""
     #: 已确认绑定（只有 approved 才是 True；其余一律 None/False，不能含糊）
     approved: bool = False
+    #: approved 时云端回的落库节点 ID；为空 = 云端只批了账户，不能算绑定成功。
+    bound_node_id: str = ""
     events: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {"state": self.state, "user_code": self.user_code,
                 "verify_url": self.verify_url, "expires_in": self.expires_in,
                 "attempts": self.attempts, "elapsed_s": self.elapsed_s,
-                "reason": self.reason, "hint": self.hint, "approved": self.approved}
+                "reason": self.reason, "hint": self.hint, "approved": self.approved,
+                "node_id": self.bound_node_id}
 
 
 def parse_start(payload: Mapping[str, Any]) -> DeviceFlow:
@@ -113,6 +116,8 @@ def apply_poll(flow: DeviceFlow, payload: Mapping[str, Any] | None,
         return flow
     flow.state = state
     flow.approved = state == "approved"
+    flow.bound_node_id = (str((data or {}).get("node_id") or "").strip()
+                          if state == "approved" else "")
     if state == "denied":
         flow.reason = "这次绑定被拒绝（网页端点了拒绝）"
         flow.hint = "要重试就再点「在浏览器确认绑定」，或用高级→手输绑定码"

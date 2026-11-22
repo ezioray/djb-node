@@ -827,6 +827,12 @@ class DesktopController:
         from .. import device_flow as flow_mod
 
         if flow.state == "approved":
+            # 2026-11-22 P0 防线：云端只回 approved、没有 node_id 时不能显示成功。
+            # 0.5.8 的假绑定就是“approved=成功”，但节点实际 unbound。
+            if not str(getattr(flow, "bound_node_id", "") or "").strip():
+                return ActionResult("云端已批准，但没有返回节点 ID；本次不能算绑定成功。"
+                                    "请升级到 0.5.9+ 后重新发起，或改用「手输绑定码」。",
+                                    ok=False, payload=flow.as_dict())
             # 绑定成功后重新取数：绑定状态/收款面板都要立刻反映
             return ActionResult("绑定成功：这台电脑已经绑到你的账户（" + flow.user_code + "）"
                                 "（USDT 收款地址是另一件事：在本页「③ 提交 USDT 收款地址」"
