@@ -110,21 +110,63 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
 
 
 # ─────────────────────────────────────────────────────────── init
+def _packaged_config() -> dict[str, Any]:
+    """读取便携包自带的 ``config.json``（仅冻结包；源码运行不读）。
+
+    0.5.9 的 Windows zip 已带生产 ``config.json``，但 ``init --preset`` 是按
+    源码默认值写 home，导致首装 ``update_source`` 落 mock。首启时把包内
+    载体作为默认值，显式参数仍然优先。
+    """
+    if not getattr(sys, "frozen", False):
+        return {}
+    path = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     paths = _paths(args)
+    fresh = not os.path.exists(paths.config_file)
+    packaged = _packaged_config() if fresh else {}
     config = load_config(paths)
+    packaged_note = ""
     if getattr(args, "gateway", None):
         config.gateway_url = str(args.gateway).strip()
     elif _gateway_is_placeholder(config.gateway_url):
-        # 没显式给地址就用构建期默认（2026-11-06：占位符发到客户手里 = 装完连不上）
-        from .bootstrap import DEFAULT_GATEWAY_URL
-        config.gateway_url = DEFAULT_GATEWAY_URL
+        # 没显式给地址：优先包内载体（测试栈包可以带自己的地址），否则用构建默认。
+        packaged_gateway = str(packaged.get("gateway_url") or "").strip()
+        if packaged_gateway:
+            config.gateway_url = packaged_gateway
+            packaged_note = "已读取包内 config.json 的首启地址"
+        else:
+            # 2026-11-06：占位符发到客户手里 = 装完连不上
+            from .bootstrap import DEFAULT_GATEWAY_URL
+            config.gateway_url = DEFAULT_GATEWAY_URL
     if getattr(args, "port", None):
         config.mirror_port = int(args.port)
     if getattr(args, "channel", None):
         config.update_channel = args.channel
     edition = getattr(args, "edition", None)
-    edition_note = ""
+    edition_note = packaged_note
+    if (fresh and edition is None
+            and getattr(args, "update_source", None) is None):
+        # 首装且没有显式更新源：包内 config.json 是构建时的显式载体。
+        packaged_source = str(packaged.get("update_source") or "").strip()
+        packaged_edition = str(packaged.get("edition") or "").strip()
+        if packaged_source or packaged_edition:
+            if packaged_source:
+                config.update_source = packaged_source
+            if packaged_edition in update_source.editions():
+                config.edition = packaged_edition
+            packaged_channel = str(packaged.get("update_channel") or "").strip()
+            if (not getattr(args, "channel", None)
+                    and packaged_channel in facts.UPDATE_CHANNELS):
+                config.update_channel = packaged_channel
+            edition_note = "已读取包内 config.json 的更新源/档位（首启默认）"
     if edition:
         # 0.3.1（RC8.3-C）：显式给档位 = 明确要该通道的签名更新源。
         # 已有**自定义**源（内网镜像 / 本地目录）不覆盖 —— 那是运维刻意的选择。
@@ -2442,7 +2484,7 @@ def build_parser() -> argparse.ArgumentParser:
     boot.add_argument("--no-daemon", action="store_true", help="只自举，不拉起 daemon")
 
     init = add_common(cmd_init, "init", "初始化本机数据目录 / 预设 / 限额，并做一次环境检测")
-    init.add_argument("--gateway", help="服务端地址（默认占位 api.example.invalid）")
+    init.add_argument("--gateway", help="服务端地址（默认取包内 config.json 或构建默认）")
     init.add_argument("--port", type=int, help="本机镜像端口（1024–65535，默认 1717）")
     init.add_argument("--channel", choices=facts.UPDATE_CHANNELS, help="更新频道")
     init.add_argument("--update-source", help="更新源（URL / 本地目录；留空用 mock 源）")

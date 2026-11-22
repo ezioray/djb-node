@@ -6,6 +6,18 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.5.10 · 2026-11-22
+
+**首启读取包内 config.json（离线，未发布）**。0.5.9 的 Windows 便携包已带生产
+`config.json`，但 `init --preset` 按源码默认写 home，`update_source` 落回 mock；
+新装用户因此收不到后续更新。
+
+- 冻结包首启（home 下无 `config.json`）时，从 exe 同级 `config.json` 读取
+  `gateway_url` / `update_source` / `edition` / `update_channel` 作为默认值。
+- 显式命令行参数永远优先；已有 home 配置不被覆盖；源码运行不读包内文件（仍 mock）。
+- `init --gateway` 帮助改为“默认取包内 config.json 或构建默认”，不再写已废弃的占位地址。
+- 无协议契约变更，无新增依赖；`__version__` / `pyproject.toml` / Helm `appVersion` 同源到 `0.5.10`。
+
 ## 0.5.9 · 2026-11-22
 
 **设备码绑定闭环（离线，零生产写入）**（CHG-20261122-BIND-CLAIM）。`__version__` /
