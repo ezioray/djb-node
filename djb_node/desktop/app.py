@@ -737,6 +737,9 @@ class DesktopApp:
         ident = tk.Frame(side, background=ground)
         ident.pack(fill="x", padx=16, pady=(14, 10))
         self._ident = ident
+        # 身份块第 3 行要按**真实列宽**截字（字阶 +1px 后 900px 窗里会超出 13 px）；
+        # 首次布局完成时再算一遍，否则拿到的是 winfo_width()==1 的未映射状态。
+        ident.bind("<Configure>", lambda _event: self._update_identity())
         tk.Label(ident, text="本机节点", font=fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground, anchor="w").pack(fill="x")
         self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.px("h2"), bold=True),
@@ -1140,6 +1143,10 @@ class DesktopApp:
                                       foreground=dual.color("muted_text"),
                                       background=dual.color("surface3"), anchor="e")
         self._status_right.pack(side="right", padx=(0, self._px(14)), pady=self._px(4))
+        # 2026-11-24：字阶整体 +1px 后，900px 宽窗里「GPU · 显存 · 版本 · 主题」四段放不下
+        # （需求 273 px / 实得 197 px），而窄窗阈值仍是 760 —— 阈值跟不上字阶。
+        # 这里按**实测是否被裁**退一档，而不是再加一个魔法宽度。
+        bar.bind("<Configure>", lambda _event: self._fit_status_right())
 
     def _sync_content_width(self) -> None:
         """把内容列宽钉回画布宽（B4：**任何时刻**内容宽 ≤ 画布宽）。
@@ -2169,7 +2176,8 @@ class DesktopApp:
             name = name[:21] + "…"
         total = device.get("memory_total_mb")
         vram = (str(round(float(total) / 1024.0)) + " GB") if is_number(total) else "—"
-        self._ident_meta.configure(text=name + " · " + vram if device else "显卡：暂不可用")
+        meta = (name + " · " + vram) if device else "显卡：暂不可用"
+        self._ident_meta.configure(text=self._fit_text(self._ident_meta, meta))
 
     def _update_clock(self) -> None:
         """页头/头上的「数据截至」：只用 ``Snapshot.fetched_at``，没有就写「—」。"""
@@ -2191,8 +2199,12 @@ class DesktopApp:
         parts = [part.strip() for part in line.split("·") if part.strip()]
         return " · ".join(parts[:2])
 
-    def _status_right_text(self) -> str:
-        """状态条右侧：GPU 利用率 · 显存 · 版本 · 主题（缺值写「—」，不写 0）。"""
+    def _status_right_text(self, *, compact: bool | None = None) -> str:
+        """状态条右侧：GPU 利用率 · 显存 · 版本 · 主题（缺值写「—」，不写 0）。
+
+        ``compact`` 显式要求两段式（版本 + 主题）；``None`` 时看 ``_narrow`` /
+        ``_status_compact``（见 ``_fit_status_right``）。
+        """
         from ..facts import CLIENT_VERSION
         snapshot = self._controller.snapshot
         gpu = snapshot_section(snapshot, "gpu")
@@ -2201,8 +2213,9 @@ class DesktopApp:
         util = device.get("utilization_pct")
         used, total = device.get("memory_used_mb"), device.get("memory_total_mb")
         theme_name = "日间" if self._theme_name == "day" else "夜间"
-        if getattr(self, "_narrow", False):
-            # 窄窗：GPU/显存留给主卡，状态条只留版本与主题（否则两段文字会叠在一起）
+        compact = bool(compact if compact is not None else getattr(self, "_status_compact", False))
+        if getattr(self, "_narrow", False) or compact:
+            # 窄窗 / 完整文案被裁：GPU/显存留给主卡，状态条只留版本与主题
             return "v" + CLIENT_VERSION + "  ·  " + theme_name
         parts = ["GPU " + (str(int(float(util))) + "%" if is_number(util) else "—"),
                  "显存 " + ("%.1f/%.0f GB" % (float(used) / 1024.0, float(total) / 1024.0)
@@ -2210,6 +2223,61 @@ class DesktopApp:
                  "v" + CLIENT_VERSION,
                  theme_name]
         return "  ·  ".join(parts)
+
+    def _fit_status_right(self) -> None:
+        """状态条右侧自适应：**实测**放不下就退到「版本 + 主题」，绝不让文字被硬裁。
+
+        2026-11-24（R2.1 ⑤ 之后字阶 +1px）：900px 宽窗下四段式需求 273 px、实得 197 px，
+        旧逻辑只在 <760 才退两段，于是状态条被硬裁。这里按 label 的真实需求宽度判断，
+        窗变宽时再自动恢复四段（每次 ``<Configure>`` 重算，不缓存结论）。
+        """
+        label = getattr(self, "_status_right", None)
+        if label is None or getattr(self, "_fitting_status", False):
+            return
+        self._fitting_status = True
+        try:
+            label.update_idletasks()
+            if not label.winfo_ismapped() or getattr(self, "_narrow", False):
+                return
+            clipped = label.winfo_reqwidth() > label.winfo_width() + 2
+            if clipped and not getattr(self, "_status_compact", False):
+                self._status_compact = True
+                label.configure(text=self._status_right_text(compact=True))
+            elif not clipped and getattr(self, "_status_compact", False):
+                full = self._status_right_text(compact=False)
+                if self._text_width(label, full) <= label.winfo_width() + 2:
+                    self._status_compact = False
+                    label.configure(text=full)
+        except Exception:                                  # pragma: no cover - 控件已销毁
+            return
+        finally:
+            self._fitting_status = False
+
+    def _text_width(self, label, text: str) -> int:
+        """按 label 自己的字体量文字宽度（px）；量不了就退回 reqwidth 估算。"""
+        try:
+            font = self._tk.font.Font(font=label.cget("font"))
+            return int(font.measure(text))
+        except Exception:                                  # pragma: no cover - 字体异常
+            return 0
+
+    def _fit_text(self, label, text: str) -> str:
+        """把文字截到控件**当前**可用宽度内（超出加「…」），不让 Tk 硬裁。
+
+        2026-11-24：字阶 +1px 后 900px 窗里侧栏「显卡名 · 显存」超出列宽 13 px。
+        """
+        try:
+            width = int(label.winfo_width())
+            if width <= 1:
+                return text
+            if self._text_width(label, text) <= width + 2:
+                return text
+            cut = text
+            while cut and self._text_width(label, cut + "…") > width + 2:
+                cut = cut[:-1]
+            return (cut + "…") if cut else "…"
+        except Exception:                                  # pragma: no cover - 控件已销毁
+            return text
 
     def _apply_kit_skin(self) -> None:
         """把 ttk 字体与 ``*Font`` 默认字体重新钉回 ui_kit 那套（幂等，换肤后必须调一次）。
@@ -3009,9 +3077,14 @@ class DesktopApp:
                         else action.label + "（不可用：" + (action.reason or "条件不满足") + "）")
         button.pack(side="left", padx=(0, 8))
         if not action.enabled and action.reason:
-            tk.Label(parent, text=action.reason, font=self._fonts.sans(kit.px("micro")),
-                     foreground=dual.color("muted_text"), background=base).pack(
-                         side="left", padx=(0, 10))
+            # 2026-11-24：置灰原因以前是「自然宽度」，900px 窗里被硬裁成半句
+            # （'节点进程未运行：先启动节点（「重新注册」只在节点被云端清' 412 px / 166 px）。
+            # 走与表单提示同一套「按实际列宽换行」机制，不再切尾巴。
+            self._wrap_to_column(tk.Label(
+                parent, text=action.reason, font=self._fonts.sans(kit.px("micro")),
+                foreground=dual.color("muted_text"), background=base,
+                anchor="w", justify="left",
+                wraplength=self._wrap_hint())).pack(side="left", padx=(0, 10))
 
     def _render_table(self, table: Table, parent: Any = None,
                       max_rows: int = 12, primary: bool = True) -> None:

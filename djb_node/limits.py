@@ -4,8 +4,11 @@
 优先级 **L1 > L2 > L3**（INV-04）：
 
 * **L1 让路**：检测用户在用（全屏 / 游戏 / 会议 / 渲染 / 锁屏 / 电源 / 温度）。
-  检测器**异常** -> 只记为 ``degraded``（未知），**不再**当成「用户在用」永久暂停；
-  这是 2026-11-22 owner 裁决（Windows AttributeError 被误判为活跃，客户永远等不到恢复）。
+  任一检测器**异常** -> 视为用户在用（更保守），立即暂停接单（INV-04；README-CLIENT.md
+  同口径「检测失败按用户在用」）。异常这类结果额外打 ``degraded`` 标记，供界面写清
+  「检测器降级」而不是冒充「用户真的在用」。
+  2026-11-24 lead 裁决（D23）：``344800a`` 把异常改成放行属背离文档，回到本条；
+  若将来要改成放行，必须**先改 README-CLIENT.md + owner 批**。
   「不适用」（如无显示器的服务器）不算失败。
 * **L2 资源**：CPU 40% / GPU 70% / 内存 70% 为默认上限（可调，不越上限）。
   超限只停新单（软停），不中断在途任务。
@@ -191,9 +194,13 @@ class YieldResult:
     in_use: bool
     source: str           # in_use 的来源或 idle
     signals: list[Signal] = field(default_factory=list)
+    #: 检测器异常导致的「保守暂停」：in_use 仍为 True（INV-04），但界面要说清是
+    #: 检测降级而不是用户真的在用（D23）。默认 False = 结论来自真实信号。
+    degraded: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {"in_use": self.in_use, "source": self.source,
+                "degraded": bool(self.degraded),
                 "signals": [{"source": item.source, "state": item.state,
                              "detail": item.detail} for item in self.signals]}
 
@@ -216,7 +223,7 @@ class YieldDetector:
         for probe in self.probes:
             try:
                 signal = probe.read(moment)
-            except Exception as exc:                 # 检测失败 = degraded，不冒充用户在用
+            except Exception as exc:                 # INV-04：检测失败 = 保守按「在用」
                 signal = Signal(getattr(probe, "name", "probe"), "error",
                                 "检测器异常：" + type(exc).__name__)
             signals.append(signal)
@@ -224,11 +231,14 @@ class YieldDetector:
                 errors.append(signal)
             elif signal.state == "in_use":
                 in_use.append(signal)
+        if errors:
+            # D23（2026-11-24 lead 裁决）：检测器异常 = 保守暂停（INV-04 / README-CLIENT.md:169）。
+            # degraded=True 只用于界面标注「检测降级」，不改变「暂停」这个结论；
+            # 原始 source 保留探针名（诊断时要能看出是谁坏了）。
+            return YieldResult(in_use=True, source=errors[0].source, signals=signals,
+                               degraded=True)
         if in_use:
             return YieldResult(in_use=True, source=in_use[0].source, signals=signals)
-        if errors:
-            # 检测器坏了 ≠ 用户在用：降级为未知，继续接单；错误留在 signals 里供诊断。
-            return YieldResult(in_use=False, source="degraded", signals=signals)
         return YieldResult(in_use=False, source="idle", signals=signals)
 
 
@@ -483,6 +493,7 @@ class Limiter:
         if yielded.in_use:
             return Decision(False, "yield_paused", "yield_paused", NEXT_STEP["yield_paused"],
                             detail={"source": yielded.source,
+                                    "degraded": yielded.degraded,
                                     "signals": yielded.to_dict()["signals"]})
         # 3) L2 资源
         caps = {"cpu_pct": profile.cpu_pct, "gpu_pct": profile.gpu_pct,
