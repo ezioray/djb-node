@@ -183,3 +183,33 @@ def test_check_kernel_on_windows_reports_windows_version(monkeypatch):
     assert "Linux" not in result.conclusion
     assert "10.0.26100" in result.conclusion
     assert result.evidence["os"] == "windows"
+
+
+def test_check_system_on_windows_does_not_report_linux_distro(monkeypatch):
+    """2026-11-24 生产 E2E（Windows 11 / 0.5.11）真实首屏：
+
+    `[WARN] 系统与架构：未知发行版 · x86_64（未在支持矩阵内）` + 建议换 Ubuntu/Debian/Fedora。
+    Windows 上没有 /etc/os-release，`distro` 必然为空；判据必须先分平台，不能落到 Linux 矩阵。
+    """
+    monkeypatch.setattr(envcheck, "_platform_os_name", lambda: "nt")
+    monkeypatch.setattr(envcheck, "_read_os_release", lambda: {})
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(platform, "release", lambda: "11")
+    monkeypatch.setattr(platform, "version", lambda: "10.0.26100")
+    result = check_system(None)
+    assert result.status == "ok"
+    assert "未知发行版" not in result.conclusion
+    assert "Ubuntu" not in result.next_step and "Debian" not in result.next_step
+    assert "Windows" in result.conclusion
+    assert result.evidence["os"] == "windows"
+
+
+def test_check_runtime_skips_posix_mode_on_windows(monkeypatch, paths):
+    """Windows 的 `stat().st_mode` 恒带 0o777：不许把它渲染成「权限过宽，收紧到 0700」。"""
+    monkeypatch.setattr(envcheck, "_platform_os_name", lambda: "nt")
+    monkeypatch.setattr(envcheck, "file_mode", lambda _p: 0o777)
+    result = check_runtime(None, paths)
+    assert result.status == "ok"
+    assert "0o777" not in result.conclusion
+    assert "0700" not in result.conclusion
+    assert result.evidence["home_mode"] is None

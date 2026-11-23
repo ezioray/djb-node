@@ -151,7 +151,7 @@ INTENTS: dict[TrayAction, TrayIntent] = {
         description="生成脱敏诊断包"),
     TrayAction.BIND: TrayIntent(
         TrayAction.BIND, ("djb", "auth", "--bind", "<一次性码>"),
-        description="绑定网页端（一次性码在 网页端 → 账户/节点 → 生成绑定码）"),
+        description="绑定网页端（一次性码在 网页端 → 共享算力 → 节点与绑定 → 生成绑定码）"),
     TrayAction.OPEN_LOGS: TrayIntent(
         TrayAction.OPEN_LOGS, ("djb", "logs", "--tail", "200"),
         description="查看脱敏日志（壳也可直接打开日志目录）"),

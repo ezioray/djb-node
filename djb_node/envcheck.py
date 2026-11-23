@@ -200,6 +200,23 @@ def check_system(now: datetime) -> Check:
                      + " / ".join(facts.SUPPORTED_ARCHES) + "）",
                      "换 x86_64 / aarch64 机器，或等待对应架构的安装包",
                      {"arch": arch, "raw_arch": raw_arch})
+    # 2026-11-24 真机（Windows 11 / 0.5.11）：没有 /etc/os-release，distro 为空，
+    # 直接落到最下面的「未知发行版 · x86_64（未在支持矩阵内）」，还建议换 Ubuntu/Debian/Fedora。
+    # Windows / macOS 用户看到的是「你的系统不认识 + 去装 Linux」——判据用错了平台。
+    # 这两个平台由安装包形态本身决定（exe / dmg），不适用 Linux 发行版矩阵。
+    if _platform_os_name() == "nt":
+        return Check("system", "系统与架构", "ok",
+                     "Windows " + (platform.release() or "") + " · " + arch + "（受支持）",
+                     "无需处理",
+                     {"os": "windows", "distro": "windows",
+                      "version": platform.version() or "", "arch": arch, "raw_arch": raw_arch})
+    if sys.platform == "darwin":
+        mac_version = platform.mac_ver()[0] or "unknown"
+        return Check("system", "系统与架构", "ok",
+                     "macOS " + mac_version + " · " + arch + "（受支持）",
+                     "无需处理",
+                     {"os": "macos", "distro": "macos", "version": mac_version,
+                      "arch": arch, "raw_arch": raw_arch})
     if distro == "ubuntu":
         pair = _version_pair(version)
         ok = pair >= facts.MIN_UBUNTU
@@ -337,7 +354,11 @@ def check_runtime(now: datetime, paths: Paths) -> Check:
         sqlite_version = sqlite3.sqlite_version
     except Exception:                                       # pragma: no cover
         sqlite_version = "unknown"
-    mode = file_mode(paths.home)
+    # 2026-11-24 真机（Windows 11 / 0.5.11）：Windows 上 `stat().st_mode` 恒带 0o777
+    # （POSIX 位对 NTFS ACL 没有意义），于是首屏出现「本地目录 0o777 · 权限过宽 · 收紧到 0700」，
+    # 用户按提示也做不出 0700。NT 不评 POSIX 位：权限交给安装包/目录 ACL，不在这里误报。
+    nt = _platform_os_name() == "nt"
+    mode = None if nt else file_mode(paths.home)
     ok_mode = mode is None or (mode & 0o077) == 0
     status = "ok" if (ok_py and ok_mode) else "warn"
     next_step = "无需处理"
@@ -345,8 +366,9 @@ def check_runtime(now: datetime, paths: Paths) -> Check:
         next_step = "升级 Python 到 3.10+（客户端只用标准库，无第三方依赖）"
     elif not ok_mode:
         next_step = "本机目录权限过宽：执行 djb init 会收紧到 0700"
-    conclusion = ("Python " + py + " · SQLite " + sqlite_version
-                  + " · 本地目录 " + ("0700" if ok_mode else oct(mode or 0)))
+    conclusion = "Python " + py + " · SQLite " + sqlite_version
+    if not nt:
+        conclusion += " · 本地目录 " + ("0700" if ok_mode else oct(mode or 0))
     return Check("runtime", "运行时", status, conclusion, next_step,
                  {"python": py, "sqlite": sqlite_version,
                   "home_mode": oct(mode) if mode is not None else None})

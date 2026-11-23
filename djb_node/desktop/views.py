@@ -2353,7 +2353,7 @@ def _account(snapshot: Snapshot) -> View:
                             group=GROUP_IDENTITY))
     if can_bind:
         fields.append(Field("网页端", facts.WEB_CONSOLE_URL, key="web_console",
-                            hint="在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里",
+                            hint="在网页端 → 共享算力 → 节点与绑定 → 生成绑定码，然后粘贴到这里",
                             group=GROUP_BIND))
     # E（RC14 IA 拆分）：USDT 收款地址**只在这里**（原来在「接入配置」，两处都能填、
     # 两处都以为生效）。输入框不预填掩码（prefill=False），否则一点保存就把掩码写回配置。
@@ -2493,11 +2493,18 @@ def _account(snapshot: Snapshot) -> View:
                               group=GROUP_IDENTITY))
     # 解绑 = 原来「接入配置」页那颗「粘贴绑定码绑定」的对偶：绑定与解绑都只在本页。
     # 键名保留 ``account.logout``（接口只加不改）：它就是「解绑 + 清本机密钥」那一个动作。
-    actions.append(Action("account.logout", "解绑这台电脑（登出并清本机密钥）", danger=True,
-                          enabled=bool(security.get("node_id")),
-                          reason=("尚未登录" if not node_id
-                                  else "本机无凭据（解绑要清本机密钥）"),
-                          group=GROUP_IDENTITY))
+    # 2026-11-24（R2 生产 E2E）：未绑定账户时这颗按钮仍叫「解绑这台电脑（登出…）」，
+    # 可本机根本没有账户可登出——点下去只是清本机密钥。按有没有账户说人话：
+    # 绑定 → 解绑并清密钥；未绑定 → 清除本机节点身份（重新注册）。
+    actions.append(Action(
+        "account.logout",
+        ("解绑这台电脑（登出并清本机密钥）" if bound
+         else "清除本机节点身份（用于重新注册）"),
+        danger=True,
+        enabled=bool(security.get("node_id")),
+        reason=("" if security.get("node_id")
+                else ("本机无凭据（解绑要清本机密钥）" if node_id else "尚未登录")),
+        group=GROUP_IDENTITY))
     if can_bind:
         actions.append(Action("account.open_web", "打开网页端", group=GROUP_IDENTITY))
     notes = [str(account.get("note") or "未登录时只显示本机信息。"),
@@ -2515,7 +2522,7 @@ def _account(snapshot: Snapshot) -> View:
         notes = [
             # RC15-039 #11：绑定是**界面内动作**（「手输绑定码」按钮弹输入框，界面自己调本机命令），
             # 不再甩半条 CLI 命令当解决方案。
-            "绑定：在网页端 → 账户/节点 → 生成绑定码，回到这一页点「手输绑定码」"
+            "绑定：在网页端 → 共享算力 → 节点与绑定 → 生成绑定码，回到这一页点「手输绑定码」"
             "（或「绑定网页端」）把码粘进去。",
             "网页端：" + facts.WEB_CONSOLE_URL,
         ] + notes

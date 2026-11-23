@@ -42,7 +42,7 @@ from .outbox import ReceiptFactory, validate_receipt
 from .policy import summary as policy_summary
 from .relay import RelayError, RelayManager, capacity_targets
 from .secure import CredentialStore
-from .state import StateMachine, Snapshot
+from .state import StateMachine, Snapshot, reason_label
 from .store import ProfileRecord, Store, UpstreamRecord
 from . import plan_router
 from . import quotes as quotes_mod
@@ -328,7 +328,7 @@ def _auth_status_text(value: dict[str, Any]) -> str:
         "服务端：" + str(value.get("gateway")),
     ]
     if not value.get("bound"):
-        lines.append("绑定：网页端 → 账户/节点 → 生成绑定码，然后 djb auth --bind <码>")
+        lines.append("绑定：网页端 → 共享算力 → 节点与绑定 → 生成绑定码，然后 djb auth --bind <码>")
         lines.append("网页端：" + facts.WEB_CONSOLE_URL)
     return "\n".join(lines)
 
@@ -547,7 +547,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         return facts.EXIT_NOT_RUNNING
     # 控制口起来 ≠ 已经接单：等状态机真的走到 online（或走到 paused/error 这类终态）。
     # 否则用户看到「已启动」，实际还在 starting、一单也不接。
-    state, reason = "", ""
+    state, reason, next_step = "", "", ""
     error_seen = 0
     while time.monotonic() < deadline:
         try:
@@ -560,6 +560,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             continue
         state = str(status.get("state") or "")
         reason = str(status.get("reason") or "")
+        next_step = str(status.get("next_step") or "")
         if state in _START_SETTLED_STATES:
             # error 可能是**瞬时**的（例：注册被拒 -> 随即落到 paused/unbound）。
             # 连续两次都读到 error 才当终态，否则会误报「启动失败」。
@@ -573,9 +574,13 @@ def cmd_start(args: argparse.Namespace) -> int:
     if state not in _START_ACCEPT_STATES:
         # 状态优先于「早期连接错误」：daemon 已经起来了，真正的原因是没进接单状态
         # （例如未绑定账户 -> paused/unbound），这时再说「控制套接字不存在」是误导。
+        # 2026-11-24（R2 生产 E2E）：只说「状态是 error」等于没说——daemon 已经算好了
+        # 处置指引（register_conflict 的解绑/复用密钥路径），这里原样带出来。
         detail = ("daemon 已启动但状态是 " + (state or "未知")
                   + ("（" + reason + "）" if reason else "")
-                  + "，没有进入接单状态；查看 djb status / djb logs --tail 50")
+                  + "，没有进入接单状态"
+                  + ("；下一步：" + next_step if next_step else "")
+                  + "；查看 djb status / djb logs --tail 50")
         if not state and last_error:
             detail = "daemon 没有起来：" + last_error
         print("djb: " + detail, file=sys.stderr)
@@ -763,10 +768,16 @@ def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
                   "planned": True, "status": "daemon 未运行",
                   "fresh_window_s": facts.PROBE_FRESH_S,
                   "models": local_models},
-        "state": snapshot.state if snapshot.state == "stopped" else "stopped",
-        "reason": None,
-        "reason_label": "daemon 未运行",
-        "next_step": "djb start 启动 daemon",
+        # 2026-11-24（R2 生产 E2E）：daemon 死在 error 后，离线读取把状态压成 "stopped"，
+        # 现场只剩「djb start 启动 daemon」——register_conflict 这类**已经算好的处理指引**
+        # （snapshot.next_step）整段丢失，用户照着「再启动一次」做只会再撞一次。
+        # 离线态保留最后一次非 stopped 的结论与下一步：只读持久化快照，不猜、不补。
+        "state": snapshot.state if snapshot.state != "stopped" else "stopped",
+        "reason": snapshot.reason if snapshot.state != "stopped" else None,
+        "reason_label": (reason_label(snapshot.reason)
+                         if snapshot.state != "stopped" else "daemon 未运行"),
+        "next_step": (snapshot.next_step if snapshot.state != "stopped" and snapshot.next_step
+                      else "djb start 启动 daemon"),
         "since": snapshot.since,
         "accepting": False,
         "version": facts.CLIENT_VERSION,

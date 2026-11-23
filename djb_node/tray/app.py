@@ -438,7 +438,7 @@ class TkBackend:
         """一次性绑定码输入框（模态；取消 / 空串返回 None，不执行任何命令）。"""
         from tkinter import simpledialog
         from .. import facts
-        message = ("在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里。\n\n"
+        message = ("在网页端 → 共享算力 → 节点与绑定 → 生成绑定码，然后粘贴到这里。\n\n"
                    + facts.WEB_CONSOLE_URL)
         value = simpledialog.askstring("TokenBank / 绑定网页端", message, parent=self._root)
         text = str(value).strip() if value else ""
@@ -704,7 +704,7 @@ def desktop_intent_sink(backend, *, refresh):
             if not code:
                 backend.show_feedback("绑定网页端 / 已取消",
                                       "没有输入绑定码，未执行任何命令。\n\n"
-                                      "在网页端 → 账户/节点 → 生成绑定码。")
+                                      "在网页端 → 共享算力 → 节点与绑定 → 生成绑定码。")
                 event("tray.bind_cancelled")
                 return
             rc, out, err = _run_cli_command(("auth", "--bind", code, "--json"))

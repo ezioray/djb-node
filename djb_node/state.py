@@ -35,7 +35,7 @@ NEXT_STEP: dict[str, str] = {
     "upstream_invalid": "上游不可用：djb upstream probe 后修正端点/模型",
     "credential_invalid": "凭据失效：djb auth --set-key 更换密钥，或重新绑定",
     "account_pending": "等待平台审核（通常 1 个工作日内）：审核通过后自动上线，"
-                       "无需重新绑定；进度见网页端「账户 / 节点」",
+                       "无需重新绑定；进度见网页端「共享算力 · 节点与绑定」",
     "account_frozen": "账户/节点被冻结：查看平台通知并申诉；本地配置与在途收据保留",
     "retired": "节点已清退（不可逆，重装也拿不回旧节点）：在「接入配置」页点「重新注册这台机器」会用同一台机器开一个新节点，然后要重新绑定网页端",
     "update_failed": "更新失败已回滚：djb update --status 查看原因，修复后重试",

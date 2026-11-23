@@ -242,3 +242,30 @@ def test_status_json_carries_edition_without_changing_old_fields(home, capsys):
     for key in ("state", "daemon_running", "version", "channel", "probe", "install"):
         assert key in payload, "旧字段丢了：" + key
     assert payload["daemon_running"] is False
+
+
+def test_offline_status_keeps_last_error_state_and_next_step(tmp_path):
+    """2026-11-24 生产 E2E（Windows / 0.5.11）：daemon 撞 `register_conflict` 死掉后，
+    `djb status` 只剩「状态：stopped（daemon 未运行）/ 下一步：djb start 启动 daemon」，
+    daemon 早就写好的处置指引（解绑 / 复用密钥）整段丢失，用户只会原地重试再撞一次。
+
+    口径：离线态保留最后一次**非 stopped** 的结论与下一步（只读快照，不猜不补）。
+    """
+    from djb_node.config import Paths, save_config
+    from djb_node.state import Snapshot, StateMachine
+    from djb_node.store import Store
+    from djb_node.util import utcnow
+
+    paths = Paths(str(tmp_path / "home"))
+    paths.prepare()
+    save_config(paths, cli_module.ClientConfig())
+    store = Store.create(paths.db_file, version=facts.CLIENT_VERSION)
+    machine = StateMachine(Snapshot(state="starting", since=utcnow()))
+    machine.fail(next_step="先登录网页端解绑这台机器，再重启客户端重新注册",
+                 detail={"reason": "register_conflict"})
+    store.set_kv("daemon_state", machine.snapshot.to_dict())
+    value = cli_module._offline_status(paths, store)
+    assert value["state"] == "error"
+    assert value["reason_label"] and "daemon 未运行" != value["reason_label"]
+    assert "解绑" in value["next_step"]
+    store.close() if hasattr(store, "close") else None

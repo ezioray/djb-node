@@ -721,8 +721,8 @@ class LocalDataSource:
         except Exception:
             node_id = ""
         if node_id:
-            return "云端未接通（未登录节点：节点已注册但未绑定账号）"
-        return "云端未接通（未登录节点：本机尚未注册节点）"
+            return "云端未接通 · 节点已注册但未绑定账号"
+        return "云端未接通 · 本机尚未注册节点"
 
     def _cloud_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         cloud = self._ensure_cloud()

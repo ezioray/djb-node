@@ -4024,7 +4024,7 @@ class DesktopApp:
         """一次性绑定码输入框（模态；Esc/取消返回 None，不执行任何命令）。"""
         from tkinter import simpledialog
         from .. import facts
-        message = ("在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里。\n\n"
+        message = ("在网页端 → 共享算力 → 节点与绑定 → 生成绑定码，然后粘贴到这里。\n\n"
                    + facts.WEB_CONSOLE_URL)
         # 2026-11-20：**显式给空初始值**。之前没传 initialvalue，客户看到输入框里
         # 预填着网页端地址（URL 其实在 message 里），以为「绑定码就是那个地址」，

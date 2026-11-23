@@ -1019,7 +1019,7 @@ def test_unbound_account_shows_bind_entry_with_code_hint_and_web_url():
     assert bind.primary is True and bind.label == "绑定网页端"
 
     text = view.plain_text()
-    assert "绑定：在网页端 → 账户/节点 → 生成绑定码" in text
+    assert "绑定：在网页端 → 共享算力 → 节点与绑定 → 生成绑定码" in text
     # RC15-039 #11：绑定是界面内动作，提示里**不许**再甩半条 CLI 命令（客户手边没终端）
     assert "手输绑定码" in text
     assert "djb auth --bind" not in text, "CLI 不许再当解决方案出现在界面上"
@@ -1118,7 +1118,7 @@ def test_account_bind_entry_survives_unavailable_account_domain():
     text = view.plain_text()
     assert "绑定网页端" in text
     assert "不是配置损坏" in text                     # 红字旁边给出可操作解释
-    assert "账户/节点 → 生成绑定码" in text            # 可照抄的步骤仍在
+    assert "共享算力 → 节点与绑定 → 生成绑定码" in text            # 可照抄的步骤仍在
 
 
 # ─────────────────────────── 接入配置：节点 ID 上屏 + 复制（P0-node，2026-11-12）
