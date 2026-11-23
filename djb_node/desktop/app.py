@@ -645,6 +645,13 @@ class DesktopApp:
         # 指针在侧栏导航上滚导航、在内容区滚内容（B2：矮窗要能翻到最后一项）
         # 滚轮按平台绑「真实会到货」的序列：X11 是 Button-4/5，绑 MouseWheel 等于没绑
         platform_ui.bind_wheel(self._root, self._on_mousewheel)
+        # F33（2026-11-24 真机）：只用键盘的客户翻不到折线以下——`Page_Down` / `End`
+        # 原来什么都没绑，动作栏在首屏外就等于不可达。
+        # 只绑「翻页」与 Ctrl+Home/End：不改 ↑↓/Home/End 的原义（表格选择要用它们）。
+        self._root.bind("<Prior>", lambda _e: self._page_scroll(-1), add="+")
+        self._root.bind("<Next>", lambda _e: self._page_scroll(1), add="+")
+        self._root.bind("<Control-Home>", lambda _e: self._scroll_to_edge(0.0), add="+")
+        self._root.bind("<Control-End>", lambda _e: self._scroll_to_edge(1.0), add="+")
         padding = (self._px(26), self._px(18)) if not self._is_narrow() else (self._px(12), self._px(12))
         self._content = tk.Frame(self._canvas, background=dual.color("bg"), bd=0,
                                  highlightthickness=0)
@@ -991,6 +998,33 @@ class DesktopApp:
         if platform_ui.is_self_scrolling(target):
             return "break"                           # 表格/日志框自己滚，页面不动
         self._canvas.yview_scroll(-steps, "units")
+        return "break"
+
+
+    def _page_scroll(self, direction: int) -> str:
+        """键盘翻页：一屏的 0.9（留一行上下文），表格内自己滚就不抢。"""
+        try:
+            target = self._root.focus_get()
+        except Exception:                            # pragma: no cover - 无焦点
+            target = None
+        if platform_ui.is_self_scrolling(target):
+            return "break"
+        try:
+            height = max(1, int(self._canvas.winfo_height() / 20))
+        except Exception:                            # pragma: no cover - 未 map
+            return "break"
+        self._canvas.yview_scroll(int(direction * max(1, height - 1)), "units")
+        return "break"
+
+    def _scroll_to_edge(self, fraction: float) -> str:
+        """Ctrl+Home / Ctrl+End：到顶/到底（同样让表格自己滚）。"""
+        try:
+            target = self._root.focus_get()
+        except Exception:                            # pragma: no cover
+            target = None
+        if platform_ui.is_self_scrolling(target):
+            return "break"
+        self._canvas.yview_moveto(1.0 if fraction >= 0.5 else 0.0)
         return "break"
 
     def _nav_scroll(self, units: int) -> None:

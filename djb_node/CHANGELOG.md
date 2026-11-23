@@ -6,6 +6,18 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.5.23 · 2026-11-24
+
+**键盘翻不到折线以下（F33，P1）**。`__version__` / `pyproject.toml` / Chart `appVersion`
+同源到 `0.5.23`；无协议契约变更。
+
+- 真机：内容区原来只认滚轮，`Page_Down` / `End` / 方向键什么都没绑 —— 只用键盘的客户
+  到不了首屏以下的动作栏，等于按钮不存在。
+- 现在：`PageUp` / `PageDown` 翻一屏（留一行上下文），`Ctrl+Home` / `Ctrl+End` 到顶/到底；
+  指针在表格/日志框里时让它们自己滚，不抢。`↑↓` / `Home` / `End` 的原义**不动**
+  （表格选择要用它们）。
+- 状态栏提示补上「PageUp/PageDown 翻页」。
+
 ## 0.5.22 · 2026-11-24
 
 **空收据页把「还没有收据」印两遍（F39）**。`__version__` / `pyproject.toml` / Chart

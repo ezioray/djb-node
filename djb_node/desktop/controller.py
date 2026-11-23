@@ -42,7 +42,7 @@ SUB_CONTROL = "control"
 
 # RC15-039 #32：状态条是键盘用户第一眼看到的一行，新加的 Tab 路径要在这里露面
 # （↑↓/Home/End/Enter 是表格内的键，写在表格下面；Tab 是全窗的，写在这里）
-DEFAULT_MESSAGE = "就绪：F5 刷新 · Tab 走焦点 · Ctrl+1…9 切换视图 · 关闭窗口不会停止 daemon"
+DEFAULT_MESSAGE = ("就绪：F5 刷新 · Tab 走焦点 · PageUp/PageDown 翻页 · Ctrl+1…9 切换视图 · 关闭窗口不会停止 daemon")
 
 
 @dataclass(frozen=True)
