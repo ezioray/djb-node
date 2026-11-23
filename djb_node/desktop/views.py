@@ -48,6 +48,22 @@ MARK_IDLE = "·"
 #: 九状态全覆盖（``update.STATE_GUIDANCE`` 是权威表，这里只是**短标签**用于表格单元格；
 #: 详细「下一步」由 toast 用的 ``update.guidance()`` 给）。缺失的状态退回显示状态码，
 #: 绝不显示成「已是最新」。
+#: 本机凭据后端 → 客户能看懂的一句话（2026-11-24 实测：界面直接把 ``file-0600`` 给客户看）
+STORAGE_TEXT = {
+    "file-0600": "仅本机可读（0600）",
+    "os-keychain": "系统密钥链",
+    "keychain": "系统密钥链",
+    "dpapi": "系统密钥链（DPAPI）",
+}
+
+
+def _storage_text(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return "—"
+    return STORAGE_TEXT.get(text, text)
+
+
 UPDATE_STATE_TEXT = {
     "offline": "网络不通，没拿到清单",
     "invalid": "更新源异常，不要安装",
@@ -58,6 +74,7 @@ UPDATE_STATE_TEXT = {
     "not_eligible": "灰度未命中，本轮不更新",
     "no_artifact": "本平台暂无安装包",
     "eligible": "有可用更新",
+    "unchecked": "尚未检查",
 }
 
 
@@ -2538,7 +2555,7 @@ def _account(snapshot: Snapshot) -> View:
         # 2026-11-19：首排只留**身份**三张卡。USDT 云端状态挪进「收款区」（见上），
         # 否则收款信息又和身份并排出现，等于把刚分开的两件事重新混在一屏。
         cards=(Card("账户", identity, identity_meta, "default"), second,
-               Card("本机凭据", str(security.get("storage") or "—"),
+               Card("本机凭据", _storage_text(security.get("storage")),
                     str(security.get("node_id") or "本机未保存"), "muted")),
         fields=tuple(fields),
         actions=tuple(actions),

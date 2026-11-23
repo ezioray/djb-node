@@ -197,3 +197,53 @@ def test_resource_monitor_tolerates_missing_gpu(monkeypatch):
     snapshot = monitor.snapshot()
     assert set(snapshot) == {"cpu_pct", "mem_pct", "gpu_pct"}
     assert snapshot["gpu_pct"] is None
+
+
+# ── 2026-11-24 D28 复测：Windows 上让路探针不认平台 → 永久 paused（P0） ──────────
+def test_load_probe_windows_is_not_applicable(monkeypatch):
+    from djb_node import limits as mod
+
+    monkeypatch.setattr(mod, "_platform_os_name", lambda: "nt", raising=True)
+    sig = mod.LoadProbe().read(mod.utcnow())
+    assert sig.state == "not_applicable"
+    assert "loadavg" in sig.detail
+
+
+def test_render_probe_windows_uses_tasklist(monkeypatch):
+    from djb_node import limits as mod
+
+    monkeypatch.setattr(mod, "_platform_os_name", lambda: "nt", raising=True)
+
+    class Done:
+        returncode = 0
+        stdout = '"System Idle Process","4","Services","0","8 K"\n"obs64.exe","1234","Console","1","100,000 K"\n'
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: Done())
+    sig = mod.RenderProbe().read(mod.utcnow())
+    assert sig.state == "in_use"
+    assert "obs64" in sig.detail
+
+
+def test_render_probe_windows_idle_when_no_match(monkeypatch):
+    from djb_node import limits as mod
+
+    monkeypatch.setattr(mod, "_platform_os_name", lambda: "nt", raising=True)
+
+    class Done:
+        returncode = 0
+        stdout = '"python.exe","1234","Console","1","10,000 K"\n'
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: Done())
+    assert mod.RenderProbe().read(mod.utcnow()).state == "idle"
+
+
+def test_render_probe_windows_without_tasklist_is_not_applicable(monkeypatch):
+    from djb_node import limits as mod
+
+    monkeypatch.setattr(mod, "_platform_os_name", lambda: "nt", raising=True)
+
+    def boom(*a, **k):
+        raise FileNotFoundError("tasklist")
+
+    monkeypatch.setattr(mod.subprocess, "run", boom)
+    assert mod.RenderProbe().read(mod.utcnow()).state == "not_applicable"

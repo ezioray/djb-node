@@ -44,6 +44,13 @@ RENDER_PROCESSES = frozenset({"blender", "ffmpeg", "maya", "houdini", "nuke",
                               "unreal", "unity", "obs", "steam", "wine"})
 POLL_TIMEOUT_S = 1.0
 
+def _platform_os_name() -> str:
+    """平台族：``posix`` / ``nt``（测试只 patch 这个入口，别动全局 ``os.name``）。"""
+    return os.name
+
+
+WINDOWS_RENDER_HINT = "Windows 用 tasklist 判渲染/游戏进程"
+
 
 @dataclass(frozen=True)
 class Signal:
@@ -70,10 +77,16 @@ class LoadProbe:
     name = "load"
 
     def read(self, now: datetime) -> Signal:
+        if _platform_os_name() == "nt":
+            # 2026-11-24 真机（D28 复测）：Windows 没有 os.getloadavg，旧实现抛 AttributeError
+            # → 让路判定「检测器异常」→ 永久 paused，Windows 节点一单都接不到。
+            # 这条指标在 Windows 上**不存在**（不是探测失败），按「不适用」处理；
+            # Windows 的「用户在跑重活」由 RenderProbe（tasklist）兜。
+            return Signal(self.name, "not_applicable", "Windows 无 loadavg（以进程检测为准）")
         try:
             load = os.getloadavg()[0]
             cores = os.cpu_count() or 1
-        except OSError:
+        except (OSError, AttributeError):
             return Signal(self.name, "error", "无法读取系统负载")
         ratio = float(load) / float(cores)
         state = "in_use" if ratio >= YIELD_LOAD_RATIO else "idle"
@@ -170,6 +183,8 @@ class RenderProbe:
     name = "render"
 
     def read(self, now: datetime) -> Signal:
+        if _platform_os_name() == "nt":
+            return self._read_windows()
         base = PROC_BASE
         try:
             entries = os.listdir(base)
@@ -186,6 +201,35 @@ class RenderProbe:
                 continue
             if name in RENDER_PROCESSES:
                 return Signal(self.name, "in_use", "检测到 " + name)
+        return Signal(self.name, "idle", "无渲染/游戏进程")
+
+    def _read_windows(self) -> Signal:
+        """Windows：``tasklist /fo csv /nh`` 取进程名。
+
+        没有 /proc，旧实现直接 error → 永久 paused。这里用系统自带 tasklist（毫秒级），
+        名字去 ``.exe`` 小写后与 POSIX 名单对齐；tasklist 本身不可用才算 error（INV-04）。
+        """
+        try:
+            completed = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+                                       capture_output=True, text=True, timeout=POLL_TIMEOUT_S,
+                                       check=False, errors="replace",
+                                       **subprocess_window_kwargs())
+        except FileNotFoundError:
+            return Signal(self.name, "not_applicable", "系统无 tasklist（跳过进程检测）")
+        except (OSError, subprocess.SubprocessError):
+            return Signal(self.name, "error", "无法读取进程表")
+        if completed.returncode != 0:
+            return Signal(self.name, "error", "无法读取进程表")
+        for line in completed.stdout.splitlines():
+            cols = line.strip().split(",")
+            if len(cols) < 2:
+                continue
+            raw = cols[0].strip().strip('"').strip()
+            name = raw[:-4].lower() if raw.lower().endswith(".exe") else raw.lower()
+            # Windows 进程名常带版本号后缀（obs64 / blender4 / unityhub 之类），
+            # 去掉结尾数字再比，名单保持与 POSIX 的 comm 同名。
+            if name.rstrip("0123456789") in RENDER_PROCESSES or name in RENDER_PROCESSES:
+                return Signal(self.name, "in_use", "检测到 " + raw)
         return Signal(self.name, "idle", "无渲染/游戏进程")
 
 
