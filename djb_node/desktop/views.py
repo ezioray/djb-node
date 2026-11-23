@@ -898,7 +898,16 @@ def _hero(snapshot: Snapshot) -> Hero:
         elif accepting is False:
             body += "；当前不接新任务"
     elif snapshot.ok("yield"):
-        body = "自动暂停已开启，" + ("当前允许接单" if accepting is True else "接单状态未知")
+        # F37（2026-11-24 真机）：卡片标题写「正在接单」、副标题却写「接单状态未知」，
+        # 同一张卡自相矛盾。yield 段没给 accepting 时按节点状态推断，并把口径标出来。
+        if accepting is True:
+            body = "自动暂停已开启，当前允许接单"
+        elif accepting is False:
+            body = "自动暂停已开启，当前不接新任务"
+        elif state == "online":
+            body = "自动暂停已开启，当前允许接单（按节点状态推断）"
+        else:
+            body = "自动暂停已开启，接单状态未知（yield 数据未提供）"
     else:
         body = "自动暂停状态读不到（数据源未提供）"
     util = _seconds(device.get("utilization_pct"))

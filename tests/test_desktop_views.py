@@ -1786,3 +1786,12 @@ def test_unavailable_reason_has_no_nested_parentheses_or_cli_terms():
     view = vw.build_view("models", ds.Snapshot(dict(demo_snapshot().sections)))
     text = view.plain_text()
     assert "model-sync" not in text
+
+
+def test_overview_status_card_never_contradicts_its_own_title():
+    """F37：标题「正在接单」+ 副标题「接单状态未知」= 同一张卡自相矛盾（真机 0.5.17）。"""
+    snapshot = ds.Snapshot(dict(demo_snapshot().sections))
+    view = vw.build_view("overview", snapshot)
+    text = view.plain_text()
+    if "正在接单" in text:
+        assert "接单状态未知" not in text, "标题说在接单，副标题就必须给出接单口径"
