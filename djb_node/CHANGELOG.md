@@ -6,6 +6,19 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.5.19 · 2026-11-24
+
+**一次启动拉起两个 daemon（F36）**。`__version__` / `pyproject.toml` / Chart `appVersion`
+同源到 `0.5.19`；无协议契约变更，无新增依赖。
+
+- 真机 04:18:36 / 04:18:38 各起一个 `djb-node` 子进程，后一个才因单实例检查退出。
+  这段时间两个进程都会写 `runtime/daemon.pid`、都会试着轮换 `client_key` —— 竞态窗口。
+- 修法：`bootstrap.start_daemon` 的「探测 → 拉起 → 等应答」段加跨进程闸门
+  `runtime/spawn.lock`（`O_CREAT|O_EXCL`）。抢不到锁就返回 `spawning`，界面说
+  「节点正在启动（已有一个启动请求，稍等几秒）」而不是再拉一个。
+- 残锁（进程崩了没删）超过 20 秒直接抢过来 —— fail-open，绝不因为一把锁让节点起不来。
+- 新增 2 条回归测试（并发只放一个 / 残锁可抢）。
+
 ## 0.5.18 · 2026-11-24
 
 **概览「节点状态」卡自相矛盾（F37）**。`__version__` / `pyproject.toml` / Chart `appVersion`

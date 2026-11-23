@@ -177,6 +177,59 @@ def _live_daemon_record(paths: Any) -> dict[str, Any] | None:
     return record if ok else None
 
 
+
+#: 启动闸门：同一 home 同时只允许一个进程走「探测 → 拉起 → 等应答」。
+SPAWN_LOCK_STALE_S = 20.0
+
+
+def _spawn_lock(paths: Any) -> str | None:
+    """拿 runtime/spawn.lock；拿到返回路径，拿不到返回 None（有别人在启动）。
+
+    跨进程互斥用 ``O_CREAT|O_EXCL``：桌面端重复点击、桌面端 + 命令行同时起，
+    都只放一个过去。锁超过 :data:`SPAWN_LOCK_STALE_S` 视为残留（进程崩了没删），
+    直接抢过来——宁可多起一次，也不能因为一个残锁让节点永远起不来。
+    """
+    try:
+        os.makedirs(paths.runtime_dir, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    lock_path = os.path.join(paths.runtime_dir, "spawn.lock")
+    for attempt in (1, 2):
+        try:
+            handle = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(lock_path)
+            except OSError:
+                age = SPAWN_LOCK_STALE_S + 1.0
+            if attempt == 1 and age > SPAWN_LOCK_STALE_S:
+                try:
+                    os.unlink(lock_path)          # 残留锁：抢过来（下一轮重试）
+                except OSError:
+                    return None
+                continue
+            return None
+        except OSError:
+            return None
+        try:
+            os.write(handle, (str(os.getpid()) + "\n").encode())
+        except OSError:
+            pass
+        finally:
+            os.close(handle)
+        return lock_path
+    return None
+
+
+def _spawn_unlock(lock_path: str | None) -> None:
+    if not lock_path:
+        return
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        pass
+
+
 def start_daemon(home: str | os.PathLike | None = None, *,
                  enabled: bool = True,
                  wait_seconds: float = 8.0) -> dict[str, Any]:
@@ -190,34 +243,45 @@ def start_daemon(home: str | os.PathLike | None = None, *,
         if control_ping(paths):
             result["reason"] = "already-running"
             return result
-        record = _live_daemon_record(paths)
-        if record is not None:
-            # 控制面还没应答，但 pid 文件里那个进程**验得过**（pid 活 + 令牌一致 +
-            # 命令行是本 daemon + 同一个 home）：再起一个只会互相轮换 client_key。
-            result["reason"] = "already-running"
-            result["pid"] = int(record.get("pid") or 0)
+        # F36（2026-11-24 真机）：一次桌面启动会在 2 秒内拉起**两个** daemon
+        # （04:18:36 / 04:18:38 各一个），后一个才因单实例检查退出。两个进程都会写
+        # pid 文件、都会试着轮换 client_key——这段时间是竞态窗口。
+        # 用 runtime/spawn.lock 做「只许一个启动者」的闸门（跨进程 O_EXCL）。
+        lock = _spawn_lock(paths)
+        if lock is None:
+            result["reason"] = "spawning"
             return result
-        config = load_config(paths)
-        command = _daemon_command(paths, config)
-        if command is None:
-            result["reason"] = "no-cli"
-            return result
-        log_path = os.path.join(paths.logs_dir, facts.DAEMON_OUT_NAME)
-        result["log"] = log_path
-        os.makedirs(paths.logs_dir, mode=0o700, exist_ok=True)
-        with open(log_path, "ab") as stdout:
-            subprocess.Popen(command, stdout=stdout, stderr=stdout,
-                             stdin=subprocess.DEVNULL, start_new_session=True,
-                             close_fds=True, **subprocess_window_kwargs())
-        deadline = time.monotonic() + max(0.0, float(wait_seconds))
-        while time.monotonic() < deadline:
-            if control_ping(paths):
-                result["started"] = True
-                result["reason"] = "started"
+        try:
+            record = _live_daemon_record(paths)
+            if record is not None:
+                # 控制面还没应答，但 pid 文件里那个进程**验得过**（pid 活 + 令牌一致 +
+                # 命令行是本 daemon + 同一个 home）：再起一个只会互相轮换 client_key。
+                result["reason"] = "already-running"
+                result["pid"] = int(record.get("pid") or 0)
                 return result
-            time.sleep(0.25)
-        result["reason"] = "timeout"
-        result["log"] = log_path
+            config = load_config(paths)
+            command = _daemon_command(paths, config)
+            if command is None:
+                result["reason"] = "no-cli"
+                return result
+            log_path = os.path.join(paths.logs_dir, facts.DAEMON_OUT_NAME)
+            result["log"] = log_path
+            os.makedirs(paths.logs_dir, mode=0o700, exist_ok=True)
+            with open(log_path, "ab") as stdout:
+                subprocess.Popen(command, stdout=stdout, stderr=stdout,
+                                 stdin=subprocess.DEVNULL, start_new_session=True,
+                                 close_fds=True, **subprocess_window_kwargs())
+            deadline = time.monotonic() + max(0.0, float(wait_seconds))
+            while time.monotonic() < deadline:
+                if control_ping(paths):
+                    result["started"] = True
+                    result["reason"] = "started"
+                    return result
+                time.sleep(0.25)
+            result["reason"] = "timeout"
+            result["log"] = log_path
+        finally:
+            _spawn_unlock(lock)
     except Exception as exc:                      # noqa: BLE001
         result["errors"].append(type(exc).__name__ + ": " + str(exc)[:160])
     return result
@@ -228,6 +292,7 @@ def start_daemon(home: str | os.PathLike | None = None, *,
 DAEMON_REASON_TEXT = {
     "no-cli": "节点没启动：同目录缺少 djb-node.exe（请从官方压缩包**整体解压**，"
               "只留桌面端一个 exe 拉不起节点）",
+    "spawning": "节点正在启动（另一个启动请求刚发出去），稍等几秒点「刷新」",
     "timeout": "节点启动超时：8 秒内没连上本机控制口",
 }
 
@@ -254,6 +319,8 @@ def summary_text(boot: dict[str, Any], daemon: dict[str, Any] | None = None) -> 
             parts.append("节点已启动")
         elif daemon.get("reason") == "already-running":
             parts.append("节点已在运行")
+        elif daemon.get("reason") == "spawning":
+            parts.append("节点正在启动（已有一个启动请求，稍等几秒）")
         elif daemon.get("errors"):
             parts.append("节点启动失败：" + daemon["errors"][0])
         else:

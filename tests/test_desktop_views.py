@@ -6,6 +6,9 @@
 """
 from __future__ import annotations
 
+import os
+import time
+
 import pytest
 
 from djb_node.desktop import access as ac
@@ -1795,3 +1798,34 @@ def test_overview_status_card_never_contradicts_its_own_title():
     text = view.plain_text()
     if "正在接单" in text:
         assert "接单状态未知" not in text, "标题说在接单，副标题就必须给出接单口径"
+
+
+def test_start_daemon_is_single_flight(tmp_path):
+    """F36：一次启动拉起两个 daemon。第二个启动请求必须被闸门挡下。"""
+    from djb_node import bootstrap
+
+    paths = bootstrap.Paths(str(tmp_path))
+    os.makedirs(paths.runtime_dir, exist_ok=True)
+    first = bootstrap._spawn_lock(paths)
+    assert first, "第一个启动者必须拿到锁"
+    assert bootstrap._spawn_lock(paths) is None, "第二个启动者必须被挡下（不许再拉一个 daemon）"
+    bootstrap._spawn_unlock(first)
+    again = bootstrap._spawn_lock(paths)
+    assert again, "上一个启动者退出后，锁必须能再次拿到"
+    bootstrap._spawn_unlock(again)
+
+
+def test_spawn_lock_steals_stale_lock(tmp_path):
+    """进程崩了没删锁：不许把节点永久卡住，超时后要抢过来。"""
+    from djb_node import bootstrap
+
+    paths = bootstrap.Paths(str(tmp_path))
+    os.makedirs(paths.runtime_dir, exist_ok=True)
+    lock = os.path.join(paths.runtime_dir, "spawn.lock")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write("0\n")
+    old = time.time() - bootstrap.SPAWN_LOCK_STALE_S - 5
+    os.utime(lock, (old, old))
+    got = bootstrap._spawn_lock(paths)
+    assert got, "残锁必须被抢过来（fail-open）"
+    bootstrap._spawn_unlock(got)
