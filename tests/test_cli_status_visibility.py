@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import json
+import os
 from datetime import timedelta
 
 from djb_node import cli as cli_module
@@ -269,3 +271,59 @@ def test_offline_status_keeps_last_error_state_and_next_step(tmp_path):
     assert value["reason_label"] and "daemon 未运行" != value["reason_label"]
     assert "解绑" in value["next_step"]
     store.close() if hasattr(store, "close") else None
+
+
+# ─────────────── 2026-11-24 真机：控制口不可达 ≠ daemon 未运行（F35）
+
+def test_offline_status_reports_running_daemon_from_pidfile(tmp_path, monkeypatch):
+    """跨会话执行 `djb status` 时管道名对不上（会话号/完整性级别进了哈希）。
+
+    旧实现把这种「连不上」写成「daemon 未运行」，运维据此判节点掉线 = 假阴性。
+    现在 pid 文件里有可验证的 daemon 就如实说「在跑，只是本终端连不上」。
+    """
+    from djb_node import cli, pidfile
+    from djb_node.config import Paths
+    from djb_node.state import Snapshot, utcnow, iso
+    from djb_node.store import Store
+
+    paths = Paths(str(tmp_path))
+    os.makedirs(paths.runtime_dir, exist_ok=True)
+    Store.create(paths.db_file)
+    store = Store(paths.db_file)
+    store.set_kv("daemon_state", Snapshot(state="online", since=iso(utcnow())).to_dict())
+
+    record = {"schema": pidfile.SCHEMA, "pid": os.getpid(),
+              "start_token": pidfile.probe.start_token(os.getpid()),
+              "started_at": "2026-11-24T04:10:44+0800",
+              "home": str(paths.home), "marker": pidfile.probe.DAEMON_MARKER}
+    with open(paths.pid_file, "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
+    # 本测试只验「pid 文件可信时怎么报」，进程身份校验本身由 test_pidfile.py 覆盖：
+    # 拿 pytest 进程去跑真实校验必然判 NOT_DAEMON。
+    monkeypatch.setattr(pidfile, "verify", lambda rec, p: (True, ""))
+
+    value = cli._offline_status(paths, store)
+    assert value["daemon_running"] is True, value
+    assert "控制口不可达" in value["control_unreachable"]
+    assert value["channel"]["state"] == "unreachable"
+    assert value["channel"]["running"] is True          # snapshot 说 online 就一定在接单
+    text = cli._status_text(value)
+    assert "daemon：运行中（本终端控制口不可达）" in text
+    assert "通道：本终端连不上控制口" in text
+    assert "接单：是" in text, "快照 online ⇒ 接单必须是「是」，不许因为连不上管道就说否"
+    assert "控制口不可达，周期以 daemon 日志为准" in text
+
+
+def test_offline_status_stays_offline_without_pidfile(tmp_path):
+    """没有 daemon（也没有 pid 文件）时仍然是「未运行」，不许无脑乐观。"""
+    from djb_node import cli
+    from djb_node.config import Paths
+    from djb_node.store import Store
+
+    paths = Paths(str(tmp_path))
+    os.makedirs(paths.runtime_dir, exist_ok=True)
+    Store.create(paths.db_file)
+    value = cli._offline_status(paths, Store(paths.db_file))
+    assert value["daemon_running"] is False
+    assert value["control_unreachable"] == ""
+    assert value["channel"]["state"] == "offline"

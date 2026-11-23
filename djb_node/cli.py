@@ -721,6 +721,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         response = client.call({"cmd": "status"}, timeout=5.0)
         payload = dict(response.get("status") or {})
         payload["daemon_running"] = True
+        payload["control_ok"] = True
     except NotRunningError:
         payload = _offline_status(paths, store)
     # R-3（0.3.4）：顶层补 `edition`——**只加不改**，旧字段一个不动。
@@ -738,6 +739,33 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _control_unreachable_reason(paths: Paths) -> str:
+    """控制口连不上时，pid 文件里那个 daemon 还活着吗？
+
+    F35（2026-11-24 真机）：Windows 的控制管道名把「会话号 + 完整性级别」也算进哈希
+    （``ipc_windows.pipe_name``），所以**在另一个会话里**执行 ``djb status``（远程 SSH、
+    服务账号、另一个用户的终端）永远连不上管道——但 daemon 明明在跑，页面和日志都在
+    正常心跳。旧实现把这种「连不上」直接写成「daemon 未运行」，运维据此判断节点掉线，
+    是**假阴性**（比不报更坏）。
+    """
+    try:
+        from . import pidfile as _pidfile
+        record = _pidfile.read(paths)
+    except Exception:                                  # pragma: no cover - 文件不可读
+        return ""
+    if not record:
+        return ""
+    try:
+        ok, reason = _pidfile.verify(record, paths)
+    except Exception:                                  # pragma: no cover - 探针不可用
+        return ""
+    if not ok:
+        return ""
+    return ("控制口不可达（不同会话/权限的终端看不到本机管道），但 pid 文件显示 daemon 在跑"
+            "（pid " + str(record.get("pid")) + "，起于 " + str(record.get("started_at")) + "）："
+            "请在本机桌面终端执行，或直接看 logs/djb.log 的心跳")
+
+
 def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
     snapshot = Snapshot.from_dict(store.get_kv("daemon_state"))
     install = store.install()
@@ -751,12 +779,18 @@ def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
     manager = UpstreamManager(store, CredentialStore(paths))
     local_models = [entry for item in manager.list()
                     for entry in manager.probe_details(item.id)]
+    unreachable = _control_unreachable_reason(paths)
     return {
-        "daemon_running": False,
-        "channel": {"enabled": channel_enabled(config), "running": False,
+        # pid 文件里有可验证的 daemon ⇒ 进程确实在跑，只是这个终端连不上控制口。
+        # 「在跑」和「本终端能控制」分开说，避免运维误判节点掉线。
+        "daemon_running": bool(unreachable),
+        "control_unreachable": unreachable,
+        "channel": {"enabled": channel_enabled(config),
+                    "running": bool(unreachable) and snapshot.is_accepting(),
                     "required": bool(required),
                     "wanted": channel_enabled(config, required=required),
-                    "state": "offline", "wait_s": facts.CHANNEL_POLL_WAIT_S,
+                    "state": ("unreachable" if unreachable else "offline"),
+                    "wait_s": facts.CHANNEL_POLL_WAIT_S,
                     "jobs_done": 0, "jobs_failed": 0, "last_error": None},
         # ROUND3：daemon 未运行时也必须能回答「周期复探：每 …」——真机取证（Windows
         # win-probe.json）就是停止态采的，此时 interval_s=None 会让整行消失，
@@ -765,7 +799,9 @@ def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
         "probe": {"periodic_enabled": feature_flag(config, facts.PROBE_FLAG_PERIODIC),
                   "interval_s": facts.PROBE_PERIODIC_DEFAULT_S,
                   "cap_s": facts.PROBE_PERIODIC_CAP_S,
-                  "planned": True, "status": "daemon 未运行",
+                  "planned": True,
+                  "status": ("控制口不可达（daemon 在跑）" if unreachable
+                             else "daemon 未运行"),
                   "fresh_window_s": facts.PROBE_FRESH_S,
                   "models": local_models},
         # 2026-11-24（R2 生产 E2E）：daemon 死在 error 后，离线读取把状态压成 "stopped"，
@@ -773,13 +809,17 @@ def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
         # （snapshot.next_step）整段丢失，用户照着「再启动一次」做只会再撞一次。
         # 离线态保留最后一次非 stopped 的结论与下一步：只读持久化快照，不猜、不补。
         "state": snapshot.state if snapshot.state != "stopped" else "stopped",
+        # F35：控制口不可达时，「接单」仍按状态库快照回答（心跳在写它）。
+        # 缺这一行会让 `djb status` 说「接单：否」，把在跑的节点误报成停止服务。
+        "accepting": (snapshot.is_accepting() if unreachable else False),
         "reason": snapshot.reason if snapshot.state != "stopped" else None,
         "reason_label": (reason_label(snapshot.reason)
                          if snapshot.state != "stopped" else "daemon 未运行"),
-        "next_step": (snapshot.next_step if snapshot.state != "stopped" and snapshot.next_step
-                      else "djb start 启动 daemon"),
+        "next_step": (unreachable if unreachable
+                      else (snapshot.next_step
+                            if snapshot.state != "stopped" and snapshot.next_step
+                            else "djb start 启动 daemon")),
         "since": snapshot.since,
-        "accepting": False,
         "version": facts.CLIENT_VERSION,
         "protocol_version": facts.PROTOCOL_VERSION,
         "install": install.to_dict(),
@@ -918,10 +958,17 @@ def _capacity_lines(value: dict[str, Any]) -> list[str]:
                 parts.append("上限 " + _duration_exact(cap) + "（" + str(cap) + " 秒）")
             parts.append("退避不得越过上限")
             if probe.get("planned") is True:
-                parts.append("daemon 未运行，启动后生效")
+                parts.append("控制口不可达，周期以 daemon 日志为准"
+                             if _probe_unreachable(probe)
+                             else "daemon 未运行，启动后生效")
             lines.append(" · ".join(parts))
     return lines
 
+
+
+def _probe_unreachable(probe: dict[str, Any]) -> bool:
+    """探测块是否来自「控制口不可达」的降级路径（而不是 daemon 真没跑）。"""
+    return str(probe.get("status") or "").startswith("控制口不可达")
 
 def _channel_text(channel: dict[str, Any]) -> str:
     """「通道：已连接 / 未开启 / 已断开」——只按证据说，**不得谎报**（P4 落点 C）。
@@ -942,6 +989,8 @@ def _channel_text(channel: dict[str, Any]) -> str:
     if not wanted:
         return ("未开启（云端派单要等超时；开：djb flags --enable "
                 + facts.CHANNEL_FLAG + " 后重启 daemon）")
+    if state == "unreachable":
+        return "本终端连不上控制口（daemon 在跑，见 logs/djb.log 心跳）"
     if state == "offline":
         return "已断开（daemon 未运行）"
     if not running:
@@ -982,7 +1031,8 @@ def _status_text(value: dict[str, Any]) -> str:
             "（" + str(value.get("reason_label")) + "）" if value.get("reason_label") else ""),
         "接单：" + ("是" if value.get("accepting") else "否"),
         "版本：" + str(value.get("version")) + " · 协议 " + str(value.get("protocol_version")),
-        "daemon：" + ("运行中" if value.get("daemon_running") else "未运行"),
+        "daemon：" + ("运行中" if value.get("daemon_running") else "未运行")
+        + ("（本终端控制口不可达）" if value.get("control_unreachable") else ""),
     ]
     # P4 落点 C：通道三态。没这一行时「路由成功但节点收不到单」根本看不出来。
     channel = value.get("channel")
