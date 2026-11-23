@@ -28,12 +28,13 @@ def _app(root, tmp_path):
     controller = DesktopController(FakeDataSource(dict(app_module._DEMO_SECTIONS), source="test"))
     return app_module.DesktopApp(controller, root=root, prefs_home=str(tmp_path))
 
+#: lead 2026-11-24 定稿：yield → 收益（不接单时的收益策略）、tasks → 共享（探针/推理任务）
 EXPECTED_GROUPS = (
     ("connect", "接入", ("agent", "access")),
-    ("share", "共享", ("token_plan", "models")),
-    ("earn", "收益", ("receipts", "earnings")),
-    ("account", "账户", ("yield", "account")),
-    ("diag", "诊断", ("overview", "bench", "tasks", "gpu", "logs")),
+    ("share", "共享", ("token_plan", "models", "tasks")),
+    ("earn", "收益", ("receipts", "earnings", "yield")),
+    ("account", "账户", ("account",)),
+    ("diag", "诊断", ("overview", "bench", "gpu", "logs")),
 )
 
 

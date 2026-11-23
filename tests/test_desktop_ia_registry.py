@@ -79,8 +79,9 @@ def test_five_groups_in_the_owner_order():
     ]
     # 13 项一个不少、组内顺序沿用现有侧栏顺序
     assert ia.flat_keys() == (
-        "agent", "access", "token_plan", "models", "receipts", "earnings",
-        "yield", "account", "overview", "bench", "tasks", "gpu", "logs",
+        "agent", "access", "token_plan", "models", "tasks",
+        "receipts", "earnings", "yield", "account",
+        "overview", "bench", "gpu", "logs",
     )
 
 

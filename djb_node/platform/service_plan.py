@@ -127,7 +127,7 @@ class ServicePlan:
     def render_text(self) -> str:
         """纯文本计划（给人看 / 落日志；不执行）。"""
         lines = [
-            "DJB 联脑 · " + self.platform + " 服务安装计划（需要管理员："
+            "TokenBank 联脑 · " + self.platform + " 服务安装计划（需要管理员："
             + ("是" if self.requires_admin else "否") + "）",
         ]
         if self.files:
@@ -184,7 +184,7 @@ def _default_unit_dir(system: str) -> str:
 
 def _powershell_plan(spec: Any, install_cmds: tuple[str, ...]) -> str:
     lines = [
-        "# DJB 联脑 · Windows 服务安装计划（C4 脚手架生成；纯文本，本仓不执行）",
+        "# TokenBank 联脑 · Windows 服务安装计划（C4 脚手架生成；纯文本，本仓不执行）",
         "# 需要管理员权限：以「管理员身份运行 PowerShell」后执行本脚本。",
         "$ErrorActionPreference = 'Stop'",
         *install_cmds,

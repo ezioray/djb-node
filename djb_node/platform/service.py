@@ -67,8 +67,11 @@ class ServiceSpec:
 
     name: str
     argv: tuple[str, ...]
-    display_name: str = "DJB 联脑 节点客户端"
-    description: str = "DJB 联脑共享节点客户端（本机镜像 + daemon）"
+    # D16（owner 2026-11-24）：显示名/描述是**用户可见品牌位**（services.msc、systemd
+    # ``Description=``、安装向导）→ TokenBank；``name``（服务 key，如 ``djb-node``）
+    # 是标识，运维脚本按名找，**不动**。
+    display_name: str = "TokenBank 联脑 节点客户端"
+    description: str = "TokenBank 联脑共享节点客户端（本机镜像 + daemon）"
     env: Mapping[str, str] | Sequence[tuple[str, str]] = ()
     workdir: str | None = None
     log_file: str | None = None

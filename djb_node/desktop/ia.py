@@ -99,19 +99,20 @@ SECTION_ORDER: tuple[str, ...] = ("connect", "share", "earn", "account", "diag")
 #:
 #: 记一次是**有意**的判断（owner 只给了五个组名，视图归属由开发按模块落表）：
 #:   接入 CONNECT  agent, access          这台机器怎么接上云端和我的账号
-#:   共享 SHARE    token_plan, models     我能拿什么去共享
-#:   收益 EARN     receipts, earnings     共享换回来多少钱
-#:   账户 ACCOUNT  yield, account         我的账户与接单策略（让路＝接单开关，属账户域）
-#:   诊断 DIAG     overview, bench, tasks, gpu, logs
-#:                                        机器现状与排障（总览/基准/队列/显卡/日志）
-#: 两处可争议：``yield``（也可放诊断）与 ``tasks``（也可放共享）；改一行就能换组，
-#: 票面已列对照表请 lead 复核。
+#:   共享 SHARE    token_plan, models, tasks
+#:                                        我能拿什么去共享（探针/推理任务是共享侧的活）
+#:   收益 EARN     receipts, earnings, yield
+#:                                        共享换回来多少钱（让路=不接单时的收益策略）
+#:   账户 ACCOUNT  account                绑定与收款
+#:   诊断 DIAG     overview, bench, gpu, logs
+#:                                        机器现状与排障（总览/基准/显卡/日志）
+#: 两处归属曾按模块初判、已由 lead 2026-11-24 定稿：``yield`` → 收益、``tasks`` → 共享。
 IA_SECTIONS_SHARE: tuple[SectionSpec, ...] = (
     SectionSpec("connect", "接入", "接入", ("agent", "access")),
-    SectionSpec("share", "共享", "共享", ("token_plan", "models")),
-    SectionSpec("earn", "收益", "收益", ("receipts", "earnings")),
-    SectionSpec("account", "账户", "账户", ("yield", "account")),
-    SectionSpec("diag", "诊断", "诊断", ("overview", "bench", "tasks", "gpu", "logs")),
+    SectionSpec("share", "共享", "共享", ("token_plan", "models", "tasks")),
+    SectionSpec("earn", "收益", "收益", ("receipts", "earnings", "yield")),
+    SectionSpec("account", "账户", "账户", ("account",)),
+    SectionSpec("diag", "诊断", "诊断", ("overview", "bench", "gpu", "logs")),
 )
 
 #: 0.3.4 现状（回滚路径）：4 组，与 ``views.NAV_SECTIONS`` 逐项一致
@@ -131,11 +132,11 @@ PAGES: dict[str, PageSpec] = {
                        subtitle="价格模式 / 节点凭证 / 配置文件（绑定与收款在「账户与安全」）"),
     "overview": PageSpec("overview", "总览", "总览", "diag"),
     "bench": PageSpec("bench", "性能基准", "性能基准", "diag"),
-    "tasks": PageSpec("tasks", "任务队列", "任务队列", "diag"),
+    "tasks": PageSpec("tasks", "任务队列", "任务队列", "share"),
     "receipts": PageSpec("receipts", "收据", "收据", "earn"),
     "earnings": PageSpec("earnings", "收益", "收益", "earn"),
     "agent": PageSpec("agent", "Agent 接入", "接入向导", "connect"),
-    "yield": PageSpec("yield", "暂停接单", "让路与节能", "account"),
+    "yield": PageSpec("yield", "暂停接单", "让路与节能", "earn"),
     "gpu": PageSpec("gpu", "GPU 监控", "显卡监控", "diag", beta=True,
                     subtitle="GPU 监控（BETA）· 共享算力为后续能力，当前仅本机监控"),
     "account": PageSpec("account", "账户与安全", "账户与安全", "account"),

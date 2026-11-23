@@ -21,6 +21,7 @@ from djb_node.desktop import app as desktop_app
 from djb_node.desktop import platform_ui, ui_kit, views
 from djb_node.platform import paths as platform_paths
 from djb_node.platform import service as platform_service
+from djb_node.platform import service_plan as service_plan_module
 from djb_node import protocol
 from djb_node.tray import app as tray_app
 
@@ -29,8 +30,6 @@ PACKAGE = pathlib.Path(desktop_app.__file__).resolve().parents[1]
 #: 允许暂时保留 ``DJB`` 品牌字样的文件（第二类，等 lead 裁决；裁决后删掉对应行即可收紧）
 BRAND_PENDING = {
     "__init__.py",            # 模块 docstring（内部文档，不显示给客户）
-    "service.py",             # Windows 服务 display_name / description（服务身份）
-    "service_plan.py",        # 服务安装计划标题（release-manager 用的纯文本计划）
 }
 
 
@@ -81,6 +80,22 @@ def test_about_menu_and_notification_app_name_use_tokenbank():
     source = pathlib.Path(platform_ui.__file__).read_text(encoding="utf-8")
     assert 'actions.get("app_name") or "TokenBank 联脑"' in source
     assert "关于 " + "DJB" not in source
+
+
+def test_service_display_name_is_branded_but_service_name_is_not():
+    """D16：显示名是品牌位（services.msc / systemd Description），服务名是标识。"""
+    spec = platform_service.ServiceSpec(name="djb-node", argv=("/usr/bin/python3", "-m"))
+    assert spec.display_name == "TokenBank 联脑 节点客户端"
+    assert spec.description.startswith("TokenBank 联脑共享节点客户端")
+    assert spec.name == "djb-node"                                # 服务 key 不动
+    unit = platform_service.render_systemd_unit(spec)
+    assert "Description=TokenBank 联脑共享节点客户端" in unit
+    assert "djb-node" in platform_service.systemd_unit_name(spec)
+    # 纯文本安装计划标题也是用户可见品牌位（release-manager 会原样贴进交接单）
+    plan = service_plan_module.ServicePlan(
+        platform="linux", install_cmds=("true",), uninstall_cmds=("true",),
+        verify_cmds=("true",))
+    assert plan.render_text().splitlines()[0].startswith("TokenBank 联脑 · ")
 
 
 def test_views_copy_and_diagnose_bundle_use_tokenbank():
