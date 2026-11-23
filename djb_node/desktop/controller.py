@@ -255,6 +255,10 @@ class DesktopController:
     update_factory: Callable[[], Any] | None = None
     #: 最近一次检查结果（``check()`` 原样 payload；界面/日志都用它）
     last_update: Mapping[str, Any] | None = None
+    #: R2.4 S3/S4：本机数据目录（非空 = 允许读/写快照缓存；demo/无目录时为空）
+    cache_home: str | None = None
+    #: 当前画面是不是「上次的快照」（状态条要如实说「缓存」，不许冒充新数据）
+    stale_from_cache: bool = False
     _snapshot: Snapshot | None = None
 
     # ── 快照 / 视图
@@ -263,6 +267,27 @@ class DesktopController:
         if self._snapshot is None:
             self._snapshot = self.source.snapshot()
         return self._snapshot
+
+    # ── R2.4 S4：启动先画缓存（零网络首屏）
+    def prime_from_cache(self) -> bool:
+        """用上次的快照**先把窗口画出来**；返回 ``True`` = 用上了缓存。
+
+        只在启动时调用一次：拿不到缓存就返回 ``False``，调用方照旧走实时取数。
+        用上缓存时 ``stale_from_cache=True``，界面状态条必须写「缓存 + 正在刷新」。
+        """
+        from . import snapshot_cache
+
+        cached = snapshot_cache.load(self.cache_home)
+        if not cached:
+            return False
+        self._snapshot = Snapshot(sections=cached["sections"],
+                                  fetched_at=str(cached.get("fetched_at") or ""),
+                                  source="cache")
+        self.stale_from_cache = True
+        stamp = str(cached.get("fetched_at") or "")
+        self.message = ("已就绪：显示 " + (stamp.split(" ")[-1] if " " in stamp else stamp or "上次")
+                        + " 的快照（缓存），正在后台刷新…")
+        return True
 
     @property
     def views(self) -> dict[str, View]:
@@ -432,6 +457,12 @@ class DesktopController:
             else:
                 self._snapshot = fresh
             self.message = "已刷新：" + (self._snapshot.fetched_at or "刚刚")
+            self.stale_from_cache = False
+            if self.cache_home:
+                from . import snapshot_cache
+
+                snapshot_cache.save(self.cache_home, self._snapshot.sections,
+                                    fetched_at=self._snapshot.fetched_at)
         if quiet:
             # RC15-039 #4：自动刷新是后台动作。**成功**时保留客户正在读的那句（例如
             # 「未保存：…」），失败时保留上面刚写的失败说明——两种都不进托盘广播。

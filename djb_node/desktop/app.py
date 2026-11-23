@@ -35,6 +35,7 @@ from . import theme as dual          # 双主题：色板 + 偏好 + 动效助�
 from .a11y import install as install_a11y   # 读屏（MSAA）；**静态 import**，别改成 import_module
 from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
 from .. import facts                 # WEB_CONSOLE_URL（401 横幅的「打开网页端」）
+from . import client_flags            # R2.4 S1/S3/S4：壳层开关（默认关，三字段齐全）
 from . import platform_ui
 from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
                     Metric, RailCard, Row, Table, View, page_kicker, with_field_errors)
@@ -389,6 +390,18 @@ class DesktopApp:
         except Exception:                    # pragma: no cover - 偏好文件坏了：用默认（开）
             pass
         dual.apply(self._root, ttk, self._theme_name)
+        # ── R2.4 S1/S4：开关与缓存必须在 **_build_shell 之前**定下来
+        # 外壳本身要读一次 ``controller.snapshot``（侧栏「演示数据」判断），所以缓存
+        # 预填必须更早，否则「启动零网络」这条在第一次 build 就已经破了。
+        self._startup_ms: dict[str, float] = {}
+        self._skeleton_on = bool(self._flag_enabled(client_flags.SKELETON_FLAG))
+        self._cache_primed = False
+        self._skeleton_shown = False           # 只有真画了骨架才置 True（测试/取证都读它）
+        if self._skeleton_on and self._flag_enabled(client_flags.CACHE_FLAG):
+            try:
+                self._cache_primed = bool(controller.prime_from_cache())
+            except Exception:                    # 缓存坏了：退回骨架，绝不挡启动
+                self._cache_primed = False
         self._build_shell()
         self._bind_keys()
         self._root.bind("<Configure>",
@@ -409,6 +422,11 @@ class DesktopApp:
                 bind("<Escape>", self._on_escape, add="+")
             except Exception:                            # pragma: no cover - 无窗口
                 pass
+        # ── R2.4 S1：先出壳（骨架/缓存），再填数据
+        # 关（默认）= 0.5.10 行为：show_view 里同步等第一次快照，窗口空白到数据回来。
+        # 开 = 先把窗口真正画到屏幕上（骨架或上次缓存的快照），首屏 ≤1.5s 有内容。
+        if self._skeleton_on:
+            self._paint_first_screen(controller)
         self.show_view(controller.view)
         self._a11y = self._install_a11y()    # 读屏：装不上就 None，界面照跑
         self._bind_activity()                # 记录最后一次输入（判「空闲 60 秒」）
@@ -907,6 +925,67 @@ class DesktopApp:
         if first <= 0.0 and last >= 1.0:             # 没溢出：滚轮不该动任何东西
             return
         canvas.yview_scroll(int(units), "units")
+
+    # ── R2.4 S1：骨架 / 缓存首屏（先出壳，再填数据）
+    def _flag_enabled(self, name: str) -> bool:
+        """读壳层开关（配置读不到一律按关闭 —— 默认关是硬约束）。"""
+        try:
+            return client_flags.enabled(name, config=_flags_config(self._prefs_home))
+        except Exception:                          # 开关模块坏了也不许挡住启动
+            return False
+
+    def _paint_first_screen(self, controller: Any) -> None:
+        """把**有内容的首屏**画到屏幕上并记时（骨架 or 上次缓存），不等网络。
+
+        顺序很关键：``update_idletasks()`` 让 X11/Win32 真的把这一帧推出去，
+        否则「首屏时间」只是 Python 里的一个数字，客户看到的还是空白窗。
+        """
+        cache_ok = bool(getattr(self, "_cache_primed", False))
+        if cache_ok:
+            view = controller.current()             # 从缓存算视图，**不取数**
+            self._render(view, force=True)
+            self._update_status()
+        else:
+            self._render_skeleton()
+        self._startup_ms["first_paint"] = time.monotonic()
+        try:
+            self._root.update_idletasks()           # 真正把这一帧推给窗口管理器
+        except Exception:                           # pragma: no cover - 无窗口
+            pass
+
+    def _render_skeleton(self) -> None:
+        """骨架：标题 + 三块灰色占位卡 + 一行「正在读取本机数据…」。
+
+        为什么不是转圈圈：客户在真机上第一次看到的是空白窗，最需要的一句话是
+        「它在动」——文字比动画在截图/读屏里都留得下证据。
+        """
+        kit, tk = self._kit, self._tk
+        ground = dual.color("bg")
+        try:
+            # ``_body`` 是 ``_render`` 里按页新建的；骨架先自己起一个，下一次 _render 会整体
+            # ``_clear()`` 掉（骨架只是一次性的占位，不参与任何布局契约）。
+            for child in list(self._content.winfo_children()):
+                child.destroy()
+            body = tk.Frame(self._content, background=ground, bd=0, highlightthickness=0)
+            body.pack(fill="both", expand=True, padx=(26, 6), pady=(12, 6))
+            self._body = body
+            tk.Label(self._body, text="正在读取本机数据…", font=self._fonts.sans(kit.px("h2"),
+                     bold=True), foreground=dual.color("ink"), background=ground,
+                     anchor="w").pack(anchor="w", pady=(2, 2))
+            tk.Label(self._body, text="窗口已经起来了：节点状态、收益与接入数据正在读，"
+                     "读到就会自动填进来。", font=self._fonts.sans(kit.px("small")),
+                     foreground=dual.color("muted_text"), background=ground, anchor="w",
+                     justify="left", wraplength=self._wrap_hint()).pack(anchor="w", pady=(0, 10))
+            for _card_index in range(3):
+                card = kit.RoundedCard(self._body, ground=dual.color("surface"), pad=(14, 11))
+                card.pack(fill="x", pady=(0, 8))
+                for line, height in ((0, 10), (1, 10), (2, 8)):
+                    bar = tk.Frame(card.body, background=dual.color("line"), height=height)
+                    bar.pack(fill="x", pady=(0 if line == 0 else 6, 0))
+            self._skeleton_shown = True
+        except Exception as exc:                       # pragma: no cover - 渲染失败不许挡住启动
+            self._skeleton_shown = False
+            self._skeleton_error = type(exc).__name__ + ": " + str(exc)
 
     # ── R2.1 C4：窗口图标（读不到就静默跳过，绝不影响启动）
     def _install_brand_icon(self) -> None:
@@ -4285,11 +4364,30 @@ def make_controller(*, home: str | os.PathLike | None = None, demo: bool = False
         def factory() -> Any:              # noqa: ANN401 - 惰性构造（worker 线程里调用）
             from ..update import open_manager
             return open_manager(home)
-    return DesktopController(source, access=access, control=LocalControlChannel(home), bus=bus,
-                             cli=_make_cli_runner(home) if not demo else None,
-                             # G4：更新检查要 UpdateManager（本机 paths/store/config），
-                             # 由装配层注入，controller 不自己找 home（S3 教训）
-                             update_factory=factory)
+    controller = DesktopController(source, access=access, control=LocalControlChannel(home),
+                                   bus=bus,
+                                   cli=_make_cli_runner(home) if not demo else None,
+                                   # G4：更新检查要 UpdateManager（本机 paths/store/config），
+                                   # 由装配层注入，controller 不自己找 home（S3 教训）
+                                   update_factory=factory)
+    # R2.4 S3/S4：只有**开关打开**时才接缓存（关 = 完全不读不写，回旧行为）。demo 不接：
+    # 演示数据每次都是同一份，接了反而让「缓存」这件事在截图里说不清。
+    if not demo and home and client_flags.enabled(client_flags.CACHE_FLAG,
+                                                  config=_flags_config(home)):
+        controller.cache_home = str(home)
+    return controller
+
+
+def _flags_config(home: str | os.PathLike | None) -> Any:
+    """读开关用的配置（读不到就当空配置：开关按默认值关闭）。"""
+    if not home:
+        return {}
+    try:
+        from ..config import Paths, load_config
+
+        return load_config(Paths(os.fspath(home)))
+    except Exception:                      # 配置坏了不影响开关求值（默认全关）
+        return {}
 
 
 def _default_home() -> str:
