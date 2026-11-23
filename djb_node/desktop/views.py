@@ -920,7 +920,9 @@ def _hero(snapshot: Snapshot) -> Hero:
         hint = "还没有客户端授权"
     else:
         hint = "授权状态暂不可用"
-    return Hero(kicker="NODE STATUS / " + node_id, title=titles.get(state, "状态未知"),
+    # R2.1 ②：眉标中文化 + 节点号只用短标签（原样是 "NODE STATUS / n_<32 hex>"）
+    node_display = node_label(node_id, profile.get("display_name"))
+    return Hero(kicker="节点状态 / " + node_display, title=titles.get(state, "状态未知"),
                 chip=chip, chip_tone=chip_tone, body=body,
                 runtime=_runtime_text(status.get("uptime_s")), gauge=gauge, metrics=metrics,
                 actions=actions, hint=hint)
@@ -1201,7 +1203,7 @@ def _bench(snapshot: Snapshot) -> View:
         table=Table(("检查项", "结论", "下一步"), tuple(rows),
                     note="检查项来自本机只读探测", empty="环境检测暂不可用", title="环境检测"),
         actions=(Action("bench.run", "开始跑分（≤10 秒）", primary=True),
-                 Action("bench.copy", "复制结果")),
+                 copy_action("bench.copy", "结果")),
         unavailable=_missing(snapshot, ("bench",)),
         notes=("跑分只做本地计算：sha256 吞吐 / 浮点 / 整数；不上传、不写 store。",),
     )
@@ -1846,7 +1848,7 @@ def _token_plan(snapshot: Snapshot) -> View:
         key="token_plan", title="提供 Token Plan",
         subtitle="接入 / 模型清单 / 逐模型底价 / 探针（本页可操作）",
         cards=(
-            Card("共享状态", state_text, bound_text + " · 节点 " + node_id,
+            Card("共享状态", state_text, bound_text + " · 节点 " + mask_node_id(node_id),
                  "amber" if bound is False else state_tone),
             Card("我的 Token Plan（上游）",
                  _count(snapshot, "token_plan", str(len(rows)) + " 条上游"),
@@ -1928,11 +1930,15 @@ def _access(snapshot: Snapshot) -> View:
     daemon = access.get("daemon") if isinstance(access.get("daemon"), Mapping) else {}
     # 「清退」是**不可逆**状态：判据用 code（reason 是本地化标签，不能拿来做条件）
     retired = str(daemon.get("reason_code") or "") == "retired"
+    # R2.1 ②（owner D1）：日常只显示短标签；完整 ID 折叠进「高级（排障用）」并保留复制。
+    # 可编辑的 ``node_id`` 框仍在折叠区里且 **prefill=False**：预填完整 ID 等于把长串摆回
+    # 界面，而「粘新的才覆盖」这条 KEEP 语义已经够用（空 = 不改）。
+    node_display = node_label(node_id, access.get("display_name"))
     if node_id:
-        node_hint = ("网页端绑定要填这个 ID（本机只读）" if node_source != "config"
-                     else "网页端绑定要填这个 ID")
-        node_field = Field("节点标识", node_id, key="node_id",
-                           editable=node_source == "config", hint=node_hint)
+        node_hint = ("日常只看后 8 位；客服核对用「复制节点 ID」（完整值在「高级」里）"
+                     if node_source != "config" else
+                     "本机手填的 ID：要改就在「高级（排障用）」里粘完整值")
+        node_field = Field("节点标识", node_display, key="node_label", hint=node_hint)
     else:
         # 旧文案「先启动一次」把三种完全不同的故障说成一句话，客户照做也没用。
         # 现在按**已知原因**说下一步；原因不明时给可执行的排查入口。
@@ -1965,7 +1971,7 @@ def _access(snapshot: Snapshot) -> View:
                     else _flag(valid, "通过校验", "有字段需修正"), "",
                     "amber" if access.get("saved") is False or not valid else "mint"),
                Card("节点绑定", _flag(bound if bound is not None else None, "已绑定", "未绑定"),
-                    card_node or "—", "default"),
+                    mask_node_id(card_node) if card_node else "—", "default"),
                # 第三张卡给「本页能做什么」：客户在本页找不到绑定时，得知道去哪
                Card("绑定与收款", "在「账户与安全」",
                     "本页只存本机配置（0600）", "muted")),
@@ -1984,6 +1990,14 @@ def _access(snapshot: Snapshot) -> View:
             Field("价格模式", str(config.get("price_mode") or "—"), key="price_mode",
                   editable=True,
                   hint="auto / manual；当前：" + str(config.get("price_mode_label") or "—")),
+            # 完整节点 ID：客服核对 / 重绑时才需要（日常界面只有后 8 位）。
+            # 没有 ID 时整条不渲染（否则与上面那条只读字段撞同一个 key）。
+            *((Field("完整节点 ID", node_id, key="node_id",
+                     editable=node_source == "config", advanced=True, prefill=False,
+                     hint=("粘贴完整 ID 才会覆盖；日常不需要改"
+                           if node_source == "config" else
+                           "服务端下发的完整值（只读）；客服核对时点「复制节点 ID」")),)
+              if node_id else ()),
             # 节点凭证 = 节点密钥（排障要用，绝不能占首屏）→ 折叠进「高级（排障用）」
             Field("节点凭证", str(config.get("node_secret") or "—"), key="node_secret",
                   editable=True, secret=True, advanced=True,
@@ -1996,9 +2010,9 @@ def _access(snapshot: Snapshot) -> View:
                          action="access.toggle_auto_refresh",
                          hint="页面可见时每 10 秒；最小化或空闲 60 秒；只读本机数据"),),
         actions=(Action("access.save", "保存并回读", primary=True),
-                 Action("access.copy_node_id", "复制节点标识", enabled=bool(node_id),
-                        reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
-                                + _diag_hint(diag) + "）") if not node_id else ""),
+                 copy_action("access.copy_node_id", "节点 ID", enabled=bool(node_id),
+                             reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
+                                     + _diag_hint(diag) + "）") if not node_id else ""),
                  Action("access.reset_node", "重新注册这台机器（清退恢复）",
                         enabled=retired,
                         # 2026-11-19 验收 P3：旧文案把「只有被清退才需要」与「当前原因：
@@ -2164,6 +2178,70 @@ def binding_state(snapshot: Snapshot) -> tuple[bool | None, str]:
     return bound, node_id
 
 
+#: 云端节点 ID 前缀（``n_`` / 旧版 ``nd_``）：**日常界面不许出现**
+NODE_ID_PREFIXES: tuple[str, ...] = ("n_", "nd_")
+#: 云端 ``user_code`` 契约：``^[A-Z2-9]{8}$``（不含 0/1/I/O 这类易混字符）
+SHORT_CODE_LEN = 8
+_SHORT_CODE_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ23456789")
+
+
+def copy_action(key: str, what: str, *, enabled: bool = True, reason: str = "",
+                group: str = "", primary: bool = False) -> Action:
+    """**统一复制组件**（R2.1 ④）：短码 / 链接 / 地址 / 密钥 都走这一个入口。
+
+    复制这条路以前四页各写一遍按钮：文案有的叫「复制」有的叫「…到剪贴板」，禁用态有的
+    有原因有的空白，反馈只活在状态栏。现在统一三件事：
+
+    * 文案固定 ``复制 + what``（what 是**客户认得的那个东西**，如「绑定短码」）；
+    * 禁用必须给 ``reason``（说不出为什么能点/不能点，等于让客户猜）；
+    * 成败反馈由 app 的 ``copy_text`` 统一 toast（成功「已复制 …」，失败说剪贴板被占）。
+    """
+    return Action(key, "复制" + what, enabled=enabled, reason=reason, group=group,
+                  primary=primary)
+
+
+def format_short_code(code: object) -> str:
+    """8 位绑定短码 → ``XXXX-XXXX``（去分隔符 / 转大写；不是 8 位就原样返回）。
+
+    短码**只用于绑定**（owner D1）：它是一次性的、10 分钟过期，当「节点号」用会误导客户
+    以为可以长期对外报这个号。这里只负责显示口径，不判断有效性（有效性在 device_flow 里）。
+    """
+    text = str(code or "").strip().upper().replace("-", "").replace(" ", "")
+    if len(text) != SHORT_CODE_LEN or any(ch not in _SHORT_CODE_ALPHABET for ch in text):
+        return str(code or "").strip()
+    return text[:4] + "-" + text[4:]
+
+
+def mask_node_id(node_id: object) -> str:
+    """节点 ID → 日常展示用的短标签（``…3f9a2c1b``）；**绝不返回 ``n_`` 长串**。
+
+    为什么不是全文：节点 ID 是 ``n_`` + 32 位十六进制，塞进首屏/卡片副标题后每条都折行
+    （R2.1 ② DoD「界面不出现 n_ 长串」）。客户日常认「后 8 位」足够；客服核对要走
+    「复制节点 ID」或「高级（排障用）」里的完整值。
+    """
+    text = str(node_id or "").strip()
+    if not text or text in ("—", "None"):
+        return "—"
+    for prefix in NODE_ID_PREFIXES:
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):]
+            break
+    text = text.strip() or str(node_id or "").strip()
+    return ("…" + text[-8:]) if len(text) > 8 else text
+
+
+def node_label(node_id: object, display_name: object = "") -> str:
+    """人看的节点名：有设备名用设备名，否则用 :func:`mask_node_id` 的短标签。
+
+    设备名（``profile.display_name``）是客户自己在网页端起的名字，比 ID 好认；
+    这里**不做截断**（改名是客户的事），只在没有名字时才退回短标签。
+    """
+    name = str(display_name or "").strip()
+    if name and name not in ("—", "None"):
+        return name
+    return mask_node_id(node_id)
+
+
 def _account_bound(profile: Mapping[str, Any], security: Mapping[str, Any],
                    binding: Mapping[str, Any]) -> bool | None:
     """账户页的绑定态：服务端 binding 优先，其次 profile.bound，最后看本机有没有节点凭据。
@@ -2193,7 +2271,9 @@ def _account(snapshot: Snapshot) -> View:
     # 旧/演示形状给的是账户（email/role/2FA）；两种都如实展示，缺的字段给「—」。
     node_id = profile.get("node_id")
     email = profile.get("email")
-    identity = str(node_id or email or "—")
+    # R2.1 ②：身份栏日常只显示「设备名 / 后 8 位」，完整 ID 折叠进「高级（排障用）」。
+    identity = node_label(node_id, profile.get("display_name")) if node_id else str(email or "—")
+    full_node_id = str(node_id or "")
     identity_meta = str(profile.get("state") or profile.get("role") or "—")
     bound, bound_node_id = binding_state(snapshot)
     # 绑定入口**不能**被「本域暂不可用」挡掉：未登录时账户域本来就取不到云端数据，
@@ -2219,8 +2299,12 @@ def _account(snapshot: Snapshot) -> View:
         second = Card("双因素验证", _flag(twofa, "已开启", "未开启", "暂不可用"),
                       "登录保护的第二步", "mint" if twofa is True else "amber")
     if node_id:
-        fields: list[Field] = [Field("节点标识", identity, key="node_id",
-                                     hint="节点身份由服务端下发，本机只读",
+        fields: list[Field] = [Field("节点标识", identity, key="node_label",
+                                     hint="日常只看后 8 位（客服核对用「复制节点 ID」）",
+                                     group=GROUP_IDENTITY),
+                               Field("完整节点 ID", full_node_id, key="node_id",
+                                     advanced=True,
+                                     hint="服务端下发的完整值（只读）；排障/客服核对用",
                                      group=GROUP_IDENTITY)]
     else:
         fields = [Field("邮箱", identity, key="email", hint="登录后在服务端修改",
@@ -2262,6 +2346,11 @@ def _account(snapshot: Snapshot) -> View:
     fields.append(Field("云端收款状态", payout["state"], key="payout_state",
                         hint=payout["meta"], tone=payout["tone"],
                         group=GROUP_PAYOUT))
+    # R2.1 ④：地址也走统一复制组件（填了就复制；没填先给原因，不让点空白按钮）
+    address_ready = bool(payout["local"] and payout["local"] != "—")
+    actions_payout = [copy_action("account.copy_address", "收款地址", enabled=address_ready,
+                                  reason="" if address_ready else "本机还没填收款地址",
+                                  group=GROUP_PAYOUT)]
     # RC14 C 设备码状态（开关关 → 整段不渲染，连状态都不显示）
     device = account.get("device_flow") if isinstance(account.get("device_flow"), Mapping) else {}
     device_on = bool(device.get("enabled"))
@@ -2270,33 +2359,41 @@ def _account(snapshot: Snapshot) -> View:
         from .. import device_flow as flow_mod
 
         state_text = flow_mod.STATE_TEXT.get(device_state, device_state)
+        # R2.1 ②：短码按契约显示成 XXXX-XXXX（原来是 8 位连写，客户照着念会错位），
+        # 并在旁边给「复制绑定短码」——短码只用于绑定，绑定完成后不再显示（owner D1）。
+        short_code = format_short_code(device.get("user_code"))
         detail = "｜".join(item for item in (
-            str(device.get("user_code") or ""),
+            short_code,
             "等待第 " + str(device.get("attempts") or 0) + " 次确认" if device_state == "pending" else "",
             str(device.get("reason") or "")) if item)
-        fields.append(Field("设备码", detail or "未申请", key="device_state",
+        fields.append(Field("绑定短码", detail or "未申请", key="device_state",
                             group=GROUP_BIND,
                             hint=(("打开 " + str(device.get("verify_url") or "确认链接")
-                                   + " 并在网页里点「确认」；本机每 5/15/30 秒自动问一次，10 分钟停")
+                                   + " 并在网页里点「确认」；本机每 5/15/30 秒自动问一次，"
+                                   "10 分钟停（短码只用于绑定，一次性）")
                                   if device_state == "pending" else
                                   "状态：" + state_text + "（"
-                                  + (str(device.get("hint") or "") or "点左边按钮开始") + "）")))
+                                  + (str(device.get("hint") or "") or "点左边按钮开始") + "）"
+                                  + "；短码只用于绑定，10 分钟内一次性")))
     fields.append(Field("会话", "本机窗口", key="session", hint="关闭窗口不会退出登录",
                         group=GROUP_IDENTITY))
-    actions: list[Action] = []
+    actions: list[Action] = list(actions_payout)
     # RC14 C 设备码：主按钮 = 「在浏览器确认绑定」（开关关着 → 只保留老的手输码入口）
     if device_on and can_bind:
         actions.append(Action("account.bind_device", "在浏览器确认绑定", primary=True,
                               enabled=device_state not in ("pending",),
-                              reason=("正在等待网页确认（" + str(device.get("user_code") or "")
+                              reason=("正在等待网页确认（" + format_short_code(device.get("user_code"))
                                       + "）：确认后本机会自动接上；要重来先点「停止等待」"
                                       if device_state == "pending" else ""),
                               group=GROUP_BIND))
         if device_state == "pending":
             actions.append(Action("account.bind_device_cancel", "停止等待", group=GROUP_BIND))
+            if short_code:
+                actions.append(copy_action("account.copy_short_code", "绑定短码",
+                                           group=GROUP_BIND))
             if device.get("verify_url"):
-                actions.append(Action("account.copy_verify_url", "复制确认链接",
-                                      group=GROUP_BIND))
+                actions.append(copy_action("account.copy_verify_url", "确认链接",
+                                           group=GROUP_BIND))
     if can_bind:
         actions.append(Action("account.bind", "绑定网页端" if not device_on else "手输绑定码",
                              primary=not device_on, group=GROUP_BIND))
@@ -2563,7 +2660,8 @@ def _logs(snapshot: Snapshot) -> View:
         filters=(Filter("log_level", "级别", options=options, value=level,
                         action="logs.filter",
                         hint="只改本页显示；日志文件不动。"),) if levels else (),
-        actions=(Action("logs.copy", "复制当前筛选", enabled=bool(rows), reason="没有日志行"),
+        actions=(copy_action("logs.copy", "当前筛选", enabled=bool(rows),
+                             reason="没有日志行"),
                  Action("logs.open_dir", "打开日志目录")),
         unavailable=_missing(snapshot, ("logs",)),
         # 旧页脚许诺「级别筛选：all / debug / …」却**没有**任何筛选控件（走查原话：

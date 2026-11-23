@@ -735,7 +735,10 @@ class DesktopController:
             reason = str((daemon or {}).get("reason") or "") if isinstance(daemon, Mapping) else ""
             detail = ("；节点进程原因：" + reason) if reason else "；原因见「接入配置」页的注册状态"
             return ActionResult("暂不可用（还没有节点 ID" + detail + "）", ok=False)
-        return ActionResult("已复制节点标识：" + node_id, effect="copy", payload=node_id)
+        from .views import mask_node_id
+
+        return ActionResult("已复制节点 ID（" + mask_node_id(node_id) + "）：粘到网页端绑定框即可",
+                            effect="copy", payload=node_id)
 
     def _act_agent_save(self, *, confirm=None) -> ActionResult:
         return self.save_agent()
@@ -902,13 +905,53 @@ class DesktopController:
         return ActionResult("已停止等待绑定；随时可以重新点「在浏览器确认绑定」",
                             effect="refresh")
 
+    # ── R2.1 ④：收款地址复制（统一复制组件的「地址」一格）
+    def _act_account_copy_address(self, *, confirm=None) -> ActionResult:
+        """复制**本机已存**的收款地址（只读快照，不写配置、不提交云端）。
+
+        为什么不是「复制云端那个」：云端地址是提交后才有的只读结果，客户真正要粘的是
+        自己钱包里的地址（填进钱包/发给对方），本机这份才是他的输入。
+        """
+        address = self.payout_address()
+        if not address:
+            return ActionResult("还没有收款地址：先在上面填 Polygon（0x 开头 42 位）再保存",
+                               ok=False)
+        shown = address if len(address) <= 12 else address[:6] + "…" + address[-4:]
+        return ActionResult("已复制收款地址 " + shown + "（Polygon / ERC20）",
+                            effect="copy", payload=address)
+
     def _act_account_copy_verify_url(self, *, confirm=None) -> ActionResult:
+        from .views import format_short_code
+
         flow = self.device_flow
         url = str(getattr(flow, "verify_url", "") or "")
         if not url:
             return ActionResult("还没有确认链接：先点「在浏览器确认绑定」", ok=False)
-        return ActionResult("已复制确认链接（在浏览器打开后输入 " + str(flow.user_code) + "）",
+        return ActionResult("已复制确认链接（在浏览器打开后输入 "
+                            + format_short_code(getattr(flow, "user_code", "")) + "）",
                             effect="copy", payload=url)
+
+    # ── R2.1 ②：绑定短码可复制（短码**只用于绑定**，一次性 + 10 分钟）
+    def _act_account_copy_short_code(self, *, confirm=None) -> ActionResult:
+        """把当前绑定短码交给剪贴板（``effect="copy"``）；没有短码就说下一步。
+
+        短码来自设备流程（``device_flow.user_code``，云端契约 ``^[A-Z2-9]{8}$``）。
+        已经绑定完成 / 短码过期时**不复制旧码**——旧码粘到网页端只会报「无效」，客户
+        会以为客户端坏了；这里如实说「重新生成一个」。
+        """
+        from .views import format_short_code
+
+        flow = self.device_flow
+        code = format_short_code(getattr(flow, "user_code", ""))
+        if not code or not str(getattr(flow, "user_code", "") or "").strip():
+            return ActionResult("还没有绑定短码：点「在浏览器确认绑定」生成一个"
+                               "（短码一次性、10 分钟有效）", ok=False)
+        state = str(getattr(flow, "state", "") or "")
+        if state in ("approved", "bound"):
+            return ActionResult("这台的绑定已经完成，短码已失效：不用再复制"
+                               "（要绑另一台电脑就在那台上重新生成）", ok=False)
+        return ActionResult("已复制绑定短码 " + code + "（10 分钟内一次性，只用于绑定）",
+                            effect="copy", payload=code)
 
     # ── RC14 B 首次引导（应用内面板，不是模态；每步都能跳）
     def _onboarding_store(self):
