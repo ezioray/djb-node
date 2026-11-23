@@ -1686,3 +1686,74 @@ def test_no_english_in_any_page_eyebrow():
         if hits:
             offenders[key] = hits
     assert offenders == {}, "眉标里还有英文：" + repr(offenders)
+
+
+# ─────────────────── 2026-11-24 真机复查：文案与布局（F25/F26/F27/F28/F29）
+
+def test_access_action_bar_splits_into_groups_so_no_button_is_clipped():
+    """F27：五个动作挤一条栏时最右一颗被卡片裁掉（真机只看到「绑定与…」）。
+
+    分组渲染会给每组单起一行，行内按钮数从 5 降到 ≤3，宽度不再溢出。
+    """
+    view = vw.build_view("access", _access_snapshot(node_id="nd_1"))
+    groups = vw.action_groups(view.actions)
+    assert len(groups) >= 2, "接入配置页动作必须分组，否则按钮行会溢出"
+    for title, members in groups:
+        assert title, "分组必须带小标题，客户才知道这一行是干什么的"
+        assert len(members) <= 3, ("每组 ≤3 颗按钮（真机可用宽度），实测 " + title
+                                   + " 有 " + str(len(members)) + " 颗")
+
+
+def test_task_queue_notes_do_not_leak_internal_field_names():
+    """F26：任务队列页脚注曾把 inflight/recorded/settled 这些内部字段名写给客户。"""
+    view = vw.build_view("tasks", ds.Snapshot(dict(demo_snapshot().sections)))
+    text = " ".join(view.notes) + " " + view.plain_text()
+    for internal in ("inflight", "recorded", "settled", "origin", "schema"):
+        assert internal not in text, "内部字段名外泄：" + internal
+    assert "进行中" in " ".join(view.notes)
+
+
+def test_token_plan_subtitle_tells_the_next_action():
+    """F28：页面副标题改成「下一步做什么」，首屏就有操作焦点（不再是功能清单）。"""
+    view = vw.build_view("token_plan", _token_plan_snapshot(upstreams=()))
+    assert view.subtitle.startswith("下一步："), view.subtitle
+    assert "测试联通性" in view.subtitle
+
+
+def test_token_plan_price_hint_is_short_and_free_of_engineer_words():
+    """F28：最低价说明曾堆了 5 个概念（云端驳回 / 牌价 / 最优价 / 客户实付 / 服务端快照）。"""
+    view = vw.build_view("token_plan", _token_plan_snapshot(upstreams=()))
+    field = [f for f in view.fields if f.key == "min_price"][0]
+    assert len(field.hint) <= 100, field.hint         # 两行以内，真机不折成 5 行
+    for word in ("驳回", "快照", "牌价"):
+        assert word not in field.hint
+    assert "客户实付" in field.hint and "最低价" in field.hint
+
+
+def test_missing_cloud_endpoint_message_has_no_method_name():
+    """F29：缺接口时曾把 model_catalog/binding 这样的方法名打到客户屏幕上。"""
+    from djb_node.desktop import datasource as dsrc
+
+    class NoMethods:
+        pass
+
+    src = object.__new__(dsrc.LocalDataSource)
+    src._offline_reason = ""
+    src.notes = []
+    src._cloud = object()                     # 有一个「云对象」，但它没有 model_catalog 方法
+    try:
+        dsrc.LocalDataSource._cloud_call(src, "model_catalog")
+    except dsrc.ProviderError as exc:
+        assert "model_catalog" not in exc.reason
+        assert "还没开通" in exc.reason
+    else:                                              # pragma: no cover - 防御
+        raise AssertionError("缺接口必须抛 ProviderError")
+
+
+def test_cli_credential_line_uses_customer_wording():
+    """F25：CLI `djb status` 把后端代号 file-0600 直接打给客户。"""
+    from djb_node import cli
+
+    assert cli._storage_label("file-0600") == "仅本机可读（0600）"
+    assert cli._storage_label("") == "—"
+    assert cli._storage_label("future-backend") == "future-backend"

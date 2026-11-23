@@ -530,7 +530,8 @@ def test_cloud_is_reassembled_after_daemon_registration(tmp_path):
 
     source = _late_cloud_source(tmp_path, factory)
     first = source.snapshot(sections=("account",)).sections["account"]
-    assert "未登录节点" in first["note"] and "本机尚未注册节点" in first["note"]
+    # 2026-11-24：文案已改成「账户资料暂不可用：…」，断言跟着走（行为不变）。
+    assert "账户资料暂不可用" in first["note"] and "本机尚未注册节点" in first["note"]
 
     # daemon 注册完成：node_id + client_key 落盘（这一步真实发生在首启后几秒内）
     CredentialStore(Paths(str(tmp_path))).set_node("n_late", "djb_ck_late_0001")
@@ -543,14 +544,14 @@ def test_cloud_is_reassembled_after_daemon_registration(tmp_path):
 
 
 def test_no_cloud_reason_distinguishes_registered_but_unbound(tmp_path):
-    """「未登录节点」要分两种：本机还没注册 / 注册了但没绑定账号。"""
+    """「账户资料暂不可用」要分两种：本机还没注册 / 注册了但没绑定账号。"""
     from djb_node.config import Paths
     from djb_node.secure import CredentialStore
 
     CredentialStore(Paths(str(tmp_path))).set_node("n_registered", "djb_ck_reg_0001")
     source = _late_cloud_source(tmp_path, lambda home: None)
     account = source.snapshot(sections=("account",)).sections["account"]
-    assert "未登录节点" in account["note"]
+    assert "账户资料暂不可用" in account["note"]
     assert "已注册但未绑定账号" in account["note"]
 
 

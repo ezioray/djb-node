@@ -1445,8 +1445,10 @@ def _tasks(snapshot: Snapshot) -> View:
                     empty=_empty_text(snapshot, "tasks", "当前没有任务"), title="任务"),
         actions=(Action("tasks.refresh", "刷新"),),
         unavailable=_missing(snapshot, ("tasks",)),
-        notes=("状态列给云端原词（recorded/settled/…）+ 中文；「进行中」来自 inflight 字段。",
-               "点行看详情：状态三态、耗时、tokens、收据号。"),
+        # F26（2026-11-24 真机）：原来这行把内部字段名（inflight/recorded/settled）
+        # 写给客户看。客户只需要知道「状态是什么意思、下一步做什么」。
+        notes=("状态：进行中 = 正在算；已完成 = 结果已记账（可点开看收据号）。",
+               "点一行看详情：耗时、tokens、收据号。"),
     )
 
 
@@ -1802,18 +1804,16 @@ def _token_plan(snapshot: Snapshot) -> View:
               hint="只存本机（0600）；云端只收「已登记」这一个布尔"),
         Field("最低申报价", str(plan.get("selected_price") or ""), key="min_price",
               editable=True, prefill=False,
-              hint=((("当前选中的 " + str(plan.get("selected_model")) + " 已存 "
+              # F28（2026-11-24 真机）：原来一句话塞了「云端跳过 / 成交规则 / 平台服务费 /
+              # 客户实付 / 服务端快照」五个概念，客户读不完。现在只留「填什么 + 怎么成交 + 抽成」。
+              hint=((("当前选中 " + str(plan.get("selected_model")) + " 已存 "
                        + str(plan.get("selected_price")) + "；") if plan.get("selected_price")
                       else (("当前选中：" + str(plan.get("selected_model")) + "（未设价）；")
                             if plan.get("selected_model") else "先在上面的表格里选一行；"))
-                    + "单位 USD / 百万 token，最小 0.01（填 0 会被云端跳过，留空 = 不申报）"
-                    # 2026-11-20 owner：设价必须让人看见「这是最低价 + 平台费 15%」。
-                    # 成交口径（原始设计）：撮合到的最优价 ≥ 这个最低价就成交。
-                    + "；**成交规则**：低于此价不成交，高于时按最优价成交"
-                    + "；平台服务费 " + format(facts.service_fee_percent(), "g") + "%"
-                    + "（客户实付 = 你的报价 × "
-                    + format(1 + facts.SERVICE_FEE_BPS / 10000.0, "g")
-                    + "，费率以成交时服务端快照为准）")),
+                    + "填你能接受的最低价（USD / 百万 token，最小 0.01，留空 = 不报这一行）。"
+                    + "低于这个价不成交；平台抽 "
+                    + format(facts.service_fee_percent(), "g") + "%，客户实付 = 报价 × "
+                    + format(1 + facts.SERVICE_FEE_BPS / 10000.0, "g") + "。")),
         Field("云端覆盖", cloud_text, key="bid_cloud",
               hint="生效顺序：云端覆盖 > 本机底价 > 未设价"),
         # R2.1 ③：联通测试的**结果区**（进行中 / 成功 / 失败 + 下一步）。
@@ -1879,7 +1879,12 @@ def _token_plan(snapshot: Snapshot) -> View:
     plan_actions = [replace(_a, primary=(_a.key == _primary_key)) for _a in plan_actions]
     return View(
         key="token_plan", title="提供 Token Plan",
-        subtitle="接入 / 模型清单 / 逐模型底价 / 探针（本页可操作）",
+        subtitle=(("下一步：填「请求地址」和「密钥」→ 点「测试联通性」（只探活，不保存）")
+                  if not (str(plan.get("base_url") or "").strip()
+                          and str(plan.get("secret_seen") or "").strip() not in ("", "未保存"))
+                  else (("下一步：点「读取模型清单并保存接入」把模型落到本机")
+                        if not rows else
+                        ("下一步：在表里选一行模型 → 填最低价 → 点「保存这一行」"))),
         cards=(
             Card("共享状态", state_text, bound_text + " · 节点 " + mask_node_id(node_id),
                  "amber" if bound is False else state_tone),
@@ -2042,12 +2047,14 @@ def _access(snapshot: Snapshot) -> View:
                          value=bool(access.get("auto_refresh", True)),
                          action="access.toggle_auto_refresh",
                          hint="页面可见时每 10 秒；最小化或空闲 60 秒；只读本机数据"),),
-        actions=(Action("access.save", "保存并回读", primary=True),
-                 copy_action("access.copy_node_id", "节点 ID", enabled=bool(node_id),
+        # F27（2026-11-24 真机）：五个按钮挤一条栏，最右一个被卡片右边界裁掉
+        # （真机只看到「绑定与…」）。按用途分两组，每组一行，避免溢出。
+        actions=(Action("access.save", "保存并回读", primary=True, group="接入配置"),
+                 copy_action("access.copy_node_id", "节点 ID", enabled=bool(node_id), group="接入配置",
                              reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
                                      + _diag_hint(diag) + "）") if not node_id else ""),
                  Action("access.reset_node", "重新注册这台机器（清退恢复）", danger=True,
-                        enabled=retired,
+                        group="维护（不可逆）", enabled=retired,
                         # 2026-11-19 验收 P3：旧文案把「只有被清退才需要」与「当前原因：
                         # daemon 未运行」糊成一句，daemon 没跑时读起来自相矛盾。
                         # 拆成两条独立原因：节点没跑就只说「先启动节点」。
@@ -2057,9 +2064,10 @@ def _access(snapshot: Snapshot) -> View:
                               if not daemon.get("running")
                               else "只有节点被云端清退后才需要（当前原因："
                                    + str(daemon.get("reason") or "—") + "）")),
-                 Action("access.reload", "请求 daemon 重载"),
+                 Action("access.reload", "请求 daemon 重载", group="维护（不可逆）"),
                  # 搬走的两个入口在这里只留**指路**（不是按钮）：本页不能做，就别假装能做
-                 Action("access.goto_account", "绑定与收款在「账户与安全」")),
+                 Action("access.goto_account", "绑定与收款在「账户与安全」",
+                        group="维护（不可逆）")),
         unavailable=_missing(snapshot, ("access",)),
         notes=(str(access.get("note") or ""),
                *(() if node_id else tuple(

@@ -734,7 +734,16 @@ class LocalDataSource:
         handler = getattr(cloud, method, None)
 
         if handler is None:
-            raise ProviderError("云端接口未接线（" + method + "）", hint="等待平台提供该接口")
+            # F29（2026-11-24 真机）：原来把方法名（model_catalog / binding …）直接打到
+            # 客户屏幕上，还带「未接线」这种工程词。客户只需要知道「没开通、不是你的问题」。
+            # 方法名只进日志（便于我们定位）。
+            try:
+                from ..logging_setup import event as _event
+                _event("desktop.cloud_call.missing", method=str(method))
+            except Exception:
+                pass
+            raise ProviderError("这项数据平台还没开通（不是你的配置问题）",
+                                hint="本页其它块照常可用；平台开通后点「刷新」自动恢复")
         try:
             return handler(*args, **kwargs)
         except ProviderError as exc:

@@ -1014,8 +1014,10 @@ def _status_text(value: dict[str, Any]) -> str:
     lines.append("收据缓冲：" + str(receipts.get("count", 0)) + " 条 · 最旧 "
                  + str(receipts.get("oldest_age_s", 0)) + " 秒")
     credentials = value.get("credentials") or {}
+    # F25（2026-11-24 真机）：CLI 直接把后端代号（file-0600）打给客户看；GUI 早已改成
+    # 「仅本机可读（0600）」，这里对齐同一套说法。
     lines.append("凭据：" + ("已配置" if credentials.get("client_key_set") else "未配置")
-                 + " · " + str(credentials.get("storage")))
+                 + " · " + _storage_label(credentials.get("storage")))
     machine = value.get("machine") or {}
     if isinstance(machine, dict) and machine.get("schema"):
         cpu = machine.get("cpu") or {}
@@ -2861,6 +2863,22 @@ def _enable_utf8_stdio() -> None:
             reconfigure(encoding="utf-8", errors="replace")
         except Exception:                       # pragma: no cover - 平台差异，失败即跳过
             continue
+
+
+STORAGE_LABELS = {
+    "file-0600": "仅本机可读（0600）",
+    "keyring": "系统密钥链",
+    "keychain": "系统钥匙串",
+    "dpapi": "Windows 凭据保护",
+}
+
+
+def _storage_label(raw: object) -> str:
+    """凭据后端代号 → 客户话（未知代号原样返回，绝不显示空）。"""
+    text = str(raw or "").strip()
+    if not text:
+        return "—"
+    return STORAGE_LABELS.get(text, text)
 
 
 def main(argv: list[str] | None = None) -> int:
