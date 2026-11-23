@@ -714,7 +714,7 @@ YIELD_MODE_SUMMARY = {
 #: 「请求地址」统一口径（RC15-039 #37）：标签只叫「…请求地址」，填法提示**逐字一致**。
 #: 以前一页叫「请求链接」、一页叫「上行 OpenAI」、还有一页叫「OpenAI 请求地址」，
 #: 同一件事三种名字，客户以为是三个不同的字段。
-BASE_URL_HINT = "填到 /v1 就行（例如 https://api.openai.com/v1）；不要带 key 参数"
+BASE_URL_HINT = "到 /v1 为止，例 https://api.openai.com/v1"
 
 #: CLI 命令的识别（RC15-039 #11）：`djb init` / `djb auth --bind <码>` / `djb start` …
 _CLI_CALL = re.compile(r"djb\s+[a-z][a-z0-9_-]*(?:\s+--?[a-z][\w-]*(?:\s+<[^>]*>)?)?")
@@ -1797,15 +1797,14 @@ def _token_plan(snapshot: Snapshot) -> View:
     fields = (
         Field("协议", str(plan.get("protocol") or ""), key="protocol", editable=True,
               choices=tuple(facts.UPSTREAM_PROTOCOLS),
-              hint="默认 " + facts.UPSTREAM_PROTOCOL_LABELS.get(
-                  facts.DEFAULT_UPSTREAM_PROTOCOL, facts.DEFAULT_UPSTREAM_PROTOCOL)
-              + "；切换不会改已填的链接"),
+              hint="推荐 " + facts.UPSTREAM_PROTOCOL_LABELS.get(
+                  facts.DEFAULT_UPSTREAM_PROTOCOL, facts.DEFAULT_UPSTREAM_PROTOCOL)),
         Field("请求地址", str(plan.get("base_url") or ""), key="base_url", editable=True,
               prefill=False, hint=BASE_URL_HINT),
         # 密钥只存本机 0600；显示按钮由 Field.can_reveal 自动给（G7）
         Field("密钥", str(plan.get("secret_seen") or "未保存"), key="upstream_secret",
               editable=True, secret=True, prefill=False,
-              hint="只存本机（0600）；云端只收「已登记」这一个布尔"),
+              hint="只存本机（0600）；云端只知道「已登记」"),
         Field("最低申报价", str(plan.get("selected_price") or ""), key="min_price",
               editable=True, prefill=False,
               # F28（2026-11-24 真机）：原来一句话塞了「云端跳过 / 成交规则 / 平台服务费 /
@@ -1814,12 +1813,11 @@ def _token_plan(snapshot: Snapshot) -> View:
                        + str(plan.get("selected_price")) + "；") if plan.get("selected_price")
                       else (("当前选中：" + str(plan.get("selected_model")) + "（未设价）；")
                             if plan.get("selected_model") else "先在上面的表格里选一行；"))
-                    + "填你能接受的最低价（USD / 百万 token，最小 0.01，留空 = 不报这一行）。"
-                    + "低于这个价不成交；平台抽 "
-                    + format(facts.service_fee_percent(), "g") + "%，客户实付 = 报价 × "
-                    + format(1 + facts.SERVICE_FEE_BPS / 10000.0, "g") + "。")),
+                    + "USD/百万 token，最小 0.01；低于此价不成交，平台抽 "
+                    + format(facts.service_fee_percent(), "g") + "%（客户实付 ×"
+                    + format(1 + facts.SERVICE_FEE_BPS / 10000.0, "g") + "）")),
         Field("云端覆盖", cloud_text, key="bid_cloud",
-              hint="生效顺序：云端覆盖 > 本机底价 > 未设价"),
+              hint="云端 > 本机 > 未设价"),
         # R2.1 ③：联通测试的**结果区**（进行中 / 成功 / 失败 + 下一步）。
         # 以前点完只有状态栏一闪，客户回头看页面什么都看不到（真机「点了没反应」）。
         Field("联通性", conn_text, key="connectivity_state", tone=conn_tone,

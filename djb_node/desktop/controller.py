@@ -1405,7 +1405,7 @@ class DesktopController:
         state = dict(self.connectivity or {})
         if not state:
             return {"state": "idle", "text": self.CONNECTIVITY_IDLE_TEXT,
-                    "next": "点「测试联通性」验证地址与密钥；只探活，不保存任何配置",
+                    "next": "点上面「测试联通性」即可（只探活，不保存）",
                     "at": "", "target": ""}
         return state
 

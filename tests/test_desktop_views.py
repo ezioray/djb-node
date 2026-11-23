@@ -1727,7 +1727,7 @@ def test_token_plan_price_hint_is_short_and_free_of_engineer_words():
     assert len(field.hint) <= 100, field.hint         # 两行以内，真机不折成 5 行
     for word in ("驳回", "快照", "牌价"):
         assert word not in field.hint
-    assert "客户实付" in field.hint and "最低价" in field.hint
+    assert "客户实付" in field.hint and "不成交" in field.hint
 
 
 def test_missing_cloud_endpoint_message_has_no_method_name():
