@@ -1523,7 +1523,7 @@ def _agent(snapshot: Snapshot) -> View:
     downlink = agent.get("downlink") if isinstance(agent.get("downlink"), Mapping) else {}
     return View(
         key="agent", title="Agent 接入",
-        subtitle="① 客户端 → Agent 上行   ② Agent → DJB 下行",
+        subtitle="① 客户端 → Agent 上行   ② Agent → TokenBank 下行",
         cards=(Card("上行", "OpenAI + Anthropic 两路", "可编辑请求地址", "default"),
                Card("下行", "已下发" if downlink.get("url") else "未设置",
                     "只读地址 + scoped token（掩码）", "muted")),

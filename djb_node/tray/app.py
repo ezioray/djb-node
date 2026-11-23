@@ -72,7 +72,7 @@ __all__ = [
 #: 周期刷新间隔（毫秒）
 DEFAULT_INTERVAL_MS = 5000
 #: 窗口 / 菜单栏标题前缀
-DEFAULT_TITLE = "DJB 联脑"
+DEFAULT_TITLE = "TokenBank 联脑"
 #: 只读 CLI 子进程超时（秒）：cli 内部 status 调用 5s，留出解释器启动余量
 CLI_TIMEOUT_S = 8.0
 #: 正常退出
@@ -399,7 +399,7 @@ class TkBackend:
         window = self._tk.Toplevel(self._root)
         from ..gui.theme import apply_theme
         apply_theme(window, ttk)
-        window.title("DJB / " + title)
+        window.title("TokenBank / " + title)
         window.geometry("640x300")
         body = ttk.Frame(window, padding=24)
         body.pack(fill="both", expand=True)
@@ -415,7 +415,7 @@ class TkBackend:
         from ..gui.theme import apply_theme
         window = self._tk.Toplevel(self._root)
         apply_theme(window, ttk)
-        window.title("DJB / 确认本机控制")
+        window.title("TokenBank / 确认本机控制")
         window.geometry("640x300")
         choice = [False]
         body = ttk.Frame(window, padding=24)
@@ -440,7 +440,7 @@ class TkBackend:
         from .. import facts
         message = ("在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里。\n\n"
                    + facts.WEB_CONSOLE_URL)
-        value = simpledialog.askstring("DJB / 绑定网页端", message, parent=self._root)
+        value = simpledialog.askstring("TokenBank / 绑定网页端", message, parent=self._root)
         text = str(value).strip() if value else ""
         return text or None
 
@@ -508,11 +508,11 @@ class TkBackend:
         status, notifications = self._context
         if not isinstance(status, Mapping) or status.get("state") not in (
                 "online", "starting", "paused", "updating", "stopped", "error"):
-            self._root.title("DJB / ? 状态未知 · 请刷新" + suffix)
+            self._root.title("TokenBank / ? 状态未知 · 请刷新" + suffix)
         else:
             labels = {"online": "运行中", "starting": "启动中", "paused": "已暂停",
                       "updating": "更新中", "stopped": "已停止", "error": "错误"}
-            self._root.title("DJB / " + labels[status["state"]] + suffix)
+            self._root.title("TokenBank / " + labels[status["state"]] + suffix)
 
     def _popup(self, event: Any) -> None:
         try:
@@ -767,7 +767,7 @@ def _positive_int(value: str) -> int:
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="djb-tray",
-        description="DJB 联脑托盘壳（Windows / macOS）：只发动作建议，不执行命令")
+        description="TokenBank 联脑托盘壳（Windows / macOS）：只发动作建议，不执行命令")
     parser.add_argument("--interval-ms", type=_positive_int, default=DEFAULT_INTERVAL_MS,
                         help="刷新间隔（毫秒，默认 " + str(DEFAULT_INTERVAL_MS) + "）")
     parser.add_argument("--title", default=DEFAULT_TITLE, help="窗口 / 菜单栏标题前缀")

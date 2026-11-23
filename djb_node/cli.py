@@ -241,7 +241,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if _json_flag(args):
         _emit(payload, as_json=True)
     else:
-        print("DJB 联脑客户端已初始化：" + paths.home)
+        print("TokenBank 联脑客户端已初始化：" + paths.home)
         print("  预设 " + store.profile().preset + " · 并发 " + str(store.profile().concurrent)
               + " · 日配额 " + str(store.profile().daily_tokens) + " tokens")
         print("  本机镜像将监听 127.0.0.1:" + str(config.mirror_port) + "/v1（仅回环）")
@@ -2456,7 +2456,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog=PROG, description="DJB 联脑 · 共享节点客户端（M15 / S2 P1 Linux CLI + daemon）",
+        prog=PROG, description="TokenBank 联脑 · 共享节点客户端（M15 / S2 P1 Linux CLI + daemon）",
         epilog="退出码：" + "；".join(str(code) + "=" + text for code, text
                                      in sorted(facts.EXIT_CODE_HELP.items())))
     parser.add_argument("--home", help="本机数据目录（默认 $DJB_HOME 或 ~/.djb）")
@@ -2803,7 +2803,7 @@ def build_parser() -> argparse.ArgumentParser:
                       "启动托盘壳（Windows/macOS；只发动作建议，不执行命令）")
     tray.add_argument("--interval-ms", type=int, default=5000,
                       help="刷新间隔（毫秒，默认 5000）")
-    tray.add_argument("--title", default="DJB 联脑", help="窗口 / 菜单栏标题前缀")
+    tray.add_argument("--title", default="TokenBank 联脑", help="窗口 / 菜单栏标题前缀")
 
     proxy = add_common(cmd_proxy, "proxy",
                        "显示 S4 代理偏好（composition / effort / proxy_mode；只打印不联网）")

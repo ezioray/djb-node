@@ -291,7 +291,7 @@ class DesktopApp:
     PAGE_FADE_MS = 33
 
     def __init__(self, controller: DesktopController, *, root: Any = None,
-                 tk: Any = None, title: str = "DJB 联脑 · 桌面控制台",
+                 tk: Any = None, title: str = "TokenBank 联脑 · 桌面控制台",
                  bus: Any | None = None, on_quit: Any = None,
                  prefs_home: Any = None) -> None:
         # DPI：必须在 Tk() 之前开感知（PMv2 → per-monitor → system 三级回退，幂等）
@@ -688,7 +688,7 @@ class DesktopApp:
             outline=dual.chart("mint_bright"))
         logo.create_text(self._px(12), self._px(12), text="D", fill=dual.color("ink"),
                          font=fonts.sans(kit.px("h2"), bold=True))
-        tk.Label(brand, text="DJB 联脑", font=fonts.sans(kit.px("h2"), bold=True),
+        tk.Label(brand, text="TokenBank 联脑", font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("ink"), background=dual.color("surface")).pack(
                      side="left", padx=(8, 0))
         self._brand_sub = tk.Label(brand, text="· 节点工作台",
@@ -1483,7 +1483,7 @@ class DesktopApp:
             from tkinter import messagebox
         except Exception:                            # pragma: no cover - 极简 Tk
             return
-        title = "DJB / 收款地址提交成功" if ok else "DJB / 收款地址没提交成功"
+        title = ("TokenBank / 收款地址提交成功" if ok else "TokenBank / 收款地址没提交成功")
         try:
             if ok:
                 messagebox.showinfo(title, text, parent=root)
@@ -4029,7 +4029,7 @@ class DesktopApp:
         # 2026-11-20：**显式给空初始值**。之前没传 initialvalue，客户看到输入框里
         # 预填着网页端地址（URL 其实在 message 里），以为「绑定码就是那个地址」，
         # 点 OK 就把 URL 当码提交了（真机复现，报 binding_code_unknown）。
-        value = simpledialog.askstring("DJB / 绑定网页端", message, parent=self._root,
+        value = simpledialog.askstring("TokenBank / 绑定网页端", message, parent=self._root,
                                        initialvalue="")
         return str(value).strip() if value else None
 
@@ -4154,7 +4154,7 @@ class DesktopApp:
         window = tk.Toplevel(self._root)
         dual.apply(window, ttk, self._theme_name)
         self._apply_kit_skin()                     # 同上：option 数据库是解释器级的，别被改回 11pt
-        window.title("DJB / 确认本机控制")
+        window.title("TokenBank / 确认本机控制")
         window.geometry("560x260")
         choice = [False]
         body = ttk.Frame(window, padding=20)
@@ -4653,7 +4653,7 @@ def _default_home() -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="djb desktop", description="DJB 联脑桌面控制台（12 视图）")
+    parser = argparse.ArgumentParser(prog="djb desktop", description="TokenBank 联脑桌面控制台（12 视图）")
     parser.add_argument("--home", help="本机数据目录（默认 $DJB_HOME 或 ~/.djb）")
     parser.add_argument("--view", default="overview", choices=VIEW_KEYS,
                         help="启动时打开的视图")

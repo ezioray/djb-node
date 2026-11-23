@@ -2244,7 +2244,7 @@ def NEXT_STEP_FOR(reason: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
-    parser = argparse.ArgumentParser(prog="djb-daemon", description="DJB 联脑 M15 daemon")
+    parser = argparse.ArgumentParser(prog="djb-daemon", description="TokenBank 联脑 M15 daemon")
     parser.add_argument("--home")
     parser.add_argument("--port", type=int)
     parser.add_argument("--token")

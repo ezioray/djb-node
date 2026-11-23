@@ -12,7 +12,8 @@ def test_tray_command_registered_with_defaults() -> None:
     args = parser.parse_args(["tray"])
     assert args.command == "tray"
     assert args.interval_ms == 5000
-    assert args.title == "DJB 联脑"
+    # 2026-11-24 R2 · D16 品牌替换：托盘标题前缀统一 TokenBank（服务名/环境变量不动）
+    assert args.title == "TokenBank 联脑"
     assert callable(args.handler)
 
 
