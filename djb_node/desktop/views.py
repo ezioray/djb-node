@@ -122,13 +122,13 @@ class NavSection:
 #: 约束：13 项不删不并；``token_plan`` 必须仍在 ``access`` 之前（既有产品语义），
 #: 因此它落在「收益」组末尾——先看到「共享了什么、还能共享多少」，再进「接入」动手。
 NAV_SECTIONS: tuple[NavSection, ...] = (
-    NavSection("run", "运行", "RUN",
+    NavSection("run", "运行", "运行",
                ("overview", "bench", "gpu", "models", "tasks")),
-    NavSection("earn", "收益", "EARN",
+    NavSection("earn", "收益", "收益",
                ("receipts", "earnings", "token_plan")),
-    NavSection("connect", "接入", "CONNECT",
+    NavSection("connect", "接入", "接入",
                ("agent", "access")),
-    NavSection("system", "系统", "SYSTEM",
+    NavSection("system", "系统", "系统",
                ("yield", "account", "logs")),
 )
 
@@ -143,29 +143,30 @@ VIEWS: tuple[tuple[str, str], ...] = tuple(
 )
 VIEW_KEYS: tuple[str, ...] = tuple(key for key, _ in VIEWS)
 
-#: 页头眉标的**页名**部分（拉丁；纯 ASCII，可交给 mono 字族）
+#: 页头眉标的**页名**部分（中文；2026-11-23 R2.1 ⑤ 起不再用拉丁，英文残留 0 处）
 PAGE_MICROS: dict[str, str] = {
-    "overview": "OVERVIEW",
-    "bench": "BENCH",
-    "gpu": "GPU",
-    "models": "MODELS",
-    "tasks": "TASKS",
-    "receipts": "RECEIPTS",
-    "earnings": "EARNINGS",
-    "token_plan": "TOKEN PLAN",
-    "agent": "AGENT",
-    "access": "ACCESS",
-    "yield": "YIELD",
-    "account": "ACCOUNT",
-    "logs": "LOGS",
+    "overview": "总览",
+    "bench": "性能基准",
+    "gpu": "显卡监控",
+    "models": "模型与探针",
+    "tasks": "任务队列",
+    "receipts": "收据",
+    "earnings": "收益",
+    "token_plan": "提供套餐",
+    "agent": "接入向导",
+    "access": "本机设置",
+    "yield": "让路与节能",
+    "account": "账户与安全",
+    "logs": "运行日志",
 }
 
 
 def page_kicker(key: str) -> str:
-    """页头面包屑眉标：``组名 / 页名`` 两级（如 ``RUN / OVERVIEW``）。
+    """页头面包屑眉标：``组名 / 页名`` 两级（如 ``运行 / 总览``）。
 
     为什么是两级：页头标题（中文 18px）只说「是哪一页」，眉标补上「在哪一组」，
-    侧栏收起（窄窗下拉）时也不会失去位置感。整串是 ASCII，走 mono 不会跳基线。
+    侧栏收起（窄窗下拉）时也不会失去位置感。2026-11-23 R2.1 ⑤ 起整串中文
+    （英文眉标残留 0 处），所以走 sans 字族，不再交给 mono。
     """
     return SECTION_FOR_VIEW[key].micro + " / " + PAGE_MICROS[key]
 

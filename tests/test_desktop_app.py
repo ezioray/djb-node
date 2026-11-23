@@ -308,8 +308,8 @@ def test_page_kickers_come_from_the_ia_table():
     from djb_node.desktop.views import page_kicker
 
     assert desktop_app.PAGE_KICKERS == {key: page_kicker(key) for key in VIEW_KEYS}
-    assert desktop_app.PAGE_KICKERS["account"] == "SYSTEM / ACCOUNT"
-    assert desktop_app.PAGE_KICKERS["receipts"] == "EARN / RECEIPTS"
+    assert desktop_app.PAGE_KICKERS["account"] == "系统 / 账户与安全"
+    assert desktop_app.PAGE_KICKERS["receipts"] == "收益 / 收据"
 
 
 def test_looks_numeric_knows_money_tokens_and_units():
@@ -519,11 +519,11 @@ def test_content_width_follows_canvas_across_views_and_resizes(tmp_path):
         root.destroy()
 
 
-def test_page_kicker_label_shows_two_level_ascii_for_account(tmp_path):
+def test_page_kicker_label_shows_two_level_chinese_for_account(tmp_path):
     app, root = _window_app(tmp_path, 1440)
     try:
         app.show_view("account")
         root.update()
-        assert app._page_kicker.cget("text") == "SYSTEM / ACCOUNT"
+        assert app._page_kicker.cget("text") == "系统 / 账户与安全"
     finally:
         root.destroy()

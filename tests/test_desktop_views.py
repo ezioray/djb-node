@@ -24,10 +24,11 @@ SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "模型与探针", "任�
                "日志"]
 #: 分组口径（00-PLAN §1.1 已裁决）：组 key / 中文名 / 拉丁微标 / 成员顺序
 SPEC_SECTIONS = [
-    ("run", "运行", "RUN", ["overview", "bench", "gpu", "models", "tasks"]),
-    ("earn", "收益", "EARN", ["receipts", "earnings", "token_plan"]),
-    ("connect", "接入", "CONNECT", ["agent", "access"]),
-    ("system", "系统", "SYSTEM", ["yield", "account", "logs"]),
+    # 2026-11-23 R2.1 ⑤：微标中文化（英文眉标残留 0 处），组顺序/成员一个不差
+    ("run", "运行", "运行", ["overview", "bench", "gpu", "models", "tasks"]),
+    ("earn", "收益", "收益", ["receipts", "earnings", "token_plan"]),
+    ("connect", "接入", "接入", ["agent", "access"]),
+    ("system", "系统", "系统", ["yield", "account", "logs"]),
 ]
 #: 合规红线：不许出现「许愿式」金融承诺。**唯一例外**是 owner 2026-11-16 D-2 那句结算口径
 #: （`views.SETTLE_NOTE`，原话里含「提现」）；除它之外任何地方出现「提现」都算违规——
@@ -70,18 +71,19 @@ def test_nav_sections_follow_the_agreed_groups():
     assert [section.key for section in vw.NAV_SECTIONS] == ["run", "earn", "connect", "system"]
 
 
-def test_every_page_kicker_is_two_level_ascii():
-    """页头眉标 =「组名 / 页名」两级；整串 ASCII，交给 mono 不会跳基线。"""
+def test_every_page_kicker_is_two_level_chinese():
+    """B3 / R2.1 ⑤：页头眉标 =「组名 / 页名」两级；**不含英文**（英文残留 0 处）。"""
+    from djb_node.desktop import ia
     for key in vw.VIEW_KEYS:
         kicker = vw.page_kicker(key)
-        assert kicker.isascii(), kicker
+        assert not ia.has_english(kicker), kicker
         parts = kicker.split(" / ")
         assert len(parts) == 2, kicker
         assert parts[0] == vw.SECTION_FOR_VIEW[key].micro
         assert parts[1] == vw.PAGE_MICROS[key]
-    assert vw.page_kicker("overview") == "RUN / OVERVIEW"
-    assert vw.page_kicker("token_plan") == "EARN / TOKEN PLAN"
-    assert vw.page_kicker("logs") == "SYSTEM / LOGS"
+    assert vw.page_kicker("overview") == "运行 / 总览"
+    assert vw.page_kicker("token_plan") == "收益 / 提供套餐"
+    assert vw.page_kicker("logs") == "系统 / 运行日志"
 
 
 def test_every_view_renders_from_demo_data():

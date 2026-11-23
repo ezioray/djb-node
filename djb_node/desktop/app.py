@@ -55,7 +55,7 @@ NAV_ICONS = {
     "logs": "list",
 }
 
-#: 页头眉标：**组名 / 页名** 两级（B3），如 ``RUN / OVERVIEW``。
+#: 页头眉标：**组名 / 页名** 两级（B3），如 ``运行 / 总览``（2026-11-23 起全中文）。
 #:
 #: 这是 **0.3.4 口径**的派生（组名来自 ``views.NAV_SECTIONS``），保留给旧调用方与截图基线；
 #: 窗口实际用的是实例级 ``self._ia_kickers``（跟着 ``DJB_UI_IA`` 走，回滚时与本表逐项相等）。
@@ -710,7 +710,7 @@ class DesktopApp:
         ident = tk.Frame(side, background=ground)
         ident.pack(fill="x", padx=16, pady=(14, 10))
         self._ident = ident
-        tk.Label(ident, text="NODE / EDGE", font=fonts.mono(kit.px("micro")),
+        tk.Label(ident, text="本机节点", font=fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground, anchor="w").pack(fill="x")
         self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.px("h2"), bold=True),
                                     foreground=dual.color("ink"), background=ground, anchor="w")
@@ -911,7 +911,7 @@ class DesktopApp:
         self._pagehead = head
         left = tk.Frame(head, background=dual.color("bg"))
         left.grid(row=0, column=0, sticky="w", padx=(self._px(26), 0), pady=(self._px(12), self._px(12)))
-        self._page_kicker = tk.Label(left, text="OVERVIEW", font=fonts.for_text("OVERVIEW", kit.px("micro")),
+        self._page_kicker = tk.Label(left, text="总览", font=fonts.for_text("总览", kit.px("micro")),
                                      foreground=dual.color("muted_text"),
                                      background=dual.color("bg"), anchor="w")
         self._page_kicker.pack(anchor="w")

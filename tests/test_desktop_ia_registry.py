@@ -35,9 +35,9 @@ def test_thirteen_pages_are_mounted_exactly_once():
 
 
 def test_share_group_is_first_and_starts_with_token_plan():
-    """§2：首屏第一组 = 共享 SHARE，首项 = 共享 Token Plan（≤1 次点击）。"""
+    """§2：首屏第一组 = 共享，首项 = 共享 Token Plan（≤1 次点击）。"""
     first = ia.IA_SECTIONS_SHARE[0]
-    assert (first.key, first.title, first.micro) == ("share", "共享", "SHARE")
+    assert (first.key, first.title, first.micro) == ("share", "共享", "共享")
     assert first.keys[0] == ia.FOCUS_KEY == "token_plan"
 
 
@@ -69,8 +69,9 @@ def test_five_groups_in_the_documented_order():
     assert [section.key for section in ia.IA_SECTIONS_SHARE] == [
         "share", "run", "earn", "connect", "system",
     ]
+    # 2026-11-23 R2.1 ⑤：眉标中文化（英文残留 0 处），组名与微标同词
     assert [section.micro for section in ia.IA_SECTIONS_SHARE] == [
-        "SHARE", "RUN", "EARN", "CONNECT", "SYSTEM",
+        "共享", "运行", "收益", "接入", "系统",
     ]
 
 
@@ -124,7 +125,7 @@ def test_validator_catches_mutations(table, expected):
 
 def test_validator_catches_a_page_registered_in_the_wrong_section():
     pages = dict(ia.PAGES)
-    pages["gpu"] = ia.PageSpec("gpu", "GPU 监控", "GPU", "share", beta=True,
+    pages["gpu"] = ia.PageSpec("gpu", "GPU 监控", "显卡监控", "share", beta=True,
                                subtitle="GPU 监控（BETA）")
     assert any("不一致" in problem for problem in ia.violations(pages=pages))
 

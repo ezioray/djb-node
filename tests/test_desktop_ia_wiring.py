@@ -56,7 +56,7 @@ def test_legacy_has_no_beta_badge_and_no_new_order():
 
 
 def test_legacy_kickers_match_0_3_4_page_kicker():
-    """回滚时页头眉标逐项等于 ``views.page_kicker``（``RUN / OVERVIEW`` 那套）。"""
+    """回滚时页头眉标逐项等于 ``views.page_kicker``（``运行 / 总览`` 那套）。"""
     for key in VIEW_KEYS:
         assert desktop_app.nav_kicker(LEGACY, key) == views.page_kicker(key)
     # 模块级常量仍是 0.3.4 口径（给旧调用方/截图基线的兼容面）
@@ -99,10 +99,10 @@ def test_beta_badge_is_only_on_gpu():
 
 
 def test_share_kickers_follow_the_new_sections():
-    assert desktop_app.nav_kicker(SHARE, "token_plan") == "SHARE / TOKEN PLAN"
-    assert desktop_app.nav_kicker(SHARE, "models") == "SHARE / MODELS"
-    assert desktop_app.nav_kicker(SHARE, "gpu") == "SYSTEM / GPU"
-    assert desktop_app.nav_kicker(SHARE, "agent") == "CONNECT / AGENT"
+    assert desktop_app.nav_kicker(SHARE, "token_plan") == "共享 / 提供套餐"
+    assert desktop_app.nav_kicker(SHARE, "models") == "共享 / 模型与探针"
+    assert desktop_app.nav_kicker(SHARE, "gpu") == "系统 / 显卡监控"
+    assert desktop_app.nav_kicker(SHARE, "agent") == "接入 / 接入向导"
     # 与 0.3.4 相比确实变了（证明新表真的生效，而不是回滚表）
     changed = [key for key in VIEW_KEYS
                if desktop_app.nav_kicker(SHARE, key) != desktop_app.nav_kicker(LEGACY, key)]

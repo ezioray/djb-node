@@ -19,7 +19,8 @@
     系统 SYSTEM   yield, gpu, account, logs      ← GPU 降到系统组，标 BETA
 
 校验（:func:`violations`，全部可执行）：13 项恰好覆盖一次、``token_plan`` 在 ``access`` 之前、
-首组首项 == ``token_plan``、``gpu`` 不在前 5 项、``gpu`` 带 BETA 副标、眉标纯 ASCII。
+首组首项 == ``token_plan``、``gpu`` 不在前 5 项、``gpu`` 带 BETA 副标、眉标**不含英文**
+（2026-11-23 R2.1 ⑤：侧栏与页头眉标全部中文化，英文残留 0 处）。
 
 为什么 ``legacy`` 表也留在这里
 ==============================
@@ -41,9 +42,10 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 __all__ = [
-    "FOCUS_KEY", "IA_SECTIONS_LEGACY", "IA_SECTIONS_SHARE", "IA_MODES", "MIN_GPU_INDEX",
-    "IaDecision", "PageSpec", "RegionSpec", "SectionSpec", "flat_keys", "index_of",
-    "nav_sections", "page", "resolve_ia", "section_for", "violations",
+    "FOCUS_KEY", "IA_SECTIONS_LEGACY", "IA_SECTIONS_SHARE", "IA_MODES", "LATIN_LETTERS",
+    "MIN_GPU_INDEX", "IaDecision", "PageSpec", "RegionSpec", "SectionSpec", "flat_keys",
+    "has_english", "index_of", "nav_sections", "page", "resolve_ia", "section_for",
+    "violations",
 ]
 
 #: 首屏第一组、一屏可见的「共享 Token Plan」——产品主路径（§1 现状：它原来是第 8 项）
@@ -55,6 +57,17 @@ MIN_GPU_INDEX = 5
 #: 可选的 IA 模式：``share``（默认，方案 A）/ ``legacy``（0.3.4 旧顺序，仅排障）
 IA_MODES: tuple[str, ...] = ("share", "legacy")
 
+#: 眉标里**不许**出现的拉丁字母（R2.1 ⑤：侧栏 / 页头眉标全中文，英文残留 0 处）。
+#:
+#: 只查 A–Z/a–z：数字、空格、``/``、``·`` 与中文照常允许（「组名 / 页名」两级结构不变）。
+#: 刻意不用 ``re``：本模块要保持「只依赖 dataclasses/typing」的纯数据边界。
+LATIN_LETTERS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+
+def has_english(text: object) -> bool:
+    """眉标/微标里是否还有英文字母（数字与分隔符不算）。"""
+    return any(ch in LATIN_LETTERS for ch in str(text or ""))
+
 
 @dataclass(frozen=True)
 class SectionSpec:
@@ -62,7 +75,7 @@ class SectionSpec:
 
     key: str            # 组 key（英文小写，测试/样式用）
     title: str          # 中文组名（侧栏分组头主文案）
-    micro: str          # 拉丁微标（只放 ASCII，别让中文进 mono）
+    micro: str          # 中文微标（2026-11-23 起不用拉丁；英文残留 0 处）
     keys: tuple[str, ...]   # 组成员，顺序即侧栏顺序
 
 
@@ -72,7 +85,7 @@ class PageSpec:
 
     key: str
     title: str              # 侧栏标题（中文）
-    kicker: str             # 页头眉标的页名部分（纯 ASCII，可交给 mono）
+    kicker: str             # 页头眉标的页名部分（中文；不再用拉丁）
     section: str            # 所属分组 key（与 :class:`SectionSpec.key` 对应）
     subtitle: str = ""      # 页头副标（如 GPU 的 BETA 说明）
     beta: bool = False      # 是否为滞后/BETA 能力（渲染层加徽标，并降主 CTA 权重）
@@ -81,7 +94,7 @@ class PageSpec:
 
 #: 方案 A：5 组、共享前置（02-IA-TOKENPLAN §2）
 IA_SECTIONS_SHARE: tuple[SectionSpec, ...] = (
-    SectionSpec("share", "共享", "SHARE", ("token_plan", "models")),
+    SectionSpec("share", "共享", "共享", ("token_plan", "models")),
     # 2026-11-20 IA v2（owner：「导航分类还是不合理」）：按**用户要办的事**重排，
     # 不按后端模块排。上一版的毛病：本机设置挂在「共享」下（它不是共享）、
     # 「接入」只剩一个 Agent 接入（一组的价值撑不起一组）、让路/节能挂在「系统」里
@@ -92,38 +105,38 @@ IA_SECTIONS_SHARE: tuple[SectionSpec, ...] = (
     #   收益 EARN     赚了多少：收据、收益
     #   接入 CONNECT  这台机器怎么接上云端和我的账号：Agent 接入、本机设置、账户与安全
     #   系统 SYSTEM   出问题才来：GPU 监控（BETA）、日志
-    SectionSpec("run", "运行", "RUN", ("overview", "yield", "bench", "tasks")),
-    SectionSpec("earn", "收益", "EARN", ("receipts", "earnings")),
-    SectionSpec("connect", "接入", "CONNECT", ("agent", "access", "account")),
-    SectionSpec("system", "系统", "SYSTEM", ("gpu", "logs")),
+    SectionSpec("run", "运行", "运行", ("overview", "yield", "bench", "tasks")),
+    SectionSpec("earn", "收益", "收益", ("receipts", "earnings")),
+    SectionSpec("connect", "接入", "接入", ("agent", "access", "account")),
+    SectionSpec("system", "系统", "系统", ("gpu", "logs")),
 )
 
 #: 0.3.4 现状（回滚路径）：4 组，与 ``views.NAV_SECTIONS`` 逐项一致
 IA_SECTIONS_LEGACY: tuple[SectionSpec, ...] = (
-    SectionSpec("run", "运行", "RUN", ("overview", "bench", "gpu", "models", "tasks")),
-    SectionSpec("earn", "收益", "EARN", ("receipts", "earnings", "token_plan")),
-    SectionSpec("connect", "接入", "CONNECT", ("agent", "access")),
-    SectionSpec("system", "系统", "SYSTEM", ("yield", "account", "logs")),
+    SectionSpec("run", "运行", "运行", ("overview", "bench", "gpu", "models", "tasks")),
+    SectionSpec("earn", "收益", "收益", ("receipts", "earnings", "token_plan")),
+    SectionSpec("connect", "接入", "接入", ("agent", "access")),
+    SectionSpec("system", "系统", "系统", ("yield", "account", "logs")),
 )
 
 #: 页面注册表：13 项一个不少、一个不并（§1 约束）
 PAGES: dict[str, PageSpec] = {
-    "token_plan": PageSpec("token_plan", "提供 Token Plan", "TOKEN PLAN", "share",
+    "token_plan": PageSpec("token_plan", "提供 Token Plan", "提供套餐", "share",
                            subtitle="接入 / 模型清单 / 逐模型底价 / 探针"),
-    "models": PageSpec("models", "模型与探针", "MODELS", "share"),
-    "access": PageSpec("access", "本机设置", "ACCESS", "connect",
+    "models": PageSpec("models", "模型与探针", "模型与探针", "share"),
+    "access": PageSpec("access", "本机设置", "本机设置", "connect",
                        subtitle="价格模式 / 节点凭证 / 配置文件（绑定与收款在「账户与安全」）"),
-    "overview": PageSpec("overview", "总览", "OVERVIEW", "run"),
-    "bench": PageSpec("bench", "性能基准", "BENCH", "run"),
-    "tasks": PageSpec("tasks", "任务队列", "TASKS", "run"),
-    "receipts": PageSpec("receipts", "收据", "RECEIPTS", "earn"),
-    "earnings": PageSpec("earnings", "收益", "EARNINGS", "earn"),
-    "agent": PageSpec("agent", "Agent 接入", "AGENT", "connect"),
-    "yield": PageSpec("yield", "暂停接单", "YIELD", "run"),
-    "gpu": PageSpec("gpu", "GPU 监控", "GPU", "system", beta=True,
+    "overview": PageSpec("overview", "总览", "总览", "run"),
+    "bench": PageSpec("bench", "性能基准", "性能基准", "run"),
+    "tasks": PageSpec("tasks", "任务队列", "任务队列", "run"),
+    "receipts": PageSpec("receipts", "收据", "收据", "earn"),
+    "earnings": PageSpec("earnings", "收益", "收益", "earn"),
+    "agent": PageSpec("agent", "Agent 接入", "接入向导", "connect"),
+    "yield": PageSpec("yield", "暂停接单", "让路与节能", "run"),
+    "gpu": PageSpec("gpu", "GPU 监控", "显卡监控", "system", beta=True,
                     subtitle="GPU 监控（BETA）· 共享算力为后续能力，当前仅本机监控"),
-    "account": PageSpec("account", "账户与安全", "ACCOUNT", "connect"),
-    "logs": PageSpec("logs", "日志", "LOGS", "system"),
+    "account": PageSpec("account", "账户与安全", "账户与安全", "connect"),
+    "logs": PageSpec("logs", "日志", "运行日志", "system"),
 }
 
 
@@ -177,8 +190,8 @@ def violations(sections: Sequence[SectionSpec] | None = None,
     for section in table:
         if not section.keys:
             problems.append(f"分组 {section.key} 是空组")
-        if not section.micro.isascii():
-            problems.append(f"分组 {section.key} 的微标含非 ASCII：{section.micro!r}")
+        if has_english(section.micro):
+            problems.append(f"分组 {section.key} 的微标还有英文：{section.micro!r}")
         for key in section.keys:
             if key not in registry:
                 problems.append(f"分组 {section.key} 含未注册页面 {key}")
@@ -200,10 +213,8 @@ def violations(sections: Sequence[SectionSpec] | None = None,
             continue
         if spec.section != owner.key:
             problems.append(f"{key}: 注册表 section={spec.section} 与分组表 {owner.key} 不一致")
-        if not spec.kicker.isascii():
-            problems.append(f"{key}: 眉标含非 ASCII：{spec.kicker!r}")
-        if spec.kicker != spec.kicker.upper():
-            problems.append(f"{key}: 眉标应全大写：{spec.kicker!r}")
+        if has_english(spec.kicker):
+            problems.append(f"{key}: 眉标还有英文：{spec.kicker!r}")
 
     # 3) 产品主路径：token_plan 一屏可见、在 access 之前
     focus = index_of(FOCUS_KEY, table)
