@@ -1496,6 +1496,12 @@ def _receipts(snapshot: Snapshot) -> View:
     else:
         verify_meta = "本机无副本 " + str(no_local) + " 张" + (
             "；不一致 " + str(mismatch) + " 张" if mismatch else "")
+    # F39（2026-11-24 真机）：datasource 在「没有行」时把 note 也写成「还没有收据」，
+    # 而空表本身已经印了一次 —— 同一句话在一页里出现两遍。空表时这条 note 与空态重复，丢掉。
+    _empty = _empty_text(snapshot, "receipts", "还没有收据")
+    _note = str(receipts.get("note") or "")
+    if not rows and _note.strip() == _empty.strip():
+        _note = ""
     return View(
         key="receipts", title="收据",
         subtitle="每张收据都有平台签名，本机可以独立核对；对不上就是有问题",
@@ -1504,8 +1510,7 @@ def _receipts(snapshot: Snapshot) -> View:
                Card("本机已验证", _count(snapshot, "receipts", str(verified) + " 张"),
                     verify_meta, "mint" if verified else "muted")),
         table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(rows),
-                    note=str(receipts.get("note") or ""),
-                    empty=_empty_text(snapshot, "receipts", "还没有收据"),
+                    note=_note, empty=_empty,
                     narrow_hide=("时间", "Tokens"),
                     narrow_headers=(("本机校验", "校验"),), title="收据明细"),
         actions=(Action("receipts.verify", "校验选中收据", enabled=bool(rows),

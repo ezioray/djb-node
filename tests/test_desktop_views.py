@@ -1846,3 +1846,10 @@ def test_receipts_subtitle_has_no_internal_jargon():
     snapshot = ds.Snapshot(dict(demo_snapshot().sections))
     view = vw.build_view("receipts", snapshot)
     assert "Merkle" not in view.subtitle
+
+
+def test_empty_receipts_page_says_it_once():
+    """F39：空收据页把「还没有收据」印了两遍（空态 + note 各一次）。"""
+    snapshot = ds.Snapshot({"receipts": {"rows": [], "origin": "cloud", "note": "还没有收据"}})
+    text = vw.build_view("receipts", snapshot).plain_text()
+    assert text.count("还没有收据") == 1
