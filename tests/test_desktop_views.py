@@ -1757,3 +1757,32 @@ def test_cli_credential_line_uses_customer_wording():
     assert cli._storage_label("file-0600") == "仅本机可读（0600）"
     assert cli._storage_label("") == "—"
     assert cli._storage_label("future-backend") == "future-backend"
+
+
+def test_token_plan_action_bar_is_grouped_by_step():
+    """F30：七颗按钮一行，1360px 宽时右侧被裁；分组后每组 ≤4 颗。"""
+    view = vw.build_view("token_plan", _token_plan_snapshot(upstreams=()))
+    groups = vw.action_groups(view.actions)
+    assert len(groups) >= 2
+    assert [t for t, _ in groups] == ["第 1 步 · 接入", "第 2 步 · 测试与保存",
+                                     "第 3 步 · 定价与上报"]
+    for title, members in groups:
+        assert len(members) <= 4, title + " 一行有 " + str(len(members)) + " 颗"
+
+
+def test_unavailable_reason_has_no_nested_parentheses_or_cli_terms():
+    """F31：真机显示「暂不可用（这项数据平台还没开通（不是你的配置问题））」双层括号 +
+    「本地已应用 暂不可用 · model-sync 状态」里的 CLI 子命令名。"""
+    from djb_node.desktop import datasource as dsrc
+
+    src = object.__new__(dsrc.LocalDataSource)
+    src._offline_reason = ""
+    src.notes = []
+    src._cloud = object()
+    try:
+        dsrc.LocalDataSource._cloud_call(src, "model_catalog")
+    except dsrc.ProviderError as exc:
+        assert "（" not in exc.reason and "(" not in exc.reason, exc.reason
+    view = vw.build_view("models", ds.Snapshot(dict(demo_snapshot().sections)))
+    text = view.plain_text()
+    assert "model-sync" not in text

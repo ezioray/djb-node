@@ -742,7 +742,7 @@ class LocalDataSource:
                 _event("desktop.cloud_call.missing", method=str(method))
             except Exception:
                 pass
-            raise ProviderError("这项数据平台还没开通（不是你的配置问题）",
+            raise ProviderError("这项数据平台还没开通 —— 不是你的配置问题",
                                 hint="本页其它块照常可用；平台开通后点「刷新」自动恢复")
         try:
             return handler(*args, **kwargs)

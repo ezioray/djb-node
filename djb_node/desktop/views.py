@@ -1362,7 +1362,7 @@ def _models(snapshot: Snapshot) -> View:
                Card("从未探测", str(counts["never"]) + " 个",
                     "点「立即探测」补一次", "amber" if counts["never"] else "muted"),
                Card("本地已应用", _count(snapshot, "models", str(len(local)) + " 个"),
-                    "model-sync 状态", "default")),
+                    "本地同步状态", "default")),
         table=probe_table,
         tables=(Table(("模型", "上下文", "状态", "原因 / 说明"), tuple(catalog_rows),
                       note=str(models.get("note") or ""), empty="云端目录暂不可用", title="模型目录"),),
@@ -1761,14 +1761,18 @@ def _token_plan(snapshot: Snapshot) -> View:
     # 现在拆成两颗，各自跳到真正能做这件事的地方：
     #   * 添加上游 → 本页「添加接入」（第 1 步就在下方，item 11 落地表单）
     #   * 绑定节点 → 账户与安全（绑定的唯一位）
+    # F30（2026-11-24 真机）：七颗按钮挤一行，1360px 宽时右侧被裁（「开启中继接入」只露一半）。
+    # 按「第 1 步 / 第 2 步」分组，每组一行 ≤4 颗。
     plan_actions = [Action("token_plan.add_upstream", "添加上游（填请求地址与密钥）",
-                           primary=True)]
+                           primary=True, group="第 1 步 · 接入")]
     if bound is True:
         plan_actions.append(Action("token_plan.bind_node", "已绑定这台电脑", enabled=False,
+                                   group="第 1 步 · 接入",
                                    reason="已绑定 · 解绑/换绑在「账户与安全」"))
     else:
-        plan_actions.append(Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）"))
-    plan_actions.append(Action("token_plan.refresh", "刷新"))
+        plan_actions.append(Action("token_plan.bind_node", "绑定这台电脑（拿共享收益）",
+                                   group="第 1 步 · 接入"))
+    plan_actions.append(Action("token_plan.refresh", "刷新", group="第 1 步 · 接入"))
 
     # ── RC14 I/J：一 Key 多模型 + 逐模型底价（三步同页）
     bids = plan.get("bids") if isinstance(plan.get("bids"), Mapping) else {}
@@ -1846,21 +1850,22 @@ def _token_plan(snapshot: Snapshot) -> View:
         # 拿到「N 个模型 / X ms」再决定要不要保存接入。
         Action("token_plan.test_connectivity",
                "测试中…（进行中）" if conn_state == "running" else "测试联通性",
+               group="第 2 步 · 测试与保存",
                enabled=conn_state != "running",
                reason="正在测试这一条：结果出来会自动更新（不用重复点）"
                if conn_state == "running" else ""),
-        Action("token_plan.discover", "读取模型清单并保存接入"),
+        Action("token_plan.discover", "读取模型清单并保存接入", group="第 2 步 · 测试与保存"),
         # relay 接入开关默认关闭；以前只在 CLI 报错可见，GUI 表现为「点了没反应」。
         # 这里给一键开启（flag 自带 owner/expire/rollback，失败会回话）。
-        Action("token_plan.enable_relay", "开启中继接入（一次）"),
+        Action("token_plan.enable_relay", "开启中继接入（一次）", group="第 2 步 · 测试与保存"),
         # F4：「点了没反应」是缺陷。这两颗不再置灰（置灰的按钮点了不播报），
         # 前提不满足时由动作回一句人话（「先在上面的表格里选一行模型」…）。
-        Action("token_plan.save_price", "保存这一行"),
-        Action("token_plan.preview_report", "预览将上报的内容"),
+        Action("token_plan.save_price", "保存这一行", group="第 3 步 · 定价与上报"),
+        Action("token_plan.preview_report", "预览将上报的内容", group="第 3 步 · 定价与上报"),
         # 上报默认关闭（云端 ask-settings / quotes.models[] 未开通）：置灰 + 说清原因，
         # 绝不点下去假成功
         Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,
-               reason=report_blocker),
+               group="第 3 步 · 定价与上报", reason=report_blocker),
     ])
     # 2026-11-19（全功能 UX 复查）：七颗按钮同一视觉权重，客户不知道「下一步是哪颗」。
     # 主操作随阶段走：没上游 → 添加上游；有上游没清单 → 读取清单；有清单 → 上报（不可用时退预览）。
@@ -2054,7 +2059,7 @@ def _access(snapshot: Snapshot) -> View:
                              reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
                                      + _diag_hint(diag) + "）") if not node_id else ""),
                  Action("access.reset_node", "重新注册这台机器（清退恢复）", danger=True,
-                        group="维护（不可逆）", enabled=retired,
+                        group="维护", enabled=retired,
                         # 2026-11-19 验收 P3：旧文案把「只有被清退才需要」与「当前原因：
                         # daemon 未运行」糊成一句，daemon 没跑时读起来自相矛盾。
                         # 拆成两条独立原因：节点没跑就只说「先启动节点」。
@@ -2064,10 +2069,10 @@ def _access(snapshot: Snapshot) -> View:
                               if not daemon.get("running")
                               else "只有节点被云端清退后才需要（当前原因："
                                    + str(daemon.get("reason") or "—") + "）")),
-                 Action("access.reload", "请求 daemon 重载", group="维护（不可逆）"),
+                 Action("access.reload", "请求 daemon 重载", group="维护"),
                  # 搬走的两个入口在这里只留**指路**（不是按钮）：本页不能做，就别假装能做
                  Action("access.goto_account", "绑定与收款在「账户与安全」",
-                        group="维护（不可逆）")),
+                        group="维护")),
         unavailable=_missing(snapshot, ("access",)),
         notes=(str(access.get("note") or ""),
                *(() if node_id else tuple(
