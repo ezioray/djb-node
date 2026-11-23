@@ -6,6 +6,15 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.5.24 · 2026-11-24
+
+**概览「最近收据」同样把空态说了两遍（F39 同款）**。`__version__` / `pyproject.toml` /
+Chart `appVersion` 同源到 `0.5.24`；无协议契约变更。
+
+- 空表时 `note`（「还没有收据」）与空态（「还没有收据（完成后自动生成）」）是同一件事，
+  只留后面那句；有行时 note 照旧显示。
+- 新增 1 条回归测试。
+
 ## 0.5.23 · 2026-11-24
 
 **键盘翻不到折线以下（F33，P1）**。`__version__` / `pyproject.toml` / Chart `appVersion`

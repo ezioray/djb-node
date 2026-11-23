@@ -1853,3 +1853,10 @@ def test_empty_receipts_page_says_it_once():
     snapshot = ds.Snapshot({"receipts": {"rows": [], "origin": "cloud", "note": "还没有收据"}})
     text = vw.build_view("receipts", snapshot).plain_text()
     assert text.count("还没有收据") == 1
+
+
+def test_overview_recent_receipts_says_empty_once():
+    """F39 同款（概览「最近收据」）：空表 + note 都在说「还没有收据」。"""
+    snapshot = ds.Snapshot({"receipts": {"rows": [], "origin": "cloud", "note": "还没有收据"}})
+    text = vw.build_view("overview", snapshot).plain_text()
+    assert text.count("还没有收据") == 1

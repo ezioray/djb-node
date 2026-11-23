@@ -680,6 +680,16 @@ def _count(snapshot: Snapshot, name: str, text: str) -> str:
 
 
 
+
+def _recent_receipts_note(receipts: Mapping[str, Any]) -> str:
+    """F39 同款：概览「最近收据」空表时 note 和空态说的是同一件事，只留一处。"""
+    rows = receipts.get("rows") or ()
+    note = str(receipts.get("note") or "").strip()
+    if not rows and "还没有收据" in note:
+        return ""
+    return note
+
+
 def _local_time(raw: Any) -> str:
     """云端时间戳 → 本地时间（F46：真机把 `2026-11-23T20:38:09.651933Z` 原样印出来）。
 
@@ -1121,7 +1131,7 @@ def _overview(snapshot: Snapshot) -> View:
         table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(recent),
                     narrow_hide=("时间", "Tokens"),
                     narrow_headers=(("本机校验", "校验"),),
-                    note=str(receipts.get("note") or ""),
+                    note=_recent_receipts_note(receipts),
                     empty="还没有收据（完成后自动生成）", title="最近收据"),
         # 设计样新增：左栏主卡 + 节奏图，右栏三卡（数据仍全部来自上面这些既有数据域）
         hero=_hero(snapshot),
