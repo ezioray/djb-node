@@ -934,7 +934,10 @@ def _hero(snapshot: Snapshot) -> Hero:
         if accepting is True:
             body = "自动暂停已开启，当前允许接单"
         elif accepting is False:
-            body = "自动暂停已开启，当前不接新任务"
+            # F50（2026-11-24 真机）：云端说「不接新任务」、本机状态却是 online —— 两个真相源
+            # 打架。不许只挑一边说，也不许沉默：把不一致摆到客户眼前，并给下一步。
+            body = ("云端标记「不接新任务」，但本机仍在接单 —— 两边对不上；"
+                    "点右上「刷新」重试，仍不一致请到「诊断」页导出日志")
         elif state == "online":
             body = "自动暂停已开启，当前允许接单（按节点状态推断）"
         else:

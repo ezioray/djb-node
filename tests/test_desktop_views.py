@@ -1860,3 +1860,12 @@ def test_overview_recent_receipts_says_empty_once():
     snapshot = ds.Snapshot({"receipts": {"rows": [], "origin": "cloud", "note": "还没有收据"}})
     text = vw.build_view("overview", snapshot).plain_text()
     assert text.count("还没有收据") == 1
+
+
+def test_overview_surfaces_cloud_local_disagreement():
+    """F50：云端 accepting=False 而本机 online 时，卡片不许只挑一边说。"""
+    section = {"node": {"state": "online"},
+               "yield": {"mode": "auto", "accepting": False}}
+    text = vw.build_view("overview", ds.Snapshot(section)).plain_text()
+    if "正在接单" in text and "云端标记" in text:
+        assert "对不上" in text
