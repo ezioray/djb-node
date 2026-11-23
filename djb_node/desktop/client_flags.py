@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """客户端壳层特性开关（R2.4 S1/S3/S4）：**默认关闭 + 三字段齐全 + 到期强制关**。
 
-为什么不写进 ``facts.FEATURE_FLAGS``
-====================================
+唯一登记表
+==========
 
-``facts.py`` 是全队唯一的开关登记表，但它不在本任务的写域（改了要 lead 批）。
-本模块只登记 **桌面壳层自己的** 两个开关，形状与 ``facts.FEATURE_FLAGS`` 逐字一致
-（``default / owner / expire_at / rollback_rule / description``），求值走同一个入口
-:func:`djb_node.config.feature_flag`（环境变量 > 配置 > 默认值），并在这里补上
-``expire_at`` 强制关 —— 因为 ``config.flag_expired`` 只认 ``facts`` 里已登记的开关。
+开关元数据**只认** ``djb_node.facts.FEATURE_FLAGS``（lead 2026-11-24 批准扩写域后，
+本模块原来那两份自建登记已并入 facts，见 :data:`facts.STARTUP_SKELETON_FLAG` /
+:data:`facts.SNAPSHOT_CACHE_FLAG`）。本模块只做三件事：
 
-> 待 lead 决定：是否把这两条**照抄**进 ``facts.FEATURE_FLAGS``（推荐抄：那样
-> ``tests/test_feature_flags.py`` 的唯一登记表口径也能覆盖到它们）。本模块的
-> ``CLIENT_FLAGS`` 就是抄写用的源文本，键名/字段一字不差。
+1. 把名字收窄成常量（:data:`SKELETON_FLAG` / :data:`CACHE_FLAG`），桌面端不写字面量；
+2. 求值统一走 :func:`djb_node.config.feature_flag`（环境变量 > 配置 > 登记表默认值）；
+3. 到期强制关走 :func:`djb_node.config.flag_expired`（只认 facts 已登记的开关）。
+
+一致性由 ``tests/test_feature_flags.py::test_desktop_flags_come_from_the_registry`` 钉住：
+本模块读到的每个字段都必须与 facts 逐字相同，且未登记的名字一律 ``False``。
 
 回滚
 ====
@@ -28,7 +29,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import Any, Mapping
+
+from .. import facts
 
 __all__ = ["ClientFlag", "CLIENT_FLAGS", "SKELETON_FLAG", "CACHE_FLAG",
            "enabled", "describe"]
@@ -53,32 +56,30 @@ class ClientFlag:
             raise ValueError("开关三字段不齐（owner/expire_at/rollback_rule）：" + self.name)
 
 
-SKELETON_FLAG = "client.startup_skeleton"
-CACHE_FLAG = "client.snapshot_cache"
+SKELETON_FLAG = facts.STARTUP_SKELETON_FLAG
+CACHE_FLAG = facts.SNAPSHOT_CACHE_FLAG
+
+
+def _from_registry(name: str) -> ClientFlag | None:
+    """从唯一登记表取一条；没登记/形状不对就 ``None``（调用方按关闭处理）。"""
+    spec = facts.FEATURE_FLAGS.get(name)
+    if not isinstance(spec, Mapping):
+        return None
+    try:
+        return ClientFlag(name=name, default=spec.get("default"),
+                          owner=str(spec.get("owner") or ""),
+                          expire_at=str(spec.get("expire_at") or ""),
+                          rollback_rule=str(spec.get("rollback_rule") or ""),
+                          description=str(spec.get("description") or ""))
+    except (TypeError, ValueError):        # 登记表被改坏 → 当作没登记（fail-closed）
+        return None
+
 
 CLIENT_FLAGS: dict[str, ClientFlag] = {
-    SKELETON_FLAG: ClientFlag(
-        name=SKELETON_FLAG, default=False, owner="ezio", expire_at="2026-12-31",
-        rollback_rule="置 false 即回旧行为：首屏不画骨架，直接等第一次快照（0.5.10 行为）",
-        description="启动先出壳+骨架（首屏 ≤1.5s），数据到了再填内容"),
-    CACHE_FLAG: ClientFlag(
-        name=CACHE_FLAG, default=False, owner="ezio", expire_at="2026-12-31",
-        rollback_rule="置 false 即回旧行为：启动不读/不写快照缓存，每次实时取数",
-        description="启动用上次快照缓存先画（零网络首屏），随后后台刷新替换"),
+    flag.name: flag
+    for flag in (_from_registry(SKELETON_FLAG), _from_registry(CACHE_FLAG))
+    if flag is not None
 }
-
-
-def _expired(spec: ClientFlag, *, today: date | None = None) -> bool:
-    """``expire_at`` 当日仍有效，次日起强制关（与 ``config.flag_expired`` 同口径）。"""
-    from datetime import datetime, timezone
-
-    try:
-        year, month, day = (int(part) for part in str(spec.expire_at).split("-"))
-    except Exception:                     # 元数据坏了 = fail-closed
-        return True
-    ref = today if isinstance(today, date) and not isinstance(today, datetime) \
-        else datetime.now(timezone.utc).date()
-    return ref > date(year, month, day)
 
 
 def enabled(name: str, *, config: Any = None, today: date | None = None) -> bool:
@@ -86,11 +87,11 @@ def enabled(name: str, *, config: Any = None, today: date | None = None) -> bool
     spec = CLIENT_FLAGS.get(str(name))
     if spec is None:
         return False
-    if _expired(spec, today=today):
-        return False
-    from ..config import feature_flag
+    from ..config import feature_flag, flag_expired
 
     try:
+        if flag_expired(spec.name, today=today):      # 到期当日仍有效，次日起强制关
+            return False
         return bool(feature_flag(config, spec.name, today=today))
     except Exception:                     # 配置坏了也按关闭处理（fail-closed）
         return False

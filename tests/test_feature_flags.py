@@ -37,7 +37,10 @@ EXPIRE_OVERRIDES = {facts.PLAN_GROUPS_FLAG: "2027-06-30",
                     # RC14 B/I：设计 §5.4 给这两条定的是 2027-03-31（引导与竞价 UI 一起收敛）
                     facts.ONBOARDING_FLAG: "2027-03-31",
                     facts.UPSTREAM_BID_FLAG: "2027-03-31",
-                    facts.DEVICE_FLOW_FLAG: "2027-03-31"}
+                    facts.DEVICE_FLOW_FLAG: "2027-03-31",
+                    # R2.4 桌面壳层（node-dev，2026-11-24）：骨架/缓存先跑到年底复核
+                    facts.STARTUP_SKELETON_FLAG: "2026-12-31",
+                    facts.SNAPSHOT_CACHE_FLAG: "2026-12-31"}
 
 
 def test_every_flag_has_three_fields_and_default_off():
@@ -233,3 +236,39 @@ def test_flag_readers_inherit_expiry(monkeypatch):
     monkeypatch.setattr("djb_node.config._utc_today", lambda: date(2031, 1, 1))
     assert relay_enabled(on) is False
     assert attestation_enabled(on) is False
+
+
+# ── R2.4：桌面壳层两个开关必须与 facts 唯一登记表**逐字一致** ─────────────
+
+
+def test_desktop_flags_come_from_the_registry():
+    """desktop/client_flags 不许自建第二份元数据：读到的每个字段都要等于 facts。"""
+    from djb_node.desktop import client_flags
+
+    assert client_flags.SKELETON_FLAG == facts.STARTUP_SKELETON_FLAG
+    assert client_flags.CACHE_FLAG == facts.SNAPSHOT_CACHE_FLAG
+    for name in (client_flags.SKELETON_FLAG, client_flags.CACHE_FLAG):
+        spec = facts.FEATURE_FLAGS[name]
+        read = client_flags.CLIENT_FLAGS[name]
+        assert read.default is spec["default"] is False
+        for field_name in ("owner", "expire_at", "rollback_rule", "description"):
+            assert getattr(read, field_name) == spec[field_name], name + "." + field_name
+        assert client_flags.describe()
+    # 描述里那两条必须都出现（describe 是取证/排障用的，不许漏项）
+    described = {item["name"] for item in client_flags.describe()}
+    assert described == {client_flags.SKELETON_FLAG, client_flags.CACHE_FLAG}
+
+
+def test_desktop_flags_follow_config_env_and_expiry():
+    """求值口径与全队一致：默认关、配置可开、环境变量可压、到期强制关、未登记一律关。"""
+    from djb_node.desktop import client_flags
+
+    assert client_flags.enabled(client_flags.SKELETON_FLAG, config=ClientConfig()) is False
+    on = make_config(feature_flags={client_flags.CACHE_FLAG: True})
+    assert client_flags.enabled(client_flags.CACHE_FLAG, config=on) is True
+    assert client_flags.enabled(client_flags.CACHE_FLAG, config=on,
+                                today=date(2026, 12, 31)) is True      # 到期当日仍有效
+    assert client_flags.enabled(client_flags.CACHE_FLAG, config=on,
+                                today=date(2027, 1, 1)) is False       # 次日强制关
+    assert client_flags.enabled("client.not.registered", config=on) is False
+    assert client_flags.enabled("", config=on) is False

@@ -778,6 +778,28 @@ FEATURE_FLAGS["client.onboarding.enabled"] = {
 }
 ONBOARDING_FLAG = "client.onboarding.enabled"
 
+# ── R2.4 桌面壳层（启动骨架 / 快照缓存；默认关闭，三字段齐全，到期强制关）
+# 由 node-dev 在 lead 批准扩写域后从 desktop/client_flags.py **照抄**进唯一登记表
+# （2026-11-24，CHG-20261123-R2-4）：原来的两份登记已合一，client_flags.py 只读本表。
+# 两条都是**纯界面/本机缓存**开关：不影响契约、不影响云端、不写账本。
+FEATURE_FLAGS["client.startup_skeleton"] = {
+    "default": False,
+    "owner": "ezio",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "置 false 即回旧行为：首屏不画骨架，直接等第一次快照（0.5.10 行为）",
+    "description": "启动先出壳+骨架（首屏 ≤1.5s），数据到了再填内容（R2.4 S1）",
+}
+STARTUP_SKELETON_FLAG = "client.startup_skeleton"
+
+FEATURE_FLAGS["client.snapshot_cache"] = {
+    "default": False,
+    "owner": "ezio",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "置 false 即回旧行为：启动不读/不写快照缓存，每次启动都实时取数",
+    "description": "启动用上次快照缓存先画（零网络首屏），随后后台刷新替换（R2.4 S3/S4）",
+}
+SNAPSHOT_CACHE_FLAG = "client.snapshot_cache"
+
 # ── RC14 I/J 逐模型底价上报（默认关闭：云端 ask-settings / schedule-quotes.models[]
 # 还没有主线实现，见 CHG-2026-11-14-RC14-IMPL §3-B.9；三字段齐全、到期强制关）
 FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
