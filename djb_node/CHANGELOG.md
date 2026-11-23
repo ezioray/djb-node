@@ -6,16 +6,26 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.5.20 · 2026-11-24
+
+**更正 0.5.19 的 CHANGELOG 措辞**（0.5.19 已发布，内容不改，只更正文字）。
+`__version__` / `pyproject.toml` / Chart `appVersion` 同源到 `0.5.20`。
+
+- 0.5.19 条目里「一次启动拉起两个 daemon」不成立：多出来的是 PyInstaller onefile 的
+  引导父进程，`daemon.started` 每次启动只有一条。闸门保留为防御性加固。
+- 无代码行为变化（`spawn.lock` 逻辑与 0.5.19 相同）。
+
 ## 0.5.19 · 2026-11-24
 
-**一次启动拉起两个 daemon（F36）**。`__version__` / `pyproject.toml` / Chart `appVersion`
-同源到 `0.5.19`；无协议契约变更，无新增依赖。
+**启动闸门（防御性加固；原报的「一次拉起两个 daemon」经复核为误判）**。
+`__version__` / `pyproject.toml` / Chart `appVersion` 同源到 `0.5.19`；无协议契约变更，无新增依赖。
 
-- 真机 04:18:36 / 04:18:38 各起一个 `djb-node` 子进程，后一个才因单实例检查退出。
-  这段时间两个进程都会写 `runtime/daemon.pid`、都会试着轮换 `client_key` —— 竞态窗口。
-- 修法：`bootstrap.start_daemon` 的「探测 → 拉起 → 等应答」段加跨进程闸门
-  `runtime/spawn.lock`（`O_CREAT|O_EXCL`）。抢不到锁就返回 `spawning`，界面说
-  「节点正在启动（已有一个启动请求，稍等几秒）」而不是再拉一个。
+- **更正**：真机上一次启动后进程表里能看到 2–3 个 `djb-node`，但 `logs/djb.log` 的
+  `daemon.started` 每次启动**只有一条**——多出来的是 PyInstaller onefile 的引导父进程，
+  不是第二个 daemon。原描述「一次拉起两个 daemon」不成立，此处更正。
+- 加固：`bootstrap.start_daemon` 的「探测 → 拉起 → 等应答」段仍加跨进程闸门
+  `runtime/spawn.lock`（`O_CREAT|O_EXCL`）。抢不到锁返回 `spawning`，桌面端说
+  「节点正在启动（已有一个启动请求，稍等几秒）」，不再重复 spawn。
 - 残锁（进程崩了没删）超过 20 秒直接抢过来 —— fail-open，绝不因为一把锁让节点起不来。
 - 新增 2 条回归测试（并发只放一个 / 残锁可抢）。
 
