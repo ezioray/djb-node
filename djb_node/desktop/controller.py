@@ -108,6 +108,37 @@ BIND_CODE_HINT = "；绑定码一次性、10 分钟有效——请到网页端�
 _BIND_CODE_REASONS = ("binding_code_expired", "binding_code_mismatch", "40905", "过期", "失效")
 
 
+def _now_iso() -> str:
+    """界面状态里的时间戳（本地时区，精确到秒；**不写日志、不进快照**）。"""
+    from datetime import datetime
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+def _host_of(base_url: str) -> str:
+    """从请求地址里取 host:port 给人看（不带 path/query —— 地址正文不进界面文案）。"""
+    text = str(base_url or "").strip()
+    if not text:
+        return "（未填地址）"
+    rest = text.split("://", 1)[-1]
+    host = rest.split("/", 1)[0]
+    return host or text
+
+
+def _connectivity_next_step(error_class: str, status: Any) -> str:
+    """联通失败的**下一步**：按错误类别给可执行动作（不是一句「失败了」）。"""
+    code = str(error_class or "")
+    if code in ("unauthorized", "forbidden") or status in (401, 403):
+        return "下一步：密钥不对或没有权限 —— 重新粘一次 Key（注意别带空格），再点「测试联通性」"
+    if code == "no_models_api" or status == 404:
+        return ("下一步：地址要指到兼容 OpenAI 的 /v1（例如 https://api.openai.com/v1），"
+                "不要带 /chat/completions")
+    if code in ("invalid_payload", "bad_json"):
+        return "下一步：这个地址回的不是模型列表 —— 确认是 OpenAI 兼容网关，而不是网页首页"
+    if code in ("unreachable", "timeout", "tls_error", "connection"):
+        return "下一步：本机连不上这个域名 —— 查网络/代理/证书，或换一个能访问的地址"
+    return "下一步：核对「请求地址 / 协议 / 密钥」三项后重试；本次未保存任何配置"
+
+
 def _cooldown_suffix(controller: Any, exc: Any) -> str:
     """失败文案后缀：冷却类错误补上「可再改时间 X（来自云端上一轮返回）」。"""
     from . import payout as payout_mod
@@ -211,6 +242,12 @@ class DesktopController:
     discover_via: Callable[[str, str, str], Any] | None = None
     #: 最近一次「读取模型清单」的结果（``datasource.discover_upstream_models`` 原样）
     last_discover: Mapping[str, Any] | None = None
+    #: R2.1 ③：联通测试的**界面状态**（唯一来源；视图只读，不自己记）
+    #: 形状：``{"state": "running"|"ok"|"fail", "text": …, "next": …, "at": …, "target": …}``
+    connectivity: Mapping[str, Any] | None = None
+    #: 联通测试异步通道 ``(payload) -> bool``；返回 True = 已派给 worker。
+    #: 没有通道（单测/无 Tk）就**同步**跑一次，行为与旧版一致但会立刻写状态。
+    connectivity_via: Callable[[Mapping[str, Any]], Any] | None = None
     #: CR-20261119-CLIENT-TOKENPLAN-NOOP F3：最近一次「读取模型清单」的**人话结论**
     #: （读到几个 + 有没有落成上游）。写进视图 note，不再依赖会被下一次刷新播报覆盖的状态条。
     discover_message: str = ""
@@ -269,6 +306,8 @@ class DesktopController:
                     merged_plan["selected_price"] = self._bids().price_of(selected_model)
                 except Exception:
                     merged_plan["selected_price"] = ""
+            # R2.1 ③：联通测试状态也由本层注入（视图只读，不自己记「进行中」）
+            merged_plan["connectivity"] = self.connectivity_state()
             if self.discover_message:
                 # F3：发现结论（含「已添加上游 / 未保存」）优先，且**常驻页面**
                 merged_plan["discover_note"] = self.discover_message
@@ -1328,21 +1367,72 @@ class DesktopController:
                             + "）：现在点「读取模型清单并保存接入」就能落地。",
                             effect="refresh")
 
+    CONNECTIVITY_IDLE_TEXT = "还没测过：填好请求地址与密钥后点「测试联通性」"
+
+    def connectivity_state(self) -> dict[str, Any]:
+        """视图读的联通状态（永远有话说：没测过也有「下一步」）。"""
+        state = dict(self.connectivity or {})
+        if not state:
+            return {"state": "idle", "text": self.CONNECTIVITY_IDLE_TEXT,
+                    "next": "点「测试联通性」验证地址与密钥；只探活，不保存任何配置",
+                    "at": "", "target": ""}
+        return state
+
     def _act_token_plan_test_connectivity(self, *, confirm=None) -> ActionResult:
-        """「测试联通」：只探活 + 拉清单，**不写任何配置**（真做之前先验一次）。"""
+        """「测试联通性」：**先回状态、再干活**（R2.1 ③：点击 200ms 内必须有文字变化）。
+
+        旧实现把网络调用放在 Tk 主线程里：点下去窗口就冻住，客户不知道点没点上（真机
+        「点了没反应」）。现在两段式 —— 主线程只写状态 + 派发，网络在 worker 线程跑，
+        结束时把结论写回同一份状态并让页面重画。
+        """
         base_url = str(self.drafts.get("base_url") or "").strip()
         protocol = str(self.drafts.get("protocol") or "").strip()
         secret = str(self.drafts.get("upstream_secret") or "").strip()
         if not base_url:
-            return ActionResult("先填「请求地址」（例如 https://api.openai.com/v1）", ok=False)
+            text = "先填「请求地址」（例如 https://api.openai.com/v1）"
+            self.connectivity = {"state": "fail", "text": text, "target": "",
+                                 "next": "填完再点「测试联通性」；本机不会保存任何东西",
+                                 "at": _now_iso()}
+            return ActionResult(text, ok=False)
         fn = getattr(self.source, "discover_upstream_models", None)
         if not callable(fn):
             return ActionResult("暂不可用（当前数据源不支持联通测试）", ok=False)
+        if str((self.connectivity or {}).get("state") or "") == "running":
+            return ActionResult("正在测试这一条，稍等（结果出来会自动更新）", ok=True)
+        payload = {"base_url": base_url, "protocol": protocol, "secret": secret}
+        target = _host_of(base_url)
+        self.connectivity = {"state": "running", "target": target,
+                             "text": "进行中：正在连接 " + target + " …",
+                             "next": "通常 10 秒内出结果；失败会给下一步（地址/密钥/协议）",
+                             "at": _now_iso()}
+        via = self.connectivity_via
+        started = False
+        if via is not None:
+            try:
+                started = bool(via(payload))
+            except Exception:                            # 通道坏了 → 回落同步
+                started = False
+        if not started:
+            return self.run_connectivity(payload)        # 无 worker：同步跑一次（单测/无 Tk）
+        return ActionResult("进行中：正在连接 " + target + " …", effect="connectivity",
+                            payload=payload, fields={"base_url": ""})
+
+    def run_connectivity(self, payload: Mapping[str, Any]) -> ActionResult:
+        """worker 侧：真去探活 + 拉清单（**不写配置**），把结论翻成「结果 + 下一步」。"""
+        base_url = str(payload.get("base_url") or "").strip()
+        protocol = str(payload.get("protocol") or "").strip()
+        secret = str(payload.get("secret") or "").strip()
+        target = _host_of(base_url)
+        fn = getattr(self.source, "discover_upstream_models", None)
+        if not callable(fn):
+            return self._finish_connectivity("fail", target, "暂不可用（当前数据源不支持联通测试）",
+                                             "换一台已接通的机器，或看 logs/djb.log")
         try:
             result = fn(base_url, protocol, secret) or {}
         except Exception as exc:                        # noqa: BLE001 - 失败要给人话
-            return ActionResult("联通失败（" + type(exc).__name__ + "）；未保存任何配置",
-                                ok=False)
+            return self._finish_connectivity(
+                "fail", target, "联通失败（" + type(exc).__name__ + "）",
+                "确认地址能从本机访问（代理/防火墙），再点一次；未保存任何配置")
         error = str(result.get("error_class") or "")
         if error:
             # 2026-11-20：真机上只显示「连不上」，看不出是 401、404 还是 TLS 失败。
@@ -1355,16 +1445,27 @@ class DesktopController:
                        http_status=status if status is not None else "")
             except Exception:
                 pass
-            return ActionResult("联通失败：" + str(result.get("note") or error) + extra
-                                + "；未保存任何配置", ok=False)
+            return self._finish_connectivity(
+                "fail", target, "联通失败：" + str(result.get("note") or error) + extra,
+                _connectivity_next_step(error, status))
         total = int(result.get("total") or 0)
         mapped = int(result.get("mapped") or 0)
         latency = result.get("latency_ms")
         took = (" / " + str(int(latency)) + " ms") if isinstance(latency, (int, float)) else ""
-        return ActionResult("联通正常：读到 " + str(total) + " 个模型（能对上目录 "
-                            + str(mapped) + " 个）" + took + "；还没保存，确认无误再点"
-                            + "「读取模型清单并保存接入」。",
-                            payload={"state": "probe", "total": total})
+        message = ("联通正常：读到 " + str(total) + " 个模型（能对上目录 "
+                   + str(mapped) + " 个）" + took + "；还没保存，确认无误再点"
+                   + "「读取模型清单并保存接入」。")
+        return self._finish_connectivity(
+            "ok", target, message,
+            "下一步：点「读取模型清单并保存接入」把这些模型落成本地上游（这一步才写配置）",
+            total=total)
+
+    def _finish_connectivity(self, state: str, target: str, text: str, next_step: str,
+                            **extra: Any) -> ActionResult:
+        self.connectivity = {"state": state, "target": target, "text": text,
+                             "next": next_step, "at": _now_iso(), **extra}
+        return ActionResult(text, ok=(state == "ok"), effect="connectivity",
+                            payload={"state": state})
 
     def _act_token_plan_bind_node(self, *, confirm=None) -> ActionResult:
         """绑定只有**一个**入口（「账户与安全」）；这里只负责把客户送过去。"""

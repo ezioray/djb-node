@@ -399,6 +399,7 @@ class DesktopApp:
         self._ensure_update_worker()
         self._ensure_probe_worker()
         self._ensure_discover_worker()
+        self._ensure_connectivity_worker()
         self._controller.device_via = self._start_device_flow
         self._controller.device_notify = self._device_state_changed
         bind = getattr(self._root, "bind", None)
@@ -1504,6 +1505,60 @@ class DesktopApp:
         self._probe_worker = worker
         self._controller.probe_via = self._start_probe
         return worker
+
+    # ── R2.1 ③：联通测试 worker（网络在后台；主线程只写「进行中」+ 播报结果）
+    def _ensure_connectivity_worker(self) -> Any:
+        """惰性建联通测试 worker：与刷新/探针同一个 RefreshWorker 模板。"""
+        worker = getattr(self, "_connectivity_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(
+            lambda sections=None: self._controller.run_connectivity(
+                getattr(self, "_connectivity_payload", {}) or {}),
+            apply=self._apply_connectivity, on_busy=self._connectivity_busy,
+            schedule=schedule, cancel=cancel)
+        self._connectivity_worker = worker
+        self._controller.connectivity_via = self._start_connectivity
+        return worker
+
+    def _start_connectivity(self, payload: Mapping[str, Any]) -> bool:
+        worker = self._ensure_connectivity_worker()
+        if worker is None:
+            return False                   # 无事件循环 → controller 回落同步
+        self._connectivity_payload = dict(payload or {})
+        return bool(worker.start())
+
+    def _connectivity_busy(self) -> None:
+        self._toast("上一次测试还没结束：结果出来会自动更新", ok=True)
+
+    def _apply_connectivity(self, result: Any, error: BaseException | None,
+                            sections: Any = None) -> None:
+        """worker 回来：播报结论并**立刻重画本页**（结果区就是客户要看的那句话）。"""
+        if error is not None:
+            message = "联通测试中断（" + type(error).__name__ + "）：" + str(error)[:120]
+            ok = False
+        else:
+            message = str(getattr(result, "message", "") or "联通测试完成")
+            ok = bool(getattr(result, "ok", False))
+        self._toast(message, ok=ok)
+        # 状态在 controller 里，不用整轮取数：原地重画本页（不 reset 滚动位置，客户刚在哪还哪）
+        self._force_next_render = True
+        try:
+            self._render(self._controller.current(), force=True)
+            self._update_status()
+        except Exception:                          # pragma: no cover - 窗口已销毁
+            pass
 
     def _start_probe(self) -> bool:
         worker = self._ensure_probe_worker()
@@ -3488,6 +3543,19 @@ class DesktopApp:
             self._open_dir(result.payload)
         elif result.effect == "open_url":
             self._open_url(result.payload)
+        elif result.effect == "connectivity":
+            # R2.1 ③：动作已写好「进行中」并派了 worker；同步回落（无窗口）时结果已就绪
+            if str((result.payload or {}).get("state") or "") in ("ok", "fail"):
+                self._apply_connectivity(result, None)      # 同步回落：结论已就绪
+            else:
+                # 已派给 worker：先把「进行中」画上去（这就是 200ms 内要看到的那行字）
+                self._toast(str(result.message or "进行中…"), ok=True)
+                self._force_next_render = True
+                try:
+                    self._render(self._controller.current(), force=True)
+                    self._update_status()
+                except Exception:                  # pragma: no cover - 窗口已销毁
+                    pass
         elif result.effect == "probe":
             # 「已派发」由 _probe_started 播报；只有同步回落时这里才拿到最终结论，
             # 否则 worker 侧结束时 _apply_probe 播报（两条路都只播一次）

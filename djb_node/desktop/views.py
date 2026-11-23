@@ -1763,6 +1763,11 @@ def _token_plan(snapshot: Snapshot) -> View:
     preview_models = [item for item in (preview.get("models") or [])
                       if isinstance(item, Mapping)]
     discover_note = str(plan.get("discover_note") or "")
+    conn = plan.get("connectivity") if isinstance(plan.get("connectivity"), Mapping) else {}
+    conn_state = str(conn.get("state") or "idle")
+    conn_text = str(conn.get("text") or "")
+    conn_next = str(conn.get("next") or "")
+    conn_tone = {"ok": "mint", "fail": "red", "running": "amber"}.get(conn_state, "muted")
     fields = (
         Field("协议", str(plan.get("protocol") or ""), key="protocol", editable=True,
               choices=tuple(facts.UPSTREAM_PROTOCOLS),
@@ -1791,6 +1796,10 @@ def _token_plan(snapshot: Snapshot) -> View:
                     + "，费率以成交时服务端快照为准）")),
         Field("云端覆盖", cloud_text, key="bid_cloud",
               hint="生效顺序：云端覆盖 > 本机底价 > 未设价"),
+        # R2.1 ③：联通测试的**结果区**（进行中 / 成功 / 失败 + 下一步）。
+        # 以前点完只有状态栏一闪，客户回头看页面什么都看不到（真机「点了没反应」）。
+        Field("联通性", conn_text, key="connectivity_state", tone=conn_tone,
+              hint=conn_next),
     )
     if bid_rows:
         planned = "已设价 " + str(priced) + " / " + str(len(bid_rows)) + " 个模型"
@@ -1815,7 +1824,11 @@ def _token_plan(snapshot: Snapshot) -> View:
         # 桌面端根本没落盘，模型表永远空。
         # 2026-11-20：「测试联通」独立成一步 —— 先探活（只读、不写盘），
         # 拿到「N 个模型 / X ms」再决定要不要保存接入。
-        Action("token_plan.test_connectivity", "测试联通（不保存）"),
+        Action("token_plan.test_connectivity",
+               "测试中…（进行中）" if conn_state == "running" else "测试联通性",
+               enabled=conn_state != "running",
+               reason="正在测试这一条：结果出来会自动更新（不用重复点）"
+               if conn_state == "running" else ""),
         Action("token_plan.discover", "读取模型清单并保存接入"),
         # relay 接入开关默认关闭；以前只在 CLI 报错可见，GUI 表现为「点了没反应」。
         # 这里给一键开启（flag 自带 owner/expire/rollback，失败会回话）。
