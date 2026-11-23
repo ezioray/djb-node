@@ -234,7 +234,8 @@ def test_tasks_render_cloud_rows_with_origin():
     rows = source._tasks()["rows"]
     assert rows[0]["id"] == "t-1"
     text = text_of("tasks", source)
-    assert "t-1" in text and "来源：cloud" in text
+    # R2.1 ⑤：界面文案中文化 —— 数据来源显示「云端」而不是原始值 ``cloud``
+    assert "t-1" in text and "来源：云端" in text
 
 
 def test_tasks_page_cap_note_says_more_available():
