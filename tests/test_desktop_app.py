@@ -352,11 +352,13 @@ def test_sidebar_renders_the_five_group_ia_baseline(tmp_path, monkeypatch):
         assert len(app._nav_section_headers) == 5
         assert list(app._nav_buttons) == list(app._ia_order)
         assert list(app._ia_order) == list(ia.flat_keys())
-        assert app._ia_order[0] == "token_plan"                 # 共享前置
+        assert app._ia_order[0] == "agent"                      # D17：接入组带头
         for section in ia.IA_SECTIONS_SHARE:
             header = app._nav_section_headers[section.key]
             first = app._nav_buttons[section.keys[0]]
-            assert first.winfo_y() > header.winfo_y()
+            # D17 起成员装在每组自己的 body 帧里，winfo_y() 是相对 body 的；
+            # 用屏幕坐标比较「组标题在成员之上」才和父容器无关。
+            assert first.winfo_rooty() > header.winfo_rooty()
         # GPU 带 BETA 徽标（等宽 micro 档的右侧计数位），其它 12 项没有
         assert app._nav_buttons["gpu"].count == "BETA"
         assert [k for k, item in app._nav_buttons.items() if item.count] == ["gpu"]
@@ -390,7 +392,7 @@ def test_sidebar_legacy_rollback_matches_0_3_4(tmp_path, monkeypatch):
         for section in NAV_SECTIONS:
             header = app._nav_section_headers[section.key]
             first = app._nav_buttons[section.keys[0]]
-            assert first.winfo_y() > header.winfo_y()
+            assert first.winfo_rooty() > header.winfo_rooty()
         # 快捷键/下拉也跟着回滚：Ctrl+1 回到「总览」
         assert app._ia_order[0] == "overview"
         assert app._nav_combo.get().startswith("1 · 总览") or True   # 下拉状态由 _sync_nav 管
@@ -530,7 +532,7 @@ def test_page_kicker_label_shows_two_level_chinese_for_account(tmp_path, monkeyp
     try:
         app.show_view("account")
         root.update()
-        assert app._page_kicker.cget("text") == "接入 / 账户与安全"
+        assert app._page_kicker.cget("text") == "账户 / 账户与安全"
     finally:
         root.destroy()
     monkeypatch.setenv("DJB_UI_IA", "legacy")

@@ -413,6 +413,27 @@ def save_flag(name: str, value: bool, home: str | os.PathLike[str] | None = None
     return _write_prefs(path, payload)
 
 
+def load_list(name: str, home: str | os.PathLike[str] | None = None) -> list[str]:
+    """读一个「字符串列表」界面偏好（如侧栏折叠的组 key）；形状不对 → 空列表。
+
+    只收 ``list[str]``，元素去空白、丢空串；损坏的偏好文件一律当没设置（界面照常起）。
+    """
+    value = load_prefs(home).get(str(name))
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value
+            if isinstance(item, (str, int)) and str(item).strip()]
+
+
+def save_list(name: str, values: "list[str] | tuple[str, ...]",
+              home: str | os.PathLike[str] | None = None) -> Path:
+    """写一个字符串列表界面偏好（0600 原子替换，读改写，**保留其它键**）。"""
+    path = prefs_path(home)
+    payload = load_prefs(home)
+    payload[str(name)] = [str(item) for item in values]
+    return _write_prefs(path, payload)
+
+
 def load(home: str | os.PathLike[str] | None = None) -> str:
     """读主题偏好；文件缺失/损坏/值不认识 → 默认日间（界面照常起）。"""
     try:

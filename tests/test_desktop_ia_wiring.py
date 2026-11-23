@@ -38,10 +38,10 @@ def test_legacy_table_equals_0_3_4_nav_sections():
 def test_legacy_order_labels_and_icons_are_item_by_item_identical():
     """回滚模式下侧栏计划：分组数、顺序、标题、图标全与 0.3.4 一致。"""
     plan = desktop_app.nav_plan(LEGACY)
-    assert [section.key for section, _ in plan] == [s.key for s in views.NAV_SECTIONS]
-    flat = [item[0] for _, items in plan for item in items]
+    assert [section.key for section, _items, _folded in plan] == [s.key for s in views.NAV_SECTIONS]
+    flat = [item[0] for _section, items, _folded in plan for item in items]
     assert tuple(flat) == VIEW_KEYS
-    for _, items in plan:
+    for _section, items, _folded in plan:
         for key, label, icon, _badge in items:
             assert label == VIEW_TITLES[key]
             assert icon == desktop_app.NAV_ICONS[key]
@@ -49,7 +49,7 @@ def test_legacy_order_labels_and_icons_are_item_by_item_identical():
 
 def test_legacy_has_no_beta_badge_and_no_new_order():
     """BETA 徽标只在方案 A 出现：0.3.4 的侧栏没有这个标记，回滚要逐项相等。"""
-    badges = [item[3] for _, items in desktop_app.nav_plan(LEGACY) for item in items]
+    badges = [item[3] for _section, items, _folded in desktop_app.nav_plan(LEGACY) for item in items]
     assert badges == [""] * 13
     assert desktop_app.nav_order(LEGACY) == VIEW_KEYS
     assert desktop_app.nav_order(SHARE) != VIEW_KEYS          # 新基线的确换了顺序
@@ -75,10 +75,12 @@ def test_share_baseline_is_five_groups_and_thirteen_pages():
     sections = SHARE.sections
     assert SHARE.mode == "share"
     assert len(sections) == 5
-    assert [s.key for s in sections] == ["share", "run", "earn", "connect", "system"]
+    # D17（owner 2026-11-24）：五组 = 接入 / 共享 / 收益 / 账户 / 诊断
+    assert [s.key for s in sections] == ["connect", "share", "earn", "account", "diag"]
     order = desktop_app.nav_order(SHARE)
     assert len(order) == len(set(order)) == 13
-    assert order[0] == "token_plan"                           # 共享前置
+    assert order[0] == "agent"                                # 接入组带头
+    assert order.index("token_plan") < ia.MIN_GPU_INDEX        # 共享仍在一屏内
     assert order == ia.flat_keys(ia.IA_SECTIONS_SHARE)
     # 13 个页面一个不少、一个不并
     assert set(order) == set(ia.PAGES) == set(VIEW_KEYS)
@@ -88,12 +90,12 @@ def test_gpu_stays_out_of_the_first_screen():
     """§5.3：GPU 不许进前 N 项（首屏不出现 GPU 主 CTA）。"""
     order = desktop_app.nav_order(SHARE)
     assert order.index("gpu") >= ia.MIN_GPU_INDEX
-    assert ia.page("gpu").section == "system"
+    assert ia.page("gpu").section == "diag"
 
 
 def test_beta_badge_is_only_on_gpu():
     plan = desktop_app.nav_plan(SHARE)
-    badged = {key: badge for _, items in plan for key, _l, _i, badge in items if badge}
+    badged = {key: badge for _section, items, _folded in plan for key, _l, _i, badge in items if badge}
     assert badged == {"gpu": "BETA"}
     assert ia.page("gpu").beta and ia.page("gpu").subtitle.startswith("GPU 监控（BETA）")
 
@@ -101,7 +103,7 @@ def test_beta_badge_is_only_on_gpu():
 def test_share_kickers_follow_the_new_sections():
     assert desktop_app.nav_kicker(SHARE, "token_plan") == "共享 / 提供套餐"
     assert desktop_app.nav_kicker(SHARE, "models") == "共享 / 模型与探针"
-    assert desktop_app.nav_kicker(SHARE, "gpu") == "系统 / 显卡监控"
+    assert desktop_app.nav_kicker(SHARE, "gpu") == "诊断 / 显卡监控"
     assert desktop_app.nav_kicker(SHARE, "agent") == "接入 / 接入向导"
     # 与 0.3.4 相比确实变了（证明新表真的生效，而不是回滚表）
     changed = [key for key in VIEW_KEYS
@@ -112,7 +114,7 @@ def test_share_kickers_follow_the_new_sections():
 def test_shortcuts_follow_the_active_order():
     order = desktop_app.nav_order(SHARE)
     bindings = dict(desktop_app.view_shortcut_bindings(keys=order))
-    assert bindings["<Control-Key-1>"] == "token_plan"
+    assert bindings["<Control-Key-1>"] == "agent"
     # 2026-11-20 IA v2：Ctrl+9 绑的是**第 9 项**，不写死页面（重排后仍是 agent，但别把顺序钉进测试）
     assert bindings["<Control-Key-9>"] == order[8]
     # Shift+2 = @（X11 键名）落在第 11 项（Ctrl+1..9 占前九项，Shift+1..4 接后四项），
@@ -123,7 +125,7 @@ def test_shortcuts_follow_the_active_order():
 
 def test_combo_values_match_the_sidebar_order():
     values = desktop_app.nav_combo_values(SHARE)
-    assert values[0] == "1 · 提供 Token Plan"
+    assert values[0] == "1 · Agent 接入"
     assert values == tuple(str(i) + " · " + ia.page(key).title
                            for i, key in enumerate(desktop_app.nav_order(SHARE), start=1))
     assert desktop_app.nav_combo_values(LEGACY)[0] == "1 · " + VIEW_TITLES[VIEW_KEYS[0]]

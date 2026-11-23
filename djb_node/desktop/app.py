@@ -118,15 +118,20 @@ def nav_kicker(decision: ia.IaDecision, key: str) -> str:
     return (section.micro + " / " + spec.kicker) if section is not None else spec.kicker
 
 
-def nav_plan(decision: ia.IaDecision) -> tuple[tuple[ia.SectionSpec, tuple[tuple[str, str, str, str], ...]], ...]:
-    """侧栏渲染计划：(分组, ((key, 标题, 图标, 徽标), ...))——纯数据，可无窗口逐项断言。"""
+def nav_plan(decision: ia.IaDecision, collapsed: "set[str] | frozenset[str]" = frozenset(),
+             ) -> tuple[tuple[ia.SectionSpec, tuple[tuple[str, str, str, str], ...], bool], ...]:
+    """侧栏渲染计划：(分组, ((key, 标题, 图标, 徽标), ...), 是否折叠)——纯数据，可无窗口断言。
+
+    ``collapsed`` 是**已折叠**的组 key 集合；默认空集 = 全部展开（D17 的默认态）。
+    """
     plan = []
+    folded = set(collapsed or ())
     for section in decision.sections:
         # 徽标只在方案 A 显示：legacy 回滚必须与 0.3.4 **逐项相等**（旧版没有 BETA）
         items = tuple((key, ia.page(key).title, NAV_ICONS.get(key, "dot"),
                        "BETA" if (ia.page(key).beta and decision.mode != "legacy") else "")
                       for key in section.keys)
-        plan.append((section, items))
+        plan.append((section, items, section.key in folded))
     return tuple(plan)
 
 
@@ -378,6 +383,12 @@ class DesktopApp:
         # 偏好落在数据源自己的 home（临时 home 的窗口不会写真实 ~/.djb）
         self._prefs_home = prefs_home if prefs_home is not None else getattr(
             getattr(controller, "source", None), "_home", None)
+        #: D17：折叠状态记在客户端偏好（`theme.load_list("nav_collapsed")`），默认全展开。
+        #: 只认当前生效表里存在的组 key —— 换了 IA 表/回滚 legacy 时旧 key 不生效。
+        known_sections = {section.key for section in self._ia.sections}
+        self._collapsed_sections = {
+            key for key in dual.load_list("nav_collapsed", self._prefs_home)
+            if key in known_sections}
         self._fade_job = None
         self._theme_name = dual.load(self._prefs_home)
         #: RC15-039 #4：自动刷新（本机偏好，默认开）。关掉之后**一个定时器都不留**。
@@ -782,8 +793,11 @@ class DesktopApp:
         self._nav_inner.bind("<Configure>", self._on_nav_inner_resize)
         self._nav_canvas.bind("<Configure>", self._on_nav_canvas_resize)
         self._nav_section_headers: dict[str, Any] = {}
-        for index, (section, items) in enumerate(nav_plan(self._ia)):
-            self._render_nav_section(section, items, first=index == 0)
+        self._nav_section_bodies: dict[str, Any] = {}
+        self._nav_section_chevrons: dict[str, Any] = {}
+        for index, (section, items, folded) in enumerate(
+                nav_plan(self._ia, self._collapsed_sections)):
+            self._render_nav_section(section, items, first=index == 0, collapsed=folded)
         kit.Divider(side, color=dual.color("line")).pack(fill="x", padx=12)
         foot = tk.Frame(side, background=ground)
         foot.pack(fill="x", padx=16, pady=(8, 10))
@@ -816,7 +830,7 @@ class DesktopApp:
 
     def _render_nav_section(self, section: Any,
                             items: tuple[tuple[str, str, str, str], ...] = (),
-                            *, first: bool = False) -> None:
+                            *, first: bool = False, collapsed: bool = False) -> None:
         """一个分组：micro 档分组头（拉丁微标 + 中文组名）+ 该组导航项。
 
         分组/顺序/标题/徽标全部来自 :func:`nav_plan`（IA 单一数据源）；本方法只负责画。
@@ -827,6 +841,19 @@ class DesktopApp:
         ground = dual.color("surface3")
         head = tk.Frame(self._nav_inner, background=ground)
         head.pack(fill="x", padx=6, pady=(0 if first else 10, 2))
+        # D17：组标题可折叠（默认全展开，状态存客户端偏好）。整行可点，不只箭头——
+        # 鼠标目标 14px 字太小，客户会点不中。
+        chevron = tk.Label(head, text="▸" if collapsed else "▾",
+                           font=self._fonts.sans(kit.px("micro")),
+                           foreground=dual.color("muted_text"), background=ground, anchor="w")
+        chevron.pack(side="left", padx=(0, 4))
+        self._nav_section_chevrons[section.key] = chevron
+        for widget in (head, chevron):
+            widget.bind("<Button-1>", lambda _event, name=section.key: self._toggle_nav_section(name))
+            try:
+                widget.configure(cursor="hand2")
+            except Exception:                          # pragma: no cover - 平台不支持
+                pass
         tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground,
                  anchor="w").pack(side="left")
@@ -838,13 +865,58 @@ class DesktopApp:
                      foreground=dual.color("muted_text"), background=ground,
                      anchor="w").pack(side="left", padx=(6, 0))
         self._nav_section_headers[section.key] = head
+        body = tk.Frame(self._nav_inner, background=ground)
+        self._nav_section_bodies[section.key] = body
         for key, label, icon, badge in items:
-            item = kit.NavItem(self._nav_inner, text=label, icon=icon, count=badge,
+            item = kit.NavItem(body, text=label, icon=icon, count=badge,
                                ground=ground,
                                command=lambda name=key: self.show_view(name))
             self._a11y_name(item, label + ("（当前页）" if key == self._controller.view else ""))
             item.pack(fill="x", pady=1)
             self._nav_buttons[key] = item
+        if not collapsed:
+            body.pack(fill="x")
+
+    # ── D17：分组折叠（状态持久化在客户端偏好里，默认全展开）
+    def _toggle_nav_section(self, key: str) -> None:
+        """点组标题：展开 ⇄ 折叠，并把新状态写回偏好（写不进去也照样折叠，不弹错）。"""
+        self._set_nav_collapsed(key, key not in self._collapsed_sections)
+
+    def _set_nav_collapsed(self, key: str, collapsed: bool, *, persist: bool = True) -> None:
+        """落一次折叠状态：内存 → 控件 → 偏好文件（三步各自独立，任一步坏了不连坐）。"""
+        name = str(key or "")
+        if collapsed:
+            self._collapsed_sections.add(name)
+        else:
+            self._collapsed_sections.discard(name)
+        body = self._nav_section_bodies.get(name)
+        head = self._nav_section_headers.get(name)
+        if body is not None:
+            try:
+                if collapsed:
+                    body.pack_forget()
+                elif head is not None and not body.winfo_ismapped():
+                    body.pack(fill="x", after=head)
+            except Exception:                          # pragma: no cover - 控件已销毁
+                pass
+        chevron = self._nav_section_chevrons.get(name)
+        if chevron is not None:
+            try:
+                chevron.configure(text="▸" if collapsed else "▾")
+            except Exception:                          # pragma: no cover
+                pass
+        if persist:
+            try:
+                dual.save_list("nav_collapsed", sorted(self._collapsed_sections),
+                               self._prefs_home)
+            except Exception:                          # pragma: no cover - 只读 home
+                pass
+        on_resize = getattr(self, "_on_nav_inner_resize", None)
+        if callable(on_resize):
+            try:
+                on_resize()                            # 折叠后滚动区要重算
+            except Exception:                          # pragma: no cover
+                pass
 
     # ── 侧栏导航滚动（B2：900×620 下 13 项都能点到）
     def _on_nav_inner_resize(self, _event: Any = None) -> None:
@@ -1257,6 +1329,14 @@ class DesktopApp:
                 view = self._controller.show(key)
             except ValueError:                       # pragma: no cover - 与 route 双保险
                 return self._controller.current()
+        target_section = ia.section_for(key, self._ia.sections)
+        first_show = not getattr(self, "_shown_once", False)
+        if (not first_show and target_section is not None
+                and target_section.key in self._collapsed_sections):
+            # D17：**显式**去折叠组里的页 → 先把该组展开（选中项不许藏在收起的组里）。
+            # 首屏那次不算：否则启动落在总览就会把用户折叠的「诊断」组又掰开、还写回偏好，
+            # 折叠形同虚设（重启一次偏好就被改写）。
+            self._set_nav_collapsed(target_section.key, False)
         self._set_field_errors({})          # 切页清空上一页的字段红字（走查原话：跨页残留）
         self._clear_sticky()                # D4：上一页的失败提示也不许跟到下一页
         self._render(view, force=True)      # 切页 = 显式意图：布局/焦点都要重来
@@ -1269,6 +1349,7 @@ class DesktopApp:
             pass
         self._sync_content_width()                   # B4：换视图后内容宽仍 ≤ 画布宽
         self._page_fade()
+        self._shown_once = True
         return view
 
     def refresh(self) -> View | None:

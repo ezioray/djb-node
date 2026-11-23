@@ -43,7 +43,7 @@ from typing import Mapping, Sequence
 
 __all__ = [
     "FOCUS_KEY", "IA_SECTIONS_LEGACY", "IA_SECTIONS_SHARE", "IA_MODES", "LATIN_LETTERS",
-    "MIN_GPU_INDEX", "IaDecision", "PageSpec", "RegionSpec", "SectionSpec", "flat_keys",
+    "MIN_GPU_INDEX", "SECTION_ORDER", "IaDecision", "PageSpec", "RegionSpec", "SectionSpec", "flat_keys",
     "has_english", "index_of", "nav_sections", "page", "resolve_ia", "section_for",
     "violations",
 ]
@@ -92,23 +92,26 @@ class PageSpec:
     hidden: bool = False    # 不进侧栏（深链仍可达）
 
 
-#: 方案 A：5 组、共享前置（02-IA-TOKENPLAN §2）
+#: 侧栏分组序（D17 · owner 2026-11-24 裁决）：接入 / 共享 / 收益 / 账户 / 诊断。
+SECTION_ORDER: tuple[str, ...] = ("connect", "share", "earn", "account", "diag")
+
+#: D17 落地：**按模块**分五组，组内保留现有侧栏顺序；13 项不删不并、不改名。
+#:
+#: 记一次是**有意**的判断（owner 只给了五个组名，视图归属由开发按模块落表）：
+#:   接入 CONNECT  agent, access          这台机器怎么接上云端和我的账号
+#:   共享 SHARE    token_plan, models     我能拿什么去共享
+#:   收益 EARN     receipts, earnings     共享换回来多少钱
+#:   账户 ACCOUNT  yield, account         我的账户与接单策略（让路＝接单开关，属账户域）
+#:   诊断 DIAG     overview, bench, tasks, gpu, logs
+#:                                        机器现状与排障（总览/基准/队列/显卡/日志）
+#: 两处可争议：``yield``（也可放诊断）与 ``tasks``（也可放共享）；改一行就能换组，
+#: 票面已列对照表请 lead 复核。
 IA_SECTIONS_SHARE: tuple[SectionSpec, ...] = (
+    SectionSpec("connect", "接入", "接入", ("agent", "access")),
     SectionSpec("share", "共享", "共享", ("token_plan", "models")),
-    # 2026-11-20 IA v2（owner：「导航分类还是不合理」）：按**用户要办的事**重排，
-    # 不按后端模块排。上一版的毛病：本机设置挂在「共享」下（它不是共享）、
-    # 「接入」只剩一个 Agent 接入（一组的价值撑不起一组）、让路/节能挂在「系统」里
-    # （它是运行行为，天天要看的）而账户与安全藏在「系统」最深处。
-    #
-    #   共享 SHARE    我能卖什么：Token Plan、模型与探针
-    #   运行 RUN      机器现在怎么样：总览、让路/节能、性能基准、任务队列
-    #   收益 EARN     赚了多少：收据、收益
-    #   接入 CONNECT  这台机器怎么接上云端和我的账号：Agent 接入、本机设置、账户与安全
-    #   系统 SYSTEM   出问题才来：GPU 监控（BETA）、日志
-    SectionSpec("run", "运行", "运行", ("overview", "yield", "bench", "tasks")),
     SectionSpec("earn", "收益", "收益", ("receipts", "earnings")),
-    SectionSpec("connect", "接入", "接入", ("agent", "access", "account")),
-    SectionSpec("system", "系统", "系统", ("gpu", "logs")),
+    SectionSpec("account", "账户", "账户", ("yield", "account")),
+    SectionSpec("diag", "诊断", "诊断", ("overview", "bench", "tasks", "gpu", "logs")),
 )
 
 #: 0.3.4 现状（回滚路径）：4 组，与 ``views.NAV_SECTIONS`` 逐项一致
@@ -126,17 +129,17 @@ PAGES: dict[str, PageSpec] = {
     "models": PageSpec("models", "模型与探针", "模型与探针", "share"),
     "access": PageSpec("access", "本机设置", "本机设置", "connect",
                        subtitle="价格模式 / 节点凭证 / 配置文件（绑定与收款在「账户与安全」）"),
-    "overview": PageSpec("overview", "总览", "总览", "run"),
-    "bench": PageSpec("bench", "性能基准", "性能基准", "run"),
-    "tasks": PageSpec("tasks", "任务队列", "任务队列", "run"),
+    "overview": PageSpec("overview", "总览", "总览", "diag"),
+    "bench": PageSpec("bench", "性能基准", "性能基准", "diag"),
+    "tasks": PageSpec("tasks", "任务队列", "任务队列", "diag"),
     "receipts": PageSpec("receipts", "收据", "收据", "earn"),
     "earnings": PageSpec("earnings", "收益", "收益", "earn"),
     "agent": PageSpec("agent", "Agent 接入", "接入向导", "connect"),
-    "yield": PageSpec("yield", "暂停接单", "让路与节能", "run"),
-    "gpu": PageSpec("gpu", "GPU 监控", "显卡监控", "system", beta=True,
+    "yield": PageSpec("yield", "暂停接单", "让路与节能", "account"),
+    "gpu": PageSpec("gpu", "GPU 监控", "显卡监控", "diag", beta=True,
                     subtitle="GPU 监控（BETA）· 共享算力为后续能力，当前仅本机监控"),
-    "account": PageSpec("account", "账户与安全", "账户与安全", "connect"),
-    "logs": PageSpec("logs", "日志", "运行日志", "system"),
+    "account": PageSpec("account", "账户与安全", "账户与安全", "account"),
+    "logs": PageSpec("logs", "日志", "运行日志", "diag"),
 }
 
 
@@ -216,15 +219,22 @@ def violations(sections: Sequence[SectionSpec] | None = None,
         if has_english(spec.kicker):
             problems.append(f"{key}: 眉标还有英文：{spec.kicker!r}")
 
-    # 3) 产品主路径：token_plan 一屏可见、在 access 之前
+    # 3) 产品主路径：token_plan **一屏可见**（前 5 项）、且在 access 之前。
+    #    D17（2026-11-24）改成分模块五组后，首组变成「接入」——旧断言「首组首项必须是
+    #    token_plan」已不适用；owner 的口径是「按模块分组、组内保留现有顺序」，
+    #    因此把「一屏可见」钉成不变量，而不是钉死某个组的名字。
     focus = index_of(FOCUS_KEY, table)
-    access = index_of("access", table)
     if focus == -1:
         problems.append("共享 Token Plan 不在侧栏里")
-    if access != -1 and focus != -1 and focus >= access:
-        problems.append(f"token_plan（第 {focus + 1} 项）没有排在 access（第 {access + 1} 项）之前")
-    if table and table[0].keys and table[0].keys[0] != FOCUS_KEY:
-        problems.append(f"首组首项是 {table[0].keys[0]}，应为 {FOCUS_KEY}")
+    elif focus >= MIN_GPU_INDEX:
+        problems.append(f"token_plan 在侧栏第 {focus + 1} 项（要求前 {MIN_GPU_INDEX} 项内一屏可见）")
+    # 「token_plan 必须排在 access 之前」是 0.3.5 方案 A 的旧不变量；D17 让「接入」成为
+    # 首组后它必然不成立（access 在接入组、token_plan 在共享组），已按 owner 裁决作废。
+    # 3b) D17：五组、且顺序为 接入 / 共享 / 收益 / 账户 / 诊断
+    keys_order = tuple(section.key for section in table)
+    if keys_order != SECTION_ORDER:
+        problems.append("分组顺序是 " + " / ".join(keys_order)
+                        + "，应为 " + " / ".join(SECTION_ORDER))
 
     # 4) GPU 降级：不在前 5 项、并且带 BETA 标记
     gpu = index_of("gpu", table)
