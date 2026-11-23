@@ -769,6 +769,22 @@ class DesktopController:
     def _device_client(self):
         return getattr(self.source, "cloud", None)
 
+    # ── R2.1 ①：401 不是死路 —— 顶部横幅的「重新登录」只发一条**界面内**动作
+    def _act_auth_relogin(self, *, confirm=None) -> ActionResult:
+        """「重新登录」：能自动绑定就走设备码，否则退回手输绑定码（两条都在界面内）。
+
+        为什么不是 ``djb auth --pair``：客户没有终端入口（报告 P0-1）。这里只**派发**，
+        真正的网络/轮询在 worker（设备码）或一次性输入框（绑定码）里完成；
+        登录完成后由 app 层回到用户原来那一页（``effect="relogin"``）。
+        """
+        if self.device_flow_enabled():
+            return ActionResult(
+                "正在重新登录：浏览器里点「确认」就完成，本机会自动回到你原来的页面。",
+                effect="relogin", payload="device")
+        return ActionResult(
+            "自动绑定没开通：请在网页端生成绑定码，粘到这一页完成重新登录"
+            "（本机数据不受影响）。", effect="relogin", payload="code")
+
     def device_flow_enabled(self) -> bool:
         from .. import facts as facts_mod
         from ..config import Paths, feature_flag, load_config

@@ -519,7 +519,21 @@ def test_content_width_follows_canvas_across_views_and_resizes(tmp_path):
         root.destroy()
 
 
-def test_page_kicker_label_shows_two_level_chinese_for_account(tmp_path):
+def test_page_kicker_label_shows_two_level_chinese_for_account(tmp_path, monkeypatch):
+    """R2.1 ⑤：页头眉标两级中文，且**跟着当前 IA 表**走（回滚时是旧组名）。
+
+    ``account`` 在方案 A 里属「接入」组、在 0.3.4 旧表里属「系统」组——两套都要对，
+    这样 ``DJB_UI_IA=legacy`` 的回滚才是真的（不是只换侧栏）。
+    """
+    monkeypatch.delenv("DJB_UI_IA", raising=False)
+    app, root = _window_app(tmp_path, 1440)
+    try:
+        app.show_view("account")
+        root.update()
+        assert app._page_kicker.cget("text") == "接入 / 账户与安全"
+    finally:
+        root.destroy()
+    monkeypatch.setenv("DJB_UI_IA", "legacy")
     app, root = _window_app(tmp_path, 1440)
     try:
         app.show_view("account")

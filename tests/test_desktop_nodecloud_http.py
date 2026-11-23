@@ -145,6 +145,8 @@ def test_real_http_401_maps_to_relogin(server):
     with pytest.raises(ProviderError) as info:
         make_client(server).fetch("tasks")
     assert "登录已过期" in info.value.reason and "重新登录" in info.value.hint
+    # R2.1 ①：401 必须打上 auth_required —— 界面据此出「重新登录」横幅（不再是死路）
+    assert info.value.auth_required is True
 
 
 def test_real_http_unavailable_reason_degrades(server):

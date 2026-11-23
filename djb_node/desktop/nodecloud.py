@@ -30,7 +30,10 @@ from .datasource import ProviderError
 __all__ = ["NodeCloudClient", "micro_text", "LOGIN_HINT"]
 
 #: 401 的下一步（给视图「暂不可用（原因）」后面那句提示用）
-LOGIN_HINT = "重新登录节点后重试（djb auth --pair）"
+#:
+#: 2026-11-23 R2.1 ①：不再让客户去终端敲 ``djb auth --pair`` —— 顶部横幅给「重新登录」
+#: 按钮（设备码/绑定码两条路都走界面内动作），这句只作为**文案兜底**留给输出/日志。
+LOGIN_HINT = "点顶部「重新登录」，或在「账户与安全」重新绑定这台电脑"
 
 PATHS = {
     "tasks": "/api/v1/node/tasks",
@@ -339,9 +342,10 @@ class NodeCloudClient:
         if kind == "payout_address" and status >= 400:
             raise _payout_error(response, status)
         if status == 401:
-            raise ProviderError("登录已过期（401）", hint=LOGIN_HINT)
+            # R2.1 ①：401/403 打上 auth_required —— 界面据此出「重新登录」横幅
+            raise ProviderError("登录已过期（401）", hint=LOGIN_HINT, auth_required=True)
         if status == 403:
-            raise ProviderError("节点无权访问该数据（403）", hint=LOGIN_HINT)
+            raise ProviderError("节点无权访问该数据（403）", hint=LOGIN_HINT, auth_required=True)
         if status == 404:
             # 单条收据 / profile 对「不存在或不属于本节点」也回 404：不谎称接口没上线
             if kind == "receipt":

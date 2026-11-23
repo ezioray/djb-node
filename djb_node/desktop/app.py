@@ -34,6 +34,7 @@ from ..platform.no_window import subprocess_window_kwargs
 from . import theme as dual          # 双主题：色板 + 偏好 + 动效助手
 from .a11y import install as install_a11y   # 读屏（MSAA）；**静态 import**，别改成 import_module
 from . import ia                     # 第三轮：侧栏/快捷键/下拉的 IA 数据源
+from .. import facts                 # WEB_CONSOLE_URL（401 横幅的「打开网页端」）
 from . import platform_ui
 from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
                     Metric, RailCard, Row, Table, View, page_kicker, with_field_errors)
@@ -357,6 +358,10 @@ class DesktopApp:
         self._sticky_job: Any = None
         #: D5：刷新被「已有刷新在跑」吃掉时记在这里，等这一轮结束后补一次
         self._refresh_deferred: Any = None
+        #: R2.1 ①：401 顶部横幅（构建在 _build_auth_banner；默认隐藏）
+        self._auth_banner: Any = None
+        #: R2.1 ①：「重新登录」前所在的页 —— 登录成功后回到这里（不是把客户丢到账户页）
+        self._return_view: str = ""
         self._root.title(title)
         # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
         try:
@@ -587,12 +592,14 @@ class DesktopApp:
         self._build_sidebar()
         main = tk.Frame(self._root, background=dual.color("bg"), bd=0, highlightthickness=0)
         main.grid(row=1, column=1, sticky="nsew")
-        main.rowconfigure(1, weight=1)
+        # 0 = 401 横幅（R2.1 ①；默认 grid_remove，不占高度）/ 1 = 页头 / 2 = 滚动内容
+        main.rowconfigure(2, weight=1)
         main.columnconfigure(0, weight=1)
         self._main = main
+        self._build_auth_banner()
         self._build_pagehead()
         wrapper = tk.Frame(main, background=dual.color("bg"), bd=0, highlightthickness=0)
-        wrapper.grid(row=1, column=0, sticky="nsew")
+        wrapper.grid(row=2, column=0, sticky="nsew")
         wrapper.rowconfigure(0, weight=1)
         wrapper.columnconfigure(0, weight=1)
         self._canvas = tk.Canvas(wrapper, background=dual.color("bg"), highlightthickness=0,
@@ -899,13 +906,92 @@ class DesktopApp:
             return
         canvas.yview_scroll(int(units), "units")
 
+    # ── R2.1 ①：401 顶部横幅（登录过期不是死路）
+    def _build_auth_banner(self) -> None:
+        """一条**跨内容区**的横幅：说清「什么过期了 + 下一步按钮」，默认隐藏。
+
+        为什么放顶部而不是某一页：一轮取数里 tasks/receipts/earnings/account 会同时 401，
+        客户此刻可能停在**任何**一页；只在账户页给入口等于让他自己去猜（报告 P0-1）。
+        """
+        kit, tk = self._kit, self._tk
+        bar = tk.Frame(self._main, background=dual.color("amber_bg"), bd=0,
+                       highlightthickness=0)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.columnconfigure(0, weight=1)
+        self._auth_banner = bar
+        self._auth_text = tk.Label(
+            bar, text="登录已过期：云端数据（任务 / 收据 / 收益）暂时读不到",
+            font=self._fonts.sans(kit.px("small")),
+            foreground=dual.color("amber_text"), background=dual.color("amber_bg"),
+            anchor="w", justify="left")
+        self._auth_text.grid(row=0, column=0, sticky="w",
+                             padx=(self._px(26), self._px(10)), pady=(self._px(8), self._px(8)))
+        self._auth_button = kit.Button(
+            bar, "重新登录", self._on_relogin, kind="primary",
+            ground=dual.color("amber_bg"), px=kit.px("small"), height=self._px(32),
+            pad=12)
+        self._auth_button.grid(row=0, column=1, sticky="e", padx=(0, self._px(8)),
+                               pady=(self._px(6), self._px(6)))
+        self._auth_open = kit.Button(
+            bar, "打开网页端", lambda: self._open_url(facts.WEB_CONSOLE_URL), kind="ghost",
+            ground=dual.color("amber_bg"), px=kit.px("small"), height=self._px(32),
+            pad=12)
+        self._auth_open.grid(row=0, column=2, sticky="e", padx=(0, self._px(26)),
+                             pady=(self._px(6), self._px(6)))
+        self._a11y_name(self._auth_button, "重新登录（登录已过期）")
+        bar.grid_remove()                     # 默认不占位
+
+    def _sync_auth_banner(self) -> None:
+        """按**当前快照**决定横幅显隐（每轮渲染/状态更新都调，代价是一次属性读）。"""
+        bar = getattr(self, "_auth_banner", None)
+        if bar is None:
+            return
+        try:
+            snapshot = self._controller.snapshot
+            domain, reason = snapshot.login_required() if hasattr(snapshot, "login_required") \
+                else ("", "")
+        except Exception:                      # pragma: no cover - 快照形状异常时不挡界面
+            domain, reason = "", ""
+        if not domain:
+            if getattr(self, "_auth_shown", False):
+                bar.grid_remove()
+                self._auth_shown = False
+            return
+        text = ("登录已过期（" + reason + "）：云端数据（任务 / 收据 / 收益）暂时读不到；"
+                "重新登录后回到本页，本机数据不受影响")
+        try:
+            self._auth_text.configure(text=text)
+        except Exception:                      # pragma: no cover - 控件已销毁
+            return
+        # 每次重建壳/换肤后都要重新贴回去（横幅是 grid_remove 的，必须显式 grid）
+        try:
+            bar.grid()
+        except Exception:                      # pragma: no cover
+            pass
+        self._auth_shown = True
+
+    def _on_relogin(self) -> None:
+        """横幅按钮：记住**现在这一页**，登录成功后回到这里（R2.1 ① 的回原页口径）。"""
+        self._return_view = self._controller.view
+        self._on_action("auth.relogin")
+
+    def _resume_after_login(self, ok: bool) -> None:
+        """登录有结果后回原页（成功才回；失败留在原地，横幅还在，不会假装已登录）。"""
+        target = str(getattr(self, "_return_view", "") or "")
+        if not ok or not target:
+            return
+        self._return_view = ""
+        if target != self._controller.view:
+            self.show_view(target)
+        self._toast("已重新登录，已回到「" + VIEW_TITLES.get(target, target) + "」", ok=True)
+
     def _build_pagehead(self) -> None:
         """68px 页头：左「眉标 + 18px 标题」，右「数据时刻 + 刷新」。"""
         kit, tk = self._kit, self._tk
         fonts = self._fonts
         head = tk.Frame(self._main, background=dual.color("bg"), height=self._px(self.PAGEHEAD_H),
                         bd=0, highlightthickness=0)
-        head.grid(row=0, column=0, sticky="ew")
+        head.grid(row=1, column=0, sticky="ew")
         head.grid_propagate(False)
         head.columnconfigure(0, weight=1)
         self._pagehead = head
@@ -1487,7 +1573,10 @@ class DesktopApp:
 
     def _apply_device(self, result: Any) -> None:
         message = str(getattr(result, "message", "") or "绑定流程结束")
-        self._toast(message, ok=bool(getattr(result, "ok", False)))
+        ok = bool(getattr(result, "ok", False))
+        self._toast(message, ok=ok)
+        # R2.1 ①：这条流程也可能是顶部横幅发起的「重新登录」→ 成功就回原页
+        self._resume_after_login(ok)
         # 2026-11-19 客户报障「在浏览器确认绑定点击没反应」：旧实现只在**成功**时刷新，
         # 失败时页面一个字都不变，只闪一条 toast —— 客户看不到任何状态，就判成按钮坏了。
         self._request_refresh_async(("account", "overview", "access"))
@@ -1869,6 +1958,7 @@ class DesktopApp:
     # ── 状态（状态条 / 徽标 / 侧栏身份块 / 页头时刻）
     def _update_status(self) -> None:
         """把快照里的状态一次写进四处：状态条消息、状态徽标、身份块、页头「数据截至」。"""
+        self._sync_auth_banner()                     # R2.1 ①：401 → 顶部横幅
         snapshot = self._controller.snapshot
         # D4：失败提示粘住期间不许被「已连接 · …」这类常规状态行覆盖
         sticky = getattr(self, "_sticky_error", "")
@@ -2119,7 +2209,7 @@ class DesktopApp:
         self._clear()
         self._view_title.configure(text=view.title)
         self._set_font(self._page_kicker,
-                       self._ia_kickers.get(view.key, view.key.upper()), kit.px("micro"))
+                       self._ia_kickers.get(view.key, view.title), kit.px("micro"))
         pad = (12, 6) if self._rendered_narrow else (26, 6)
         self._content_pad = pad
         body = tk.Frame(self._content, background=dual.color("bg"), bd=0, highlightthickness=0)
@@ -2151,6 +2241,7 @@ class DesktopApp:
                                   anchor="w", pady=(2, 0))
         self._in_render = False
         self._sync_content_width()                   # B4：内容重排后把宽度钉回画布宽
+        self._sync_auth_banner()                     # R2.1 ①：401 → 顶部横幅
         self._refresh_a11y(view)                     # 读屏树跟着这一版数据走（不发焦点事件）
         if view.focus_field:
             self._focus_field(view.focus_field)
@@ -3405,6 +3496,14 @@ class DesktopApp:
         elif result.effect == "update":
             # G4-3：九状态逐个翻译成「发生了什么 + 下一步」，下载类动作顺手打开下载页
             self._apply_update(result.payload, ok=result.ok, message=result.message)
+        elif result.effect == "relogin":
+            # R2.1 ①：横幅按钮派发到这里 —— 自动绑定走设备码（后台轮询），
+            # 否则弹一次性绑定码输入框；两条路完成后都回原页（_resume_after_login）。
+            self._return_view = self._return_view or self._controller.view
+            if str(result.payload or "") == "device":
+                self._on_action("account.bind_device")
+            else:
+                self._on_action("account.bind")
         elif result.effect == "goto" and result.payload:
             self.show_view(str(result.payload))       # 例如「共享 Token Plan」→「接入配置」
         elif result.effect == "payout_submit":
@@ -3424,6 +3523,8 @@ class DesktopApp:
             # 表单错误回来了，但这个 effect 自己不重画（例如收款提交）：补一次，
             # 否则「红字在数据里、屏幕上没有」——那还是 0.3.7 的「点了没反应」。
             self._render(self._controller.current())
+        if key in ("account.bind", "account.bind_device") and bool(result.ok):
+            self._resume_after_login(True)
         self._update_status()
         self._forget_keys = set()
         # "copy" 漏在名单外 = 复制成功/失败都零反馈（S4：客户说「点了没反应」）
