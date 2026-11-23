@@ -595,6 +595,18 @@ class Chip(tk.Canvas):
         self._redraw()
 
 
+#: 按钮高度三档（逻辑 px，未经 DPI 缩放）：**大 44 / 中 36 / 小 32**。
+#:
+#: R2.1 ⑥ 的验收口径：主操作 44、次级 36、行内小按钮 32 —— 32 是**下限**，
+#: 屏幕再挤也不许低于它（真机 26–30px 的按钮在 150% 缩放下点不中）。
+BTN_HEIGHTS: dict[str, int] = {"lg": 44, "md": 36, "sm": 32}
+
+
+def btn_height(size: str, *, scale: float = 1.0) -> int:
+    """按档位取按钮高度（非法档位回落 ``sm``，绝不返回 0）。"""
+    return int(round(BTN_HEIGHTS.get(str(size), BTN_HEIGHTS["sm"]) * float(scale or 1.0)))
+
+
 class Button(tk.Canvas):
     """扁圆角按钮（主/次/危险）：Canvas 画底 + 文字，支持 hover / 禁用 / 键盘触发。
 
@@ -612,7 +624,7 @@ class Button(tk.Canvas):
 
     def __init__(self, master: Any, text: str, command: Callable[[], None] | None = None, *,
                  kind: str = "ghost", ground: str | None = None, px: float = typography.px("small"),
-                 height: int = 30, pad: int = 11, radius: int = 6,
+                 height: int = BTN_HEIGHTS["sm"], pad: int = 11, radius: int = 6,
                  enabled: bool = True, **kwargs: Any) -> None:
         self.kind = kind
         self.text = str(text)

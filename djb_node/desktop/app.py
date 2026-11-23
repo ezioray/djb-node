@@ -673,16 +673,16 @@ class DesktopApp:
         self._header_right = right
         self._refresh_button = kit.Button(right, "刷新", self.refresh, kind="ghost",
                                           ground=dual.color("surface"), px=kit.px("small"),
-                                          height=self._px(26), pad=self._px(10))
+                                          height=self._px(32), pad=self._px(10))
         self._theme_button = kit.Button(right, self._theme_button_text(), self.toggle_theme,
                                         kind="ghost", ground=dual.color("surface"),
-                                        px=kit.px("small"), height=self._px(26), pad=self._px(10))
+                                        px=kit.px("small"), height=self._px(32), pad=self._px(10))
         self._log_button = kit.Button(right, "打开日志", lambda: self.show_view("logs"),
                                       kind="ghost", ground=dual.color("surface"),
-                                      px=kit.px("small"), height=self._px(26), pad=self._px(10))
+                                      px=kit.px("small"), height=self._px(32), pad=self._px(10))
         self._tune_button = kit.Button(right, "调整贡献", lambda: self.show_view("yield"),
                                        kind="primary", ground=dual.color("surface"),
-                                       px=kit.px("small"), height=self._px(26), pad=self._px(12))
+                                       px=kit.px("small"), height=self._px(32), pad=self._px(12))
         # 头里的固定按钮：读屏要念得出「这是什么按钮」（#31①）
         for widget, name in ((self._refresh_button, "刷新本页数据（也可按 F5）"),
                              (self._theme_button, self._theme_button_text()),
@@ -2205,7 +2205,9 @@ class DesktopApp:
             button = kit.Button(row, action.label,
                                 (lambda key: (lambda: self._on_action(key)))(action.key),
                                 kind="primary" if action.primary else "ghost",
-                                ground=ground, px=kit.px("small"), height=30, pad=12,
+                                ground=ground, px=kit.px("small"),
+                                height=kit.btn_height("lg" if action.primary else "md",
+                                                      scale=self._scale), pad=12,
                                 enabled=bool(action.enabled))
             self._a11y_name(button, action.label)      # 引导卡的动作按钮同样要能念出来
             button.pack(side="left", padx=(0, 8))
@@ -2890,9 +2892,12 @@ class DesktopApp:
         base = ground or dual.color("bg")
         target = (lambda name=action.nav: self.show_view(name)) if action.nav else \
             (lambda key=action.key: self._on_action(key))
-        button = kit.Button(parent, action.label, target,
-                            kind="primary" if action.primary else "ghost", ground=base,
-                            px=kit.px("small"), height=29, pad=12, enabled=action.enabled)
+        # R2.1 ⑥：主操作 44、次级 36（下限 32），危险动作画成红按钮且动作层二次确认
+        kind = "primary" if action.primary else ("danger" if action.danger else "ghost")
+        size = "lg" if action.primary else "md"
+        button = kit.Button(parent, action.label, target, kind=kind, ground=base,
+                            px=kit.px("small"), height=kit.btn_height(size, scale=self._scale),
+                            pad=12, enabled=action.enabled)
         self._a11y_name(button, action.label if action.enabled
                         else action.label + "（不可用：" + (action.reason or "条件不满足") + "）")
         button.pack(side="left", padx=(0, 8))
@@ -3350,7 +3355,7 @@ class DesktopApp:
         hidden = tk.Frame(body, background=surface)
         toggle = kit.Button(body, "高级（排障用）", lambda: _toggle(),
                             kind="ghost", ground=surface, px=kit.px("small"),
-                            height=26, pad=10)
+                            height=self._px(32), pad=10)
         self._a11y_name(toggle, "展开高级（排障用）字段")
         toggle.pack(anchor="w", pady=(2, 0))
         # 留给真窗口取证（tests/test_desktop_payout.py）：折叠区/按钮不在首屏，也得能被点开
@@ -3481,7 +3486,7 @@ class DesktopApp:
         kit, tk = self._kit, self._tk
         state = {"shown": False}
         button = kit.Button(block, "显示", lambda: _toggle(), kind="ghost", ground=surface,
-                            px=kit.px("micro"), height=26, pad=8)
+                            px=kit.px("micro"), height=self._px(32), pad=8)
         self._a11y_name(button, "显示" + field.label + "的明文")
         button.grid(row=0, column=2, sticky="w", padx=(6, 0))
         del tk                                        # 只用 kit 的按钮，避免两套样式

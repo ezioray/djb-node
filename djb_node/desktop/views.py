@@ -319,6 +319,9 @@ class Action:
     reason: str = ""
     primary: bool = False
     nav: str = ""
+    #: 危险动作（R2.1 ⑥）：解绑 / 清退重注册这类**不可逆**操作，渲染成红按钮，
+    #: 且动作层必须二次确认（``confirm(...)`` 返回 False 就什么都不做）。
+    danger: bool = False
     #: 动作分组标题（D6，2026-11-18 客户要求「绑定节点」与「提交 USDT 地址」隔离成两块）。
     #: 空串 = 不分组（0.3.11 行为：整页一条按钮栏）。渲染层按「分组变化」插一条小标题 +
     #: 另起一行按钮，于是同一页也能有两个互不干扰的动作区。
@@ -2026,7 +2029,7 @@ def _access(snapshot: Snapshot) -> View:
                  copy_action("access.copy_node_id", "节点 ID", enabled=bool(node_id),
                              reason=("还没有节点 ID，无法复制（原因见「注册状态」一行："
                                      + _diag_hint(diag) + "）") if not node_id else ""),
-                 Action("access.reset_node", "重新注册这台机器（清退恢复）",
+                 Action("access.reset_node", "重新注册这台机器（清退恢复）", danger=True,
                         enabled=retired,
                         # 2026-11-19 验收 P3：旧文案把「只有被清退才需要」与「当前原因：
                         # daemon 未运行」糊成一句，daemon 没跑时读起来自相矛盾。
@@ -2484,7 +2487,7 @@ def _account(snapshot: Snapshot) -> View:
                               group=GROUP_IDENTITY))
     # 解绑 = 原来「接入配置」页那颗「粘贴绑定码绑定」的对偶：绑定与解绑都只在本页。
     # 键名保留 ``account.logout``（接口只加不改）：它就是「解绑 + 清本机密钥」那一个动作。
-    actions.append(Action("account.logout", "解绑这台电脑（登出并清本机密钥）",
+    actions.append(Action("account.logout", "解绑这台电脑（登出并清本机密钥）", danger=True,
                           enabled=bool(security.get("node_id")),
                           reason=("尚未登录" if not node_id
                                   else "本机无凭据（解绑要清本机密钥）"),
