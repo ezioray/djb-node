@@ -708,7 +708,7 @@ class DesktopApp:
                              (self._log_button, "打开日志"),
                              (self._tune_button, "调整贡献（去让路/节能页）")):
             self._a11y_name(widget, name)
-        self._sync_label = tk.Label(right, text="SYNC —", font=fonts.mono(kit.px("micro")),
+        self._sync_label = tk.Label(right, text="同步 —", font=fonts.mono(kit.px("micro")),
                                     foreground=dual.color("muted_text"),
                                     background=dual.color("surface"))
         self._pack_header_right(narrow=False)
@@ -717,7 +717,7 @@ class DesktopApp:
             x=0, y=self._px(self.HEADER_H) - 1, relwidth=1.0)
 
     def _pack_header_right(self, *, narrow: bool) -> None:
-        """右侧控件顺序固定：SYNC · 打开日志 · 调整贡献 · 主题 · 刷新（窄窗只留后两个）。"""
+        """右侧控件顺序固定：同步时刻 · 打开日志 · 调整贡献 · 主题 · 刷新（窄窗只留后两个）。"""
         for widget in (self._refresh_button, self._theme_button, self._log_button,
                        self._tune_button, self._sync_label):
             widget.pack_forget()
@@ -827,9 +827,13 @@ class DesktopApp:
         tk.Label(head, text=section.micro, font=self._font_for(section.micro, kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground,
                  anchor="w").pack(side="left")
-        tk.Label(head, text=section.title, font=self._fonts.sans(kit.px("micro")),
-                 foreground=dual.color("muted_text"), background=ground,
-                 anchor="w").pack(side="left", padx=(6, 0))
+        # R2.1 ⑤ 的副作用修正：微标中文化之后，有的分组 title 与 micro 是同一个词
+        # （共享/运行/收益/接入/系统），旧布局会把同一句话并排画两遍（「共享 共享」）。
+        # 相同就只画一次；不同（例如未来 title 更具体）仍然两段都画。
+        if str(section.title).strip() and str(section.title).strip() != str(section.micro).strip():
+            tk.Label(head, text=section.title, font=self._fonts.sans(kit.px("micro")),
+                     foreground=dual.color("muted_text"), background=ground,
+                     anchor="w").pack(side="left", padx=(6, 0))
         self._nav_section_headers[section.key] = head
         for key, label, icon, badge in items:
             item = kit.NavItem(self._nav_inner, text=label, icon=icon, count=badge,
@@ -2170,7 +2174,7 @@ class DesktopApp:
     def _update_clock(self) -> None:
         """页头/头上的「数据截至」：只用 ``Snapshot.fetched_at``，没有就写「—」。"""
         stamp = short_clock(self._controller.snapshot.fetched_at)
-        self._sync_label.configure(text="SYNC " + stamp)
+        self._sync_label.configure(text="同步 " + stamp)
         self._snapshot_label.configure(text="数据截至 " + stamp)
 
     def _status_line(self) -> str:

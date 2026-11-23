@@ -1657,3 +1657,32 @@ def test_access_page_offers_reset_only_when_the_node_is_retired():
     text = retired.plain_text()
     assert "节点已清退（不可逆）" in text          # 不再让客户以为「重装就好」
     assert "重新注册" in text
+
+
+#: R2.1 ⑤ 的**产品名**白名单：这些是品牌/协议名，不做翻译（owner 若要求中文化另开票）。
+EYEBROW_PRODUCT_NAMES = ("Token Plan", "Agent", "GPU", "CPU")
+
+def test_no_english_in_any_page_eyebrow():
+    """13 页的眉标（页名 / 主卡眉标 / 徽标 / 右侧栏卡片眉标 / 图表眉标）不许有英文字母。
+
+    R2.1 ⑤ 的验收口径：「侧栏 / 页头眉标中文，英文残留 0 处」。这里把**眉标层**钉住，
+    正文里的技术名（OpenAI / USDT / nvidia-smi / 节点 ID）不在这一层，属于有意保留。
+    """
+    from djb_node.desktop import ia
+
+    snapshot = demo_snapshot()
+    offenders: dict[str, list[str]] = {}
+    for key in vw.VIEW_KEYS:
+        view = vw.build_view(key, snapshot)
+        eyebrows = [view.title]
+        if view.hero is not None:
+            eyebrows += [view.hero.kicker, view.hero.chip, view.hero.title]
+        for rail in view.rail:
+            eyebrows += [rail.kicker, rail.title]
+        if view.chart is not None:
+            eyebrows += [view.chart.kicker, view.chart.title]
+        hits = [text for text in eyebrows if text and ia.has_english(text)
+                and not any(name in text for name in EYEBROW_PRODUCT_NAMES)]
+        if hits:
+            offenders[key] = hits
+    assert offenders == {}, "眉标里还有英文：" + repr(offenders)

@@ -816,9 +816,9 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
     anchor = _parse_ts(snapshot.fetched_at)
     if anchor is None and samples:
         anchor = max(moment for moment, _ in samples)
-    title, caption = "每小时用量", "近 " + str(hours) + " 小时 · 每小时 tokens"
+    title, caption = "每小时用量", "近 " + str(hours) + " 小时 · 每小时用量"
     if anchor is None:
-        return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+        return Chart(kicker="贡献节奏", title=title, caption=caption,
                      empty="暂不可用（当前没有收据时间戳）")
     end = anchor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     start = end - timedelta(hours=hours)
@@ -833,7 +833,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
             inside += 1
     total = sum(totals)
     if total <= 0:
-        return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+        return Chart(kicker="贡献节奏", title=title, caption=caption,
                      empty="暂不可用（当前没有收据时间戳）")
     peak_value = max(totals)
     peak_index = totals.index(peak_value)
@@ -843,7 +843,7 @@ def _hourly_chart(snapshot: Snapshot, *, hours: int = CHART_HOURS) -> Chart:
     labels = tuple((start + timedelta(hours=step * position)).strftime("%H:00")
                    for position in range(4)) + ("现在",)
     peak_at = (start + timedelta(hours=peak_index)).strftime("%H:00")
-    return Chart(kicker="CONTRIBUTION RHYTHM", title=title, caption=caption,
+    return Chart(kicker="贡献节奏", title=title, caption=caption,
                  values=values, labels=labels,
                  peak="峰值 " + f"{peak_value:,}" + " tokens · " + peak_at,
                  foot="近 " + str(hours) + " 小时合计 " + f"{total:,}" + " tokens · "
@@ -866,7 +866,7 @@ def _hero(snapshot: Snapshot) -> Hero:
     titles = {"online": "正在接单", "starting": "正在启动",
               "paused": "已暂停接单", "updating": "正在更新",
               "stopped": "还没开始接单", "error": "有异常，需要处理"}
-    chips = {"online": ("● LIVE", "mint"), "starting": ("◐ STARTING", "amber"),
+    chips = {"online": ("● 实时", "mint"), "starting": ("◐ 启动中", "amber"),
              "paused": ("● PAUSED", "amber"), "updating": ("◐ UPDATING", "amber"),
              "stopped": ("○ STOPPED", "muted"), "error": ("✕ ERROR", "red")}
     chip, chip_tone = chips.get(state, ("? 状态未知", "muted"))
@@ -925,7 +925,7 @@ def _hero(snapshot: Snapshot) -> Hero:
         hint = "授权状态暂不可用"
     # R2.1 ②：眉标中文化 + 节点号只用短标签（原样是 "NODE STATUS / n_<32 hex>"）
     node_display = node_label(node_id, profile.get("display_name"))
-    return Hero(kicker="节点状态 / " + node_display, title=titles.get(state, "状态未知"),
+    return Hero(kicker="节点状态", title=titles.get(state, "状态未知"),
                 chip=chip, chip_tone=chip_tone, body=body,
                 runtime=_runtime_text(status.get("uptime_s")), gauge=gauge, metrics=metrics,
                 actions=actions, hint=hint)
@@ -969,7 +969,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
         Field("USDT 收款地址", "已设置" if config.get("usdt_address") else "未设置",
               key="usdt_state"),
     )
-    setup = RailCard(kicker="SETUP / 接入进度", title="接入分三步", kind="setup",
+    setup = RailCard(kicker="接入进度", title="接入分三步", kind="setup",
                      badge=("接入完成" if done == 3 else "待完成"), badge_tone=("mint" if done == 3
                                                                           else "amber"),
                      note=str(done) + " / 3", fields=setup_fields,
@@ -990,7 +990,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
                    in ("verified", "accepted"))
     total_receipts = len([1 for row in receipts.get("rows") or () if _mapping(row)])
     today = RailCard(
-        kicker="TODAY / 今日算力", title="今日收益",
+        kicker="今日算力", title="今日收益",
         badge="进行中" if str(yield_state.get("state") or "") == "online" else "",
         badge_tone="mint",
         # 四宫格只留「标签 + 数值」：口径写进卡脚一行，格子高度才装得进一屏（G-16）
@@ -1018,7 +1018,7 @@ def _rail(snapshot: Snapshot) -> tuple[RailCard, ...]:
     if ratio is not None:
         progress = ("今日 tokens 已用", ratio,
                     f"{used_today:,} / {int(float(daily_cap)):,}（{ratio * 100:.0f}%）")
-    throttle = RailCard(kicker="PAUSE / 自动暂停", title="自动暂停",
+    throttle = RailCard(kicker="自动暂停", title="自动暂停",
                         badge="生效中" if yield_state.get("yield_enabled") else "已关闭",
                         badge_tone="mint" if yield_state.get("yield_enabled") else "muted",
                         kind="throttle", rows=throttle_rows,
@@ -1421,7 +1421,7 @@ def _tasks(snapshot: Snapshot) -> View:
         key="tasks", title="任务队列",
         subtitle="本地在途 / 云端任务（谁先有数据用谁）",
         cards=(Card("队列", _count(snapshot, "tasks", str(len(rows)) + " 条"),
-                    ("来源：" + str(tasks.get("origin") or "local")), "default"),),
+                    ("来源：" + _origin_text(tasks.get("origin"))), "default"),),
         table=Table(("任务", "状态", "耗时", "Tokens", "收据号"), tuple(rows),
                     narrow_hide=("耗时", "收据号"),
                     note=str(tasks.get("note") or ""),
@@ -1451,7 +1451,7 @@ def _receipts(snapshot: Snapshot) -> View:
         key="receipts", title="收据",
         subtitle="双签字段 · Merkle 路径 · 本地校验",
         cards=(Card("收据总数", _count(snapshot, "receipts", str(len(rows)) + " 张"),
-                    "来源：" + str(receipts.get("origin") or "local"), "default"),
+                    "来源：" + _origin_text(receipts.get("origin")), "default"),
                Card("本机已验证", _count(snapshot, "receipts", str(verified) + " 张"),
                     verify_meta, "mint" if verified else "muted")),
         table=Table(("收据号", "时间", "Tokens", "状态", "本机校验"), tuple(rows),
@@ -2256,6 +2256,12 @@ def node_label(node_id: object, display_name: object = "") -> str:
     if name and name not in ("—", "None"):
         return name
     return mask_node_id(node_id)
+
+
+def _origin_text(origin: object) -> str:
+    """数据来源的人话（``local`` → 本机，``cloud`` → 云端；未知值原样，不吞信息）。"""
+    text = str(origin or "local").strip().lower()
+    return {"local": "本机", "cloud": "云端", "cache": "缓存"}.get(text, str(origin or "本机"))
 
 
 def _account_bound(profile: Mapping[str, Any], security: Mapping[str, Any],
