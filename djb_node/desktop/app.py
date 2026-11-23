@@ -363,6 +363,7 @@ class DesktopApp:
         #: R2.1 ①：「重新登录」前所在的页 —— 登录成功后回到这里（不是把客户丢到账户页）
         self._return_view: str = ""
         self._root.title(title)
+        self._install_brand_icon()                    # R2.1 C4：窗口图标 = TOKENBANK 完整版
         # 125% 下 1180×780 逻辑 → 1475×975 物理；小屏按屏幕收缩（XPLAT-04），不出界
         try:
             screen_w = int(self._root.winfo_screenwidth())
@@ -906,6 +907,29 @@ class DesktopApp:
         if first <= 0.0 and last >= 1.0:             # 没溢出：滚轮不该动任何东西
             return
         canvas.yview_scroll(int(units), "units")
+
+    # ── R2.1 C4：窗口图标（读不到就静默跳过，绝不影响启动）
+    def _install_brand_icon(self) -> None:
+        """把 ``djb_node/assets/tokenbank-dark-full-256.png`` 设成窗口图标。
+
+        为什么不是 ``iconbitmap``（.ico）：Tk 在 Linux/macOS 只认 PNG/GIF，``iconbitmap``
+        还要求真实文件路径（冻结包里没有）。这里统一走 ``PhotoImage + iconphoto``：
+        三平台同一份代码、同一份资源，失败就当没设过。
+        """
+        from .. import assets as assets_mod
+
+        self._brand_icon = None                    # 先置空：读不到时属性也在（测试/取证读它）
+        data = assets_mod.resource_bytes(assets_mod.WINDOW_ICON)
+        if not data:
+            return
+        try:
+            import base64
+
+            self._brand_icon = self._tk.PhotoImage(
+                data=base64.b64encode(data).decode("ascii"))
+            self._root.iconphoto(True, self._brand_icon)
+        except Exception:                          # Tk 不认 / 窗口已销毁：当作没图标
+            self._brand_icon = None
 
     # ── R2.1 ①：401 顶部横幅（登录过期不是死路）
     def _build_auth_banner(self) -> None:

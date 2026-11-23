@@ -460,16 +460,47 @@ class TkBackend:
         self._root.protocol("WM_DELETE_WINDOW", self._hide)   # 关窗 = 收回托盘，不退出
 
     def _make_icon(self) -> Any:
-        """16×16 纯色图标（不下载图片资源；窗口管理器不支持时静默省略）。"""
+        """托盘图标：**品牌 LOGO（TOKENBANK 微标）**，读不到就回落到画出来的色块。
+
+        R2.1 C4「图标不是 logo」：旧实现是 16×16 紫色块 + 三根薄荷色条 —— 在托盘里
+        和别的程序分不出来。现在用 ``djb_node/assets/`` 里的 16px 微标（单 T，
+        16px 下还能认出来），24px 作高分屏备份。
+
+        任何一步失败（文件缺失 / 不是 PNG / Tk 不认 base64）都**不抛**：回落到旧色块，
+        托盘照常起来 —— 图标绝不能成为启动失败的原因。
+        """
+        icon = self._load_brand_icon("tray", "tray_2x")
+        if icon is None:
+            icon = self._draw_fallback_icon()
+        try:
+            self._root.iconphoto(True, icon)
+        except Exception:                              # 部分 WM 不支持 iconphoto：省略图标
+            pass
+        return icon
+
+    def _load_brand_icon(self, *keys: str) -> Any:
+        """按顺序试读品牌资源 → ``PhotoImage``；全都读不到返回 ``None``。"""
+        from .. import assets as assets_mod
+
+        for key in keys:
+            data = assets_mod.resource_bytes(assets_mod.ASSETS.get(key, ""))
+            if not data:
+                continue
+            try:
+                import base64
+
+                return self._tk.PhotoImage(data=base64.b64encode(data).decode("ascii"))
+            except Exception:                          # 不是 PNG / Tk 版本不认：换下一个
+                continue
+        return None
+
+    def _draw_fallback_icon(self) -> Any:
+        """回落色块（0.3.x 原样保留）：**只在品牌资源读不到时**用，保证永远有图标。"""
         icon = self._tk.PhotoImage(width=16, height=16)
         icon.put(COLORS["bg"], to=(0, 0, 16, 16))
         icon.put(COLORS["mint"], to=(2, 4, 5, 14))
         icon.put(COLORS["mint2"], to=(5, 11, 12, 14))
         icon.put(COLORS["text"], to=(10, 2, 14, 10))
-        try:
-            self._root.iconphoto(True, icon)
-        except Exception:                              # 部分 WM 不支持 iconphoto：省略图标
-            pass
         return icon
 
     def _apply_title(self) -> None:
