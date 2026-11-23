@@ -58,10 +58,13 @@ def test_l1_yield_wins_over_quota_and_resources(store):
 
 
 def test_detection_failure_is_conservative(store):
+    # 2026-11-24 lead 裁决（D23）：检测失败按 INV-04 保守暂停（README-CLIENT.md:169）。
+    # 344800a 曾改成放行（degraded 继续接单），与文档冲突，已回退；degraded 只留作 UI 标注。
     limiter = _limiter(store, probes=[FakeProbe("error", "session")])
     decision = limiter.evaluate(profile=ProfileRecord(), policy=None)
     assert decision.reason == "yield_paused"
     assert decision.detail["source"] == "session"
+    assert decision.detail["degraded"] is True
 
 
 def test_yield_disabled_by_profile(store):

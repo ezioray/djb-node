@@ -24,7 +24,8 @@ def test_systemd_unit_has_required_sections():
     unit = render_systemd_unit(LINUX_SPEC)
     assert unit.startswith("# 由 djb_node.platform.service 生成")
     assert "[Unit]" in unit and "[Service]" in unit and "[Install]" in unit
-    assert "Description=DJB 联脑共享节点客户端" in unit
+    # D16：显示名换品牌，服务名不变（`djb-node` / 单元名仍是标识，运维脚本按名找）
+    assert "Description=TokenBank 联脑共享节点客户端" in unit
     assert ("ExecStart=/usr/bin/python3 -m djb_node.daemon --home /home/u/.djb") in unit
     assert "Restart=on-failure" in unit and "RestartSec=5" in unit
     assert "StandardOutput=append:/home/u/.djb/logs/djb.log" in unit

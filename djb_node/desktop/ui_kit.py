@@ -61,12 +61,12 @@ def surface_alt(ratio: float = 0.08) -> str:
 # ``tests/test_desktop_px_wiring.py``（那里是 0.3.4 口径的唯一边界）。
 #
 # 两条例外（裁决与理由见 ``reports/RM-20261113/M1-PROGRESS.md`` §8）：
-#   * **表格**：0.3.4 是 11px 特例，现并入 ``table``（12px；行高 28 已接 ``rowheight``）；
-#   * **mono**：0.3.4 **没有**对应档位（当时等宽借微标 10px），现在 ``mono`` 是独立 token（12px）。
+#   * **表格**：0.3.4 是 11px 特例，现并入 ``table``（13px；行高 30 已接 ``rowheight``）；
+#   * **mono**：0.3.4 **没有**对应档位（当时等宽借微标 10px），现在 ``mono`` 是独立 token（13px）。
 def table_rowheight(scale: float = 1.0) -> int:
-    """表格行高（``ttk.Treeview`` 的 ``rowheight``）= ``typography.table`` 的行盒高度 28。
+    """表格行高（``ttk.Treeview`` 的 ``rowheight``）= ``typography.table`` 的行盒高度 30。
 
-    0.3.4 写死 26（当时字号 11）；0.3.5 的 ``table`` 是 12px / 行高 28（01-FONT-TYPO §2.3），
+    0.3.4 写死 26（当时字号 11）；0.5.5 及更早的 ``table`` 是 12px / 行高 28（01-FONT-TYPO §2.3），
     行盒与字号同源 ⇒ 不会出现「字号涨了行高没涨、下沿被裁」。取整与字号同一条规则
     （``typography.round_px``，继承 0.3.4 的 ``int(round(...))``），所以 100%/125% 各档一致。
     """
@@ -595,6 +595,18 @@ class Chip(tk.Canvas):
         self._redraw()
 
 
+#: 按钮高度三档（逻辑 px，未经 DPI 缩放）：**大 44 / 中 36 / 小 32**。
+#:
+#: R2.1 ⑥ 的验收口径：主操作 44、次级 36、行内小按钮 32 —— 32 是**下限**，
+#: 屏幕再挤也不许低于它（真机 26–30px 的按钮在 150% 缩放下点不中）。
+BTN_HEIGHTS: dict[str, int] = {"lg": 44, "md": 36, "sm": 32}
+
+
+def btn_height(size: str, *, scale: float = 1.0) -> int:
+    """按档位取按钮高度（非法档位回落 ``sm``，绝不返回 0）。"""
+    return int(round(BTN_HEIGHTS.get(str(size), BTN_HEIGHTS["sm"]) * float(scale or 1.0)))
+
+
 class Button(tk.Canvas):
     """扁圆角按钮（主/次/危险）：Canvas 画底 + 文字，支持 hover / 禁用 / 键盘触发。
 
@@ -612,7 +624,7 @@ class Button(tk.Canvas):
 
     def __init__(self, master: Any, text: str, command: Callable[[], None] | None = None, *,
                  kind: str = "ghost", ground: str | None = None, px: float = typography.px("small"),
-                 height: int = 30, pad: int = 11, radius: int = 6,
+                 height: int = BTN_HEIGHTS["sm"], pad: int = 11, radius: int = 6,
                  enabled: bool = True, **kwargs: Any) -> None:
         self.kind = kind
         self.text = str(text)

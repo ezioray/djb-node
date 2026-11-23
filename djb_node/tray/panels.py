@@ -71,7 +71,7 @@ class DesktopPanel:
     def __init__(self, root, tk, *, refresh):
         from tkinter import ttk
         self._window = tk.Toplevel(root)
-        self._window.title("DJB / NIGHT SIGNAL · 本地只读控制台")
+        self._window.title("TokenBank / NIGHT SIGNAL · 本地只读控制台")
         self._window.geometry("900x720")
         self._window.minsize(640, 480)
         apply_theme(self._window, ttk)
@@ -79,7 +79,7 @@ class DesktopPanel:
         self._window.bind("<Escape>", lambda _e: self._window.withdraw())
         header = ttk.Frame(self._window, padding=16)
         header.pack(fill="x")
-        ttk.Label(header, text="◢ DJB / NIGHT SIGNAL   // READBACK", style="Signal.TLabel").pack(side="left")
+        ttk.Label(header, text="◢ TokenBank / NIGHT SIGNAL   // READBACK", style="Signal.TLabel").pack(side="left")
         ttk.Button(header, text="刷新 / F5", command=refresh).pack(side="right")
         self._window.bind("<F5>", lambda _e: refresh())
         self._notebook = ttk.Notebook(self._window)

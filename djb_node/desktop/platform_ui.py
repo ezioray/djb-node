@@ -763,7 +763,7 @@ def install_macos_menu(root: Any, actions: Mapping[str, Any] | None = None, *,
         return False                          # 幂等：已经装过
 
     actions = dict(actions or {})
-    app_name = str(actions.get("app_name") or "DJB 联脑")
+    app_name = str(actions.get("app_name") or "TokenBank 联脑")
     try:
         from tkinter import Menu                # 延迟 import：模块级不碰 tkinter
         menubar = Menu(root)

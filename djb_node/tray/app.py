@@ -72,7 +72,7 @@ __all__ = [
 #: 周期刷新间隔（毫秒）
 DEFAULT_INTERVAL_MS = 5000
 #: 窗口 / 菜单栏标题前缀
-DEFAULT_TITLE = "DJB 联脑"
+DEFAULT_TITLE = "TokenBank 联脑"
 #: 只读 CLI 子进程超时（秒）：cli 内部 status 调用 5s，留出解释器启动余量
 CLI_TIMEOUT_S = 8.0
 #: 正常退出
@@ -399,7 +399,7 @@ class TkBackend:
         window = self._tk.Toplevel(self._root)
         from ..gui.theme import apply_theme
         apply_theme(window, ttk)
-        window.title("DJB / " + title)
+        window.title("TokenBank / " + title)
         window.geometry("640x300")
         body = ttk.Frame(window, padding=24)
         body.pack(fill="both", expand=True)
@@ -415,7 +415,7 @@ class TkBackend:
         from ..gui.theme import apply_theme
         window = self._tk.Toplevel(self._root)
         apply_theme(window, ttk)
-        window.title("DJB / 确认本机控制")
+        window.title("TokenBank / 确认本机控制")
         window.geometry("640x300")
         choice = [False]
         body = ttk.Frame(window, padding=24)
@@ -440,7 +440,7 @@ class TkBackend:
         from .. import facts
         message = ("在网页端 → 账户/节点 → 生成绑定码，然后粘贴到这里。\n\n"
                    + facts.WEB_CONSOLE_URL)
-        value = simpledialog.askstring("DJB / 绑定网页端", message, parent=self._root)
+        value = simpledialog.askstring("TokenBank / 绑定网页端", message, parent=self._root)
         text = str(value).strip() if value else ""
         return text or None
 
@@ -460,16 +460,47 @@ class TkBackend:
         self._root.protocol("WM_DELETE_WINDOW", self._hide)   # 关窗 = 收回托盘，不退出
 
     def _make_icon(self) -> Any:
-        """16×16 纯色图标（不下载图片资源；窗口管理器不支持时静默省略）。"""
+        """托盘图标：**品牌 LOGO（TOKENBANK 微标）**，读不到就回落到画出来的色块。
+
+        R2.1 C4「图标不是 logo」：旧实现是 16×16 紫色块 + 三根薄荷色条 —— 在托盘里
+        和别的程序分不出来。现在用 ``djb_node/assets/`` 里的 16px 微标（单 T，
+        16px 下还能认出来），24px 作高分屏备份。
+
+        任何一步失败（文件缺失 / 不是 PNG / Tk 不认 base64）都**不抛**：回落到旧色块，
+        托盘照常起来 —— 图标绝不能成为启动失败的原因。
+        """
+        icon = self._load_brand_icon("tray", "tray_2x")
+        if icon is None:
+            icon = self._draw_fallback_icon()
+        try:
+            self._root.iconphoto(True, icon)
+        except Exception:                              # 部分 WM 不支持 iconphoto：省略图标
+            pass
+        return icon
+
+    def _load_brand_icon(self, *keys: str) -> Any:
+        """按顺序试读品牌资源 → ``PhotoImage``；全都读不到返回 ``None``。"""
+        from .. import assets as assets_mod
+
+        for key in keys:
+            data = assets_mod.resource_bytes(assets_mod.ASSETS.get(key, ""))
+            if not data:
+                continue
+            try:
+                import base64
+
+                return self._tk.PhotoImage(data=base64.b64encode(data).decode("ascii"))
+            except Exception:                          # 不是 PNG / Tk 版本不认：换下一个
+                continue
+        return None
+
+    def _draw_fallback_icon(self) -> Any:
+        """回落色块（0.3.x 原样保留）：**只在品牌资源读不到时**用，保证永远有图标。"""
         icon = self._tk.PhotoImage(width=16, height=16)
         icon.put(COLORS["bg"], to=(0, 0, 16, 16))
         icon.put(COLORS["mint"], to=(2, 4, 5, 14))
         icon.put(COLORS["mint2"], to=(5, 11, 12, 14))
         icon.put(COLORS["text"], to=(10, 2, 14, 10))
-        try:
-            self._root.iconphoto(True, icon)
-        except Exception:                              # 部分 WM 不支持 iconphoto：省略图标
-            pass
         return icon
 
     def _apply_title(self) -> None:
@@ -477,11 +508,11 @@ class TkBackend:
         status, notifications = self._context
         if not isinstance(status, Mapping) or status.get("state") not in (
                 "online", "starting", "paused", "updating", "stopped", "error"):
-            self._root.title("DJB / ? 状态未知 · 请刷新" + suffix)
+            self._root.title("TokenBank / ? 状态未知 · 请刷新" + suffix)
         else:
             labels = {"online": "运行中", "starting": "启动中", "paused": "已暂停",
                       "updating": "更新中", "stopped": "已停止", "error": "错误"}
-            self._root.title("DJB / " + labels[status["state"]] + suffix)
+            self._root.title("TokenBank / " + labels[status["state"]] + suffix)
 
     def _popup(self, event: Any) -> None:
         try:
@@ -736,7 +767,7 @@ def _positive_int(value: str) -> int:
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="djb-tray",
-        description="DJB 联脑托盘壳（Windows / macOS）：只发动作建议，不执行命令")
+        description="TokenBank 联脑托盘壳（Windows / macOS）：只发动作建议，不执行命令")
     parser.add_argument("--interval-ms", type=_positive_int, default=DEFAULT_INTERVAL_MS,
                         help="刷新间隔（毫秒，默认 " + str(DEFAULT_INTERVAL_MS) + "）")
     parser.add_argument("--title", default=DEFAULT_TITLE, help="窗口 / 菜单栏标题前缀")

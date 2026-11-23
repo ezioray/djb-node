@@ -249,7 +249,8 @@ def test_account_page_actions_are_grouped_into_two_blocks():
     bind_keys = [a.key for title, members in groups if title == GROUP_BIND for a in members]
     payout_keys = [a.key for title, members in groups if title == GROUP_PAYOUT for a in members]
     assert "account.bind" in bind_keys
-    assert payout_keys == ["account.submit_payout"]
+    # 2026-11-24 R2.1 文案/交互变更：收款地址行加了「复制地址」（② 统一复制组件）
+    assert payout_keys == ["account.copy_address", "account.submit_payout"]
     assert not (set(bind_keys) & set(payout_keys)), "两块不许共用动作"
 
 

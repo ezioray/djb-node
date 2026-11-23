@@ -80,9 +80,17 @@ def test_start_without_codes_is_unavailable_not_pending():
 @pytest.mark.parametrize("state,approved", [("approved", True), ("denied", False),
                                             ("expired", False), ("pending", False)])
 def test_poll_states_map_exactly(state, approved):
-    flow = df.apply_poll(df.DeviceFlow(state="pending", device_code="dc"), {"state": state})
+    flow = df.apply_poll(df.DeviceFlow(state="pending", device_code="dc"),
+                         {"state": state, "node_id": "n_1" if approved else None})
     assert flow.state == state
     assert flow.approved is approved                 # 只有 approved 才算绑定成功
+    assert flow.bound_node_id == ("n_1" if approved else "")
+
+
+def test_approved_poll_without_node_id_keeps_evidence_but_empty_binding():
+    flow = df.apply_poll(df.DeviceFlow(state="pending"), {"state": "approved"})
+    assert flow.state == "approved" and flow.approved is True
+    assert flow.bound_node_id == ""
 
 
 def test_unknown_state_never_counts_as_success():
@@ -92,6 +100,22 @@ def test_unknown_state_never_counts_as_success():
 
 def test_poll_body_uses_the_agreed_field_name():
     assert df.poll_body(df.DeviceFlow(device_code="dc_9")) == {"device_code": "dc_9"}
+
+
+def test_start_sends_node_id_when_runner_has_one():
+    clock = _Clock()
+    calls = []
+
+    def post(path, body):
+        calls.append((path, dict(body)))
+        if path.endswith("/device"):
+            return {"user_code": "U1", "device_code": "dc",
+                    "verify_url": "https://x/activate", "expires_in": 600}
+        return {"state": "approved"}
+
+    df.DeviceFlowRunner(post, sleep=clock.sleep, clock=clock.clock,
+                        node_id="node-1").run()
+    assert calls[0][1] == {"node_id": "node-1"}
 
 
 # ─────────────────────────────────────────────── 端到端（假 post + 假时钟）
@@ -229,12 +253,25 @@ def test_flag_off_points_at_the_manual_code_path(home, monkeypatch):
 
 
 def test_approved_result_says_bound_and_refreshes(home, monkeypatch):
-    controller = _controller(home, enabled=True, polls=[{"state": "approved"}],
+    controller = _controller(home, enabled=True,
+                             polls=[{"state": "approved", "node_id": "n_test"}],
                              monkeypatch=monkeypatch)
     result = controller.action("account.bind_device")
     assert result.ok and "绑定成功" in result.message
     assert result.effect == "refresh"
     assert controller.device_flow.approved is True
+    assert controller.device_flow.bound_node_id == "n_test"
+
+
+def test_approved_without_node_id_is_not_a_success(home, monkeypatch):
+    """旧云端只回 approved、不写节点：客户端不能把账户批准当绑定成功。"""
+    controller = _controller(home, enabled=True, polls=[{"state": "approved"}],
+                             monkeypatch=monkeypatch)
+    result = controller.action("account.bind_device")
+    assert not result.ok
+    assert "没有返回节点 ID" in result.message
+    assert controller.device_flow.approved is True    # 保留云端事实，但不报成功
+    assert controller.device_flow.bound_node_id == ""
 
 
 def test_denied_result_is_not_ok(home, monkeypatch):

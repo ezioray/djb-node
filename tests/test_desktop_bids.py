@@ -224,14 +224,14 @@ def test_save_price_writes_local_book_and_never_reports():
     controller.show("token_plan")
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0.42")
-    result = controller.action("token_plan.save_price")
+    result = controller.action("token_plan.save_price", confirm=lambda _m: True)
     assert result.ok and "0.42" in result.message and "未上报" in result.message
     assert bids_mod.BidBook(store).load()["gpt-4o-mini"]["min_price"] == "0.42"
 
 
 def test_save_price_requires_a_selected_row():
     controller = _controller(_Source(_Store()))
-    result = controller.action("token_plan.save_price")
+    result = controller.action("token_plan.save_price", confirm=lambda _m: True)
     assert not result.ok and "选一行" in result.message
 
 
@@ -240,7 +240,7 @@ def test_zero_price_is_refused_before_it_reaches_the_cloud():
     controller = _controller(_Source(store))
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0")
-    result = controller.action("token_plan.save_price")
+    result = controller.action("token_plan.save_price", confirm=lambda _m: True)
     assert not result.ok and "0.01" in result.message
     assert bids_mod.BidBook(store).load() == {}
 
@@ -249,7 +249,7 @@ def test_report_with_flag_off_says_nothing_was_sent():
     controller = _controller(_Source(_Store()))
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0.5")
-    controller.action("token_plan.save_price")
+    controller.action("token_plan.save_price", confirm=lambda _m: True)
     result = controller.action("token_plan.report")
     assert not result.ok and "未发送" in result.message
 
@@ -258,7 +258,7 @@ def test_preview_lists_what_would_be_reported():
     controller = _controller(_Source(_Store()))
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0.5")
-    controller.action("token_plan.save_price")
+    controller.action("token_plan.save_price", confirm=lambda _m: True)
     result = controller.action("token_plan.preview_report")
     assert result.ok and "gpt-4o-mini=0.5" in result.message
     assert result.payload["payload"]["models"] == [{"model": "gpt-4o-mini",
@@ -426,3 +426,33 @@ def test_protocol_renders_as_a_readonly_combobox(has_display, monkeypatch):
             root.destroy()
         except Exception:                             # pragma: no cover - 已销毁
             pass
+
+def test_token_plan_primary_follows_the_stage():
+    """2026-11-19 全功能 UX 复查：七颗按钮同一权重时客户不知道下一步。
+
+    主操作必须随阶段走，且全程只能有一颗 primary。
+        """
+    # ① 没上游 → 添加上游
+    view = vw.build_view("token_plan", _plan_snapshot())
+    primaries = [a.key for a in view.actions if a.primary]
+    assert primaries == ["token_plan.add_upstream"]
+
+    # ② 有上游、云端上报被开关挡住 → 退到「预览将上报的内容」
+    view2 = vw.build_view(
+        "token_plan",
+        _plan_snapshot(base_url="https://api.example.com/v1", secret_seen="已保存"),
+    )
+    primaries2 = [a.key for a in view2.actions if a.primary]
+    assert len(primaries2) == 1
+    assert primaries2 == ["token_plan.preview_report"]
+
+    # ③ 有上游且上报可用 → 主操作是上报
+    view3 = vw.build_view(
+        "token_plan",
+        _plan_snapshot(base_url="https://api.example.com/v1", secret_seen="已保存",
+                       bids={"rows": {"gpt-4o-mini": {"min_price": "0.35"}},
+                             "cloud": {"state": "ok", "source": "cloud"},
+                             "report_blocker": "", "preview": {"models": []}}),
+    )
+    primaries3 = [a.key for a in view3.actions if a.primary]
+    assert primaries3 == ["token_plan.report"]

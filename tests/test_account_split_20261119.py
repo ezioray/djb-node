@@ -104,6 +104,8 @@ class _StubApp:
     _open_verify_url_once = app_module.DesktopApp._open_verify_url_once
     _on_device_state = app_module.DesktopApp._on_device_state
     _apply_device = app_module.DesktopApp._apply_device
+    # 2026-11-24 R2.1 ①：_apply_device 现在会调 _resume_after_login（回到原页），替身补齐
+    _resume_after_login = app_module.DesktopApp._resume_after_login
 
     def __init__(self) -> None:
         self.toasts: list[tuple[str, bool]] = []

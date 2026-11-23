@@ -110,21 +110,65 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
 
 
 # ─────────────────────────────────────────────────────────── init
+def _packaged_config() -> dict[str, Any]:
+    """读取便携包自带的 ``config.json``（仅冻结包；源码运行不读）。
+
+    0.5.9 的 Windows zip 已带生产 ``config.json``，但 ``init --preset`` 是按
+    源码默认值写 home，导致首装 ``update_source`` 落 mock。首启时把包内
+    载体作为默认值，显式参数仍然优先。
+    """
+    if not getattr(sys, "frozen", False):
+        return {}
+    path = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     paths = _paths(args)
+    fresh = not os.path.exists(paths.config_file)
+    packaged = _packaged_config()
     config = load_config(paths)
+    packaged_note = ""
     if getattr(args, "gateway", None):
         config.gateway_url = str(args.gateway).strip()
     elif _gateway_is_placeholder(config.gateway_url):
-        # 没显式给地址就用构建期默认（2026-11-06：占位符发到客户手里 = 装完连不上）
-        from .bootstrap import DEFAULT_GATEWAY_URL
-        config.gateway_url = DEFAULT_GATEWAY_URL
+        # 没显式给地址：优先包内载体（测试栈包可以带自己的地址），否则用构建默认。
+        packaged_gateway = str(packaged.get("gateway_url") or "").strip()
+        if packaged_gateway and not _gateway_is_placeholder(packaged_gateway):
+            config.gateway_url = packaged_gateway
+            packaged_note = "已读取包内 config.json 的首启地址"
+        else:
+            # 2026-11-06：占位符发到客户手里 = 装完连不上
+            from .bootstrap import DEFAULT_GATEWAY_URL
+            config.gateway_url = DEFAULT_GATEWAY_URL
     if getattr(args, "port", None):
         config.mirror_port = int(args.port)
     if getattr(args, "channel", None):
         config.update_channel = args.channel
     edition = getattr(args, "edition", None)
-    edition_note = ""
+    edition_note = packaged_note
+    if (edition is None
+            and getattr(args, "update_source", None) is None
+            and not config.update_source.strip()):
+        # 首装或 0.5.9 遗留的空更新源：包内 config.json 是构建时的显式载体。
+        # 已有非空源（自定义镜像 / 运维设置）一律不覆盖。
+        packaged_source = str(packaged.get("update_source") or "").strip()
+        packaged_edition = str(packaged.get("edition") or "").strip()
+        if packaged_source or packaged_edition:
+            if packaged_source:
+                config.update_source = packaged_source
+            if packaged_edition in update_source.editions() and not config.edition.strip():
+                config.edition = packaged_edition
+            packaged_channel = str(packaged.get("update_channel") or "").strip()
+            if (fresh and not getattr(args, "channel", None)
+                    and packaged_channel in facts.UPDATE_CHANNELS):
+                config.update_channel = packaged_channel
+            edition_note = "已读取包内 config.json 的更新源/档位（首启/空源默认）"
     if edition:
         # 0.3.1（RC8.3-C）：显式给档位 = 明确要该通道的签名更新源。
         # 已有**自定义**源（内网镜像 / 本地目录）不覆盖 —— 那是运维刻意的选择。
@@ -197,7 +241,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if _json_flag(args):
         _emit(payload, as_json=True)
     else:
-        print("DJB 联脑客户端已初始化：" + paths.home)
+        print("TokenBank 联脑客户端已初始化：" + paths.home)
         print("  预设 " + store.profile().preset + " · 并发 " + str(store.profile().concurrent)
               + " · 日配额 " + str(store.profile().daily_tokens) + " tokens")
         print("  本机镜像将监听 127.0.0.1:" + str(config.mirror_port) + "/v1（仅回环）")
@@ -1662,6 +1706,49 @@ def cmd_plan(args: argparse.Namespace) -> int:
     raise UsageError("未知的 plan 动作：" + str(action))
 
 
+def cmd_bid(args: argparse.Namespace) -> int:
+    """逐模型底价的本地账本（与 GUI 同一份数据；不联网、不上报）。
+
+    成交口径（原始设计）：设一个**最低价**，撮合到的最优价 ≥ 最低价就成交。
+    平台费 15% 加在客户侧（客户实付 = 报价 × 1.15），不从供方报价里倒扣；
+    真实费率以云端在成交时的快照为准，本地只做告知。
+    """
+    from .bids import BidBook
+
+    _paths_, _config_, store = _context(args)
+    book = BidBook(store)
+    action = getattr(args, "bid_action", None) or "list"
+    if action == "set":
+        try:
+            saved = book.set_price(args.model, args.min_price)
+        except ValueError as exc:
+            raise UsageError(str(exc)) from None
+        payload = {"model": args.model, "min_price": saved, "mode": book.mode_of(args.model),
+                   "fee_bps": facts.SERVICE_FEE_BPS,
+                   "customer_pay_example": facts.customer_pay_text(saved)}
+        _emit(payload, as_json=_json_flag(args), text=lambda v: (
+            "已保存「" + v["model"] + "」最低价 " + v["min_price"] + " USD / 百万 token"
+            + "（成交规则：低于此价不成交，高于时按最优价成交）\n"
+            + "平台服务费 " + format(facts.service_fee_percent(), "g") + "%："
+            + "客户实付约 " + v["customer_pay_example"] + "（费率以成交时服务端快照为准）"
+            + "\n（只在本机账本，未上报）"))
+        return 0
+    if action == "remove":
+        removed = book.remove(args.model)
+        _emit({"model": args.model, "removed": removed}, as_json=_json_flag(args),
+              text=lambda v: ("已移除「" + v["model"] + "」的底价（这一行不再申报）"
+                              if v["removed"] else "本来就没有这个模型的底价"))
+        return 0
+    rows = [{"model": model, "min_price": item["min_price"], "mode": book.mode_of(model)}
+            for model, item in sorted(book.load().items())]
+    _emit({"bids": rows, "count": len(rows), "fee_bps": facts.SERVICE_FEE_BPS},
+          as_json=_json_flag(args),
+          text=lambda v: ("\n".join(item["model"] + "  ≥ " + item["min_price"]
+                                    + "  (" + item["mode"] + ")" for item in v["bids"])
+                          if v["bids"] else "还没有设任何底价（djb bid set --model … --min-price …）"))
+    return 0
+
+
 def cmd_flags(args: argparse.Namespace) -> int:
     """查看 / 设置本机特性开关（默认关闭；只允许登记过的开关）。"""
     paths, config, store = _context(args)
@@ -2369,7 +2456,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog=PROG, description="DJB 联脑 · 共享节点客户端（M15 / S2 P1 Linux CLI + daemon）",
+        prog=PROG, description="TokenBank 联脑 · 共享节点客户端（M15 / S2 P1 Linux CLI + daemon）",
         epilog="退出码：" + "；".join(str(code) + "=" + text for code, text
                                      in sorted(facts.EXIT_CODE_HELP.items())))
     parser.add_argument("--home", help="本机数据目录（默认 $DJB_HOME 或 ~/.djb）")
@@ -2381,7 +2468,13 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common(handler: Callable[[argparse.Namespace], int], name: str,
                    help_text: str) -> argparse.ArgumentParser:
         item = sub.add_parser(name, help=help_text, description=help_text)
-        item.add_argument("--home", help=argparse.SUPPRESS)
+        # 2026-11-20 真机：每个子命令都带一个同名 --home，且默认 None，会**覆盖**
+        # 全局 `djb --home X <cmd>` 解析出来的值（argparse 子解析器用自身默认值
+        # 写回 namespace）→ `--home` 被静默忽略，数据写到平台默认目录。
+        # 现象：CLI 与 GUI 各自读不同的 state.db（一个 %APPDATA%\DJB、一个 --home 指向的
+        # 目录），GUI 永远看不到 CLI 写的底价。SUPPRESS = 没显式给就不写这个属性，
+        # 全局值得以保留。
+        item.add_argument("--home", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
         item.add_argument("--json", action="store_true", help="输出 JSON")
         item.set_defaults(handler=handler)
         return item
@@ -2393,7 +2486,7 @@ def build_parser() -> argparse.ArgumentParser:
     boot.add_argument("--no-daemon", action="store_true", help="只自举，不拉起 daemon")
 
     init = add_common(cmd_init, "init", "初始化本机数据目录 / 预设 / 限额，并做一次环境检测")
-    init.add_argument("--gateway", help="服务端地址（默认占位 api.example.invalid）")
+    init.add_argument("--gateway", help="服务端地址（默认取包内 config.json 或构建默认）")
     init.add_argument("--port", type=int, help="本机镜像端口（1024–65535，默认 1717）")
     init.add_argument("--channel", choices=facts.UPDATE_CHANNELS, help="更新频道")
     init.add_argument("--update-source", help="更新源（URL / 本地目录；留空用 mock 源）")
@@ -2531,6 +2624,17 @@ def build_parser() -> argparse.ArgumentParser:
         item = upstream_sub.add_parser(action, help=help_text)
         item.add_argument("--id", required=True)
         item.add_argument("--model", required=True)
+    # 2026-11-20：逐模型底价原来**只有 GUI 一条路**（且真机上那把行选中是坏的），
+    # 脚本/验收无法复核。这里补 CLI，与 GUI 共用同一个本地账本 ``rc14/model_bids``。
+    bid = add_common(cmd_bid, "bid", "逐模型最低申报价（最低价之上按最优价成交）")
+    bid_sub = bid.add_subparsers(dest="bid_action", metavar="<action>")
+    bid_set = bid_sub.add_parser("set", help="设置某模型的最低申报价")
+    bid_set.add_argument("--model", required=True)
+    bid_set.add_argument("--min-price", required=True)
+    bid_list = bid_sub.add_parser("list", help="列出本机已设的底价")
+    bid_remove = bid_sub.add_parser("remove", help="移除某模型的底价（= 不申报）")
+    bid_remove.add_argument("--model", required=True)
+
     price = upstream_sub.add_parser("price", help="设置逐模型最低价")
     price.add_argument("--id", required=True)
     price.add_argument("--model", required=True)
@@ -2699,7 +2803,7 @@ def build_parser() -> argparse.ArgumentParser:
                       "启动托盘壳（Windows/macOS；只发动作建议，不执行命令）")
     tray.add_argument("--interval-ms", type=int, default=5000,
                       help="刷新间隔（毫秒，默认 5000）")
-    tray.add_argument("--title", default="DJB 联脑", help="窗口 / 菜单栏标题前缀")
+    tray.add_argument("--title", default="TokenBank 联脑", help="窗口 / 菜单栏标题前缀")
 
     proxy = add_common(cmd_proxy, "proxy",
                        "显示 S4 代理偏好（composition / effort / proxy_mode；只打印不联网）")

@@ -711,9 +711,11 @@ REGISTER_CONFLICT_CODE = 40903
 REGISTER_CONFLICT_HINT = (
     "这台机器的硬件指纹已在服务端注册过（一台机器只跑一个节点）。"
     "处理：① 原机还留着密钥 → 直接 `djb auth --set-key -` 复用，**不要**重复注册；"
-    "② 重装/换机且原密钥丢了 → 在原账户解绑（`djb auth --unbind --yes`），"
-    "或用绑定码 `djb auth --bind <码>` 重新归属；"
+    "② 密钥丢了 → 先登录网页端「账户/节点」对这台机器的节点解绑"
+    "（命令行 --unbind/--bind 都要本机密钥，密钥丢了用不了），再重启客户端重新注册，"
+    "然后用绑定码 `djb auth --bind <码>` 重新归属；"
     "③ 确实要多个节点 → 加机器，别在同一台机器上再起一个 daemon（两个实例会互相顶掉同一份节点身份）。"
+    "网页端：" + WEB_CONSOLE_URL
 )
 
 # ─────────────────────────────────────────────────────────── 特性开关（默认关闭 + 三字段）
@@ -776,6 +778,28 @@ FEATURE_FLAGS["client.onboarding.enabled"] = {
 }
 ONBOARDING_FLAG = "client.onboarding.enabled"
 
+# ── R2.4 桌面壳层（启动骨架 / 快照缓存；默认关闭，三字段齐全，到期强制关）
+# 由 node-dev 在 lead 批准扩写域后从 desktop/client_flags.py **照抄**进唯一登记表
+# （2026-11-24，CHG-20261123-R2-4）：原来的两份登记已合一，client_flags.py 只读本表。
+# 两条都是**纯界面/本机缓存**开关：不影响契约、不影响云端、不写账本。
+FEATURE_FLAGS["client.startup_skeleton"] = {
+    "default": False,
+    "owner": "ezio",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "置 false 即回旧行为：首屏不画骨架，直接等第一次快照（0.5.10 行为）",
+    "description": "启动先出壳+骨架（首屏 ≤1.5s），数据到了再填内容（R2.4 S1）",
+}
+STARTUP_SKELETON_FLAG = "client.startup_skeleton"
+
+FEATURE_FLAGS["client.snapshot_cache"] = {
+    "default": False,
+    "owner": "ezio",
+    "expire_at": "2026-12-31",
+    "rollback_rule": "置 false 即回旧行为：启动不读/不写快照缓存，每次启动都实时取数",
+    "description": "启动用上次快照缓存先画（零网络首屏），随后后台刷新替换（R2.4 S3/S4）",
+}
+SNAPSHOT_CACHE_FLAG = "client.snapshot_cache"
+
 # ── RC14 I/J 逐模型底价上报（默认关闭：云端 ask-settings / schedule-quotes.models[]
 # 还没有主线实现，见 CHG-2026-11-14-RC14-IMPL §3-B.9；三字段齐全、到期强制关）
 FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
@@ -788,6 +812,30 @@ FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
     "description": "逐模型底价上报到云端（RC14 I/J）；云端接口未开通前保持关闭",
 }
 UPSTREAM_BID_FLAG = "client.upstream.bid_report.enabled"
+
+#: 平台服务费（**报价口径**）：``fee_mode=add`` 时「客户实付 = 供方 ask × (1 + fee_bps/10000)」。
+#: 1500 = 15%，与云端服务费率策略的默认值一致（云端上限 2000 = 20%）。
+#:
+#: 重要：**费率是服务端事实**（契约 `fee_bps` 由服务端在报价时快照，客户端不能自报）。
+#: 这里的常量只用于「设价前的告知弹窗」与界面说明；成交时以服务端快照为准。
+SERVICE_FEE_BPS = 1500
+SERVICE_FEE_SOURCE = "service_policy_default"
+
+
+def service_fee_percent() -> float:
+    """费率百分比（15.0）。界面上用 ``{:.4g}`` 打印，别写死「15%」两处。"""
+    return SERVICE_FEE_BPS / 100.0
+
+
+def customer_pay_text(ask: object) -> str:
+    """给一个供方报价，算出「客户实付」的展示文本（两位小数，算不出就给「—」）。"""
+    try:
+        from decimal import Decimal, ROUND_HALF_UP
+        base = Decimal(str(ask))
+        paid = (base * (Decimal(10000 + SERVICE_FEE_BPS) / Decimal(10000)))
+        return str(paid.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except Exception:                                     # pragma: no cover - 坏输入
+        return "—"
 UPSTREAM_BID_REPORT_PATHS: tuple[str, ...] = (
     "/api/v1/user/provider/ask-settings",
     "/api/v1/schedule/quotes",

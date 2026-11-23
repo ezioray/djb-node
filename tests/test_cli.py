@@ -14,7 +14,9 @@ COMMANDS = ["init", "bootstrap", "env", "auth", "start", "stop", "status", "paus
             "update", "logs", "diagnose", "tray", "uninstall", "model-sync", "notify",
             "proxy", "gui", "plan", "daemon", "reload", "machine",
             # RC14 B：首启引导状态（--status / --reset；只读本机 desktop/onboarding.json）
-            "onboarding"]
+            "onboarding",
+            # 2026-11-20：逐模型底价的 CLI 入口（与 GUI 共用本地账本 rc14/model_bids）
+            "bid"]
 
 
 def test_every_command_has_help(capsys):

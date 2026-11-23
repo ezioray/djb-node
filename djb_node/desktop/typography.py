@@ -25,7 +25,7 @@
    （:func:`assert_text_ok` 会抛 :class:`TypographyError`，不做静默降级）。
 
 行高口径：``line`` 是**行盒高度**（px@96dpi，实际乘 ``scale``）；``table`` 这一档的 ``line``
-（28）同时就是 ``ttk.Treeview`` 的 ``rowheight``（01-FONT-TYPO §2.3，0.3.4 写死 26）。
+（30）同时就是 ``ttk.Treeview`` 的 ``rowheight``（01-FONT-TYPO §2.3，0.3.4 写死 26）。
 渲染层取它只有一处：``ui_kit.table_rowheight(scale)``（= :func:`scaled_line`），
 所以字号与行高同源、同一取整规则，缩放档下不会出现「字涨行不涨」。
 """
@@ -86,6 +86,10 @@ class TypeToken:
 
 #: 字阶表 = 01-FONT-TYPO §2.2 逐行誊写（顺序即层级，勿随手插档）。
 #:
+#: 2026-11-20 owner 裁决「整体上调一档」：**全档 +1px、行高 +2px**（相对 0.3.5 的
+#: 30/20/18/15/14/12.5/11/12/12、行高 36/28/26/22/22/18/16/28/16）。层级差与
+#: CJK 下限（11）不变；`display` 31/38 仍满足行高 ≥1.2×，`body` 15/24 = 1.6 满足 ≥1.5×。
+#:
 #: 注意 ``tracking`` 一列**不在设计文档里**（§2.2 只有 px/行高/字重三列）：这 5 个值是
 #: 实现自定，待设计确认；Tk 不支持 letter-spacing，渲染层暂不消费。
 TOKEN_ORDER: tuple[str, ...] = (
@@ -93,18 +97,18 @@ TOKEN_ORDER: tuple[str, ...] = (
 )
 
 TYPES: dict[str, TypeToken] = {
-    "display": TypeToken("display", 30.0, 36.0, "bold", tracking=-0.4,
+    "display": TypeToken("display", 31.0, 38.0, "bold", tracking=-0.4,
                          usage="仪表环中心数字 / 首屏大数"),
-    "hero": TypeToken("hero", 20.0, 28.0, "bold", tracking=-0.2, usage="页面主标题"),
-    "h1": TypeToken("h1", 18.0, 26.0, "bold", tracking=-0.1, usage="区块标题"),
-    "h2": TypeToken("h2", 15.0, 22.0, "bold", usage="卡片标题"),
-    "body": TypeToken("body", 14.0, 22.0, "normal", usage="正文 / 说明 / 表单"),
-    "small": TypeToken("small", 12.5, 18.0, "normal", tracking=0.1, usage="辅助信息"),
-    "micro": TypeToken("micro", 11.0, 16.0, "normal", tracking=0.3,
+    "hero": TypeToken("hero", 21.0, 30.0, "bold", tracking=-0.2, usage="页面主标题"),
+    "h1": TypeToken("h1", 19.0, 28.0, "bold", tracking=-0.1, usage="区块标题"),
+    "h2": TypeToken("h2", 16.0, 24.0, "bold", usage="卡片标题"),
+    "body": TypeToken("body", 15.0, 24.0, "normal", usage="正文 / 说明 / 表单"),
+    "small": TypeToken("small", 13.5, 20.0, "normal", tracking=0.1, usage="辅助信息"),
+    "micro": TypeToken("micro", 12.0, 18.0, "normal", tracking=0.3,
                        usage="徽标 / 角标（CJK 下限）"),
-    "table": TypeToken("table", 12.0, 28.0, "normal", usage="表格正文（行高兼 rowheight）",
+    "table": TypeToken("table", 13.0, 30.0, "normal", usage="表格正文（行高兼 rowheight）",
                        line_kind="row"),
-    "mono": TypeToken("mono", 12.0, 16.0, "normal", family="mono",
+    "mono": TypeToken("mono", 13.0, 18.0, "normal", family="mono",
                       usage="仅 ASCII 数字/ID（CJK 禁止进 mono）"),
 }
 

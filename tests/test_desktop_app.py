@@ -308,8 +308,8 @@ def test_page_kickers_come_from_the_ia_table():
     from djb_node.desktop.views import page_kicker
 
     assert desktop_app.PAGE_KICKERS == {key: page_kicker(key) for key in VIEW_KEYS}
-    assert desktop_app.PAGE_KICKERS["account"] == "SYSTEM / ACCOUNT"
-    assert desktop_app.PAGE_KICKERS["receipts"] == "EARN / RECEIPTS"
+    assert desktop_app.PAGE_KICKERS["account"] == "系统 / 账户与安全"
+    assert desktop_app.PAGE_KICKERS["receipts"] == "收益 / 收据"
 
 
 def test_looks_numeric_knows_money_tokens_and_units():
@@ -352,11 +352,13 @@ def test_sidebar_renders_the_five_group_ia_baseline(tmp_path, monkeypatch):
         assert len(app._nav_section_headers) == 5
         assert list(app._nav_buttons) == list(app._ia_order)
         assert list(app._ia_order) == list(ia.flat_keys())
-        assert app._ia_order[0] == "token_plan"                 # 共享前置
+        assert app._ia_order[0] == "agent"                      # D17：接入组带头
         for section in ia.IA_SECTIONS_SHARE:
             header = app._nav_section_headers[section.key]
             first = app._nav_buttons[section.keys[0]]
-            assert first.winfo_y() > header.winfo_y()
+            # D17 起成员装在每组自己的 body 帧里，winfo_y() 是相对 body 的；
+            # 用屏幕坐标比较「组标题在成员之上」才和父容器无关。
+            assert first.winfo_rooty() > header.winfo_rooty()
         # GPU 带 BETA 徽标（等宽 micro 档的右侧计数位），其它 12 项没有
         assert app._nav_buttons["gpu"].count == "BETA"
         assert [k for k, item in app._nav_buttons.items() if item.count] == ["gpu"]
@@ -390,7 +392,7 @@ def test_sidebar_legacy_rollback_matches_0_3_4(tmp_path, monkeypatch):
         for section in NAV_SECTIONS:
             header = app._nav_section_headers[section.key]
             first = app._nav_buttons[section.keys[0]]
-            assert first.winfo_y() > header.winfo_y()
+            assert first.winfo_rooty() > header.winfo_rooty()
         # 快捷键/下拉也跟着回滚：Ctrl+1 回到「总览」
         assert app._ia_order[0] == "overview"
         assert app._nav_combo.get().startswith("1 · 总览") or True   # 下拉状态由 _sync_nav 管
@@ -519,11 +521,25 @@ def test_content_width_follows_canvas_across_views_and_resizes(tmp_path):
         root.destroy()
 
 
-def test_page_kicker_label_shows_two_level_ascii_for_account(tmp_path):
+def test_page_kicker_label_shows_two_level_chinese_for_account(tmp_path, monkeypatch):
+    """R2.1 ⑤：页头眉标两级中文，且**跟着当前 IA 表**走（回滚时是旧组名）。
+
+    ``account`` 在方案 A 里属「接入」组、在 0.3.4 旧表里属「系统」组——两套都要对，
+    这样 ``DJB_UI_IA=legacy`` 的回滚才是真的（不是只换侧栏）。
+    """
+    monkeypatch.delenv("DJB_UI_IA", raising=False)
     app, root = _window_app(tmp_path, 1440)
     try:
         app.show_view("account")
         root.update()
-        assert app._page_kicker.cget("text") == "SYSTEM / ACCOUNT"
+        assert app._page_kicker.cget("text") == "账户 / 账户与安全"
+    finally:
+        root.destroy()
+    monkeypatch.setenv("DJB_UI_IA", "legacy")
+    app, root = _window_app(tmp_path, 1440)
+    try:
+        app.show_view("account")
+        root.update()
+        assert app._page_kicker.cget("text") == "系统 / 账户与安全"
     finally:
         root.destroy()

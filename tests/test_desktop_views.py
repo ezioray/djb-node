@@ -20,14 +20,15 @@ SECRET = "djb_sk_live_9f2c41aa77be"
 SPEC_ORDER = ["overview", "bench", "gpu", "models", "tasks", "receipts", "earnings",
               "token_plan", "agent", "access", "yield", "account", "logs"]
 SPEC_TITLES = ["总览", "性能基准", "GPU 监控", "模型与探针", "任务队列", "收据", "收益",
-               "提供 Token Plan", "Agent 接入", "本机设置", "让路/节能", "账户与安全",
+               "提供 Token Plan", "Agent 接入", "本机设置", "暂停接单", "账户与安全",
                "日志"]
 #: 分组口径（00-PLAN §1.1 已裁决）：组 key / 中文名 / 拉丁微标 / 成员顺序
 SPEC_SECTIONS = [
-    ("run", "运行", "RUN", ["overview", "bench", "gpu", "models", "tasks"]),
-    ("earn", "收益", "EARN", ["receipts", "earnings", "token_plan"]),
-    ("connect", "接入", "CONNECT", ["agent", "access"]),
-    ("system", "系统", "SYSTEM", ["yield", "account", "logs"]),
+    # 2026-11-23 R2.1 ⑤：微标中文化（英文眉标残留 0 处），组顺序/成员一个不差
+    ("run", "运行", "运行", ["overview", "bench", "gpu", "models", "tasks"]),
+    ("earn", "收益", "收益", ["receipts", "earnings", "token_plan"]),
+    ("connect", "接入", "接入", ["agent", "access"]),
+    ("system", "系统", "系统", ["yield", "account", "logs"]),
 ]
 #: 合规红线：不许出现「许愿式」金融承诺。**唯一例外**是 owner 2026-11-16 D-2 那句结算口径
 #: （`views.SETTLE_NOTE`，原话里含「提现」）；除它之外任何地方出现「提现」都算违规——
@@ -70,18 +71,19 @@ def test_nav_sections_follow_the_agreed_groups():
     assert [section.key for section in vw.NAV_SECTIONS] == ["run", "earn", "connect", "system"]
 
 
-def test_every_page_kicker_is_two_level_ascii():
-    """页头眉标 =「组名 / 页名」两级；整串 ASCII，交给 mono 不会跳基线。"""
+def test_every_page_kicker_is_two_level_chinese():
+    """B3 / R2.1 ⑤：页头眉标 =「组名 / 页名」两级；**不含英文**（英文残留 0 处）。"""
+    from djb_node.desktop import ia
     for key in vw.VIEW_KEYS:
         kicker = vw.page_kicker(key)
-        assert kicker.isascii(), kicker
+        assert not ia.has_english(kicker), kicker
         parts = kicker.split(" / ")
         assert len(parts) == 2, kicker
         assert parts[0] == vw.SECTION_FOR_VIEW[key].micro
         assert parts[1] == vw.PAGE_MICROS[key]
-    assert vw.page_kicker("overview") == "RUN / OVERVIEW"
-    assert vw.page_kicker("token_plan") == "EARN / TOKEN PLAN"
-    assert vw.page_kicker("logs") == "SYSTEM / LOGS"
+    assert vw.page_kicker("overview") == "运行 / 总览"
+    assert vw.page_kicker("token_plan") == "收益 / 提供套餐"
+    assert vw.page_kicker("logs") == "系统 / 运行日志"
 
 
 def test_every_view_renders_from_demo_data():
@@ -1655,3 +1657,32 @@ def test_access_page_offers_reset_only_when_the_node_is_retired():
     text = retired.plain_text()
     assert "节点已清退（不可逆）" in text          # 不再让客户以为「重装就好」
     assert "重新注册" in text
+
+
+#: R2.1 ⑤ 的**产品名**白名单：这些是品牌/协议名，不做翻译（owner 若要求中文化另开票）。
+EYEBROW_PRODUCT_NAMES = ("Token Plan", "Agent", "GPU", "CPU")
+
+def test_no_english_in_any_page_eyebrow():
+    """13 页的眉标（页名 / 主卡眉标 / 徽标 / 右侧栏卡片眉标 / 图表眉标）不许有英文字母。
+
+    R2.1 ⑤ 的验收口径：「侧栏 / 页头眉标中文，英文残留 0 处」。这里把**眉标层**钉住，
+    正文里的技术名（OpenAI / USDT / nvidia-smi / 节点 ID）不在这一层，属于有意保留。
+    """
+    from djb_node.desktop import ia
+
+    snapshot = demo_snapshot()
+    offenders: dict[str, list[str]] = {}
+    for key in vw.VIEW_KEYS:
+        view = vw.build_view(key, snapshot)
+        eyebrows = [view.title]
+        if view.hero is not None:
+            eyebrows += [view.hero.kicker, view.hero.chip, view.hero.title]
+        for rail in view.rail:
+            eyebrows += [rail.kicker, rail.title]
+        if view.chart is not None:
+            eyebrows += [view.chart.kicker, view.chart.title]
+        hits = [text for text in eyebrows if text and ia.has_english(text)
+                and not any(name in text for name in EYEBROW_PRODUCT_NAMES)]
+        if hits:
+            offenders[key] = hits
+    assert offenders == {}, "眉标里还有英文：" + repr(offenders)

@@ -61,12 +61,19 @@ LOG_LEVELS: tuple[str, ...] = ("debug", "info", "warning", "error", "critical")
 
 
 class ProviderError(RuntimeError):
-    """某个数据域取数失败；消息只放**短中文原因**，不带 URL / 令牌 / 原始异常文本。"""
+    """某个数据域取数失败；消息只放**短中文原因**，不带 URL / 令牌 / 原始异常文本。
 
-    def __init__(self, reason: str, *, hint: str = DATA_SOURCE_HINT) -> None:
+    ``auth_required``：**是不是「登录过期/无凭据」这一类**（401/403）。视图层据此把
+    「重新登录」入口放到顶部横幅（R2.1 ①，原来全站 401 是死路：只显示一句
+    「暂不可用（登录已过期）」，没有任何可点的下一步）。
+    """
+
+    def __init__(self, reason: str, *, hint: str = DATA_SOURCE_HINT,
+                 auth_required: bool = False) -> None:
         super().__init__(reason)
         self.reason = str(reason)
         self.hint = str(hint)
+        self.auth_required = bool(auth_required)
 
     @property
     def text(self) -> str:
@@ -80,6 +87,8 @@ class Unavailable:
 
     reason: str
     hint: str = DATA_SOURCE_HINT
+    #: 这个域是因为「登录过期 / 无凭据」才不可用（401/403）→ 顶部横幅给「重新登录」
+    auth_required: bool = False
 
     def __post_init__(self) -> None:
         if not str(self.reason or "").strip():
@@ -89,9 +98,9 @@ class Unavailable:
     def text(self) -> str:
         return UNAVAILABLE + "（" + self.reason + "）"
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         return {"status": "unavailable", "reason": self.reason, "hint": self.hint,
-                "text": self.text}
+                "text": self.text, "auth_required": self.auth_required}
 
 
 @dataclass(frozen=True)
@@ -112,6 +121,22 @@ class Snapshot:
     def missing(self, name: str) -> Unavailable | None:
         value = self.sections.get(name)
         return value if isinstance(value, Unavailable) else None
+
+    # ── R2.1 ①：401 是**整窗**状态，不是某一个数据域的状态
+    def login_required(self) -> tuple[str, str]:
+        """有哪个域在喊「登录过期」（401/403）→ 返回 ``(域, 原因)``；否则 ``("", "")``。
+
+        为什么放在快照上：一轮取数里 tasks / receipts / earnings / account 会**同时** 401，
+        但客户只需要一条横幅（不是四条「暂不可用」）。取第一条就够，不重复说同一件事。
+        """
+        for name, value in self.sections.items():
+            if isinstance(value, Unavailable) and value.auth_required:
+                return str(name), value.reason
+        return "", ""
+
+    @property
+    def needs_login(self) -> bool:
+        return bool(self.login_required()[0])
 
     def text_of(self, name: str, field: str = "", default: str = UNAVAILABLE) -> str:
         """渲染取值：域不可用时直接给「暂不可用（原因）」，字段缺失给 ``default``。"""
@@ -512,7 +537,7 @@ class LocalDataSource:
         try:
             value = loader()
         except ProviderError as exc:
-            return Unavailable(exc.reason, exc.hint)
+            return Unavailable(exc.reason, exc.hint, auth_required=exc.auth_required)
         except KeyError as exc:                        # 依赖模块字段改名（并行写者）
             return Unavailable(name + " 数据结构变化（缺 " + str(exc.args[0])[:24] + "）")
         except Exception as exc:                       # 任何未预期失败都不许冒泡到 UI
@@ -790,7 +815,7 @@ class LocalDataSource:
         try:
             catalog = self._cloud_call("model_catalog")
         except ProviderError as exc:
-            error = Unavailable(exc.reason, exc.hint)
+            error = Unavailable(exc.reason, exc.hint, auth_required=exc.auth_required)
         else:
             for row in _as_rows(catalog):
                 catalog_rows.append({
@@ -1152,6 +1177,15 @@ class LocalDataSource:
             block["preview"] = payload
         except Exception as exc:            # 库坏了：底价区降级，不影响整页
             block["unavailable"] = "本地底价读不到（" + type(exc).__name__ + "）"
+            # 2026-11-20 真机：界面上只看到「未设价」，账本里明明有价 —— 就是因为
+            # 这里把异常吞成空 dict，界面上没有任何痕迹。事件里留下类型和首行原因，
+            # 视图再把 unavailable 显示出来，两处一起定位。
+            try:
+                from ..logging_setup import event as _event
+                _event("desktop.bids.unavailable", error=type(exc).__name__,
+                       detail=str(exc).splitlines()[0][:160] if str(exc) else "")
+            except Exception:
+                pass
             block["preview"] = {"models": [], "reason": "unavailable"}
             return block
         try:
@@ -1462,7 +1496,13 @@ class LocalDataSource:
                     "current_version": None, "channel": None, "verify_state": "",
                     "checked_at": "", "next_version": "", "bucket": None,
                     "edition": "", "source_kind": "", "note": ""}
+        # 2026-11-19 真机：account 版本卡写 0.3.15，而程序实际是 0.3.16。
+        # 根因就在这里——``update.status()`` 已经给出 ``package_version``（实际在跑的程序版本）
+        # 与 ``install_record_version``（安装记录），但本投影只搬了 ``current_version``，
+        # 于是视图层拿不到 package_version，回落到安装记录（手工换包/升级后记录会滞后）。
         return {"current_version": status.get("current_version"),
+                "package_version": status.get("package_version"),
+                "install_record_version": status.get("install_record_version"),
                 "channel": status.get("channel"), "verify_state": status.get("verify_state") or "",
                 "checked_at": status.get("checked_at") or "",
                 "next_version": status.get("next_version") or "",

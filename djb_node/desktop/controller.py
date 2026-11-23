@@ -108,6 +108,37 @@ BIND_CODE_HINT = "；绑定码一次性、10 分钟有效——请到网页端�
 _BIND_CODE_REASONS = ("binding_code_expired", "binding_code_mismatch", "40905", "过期", "失效")
 
 
+def _now_iso() -> str:
+    """界面状态里的时间戳（本地时区，精确到秒；**不写日志、不进快照**）。"""
+    from datetime import datetime
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+def _host_of(base_url: str) -> str:
+    """从请求地址里取 host:port 给人看（不带 path/query —— 地址正文不进界面文案）。"""
+    text = str(base_url or "").strip()
+    if not text:
+        return "（未填地址）"
+    rest = text.split("://", 1)[-1]
+    host = rest.split("/", 1)[0]
+    return host or text
+
+
+def _connectivity_next_step(error_class: str, status: Any) -> str:
+    """联通失败的**下一步**：按错误类别给可执行动作（不是一句「失败了」）。"""
+    code = str(error_class or "")
+    if code in ("unauthorized", "forbidden") or status in (401, 403):
+        return "下一步：密钥不对或没有权限 —— 重新粘一次 Key（注意别带空格），再点「测试联通性」"
+    if code == "no_models_api" or status == 404:
+        return ("下一步：地址要指到兼容 OpenAI 的 /v1（例如 https://api.openai.com/v1），"
+                "不要带 /chat/completions")
+    if code in ("invalid_payload", "bad_json"):
+        return "下一步：这个地址回的不是模型列表 —— 确认是 OpenAI 兼容网关，而不是网页首页"
+    if code in ("unreachable", "timeout", "tls_error", "connection"):
+        return "下一步：本机连不上这个域名 —— 查网络/代理/证书，或换一个能访问的地址"
+    return "下一步：核对「请求地址 / 协议 / 密钥」三项后重试；本次未保存任何配置"
+
+
 def _cooldown_suffix(controller: Any, exc: Any) -> str:
     """失败文案后缀：冷却类错误补上「可再改时间 X（来自云端上一轮返回）」。"""
     from . import payout as payout_mod
@@ -211,6 +242,12 @@ class DesktopController:
     discover_via: Callable[[str, str, str], Any] | None = None
     #: 最近一次「读取模型清单」的结果（``datasource.discover_upstream_models`` 原样）
     last_discover: Mapping[str, Any] | None = None
+    #: R2.1 ③：联通测试的**界面状态**（唯一来源；视图只读，不自己记）
+    #: 形状：``{"state": "running"|"ok"|"fail", "text": …, "next": …, "at": …, "target": …}``
+    connectivity: Mapping[str, Any] | None = None
+    #: 联通测试异步通道 ``(payload) -> bool``；返回 True = 已派给 worker。
+    #: 没有通道（单测/无 Tk）就**同步**跑一次，行为与旧版一致但会立刻写状态。
+    connectivity_via: Callable[[Mapping[str, Any]], Any] | None = None
     #: CR-20261119-CLIENT-TOKENPLAN-NOOP F3：最近一次「读取模型清单」的**人话结论**
     #: （读到几个 + 有没有落成上游）。写进视图 note，不再依赖会被下一次刷新播报覆盖的状态条。
     discover_message: str = ""
@@ -218,6 +255,10 @@ class DesktopController:
     update_factory: Callable[[], Any] | None = None
     #: 最近一次检查结果（``check()`` 原样 payload；界面/日志都用它）
     last_update: Mapping[str, Any] | None = None
+    #: R2.4 S3/S4：本机数据目录（非空 = 允许读/写快照缓存；demo/无目录时为空）
+    cache_home: str | None = None
+    #: 当前画面是不是「上次的快照」（状态条要如实说「缓存」，不许冒充新数据）
+    stale_from_cache: bool = False
     _snapshot: Snapshot | None = None
 
     # ── 快照 / 视图
@@ -226,6 +267,27 @@ class DesktopController:
         if self._snapshot is None:
             self._snapshot = self.source.snapshot()
         return self._snapshot
+
+    # ── R2.4 S4：启动先画缓存（零网络首屏）
+    def prime_from_cache(self) -> bool:
+        """用上次的快照**先把窗口画出来**；返回 ``True`` = 用上了缓存。
+
+        只在启动时调用一次：拿不到缓存就返回 ``False``，调用方照旧走实时取数。
+        用上缓存时 ``stale_from_cache=True``，界面状态条必须写「缓存 + 正在刷新」。
+        """
+        from . import snapshot_cache
+
+        cached = snapshot_cache.load(self.cache_home)
+        if not cached:
+            return False
+        self._snapshot = Snapshot(sections=cached["sections"],
+                                  fetched_at=str(cached.get("fetched_at") or ""),
+                                  source="cache")
+        self.stale_from_cache = True
+        stamp = str(cached.get("fetched_at") or "")
+        self.message = ("已就绪：显示 " + (stamp.split(" ")[-1] if " " in stamp else stamp or "上次")
+                        + " 的快照（缓存），正在后台刷新…")
+        return True
 
     @property
     def views(self) -> dict[str, View]:
@@ -269,6 +331,8 @@ class DesktopController:
                     merged_plan["selected_price"] = self._bids().price_of(selected_model)
                 except Exception:
                     merged_plan["selected_price"] = ""
+            # R2.1 ③：联通测试状态也由本层注入（视图只读，不自己记「进行中」）
+            merged_plan["connectivity"] = self.connectivity_state()
             if self.discover_message:
                 # F3：发现结论（含「已添加上游 / 未保存」）优先，且**常驻页面**
                 merged_plan["discover_note"] = self.discover_message
@@ -313,6 +377,22 @@ class DesktopController:
             raise ValueError("未知视图：" + str(key))
         self.view = key
         return self.current()
+
+    def set_boot(self, boot: Mapping[str, Any] | None) -> None:
+        """回填首启自举结论（供「先出窗口、后跑自举」的启动顺序使用）。
+
+        2026-11-19 真机实测：``djb-desktop.exe`` onefile 解包约 6 s，自举（ensure_ready +
+        start_daemon 等控制口）再叠数秒。原实现把自举放在窗口创建之前，客户观感是
+        「双击后十几秒没反应」。现在先画窗口，自举完再回填这里并重画，否则
+        「节点进程」字段会一直停在「未运行」。
+        """
+        source = getattr(self, "source", None)
+        if source is None:
+            return
+        try:
+            source._boot = dict(boot or {})           # noqa: SLF001 - 同包私有字段
+        except Exception:                              # pragma: no cover - 数据源不可写
+            pass
 
     def next_view(self, step: int = 1) -> View:
         index = (VIEW_KEYS.index(self.view) + int(step)) % len(VIEW_KEYS)
@@ -377,6 +457,12 @@ class DesktopController:
             else:
                 self._snapshot = fresh
             self.message = "已刷新：" + (self._snapshot.fetched_at or "刚刚")
+            self.stale_from_cache = False
+            if self.cache_home:
+                from . import snapshot_cache
+
+                snapshot_cache.save(self.cache_home, self._snapshot.sections,
+                                    fetched_at=self._snapshot.fetched_at)
         if quiet:
             # RC15-039 #4：自动刷新是后台动作。**成功**时保留客户正在读的那句（例如
             # 「未保存：…」），失败时保留上面刚写的失败说明——两种都不进托盘广播。
@@ -719,7 +805,10 @@ class DesktopController:
             reason = str((daemon or {}).get("reason") or "") if isinstance(daemon, Mapping) else ""
             detail = ("；节点进程原因：" + reason) if reason else "；原因见「接入配置」页的注册状态"
             return ActionResult("暂不可用（还没有节点 ID" + detail + "）", ok=False)
-        return ActionResult("已复制节点标识：" + node_id, effect="copy", payload=node_id)
+        from .views import mask_node_id
+
+        return ActionResult("已复制节点 ID（" + mask_node_id(node_id) + "）：粘到网页端绑定框即可",
+                            effect="copy", payload=node_id)
 
     def _act_agent_save(self, *, confirm=None) -> ActionResult:
         return self.save_agent()
@@ -753,6 +842,22 @@ class DesktopController:
     def _device_client(self):
         return getattr(self.source, "cloud", None)
 
+    # ── R2.1 ①：401 不是死路 —— 顶部横幅的「重新登录」只发一条**界面内**动作
+    def _act_auth_relogin(self, *, confirm=None) -> ActionResult:
+        """「重新登录」：能自动绑定就走设备码，否则退回手输绑定码（两条都在界面内）。
+
+        为什么不是 ``djb auth --pair``：客户没有终端入口（报告 P0-1）。这里只**派发**，
+        真正的网络/轮询在 worker（设备码）或一次性输入框（绑定码）里完成；
+        登录完成后由 app 层回到用户原来那一页（``effect="relogin"``）。
+        """
+        if self.device_flow_enabled():
+            return ActionResult(
+                "正在重新登录：浏览器里点「确认」就完成，本机会自动回到你原来的页面。",
+                effect="relogin", payload="device")
+        return ActionResult(
+            "自动绑定没开通：请在网页端生成绑定码，粘到这一页完成重新登录"
+            "（本机数据不受影响）。", effect="relogin", payload="code")
+
     def device_flow_enabled(self) -> bool:
         from .. import facts as facts_mod
         from ..config import Paths, feature_flag, load_config
@@ -779,10 +884,21 @@ class DesktopController:
         def post(path: str, body: Mapping[str, Any]) -> Mapping[str, Any]:
             if path.endswith("/poll"):
                 return client.device_poll(str(body.get("device_code") or ""))
-            return client.device_start()
+            node_id = str(body.get("node_id") or "")
+            try:
+                return client.device_start(node_id)
+            except TypeError:            # 旧测试桩/旧客户端不接收参数
+                return client.device_start()
 
+        access = self.snapshot.get("access")
+        node_id = str(access.get("node_id") or "") if isinstance(access, Mapping) else ""
+        if not node_id:
+            account = self.snapshot.get("account")
+            security = account.get("security") if isinstance(account, Mapping) else None
+            node_id = str((security or {}).get("node_id") or "")
         runner = flow_mod.DeviceFlowRunner(post, sleep=time.sleep, clock=time.monotonic,
-                                          on_update=self._device_update, stop=stop)
+                                          on_update=self._device_update, stop=stop,
+                                          node_id=node_id)
         flow = runner.run()
         self.device_flow = flow
         return self._device_result(flow)
@@ -800,6 +916,12 @@ class DesktopController:
         from .. import device_flow as flow_mod
 
         if flow.state == "approved":
+            # 2026-11-22 P0 防线：云端只回 approved、没有 node_id 时不能显示成功。
+            # 0.5.8 的假绑定就是“approved=成功”，但节点实际 unbound。
+            if not str(getattr(flow, "bound_node_id", "") or "").strip():
+                return ActionResult("云端已批准，但没有返回节点 ID；本次不能算绑定成功。"
+                                    "请升级到 0.5.9+ 后重新发起，或改用「手输绑定码」。",
+                                    ok=False, payload=flow.as_dict())
             # 绑定成功后重新取数：绑定状态/收款面板都要立刻反映
             return ActionResult("绑定成功：这台电脑已经绑到你的账户（" + flow.user_code + "）"
                                 "（USDT 收款地址是另一件事：在本页「③ 提交 USDT 收款地址」"
@@ -817,6 +939,14 @@ class DesktopController:
     def _act_account_bind_device(self, *, confirm=None) -> ActionResult:
         """「在浏览器确认绑定」：开关默认关；关着就只指向老的手输码路径。"""
         from .. import device_flow as flow_mod
+        # 2026-11-20：这条动作原来**一行日志都不写**，真机「点了没反应」时无从判断
+        # 是没触发、被开关挡住、还是网络卡住。入口先落一条事件（只记事实，不记凭据）。
+        try:
+            from ..logging_setup import event as _event
+            _event("desktop.device_flow.request", level="info",
+                   enabled=bool(self.device_flow_enabled()))
+        except Exception:                                  # pragma: no cover - 日志不可用
+            pass
 
         if not self.device_flow_enabled():
             # RC15-039 #11：以前甩半条 CLI（`djb auth --bind`）当解决方案——客户没有终端
@@ -845,13 +975,53 @@ class DesktopController:
         return ActionResult("已停止等待绑定；随时可以重新点「在浏览器确认绑定」",
                             effect="refresh")
 
+    # ── R2.1 ④：收款地址复制（统一复制组件的「地址」一格）
+    def _act_account_copy_address(self, *, confirm=None) -> ActionResult:
+        """复制**本机已存**的收款地址（只读快照，不写配置、不提交云端）。
+
+        为什么不是「复制云端那个」：云端地址是提交后才有的只读结果，客户真正要粘的是
+        自己钱包里的地址（填进钱包/发给对方），本机这份才是他的输入。
+        """
+        address = self.payout_address()
+        if not address:
+            return ActionResult("还没有收款地址：先在上面填 Polygon（0x 开头 42 位）再保存",
+                               ok=False)
+        shown = address if len(address) <= 12 else address[:6] + "…" + address[-4:]
+        return ActionResult("已复制收款地址 " + shown + "（Polygon / ERC20）",
+                            effect="copy", payload=address)
+
     def _act_account_copy_verify_url(self, *, confirm=None) -> ActionResult:
+        from .views import format_short_code
+
         flow = self.device_flow
         url = str(getattr(flow, "verify_url", "") or "")
         if not url:
             return ActionResult("还没有确认链接：先点「在浏览器确认绑定」", ok=False)
-        return ActionResult("已复制确认链接（在浏览器打开后输入 " + str(flow.user_code) + "）",
+        return ActionResult("已复制确认链接（在浏览器打开后输入 "
+                            + format_short_code(getattr(flow, "user_code", "")) + "）",
                             effect="copy", payload=url)
+
+    # ── R2.1 ②：绑定短码可复制（短码**只用于绑定**，一次性 + 10 分钟）
+    def _act_account_copy_short_code(self, *, confirm=None) -> ActionResult:
+        """把当前绑定短码交给剪贴板（``effect="copy"``）；没有短码就说下一步。
+
+        短码来自设备流程（``device_flow.user_code``，云端契约 ``^[A-Z2-9]{8}$``）。
+        已经绑定完成 / 短码过期时**不复制旧码**——旧码粘到网页端只会报「无效」，客户
+        会以为客户端坏了；这里如实说「重新生成一个」。
+        """
+        from .views import format_short_code
+
+        flow = self.device_flow
+        code = format_short_code(getattr(flow, "user_code", ""))
+        if not code or not str(getattr(flow, "user_code", "") or "").strip():
+            return ActionResult("还没有绑定短码：点「在浏览器确认绑定」生成一个"
+                               "（短码一次性、10 分钟有效）", ok=False)
+        state = str(getattr(flow, "state", "") or "")
+        if state in ("approved", "bound"):
+            return ActionResult("这台的绑定已经完成，短码已失效：不用再复制"
+                               "（要绑另一台电脑就在那台上重新生成）", ok=False)
+        return ActionResult("已复制绑定短码 " + code + "（10 分钟内一次性，只用于绑定）",
+                            effect="copy", payload=code)
 
     # ── RC14 B 首次引导（应用内面板，不是模态；每步都能跳）
     def _onboarding_store(self):
@@ -1122,6 +1292,24 @@ class DesktopController:
         price = str(self.drafts.get("min_price") or "").strip()
         if not model:
             return ActionResult("先在上面的表格里选一行模型", ok=False)
+        # 2026-11-20 owner：**设价时必须提醒 15% 分成**。
+        # 这里把三件事一次说清：最低价的含义（低于不成交）、高于时按最优价成交、
+        # 平台费加在客户侧（你按报价结算）。费率来自 facts（服务端策略快照口径）。
+        if confirm is not None and str(price or "").strip():
+            fee = facts.SERVICE_FEE_BPS
+            text = ("保存「" + model + "」的最低申报价 " + str(price).strip() + " USD / 百万 token？\n\n"
+                    "成交规则：低于这个价不成交；撮合到更高价时按**最优价**成交（你按成交价结算）。\n\n"
+                    "平台服务费 " + format(facts.service_fee_percent(), "g") + "%"
+                    "（fee_mode=add，" + str(fee) + "bp，以成交时服务端快照为准）：\n"
+                    "    客户实付 = 你的报价 × " + format(1 + fee / 10000.0, "g") + "\n"
+                    "    例：报价 " + str(price).strip() + " → 客户实付约 "
+                    + facts.customer_pay_text(str(price).strip()) + "\n\n"
+                    "平台费不从你的报价里倒扣。")
+            try:
+                if not confirm(text):
+                    return ActionResult("已取消保存（价格未变）", ok=False, effect="cancelled")
+            except TypeError:                      # 测试里的 confirm 可能只收位置参数
+                pass
         try:
             saved = self._bids().set_price(model, price)
         except ValueError as exc:
@@ -1178,6 +1366,137 @@ class DesktopController:
         """
         return ActionResult("在下方「添加接入」填：协议 → 请求地址 → 密钥，再点「读取模型清单」。",
                             effect="goto", payload="token_plan")
+
+    def _act_token_plan_enable_relay(self, *, confirm=None) -> ActionResult:
+        """一键开启 `client.relay.enabled`（默认关）。
+
+        真机 2026-11-20：客户填好地址和 Key 点「读取模型清单」，CLI 明明回了
+        「relay 接入开关关闭（默认关闭）…（本次未创建上游）」，GUI 却没有任何反馈，
+        客户只会看到「点了没反应」。这里把开关做成页面上的一次点击，并把「开了什么、
+        能不能回滚」一次讲清楚（flag 自带 owner/expire/rollback_rule）。
+        """
+        from .. import facts as facts_mod
+        from ..config import Paths, load_config, save_config
+
+        home = getattr(self.source, "_home", None)
+        if not home:
+            return ActionResult("本机配置目录不可用：无法开启中继接入", ok=False)
+        try:
+            config = load_config(Paths(str(home)))
+            extra = dict(config.extra or {})
+            flags = dict(extra.get("feature_flags") or {})
+            if flags.get(facts_mod.RELAY_FLAG):
+                return ActionResult("中继接入已经开着：直接点「读取模型清单」即可。",
+                                    effect="refresh")
+            flags[facts_mod.RELAY_FLAG] = True
+            extra["feature_flags"] = flags
+            config.extra = extra
+            save_config(Paths(str(home)), config)
+        except Exception as exc:                        # noqa: BLE001 - 配置坏了别打崩 UI
+            return ActionResult("开启失败（" + type(exc).__name__ + "）；配置未改动", ok=False)
+        return ActionResult("已开启中继接入（" + facts_mod.RELAY_FLAG
+                            + "）：现在点「读取模型清单并保存接入」就能落地。",
+                            effect="refresh")
+
+    CONNECTIVITY_IDLE_TEXT = "还没测过：填好请求地址与密钥后点「测试联通性」"
+
+    def connectivity_state(self) -> dict[str, Any]:
+        """视图读的联通状态（永远有话说：没测过也有「下一步」）。"""
+        state = dict(self.connectivity or {})
+        if not state:
+            return {"state": "idle", "text": self.CONNECTIVITY_IDLE_TEXT,
+                    "next": "点「测试联通性」验证地址与密钥；只探活，不保存任何配置",
+                    "at": "", "target": ""}
+        return state
+
+    def _act_token_plan_test_connectivity(self, *, confirm=None) -> ActionResult:
+        """「测试联通性」：**先回状态、再干活**（R2.1 ③：点击 200ms 内必须有文字变化）。
+
+        旧实现把网络调用放在 Tk 主线程里：点下去窗口就冻住，客户不知道点没点上（真机
+        「点了没反应」）。现在两段式 —— 主线程只写状态 + 派发，网络在 worker 线程跑，
+        结束时把结论写回同一份状态并让页面重画。
+        """
+        base_url = str(self.drafts.get("base_url") or "").strip()
+        protocol = str(self.drafts.get("protocol") or "").strip()
+        secret = str(self.drafts.get("upstream_secret") or "").strip()
+        if not base_url:
+            text = "先填「请求地址」（例如 https://api.openai.com/v1）"
+            self.connectivity = {"state": "fail", "text": text, "target": "",
+                                 "next": "填完再点「测试联通性」；本机不会保存任何东西",
+                                 "at": _now_iso()}
+            return ActionResult(text, ok=False)
+        fn = getattr(self.source, "discover_upstream_models", None)
+        if not callable(fn):
+            return ActionResult("暂不可用（当前数据源不支持联通测试）", ok=False)
+        if str((self.connectivity or {}).get("state") or "") == "running":
+            return ActionResult("正在测试这一条，稍等（结果出来会自动更新）", ok=True)
+        payload = {"base_url": base_url, "protocol": protocol, "secret": secret}
+        target = _host_of(base_url)
+        self.connectivity = {"state": "running", "target": target,
+                             "text": "进行中：正在连接 " + target + " …",
+                             "next": "通常 10 秒内出结果；失败会给下一步（地址/密钥/协议）",
+                             "at": _now_iso()}
+        via = self.connectivity_via
+        started = False
+        if via is not None:
+            try:
+                started = bool(via(payload))
+            except Exception:                            # 通道坏了 → 回落同步
+                started = False
+        if not started:
+            return self.run_connectivity(payload)        # 无 worker：同步跑一次（单测/无 Tk）
+        return ActionResult("进行中：正在连接 " + target + " …", effect="connectivity",
+                            payload=payload, fields={"base_url": ""})
+
+    def run_connectivity(self, payload: Mapping[str, Any]) -> ActionResult:
+        """worker 侧：真去探活 + 拉清单（**不写配置**），把结论翻成「结果 + 下一步」。"""
+        base_url = str(payload.get("base_url") or "").strip()
+        protocol = str(payload.get("protocol") or "").strip()
+        secret = str(payload.get("secret") or "").strip()
+        target = _host_of(base_url)
+        fn = getattr(self.source, "discover_upstream_models", None)
+        if not callable(fn):
+            return self._finish_connectivity("fail", target, "暂不可用（当前数据源不支持联通测试）",
+                                             "换一台已接通的机器，或看 logs/djb.log")
+        try:
+            result = fn(base_url, protocol, secret) or {}
+        except Exception as exc:                        # noqa: BLE001 - 失败要给人话
+            return self._finish_connectivity(
+                "fail", target, "联通失败（" + type(exc).__name__ + "）",
+                "确认地址能从本机访问（代理/防火墙），再点一次；未保存任何配置")
+        error = str(result.get("error_class") or "")
+        if error:
+            # 2026-11-20：真机上只显示「连不上」，看不出是 401、404 还是 TLS 失败。
+            # 把错误类别与 HTTP 状态一起给人看，并落一条事件（不含密钥/地址正文）。
+            status = result.get("http_status")
+            extra = ("（" + error + ("" if status in (None, "") else " / HTTP " + str(status)) + "）")
+            try:
+                from ..logging_setup import event as _event
+                _event("desktop.discover.failed", error_class=error,
+                       http_status=status if status is not None else "")
+            except Exception:
+                pass
+            return self._finish_connectivity(
+                "fail", target, "联通失败：" + str(result.get("note") or error) + extra,
+                _connectivity_next_step(error, status))
+        total = int(result.get("total") or 0)
+        mapped = int(result.get("mapped") or 0)
+        latency = result.get("latency_ms")
+        took = (" / " + str(int(latency)) + " ms") if isinstance(latency, (int, float)) else ""
+        message = ("联通正常：读到 " + str(total) + " 个模型（能对上目录 "
+                   + str(mapped) + " 个）" + took + "；还没保存，确认无误再点"
+                   + "「读取模型清单并保存接入」。")
+        return self._finish_connectivity(
+            "ok", target, message,
+            "下一步：点「读取模型清单并保存接入」把这些模型落成本地上游（这一步才写配置）",
+            total=total)
+
+    def _finish_connectivity(self, state: str, target: str, text: str, next_step: str,
+                            **extra: Any) -> ActionResult:
+        self.connectivity = {"state": state, "target": target, "text": text,
+                             "next": next_step, "at": _now_iso(), **extra}
+        return ActionResult(text, ok=(state == "ok"), effect="connectivity",
+                            payload={"state": state})
 
     def _act_token_plan_bind_node(self, *, confirm=None) -> ActionResult:
         """绑定只有**一个**入口（「账户与安全」）；这里只负责把客户送过去。"""
@@ -1538,13 +1857,14 @@ class DesktopController:
                             payload=dict(result or {}))
 
     def _act_update_apply(self, *, confirm=None) -> ActionResult:
-        """「安装更新」：二次确认后走 worker（下载 + 校验 + 装到版本目录，重启生效）。
+        """「下载更新包」：二次确认后走 worker（下载 + 校验 + 落到版本目录；**不换装**）。
 
         与 CLI ``djb update --apply`` 同一条代码路径；桌面端**永不自动装**。
         """
         if confirm is not None and not confirm(
-                "现在下载并安装更新？装完需要重启客户端才生效。\n"
-                "（校验失败会自动拒绝安装，版本不变）"):
+                "现在下载并校验更新包？\n"
+                "当前版本不会被自动替换（安装器尚未上线），下载后按提示手动安装。\n"
+                "（校验失败会自动拒绝，版本不变）"):
             return ActionResult("已取消安装（版本未变）。", ok=False, effect="cancelled")
         hook = self.update_via
         if hook is not None:
@@ -1553,7 +1873,7 @@ class DesktopController:
             except Exception:
                 started = False
             if started:
-                return ActionResult("正在下载并安装更新…（校验签名与哈希，完成后提示重启）",
+                return ActionResult("正在下载并校验更新包…（签名与哈希校验，完成后给出安装路径）",
                                     effect="update", payload={"state": "applying"})
         return self.run_update_apply()
 
@@ -1568,8 +1888,15 @@ class DesktopController:
         self.last_update = result
         if result.get("installed"):
             version = str(result.get("version") or "")
+            where = ""
+            try:
+                paths = self._update_manager().paths
+                where = "安装包：" + os.path.join(str(paths.versions_dir), version, "artifact.bin") + "；"
+            except Exception:                          # 取不到路径不影响主结论
+                where = ""
             return ActionResult("已下载待安装 " + version
-                                + "（校验通过；安装器上线前不自动换装，重启不改变运行版本）。",
+                                + "（校验通过；安装器上线前不自动换装，重启不改变运行版本）。"
+                                + where + "当前运行的仍是原版本。",
                                 ok=True, effect="update", payload=result)
         state = str(result.get("state") or "")
         reason = str(result.get("message") or "更新器没有给出原因（state=" + state + "）")

@@ -190,6 +190,119 @@ def test_cli_init_edition_writes_explicit_source(home, capsys) -> None:
     assert config.update_source == update_source.MANIFEST_URL
 
 
+def _fake_packaged_app(tmp_path: Path) -> Path:
+    """造一个冻结包目录：exe 同级的 config.json 就是构建载体。"""
+    app = tmp_path / "packaged-app"
+    app.mkdir()
+    (app / "config.json").write_text(json.dumps({
+        "gateway_url": "https://packaged.example.com",
+        "update_source": update_source.MANIFEST_URL,
+        "edition": "consumer",
+        "update_channel": "stable",
+    }), encoding="utf-8")
+    return app
+
+
+def test_cli_init_reads_packaged_config_on_first_run(home, tmp_path, monkeypatch, capsys) -> None:
+    from djb_node.cli import main
+
+    app = _fake_packaged_app(tmp_path)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "djb-node.exe"))
+    assert main(["init", "--no-env"]) == 0
+    capsys.readouterr()
+    config = load_config(Paths(str(home)))
+    assert config.gateway_url == "https://packaged.example.com"
+    assert config.update_source == update_source.MANIFEST_URL
+    assert config.edition == "consumer"
+    assert config.update_channel == "stable"
+
+
+def test_cli_init_ignores_placeholder_packaged_gateway(home, tmp_path, monkeypatch, capsys) -> None:
+    from djb_node.cli import main
+
+    app = tmp_path / "packaged-placeholder"
+    app.mkdir()
+    (app / "config.json").write_text(json.dumps({
+        "gateway_url": "https://api.example.invalid",
+        "update_source": update_source.MANIFEST_URL,
+        "edition": "consumer",
+    }), encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "djb-node.exe"))
+    assert main(["init", "--no-env"]) == 0
+    capsys.readouterr()
+    config = load_config(Paths(str(home)))
+    assert config.gateway_url != "https://api.example.invalid"
+    assert config.update_source == update_source.MANIFEST_URL
+
+
+def test_cli_init_explicit_args_beat_packaged_config(home, tmp_path, monkeypatch, capsys) -> None:
+    from djb_node.cli import main
+
+    app = _fake_packaged_app(tmp_path)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "djb-node.exe"))
+    mirror = "https://mirror.internal.example/update-manifest.json"
+    assert main(["init", "--no-env", "--gateway", "https://cli.example.com",
+                 "--update-source", mirror, "--channel", "beta"]) == 0
+    capsys.readouterr()
+    config = load_config(Paths(str(home)))
+    assert config.gateway_url == "https://cli.example.com"
+    assert config.update_source == mirror
+    assert config.update_channel == "beta"
+
+
+def test_cli_init_fills_empty_existing_update_source(home, tmp_path, monkeypatch, capsys) -> None:
+    """0.5.9 遗留：home 已存在但 update_source 为空；再 init 应补上包内默认。"""
+    from djb_node.cli import main
+
+    paths = Paths(str(home))
+    paths.prepare()
+    save_config(paths, ClientConfig(gateway_url="https://existing.example.com",
+                                    update_source="", edition=""))
+    app = _fake_packaged_app(tmp_path)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "djb-node.exe"))
+    assert main(["init", "--no-env"]) == 0
+    capsys.readouterr()
+    config = load_config(paths)
+    assert config.gateway_url == "https://existing.example.com"
+    assert config.update_source == update_source.MANIFEST_URL
+    assert config.edition == "consumer"
+
+
+def test_cli_init_existing_config_ignores_packaged_config(home, tmp_path, monkeypatch, capsys) -> None:
+    from djb_node.cli import main
+
+    paths = Paths(str(home))
+    paths.prepare()
+    mirror = "https://ops-mirror.example/update-manifest.json"
+    save_config(paths, ClientConfig(gateway_url="https://existing.example.com",
+                                    update_source=mirror, edition="consumer"))
+    app = _fake_packaged_app(tmp_path)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "djb-node.exe"))
+    assert main(["init", "--no-env"]) == 0
+    capsys.readouterr()
+    config = load_config(paths)
+    assert config.gateway_url == "https://existing.example.com"
+    assert config.update_source == mirror
+
+
+def test_cli_init_source_run_does_not_read_packaged_config(home, tmp_path, monkeypatch, capsys) -> None:
+    from djb_node.cli import main
+
+    app = _fake_packaged_app(tmp_path)
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "python3"))
+    assert main(["init", "--no-env"]) == 0
+    capsys.readouterr()
+    config = load_config(Paths(str(home)))
+    assert config.update_source == ""          # 源码运行保持 mock 默认
+    assert config.gateway_url != "https://packaged.example.com"
+
+
 def test_cli_init_update_source_beats_edition(home, capsys) -> None:
     from djb_node.cli import main
 

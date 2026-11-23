@@ -34,26 +34,31 @@ def test_thirteen_pages_are_mounted_exactly_once():
     assert len(set(keys)) == 13
 
 
-def test_share_group_is_first_and_starts_with_token_plan():
-    """§2：首屏第一组 = 共享 SHARE，首项 = 共享 Token Plan（≤1 次点击）。"""
-    first = ia.IA_SECTIONS_SHARE[0]
-    assert (first.key, first.title, first.micro) == ("share", "共享", "SHARE")
-    assert first.keys[0] == ia.FOCUS_KEY == "token_plan"
+def test_token_plan_is_one_screen_away():
+    """D17（2026-11-24 owner）：按模块分组后「共享」是第 2 组，token_plan 仍在前 5 项内。"""
+    assert ia.index_of(ia.FOCUS_KEY) == 2
+    assert ia.index_of(ia.FOCUS_KEY) < ia.MIN_GPU_INDEX
+    share = ia.section_for("token_plan")
+    assert (share.key, share.title) == ("share", "共享")
+    assert share.keys[0] == ia.FOCUS_KEY
 
 
-def test_token_plan_comes_before_access():
-    """既有产品语义：先说「共享了什么」再进「接入配置」动手。"""
-    assert ia.index_of("token_plan") < ia.index_of("access")
-    assert ia.index_of("token_plan") == 0
+def test_connect_group_leads_after_d17():
+    """D17：owner 定的组序是 接入 / 共享 / 收益 / 账户 / 诊断 —— 接入带头。
+
+    「token_plan 必须排在 access 之前」是 0.3.5 方案 A 的旧约束，D17 后不成立（已作废）。
+    """
+    assert ia.index_of("agent") == 0
+    assert ia.index_of("token_plan") > ia.index_of("access")
 
 
 def test_gpu_left_the_primary_path():
-    """§1/§5.3：GPU 从第 3 项降到系统组，且不在前 5 项（首屏不出现 GPU 主 CTA）。"""
+    """§1/§5.3：GPU 不在前 5 项（首屏不出现 GPU 主 CTA）；D17 后落在「诊断」组。"""
     index = ia.index_of("gpu")
     assert ia.MIN_GPU_INDEX == 5
     assert index > ia.MIN_GPU_INDEX
-    assert index == 10                      # 共享3 + 运行3 + 收益2 + 接入1 + 让路1
-    assert ia.section_for("gpu").key == "system"
+    assert index == len(ia.flat_keys()) - 2   # 诊断组倒数第二项（诊断 = 总览/基准/队列/GPU/日志）
+    assert ia.section_for("gpu").key == "diag"
 
 
 def test_gpu_is_beta_with_a_subtitle():
@@ -63,13 +68,21 @@ def test_gpu_is_beta_with_a_subtitle():
     assert gpu.title == "GPU 监控"
 
 
-def test_five_groups_in_the_documented_order():
+def test_five_groups_in_the_owner_order():
+    """D17（owner 2026-11-24）：五组、顺序 接入 / 共享 / 收益 / 账户 / 诊断，组内保留现有顺序。"""
     assert [section.key for section in ia.IA_SECTIONS_SHARE] == [
-        "share", "run", "earn", "connect", "system",
+        "connect", "share", "earn", "account", "diag",
     ]
+    # 2026-11-23 R2.1 ⑤：眉标中文化（英文残留 0 处），组名与微标同词
     assert [section.micro for section in ia.IA_SECTIONS_SHARE] == [
-        "SHARE", "RUN", "EARN", "CONNECT", "SYSTEM",
+        "接入", "共享", "收益", "账户", "诊断",
     ]
+    # 13 项一个不少、组内顺序沿用现有侧栏顺序
+    assert ia.flat_keys() == (
+        "agent", "access", "token_plan", "models", "tasks",
+        "receipts", "earnings", "yield", "account",
+        "overview", "bench", "gpu", "logs",
+    )
 
 
 # ────────────────────────────────────────────────────────────── 校验器不是空转
@@ -88,7 +101,15 @@ def test_five_groups_in_the_documented_order():
           ia.SectionSpec("earn", "收益", "EARN", ("receipts", "earnings")),
           ia.SectionSpec("connect", "接入", "CONNECT", ("agent",)),
           ia.SectionSpec("system", "系统", "SYSTEM", ("yield", "gpu", "account", "logs"))),
-         "没有排在 access"),
+         "分组顺序是"),
+        # token_plan 被挤出前 5 项（一屏看不见）
+        ((ia.SectionSpec("connect", "接入", "接入", ("agent", "access")),
+          ia.SectionSpec("share", "共享", "共享", ("models",)),
+          ia.SectionSpec("earn", "收益", "收益", ("receipts", "earnings")),
+          ia.SectionSpec("account", "账户", "账户", ("yield", "account")),
+          ia.SectionSpec("diag", "诊断", "诊断",
+                         ("overview", "bench", "tasks", "gpu", "logs", "token_plan"))),
+         "token_plan 在侧栏第"),
         # 重复挂载
         ((ia.SectionSpec("share", "共享", "SHARE", ("token_plan", "models", "access")),
           ia.SectionSpec("run", "运行", "RUN", ("overview", "bench", "tasks", "tasks")),
@@ -122,7 +143,7 @@ def test_validator_catches_mutations(table, expected):
 
 def test_validator_catches_a_page_registered_in_the_wrong_section():
     pages = dict(ia.PAGES)
-    pages["gpu"] = ia.PageSpec("gpu", "GPU 监控", "GPU", "share", beta=True,
+    pages["gpu"] = ia.PageSpec("gpu", "GPU 监控", "显卡监控", "share", beta=True,
                                subtitle="GPU 监控（BETA）")
     assert any("不一致" in problem for problem in ia.violations(pages=pages))
 

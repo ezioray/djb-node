@@ -127,7 +127,7 @@ class TkBackend:
         except Exception as exc:
             raise HeadlessError(type(exc).__name__) from None
         self._tk, self._ttk, self._settings = tk, ttk, settings
-        self._root.title("DJB / NIGHT SIGNAL · 共享草稿")
+        self._root.title("TokenBank / NIGHT SIGNAL · 共享草稿")
         self._root.geometry("840x850")
         self._root.minsize(700, 700)
         apply_theme(self._root, ttk)
@@ -139,7 +139,7 @@ class TkBackend:
         self._on_save = lambda: None
         self._body = ttk.Frame(self._root, padding=24)
         self._body.pack(fill="both", expand=True, padx=2, pady=2)
-        ttk.Label(self._body, text="◢ DJB / NIGHT SIGNAL     // LOCAL DRAFT",
+        ttk.Label(self._body, text="◢ TokenBank / NIGHT SIGNAL     // LOCAL DRAFT",
                   style="Signal.TLabel").pack(anchor="w")
         ttk.Label(self._body, text="你想怎么共享？", font=("Microsoft YaHei UI", 22, "bold")).pack(anchor="w", pady=(12, 4))
         ttk.Label(self._body, text="最终有效规则 = 本地规则与平台策略中更严格者", style="Muted.TLabel").pack(anchor="w")

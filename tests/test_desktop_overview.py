@@ -78,9 +78,11 @@ def test_hero_hint_tracks_the_access_binding():
     assert bound.hint == "已授权 1 个客户端"
     access = dict(base.sections["access"])
     access["binding"] = {"state": "unbound"}
-    assert overview(patched(access=access)).hero.hint == "还没有客户端授权"
+    # 2026-11-24 R2.1 文案/交互变更：未绑定时 hint 直说后果（2026-11-20 owner 口径）
+    assert overview(patched(access=access)).hero.hint == "这台电脑还没绑定：绑定后才能接单和收款"
     unavailable = ds.Snapshot({name: ds.Unavailable("测试：未接线") for name in ds.SECTIONS})
-    assert overview(unavailable).hero.hint == "授权状态暂不可用"
+    # 2026-11-24 R2.1 文案/交互变更：读不到绑定状态时直接说「登录后再看」
+    assert overview(unavailable).hero.hint == "绑定状态暂不可用（登录后再看）"
 
 
 def test_hero_actions_pause_and_resume_are_mutually_exclusive():
@@ -206,15 +208,17 @@ def test_throttle_card_shows_limits_and_the_yield_mode():
     rows = dict((label, value) for label, value, _tone in throttle.rows)
     assert rows["并发上限"] == "4 路"
     assert rows["每日 tokens 上限"] == "200,000"
-    assert rows["让路模式"] == vw.YIELD_MODE_SUMMARY["balanced"]
-    assert throttle.toggle == ("自动让路", True)
+    # 2026-11-24 R2.1 文案/交互变更：「让路模式」→「暂停方式」、「自动让路」→「自动暂停接单」
+    assert rows["暂停方式"] == vw.YIELD_MODE_SUMMARY["balanced"]
+    assert throttle.toggle == ("自动暂停接单", True)
 
 
 def test_throttle_card_says_off_when_the_yield_daemon_is_stopped():
     yield_state = dict(demo_snapshot().sections["yield"])
     yield_state["yield_enabled"] = False
     throttle = overview(patched(**{"yield": yield_state})).rail[2]
-    assert throttle.toggle == ("自动让路", False)
+    # 2026-11-24 R2.1 文案/交互变更：开关标签改成「自动暂停接单」
+    assert throttle.toggle == ("自动暂停接单", False)
     assert throttle.badge == "已关闭" and throttle.badge_tone == "muted"
 
 
@@ -224,7 +228,7 @@ def test_plain_text_carries_the_whole_overview_so_screenshots_are_not_the_only_e
     text = view.plain_text()
     for needle in (view.hero.title, view.hero.gauge.label, view.chart.title,
                    view.chart.peak, view.rail[0].title, view.rail[1].title,
-                   view.rail[2].title, "自动让路：开"):
+                   view.rail[2].title, "自动暂停接单：开"):
         assert needle in text, needle
 
 

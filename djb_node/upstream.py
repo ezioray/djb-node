@@ -332,7 +332,7 @@ def a2_prompt(*, base_url: str, model: str, credential_ref: str,
                             concurrency_limit=concurrency_limit,
                             receipt_sample=receipt_sample)
     sections = {
-        "目标": "把本机模型以 OpenAI 兼容端点接入 DJB 联脑共享供给（A2 本机代理），"
+        "目标": "把本机模型以 OpenAI 兼容端点接入 TokenBank 联脑共享供给（A2 本机代理），"
                 "只开放已声明的模型，按并发上限接收任务并产出双签收据。",
         "约束": "1) 端点形态 " + fields["endpoint"] + "；2) 只允许模型 "
                 + fields["model"] + "；3) 凭据只以本机引用 " + fields["credential_ref"]

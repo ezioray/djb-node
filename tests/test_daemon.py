@@ -232,6 +232,7 @@ def test_status_exposes_pause_detail_only_while_paused(paths, store, credentials
 
 
 def test_detection_error_pauses(paths, store, credentials, mock, clock):
+    # 2026-11-24 lead 裁决：检测失败按 INV-04 保守暂停；如需改成放行，先改 README + owner 批（D23）。
     _add_upstream(store, mock)
     daemon = _daemon(paths, store, credentials, mock,
                      probes=[FixedProbe("error", "session")], clock=clock)

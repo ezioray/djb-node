@@ -24,15 +24,15 @@ def test_token_table_is_the_design_doc_row_by_row():
     """§2.2：9 档，px/行高/字重逐值对齐（差一个值就是排版漂移）。"""
     expected = {
         # token:  (px,  line, weight,  family)
-        "display": (30, 36, "bold", "sans"),
-        "hero": (20, 28, "bold", "sans"),
-        "h1": (18, 26, "bold", "sans"),
-        "h2": (15, 22, "bold", "sans"),
-        "body": (14, 22, "normal", "sans"),
-        "small": (12.5, 18, "normal", "sans"),
-        "micro": (11, 16, "normal", "sans"),
-        "table": (12, 28, "normal", "sans"),
-        "mono": (12, 16, "normal", "mono"),
+        "display": (31, 38, "bold", "sans"),
+        "hero": (21, 30, "bold", "sans"),
+        "h1": (19, 28, "bold", "sans"),
+        "h2": (16, 24, "bold", "sans"),
+        "body": (15, 24, "normal", "sans"),
+        "small": (13.5, 20, "normal", "sans"),
+        "micro": (12, 18, "normal", "sans"),
+        "table": (13, 30, "normal", "sans"),
+        "mono": (13, 18, "normal", "mono"),
     }
     assert set(T.TYPES) == set(expected)
     for name, (px, line, weight, family) in expected.items():
@@ -41,11 +41,11 @@ def test_token_table_is_the_design_doc_row_by_row():
 
 
 def test_table_line_is_the_row_height():
-    """§2.3：``table`` 的 28 同时是 ``ttk.Treeview`` 的 rowheight（0.3.4 写死 26）。"""
-    assert T.token("table").line == 28
+    """§2.3：``table`` 的行高 30 同时是 ``ttk.Treeview`` 的 rowheight（0.3.4 写死 26）。"""
+    assert T.token("table").line == 30
     assert T.token("table").line_kind == "row"
-    assert T.line_height("table") == 28
-    assert T.scaled_line("table", 1.0) == 28
+    assert T.line_height("table") == 30
+    assert T.scaled_line("table", 1.0) == 30
 
 
 #: 0.3.4 的字号真值（``ui_kit`` 里已删除，这里作为**历史口径**保留在测试里）。
@@ -57,15 +57,18 @@ OLD_0_3_4: dict[str, float] = {
 
 
 def test_delta_against_0_3_4_is_the_intended_one():
-    """相对 0.3.4 的**有意**变更，逐项钉死（旧值不再从 ``ui_kit`` 读取）。"""
-    assert T.px("display") == OLD_0_3_4["display"]          # 不变
-    assert T.px("hero") - OLD_0_3_4["hero"] == 2            # 18 → 20
-    assert T.px("h1") - OLD_0_3_4["h1"] == -1               # 19 → 18
-    assert T.px("h2") - OLD_0_3_4["h2"] == 2                # 13 → 15
-    assert T.px("body") - OLD_0_3_4["body"] == 1            # 13 → 14
-    assert T.px("small") - OLD_0_3_4["small"] == 0.5        # 12 → 12.5
-    assert T.px("micro") - OLD_0_3_4["micro"] == 1          # 10 → 11（CJK 下限）
-    assert T.px("table") - OLD_0_3_4["table"] == 1          # 11 → 12（例外①，见 px_wiring）
+    """相对 0.3.4 的**有意**变更，逐项钉死（旧值不再从 ``ui_kit`` 读取）。
+
+    2026-11-20 owner 裁决「整体上调一档」= 全档 +1px，叠加 0.3.5 的有意 delta。
+    """
+    assert T.px("display") - OLD_0_3_4["display"] == 1      # 30 → 31
+    assert T.px("hero") - OLD_0_3_4["hero"] == 3            # 18 → 21
+    assert T.px("h1") - OLD_0_3_4["h1"] == 0                # 19 → 19（0.3.5 的 −1 被 +1 抵消）
+    assert T.px("h2") - OLD_0_3_4["h2"] == 3                # 13 → 16
+    assert T.px("body") - OLD_0_3_4["body"] == 2            # 13 → 15
+    assert T.px("small") - OLD_0_3_4["small"] == 1.5        # 12 → 13.5
+    assert T.px("micro") - OLD_0_3_4["micro"] == 2          # 10 → 12
+    assert T.px("table") - OLD_0_3_4["table"] == 2          # 11 → 13（例外①，见 px_wiring）
 
 
 # ────────────────────────────────────────────────────────────── 不变量
@@ -90,14 +93,14 @@ def test_cjk_floor_is_11px_for_every_sans_token():
 
 
 def test_body_line_height_is_at_least_one_and_a_half():
-    """§2.2 明文：正文 14/22 = 1.57，不许低于 1.5。"""
+    """§2.2 明文：正文行高 ≥1.5×（当前 15/24 = 1.6）。"""
     assert T.line_height("body") / T.px("body") >= 1.5
 
 
 def test_hierarchy_never_collapses():
     """§2.2 的层级规则：差 2px **或**字重不同，二者必居其一。
 
-    §2.2 原文「标题与正文至少差 2px 且字重不同」与它自己的 h2=15 / body=14 冲突（只差 1px，
+    §2.2 原文「标题与正文至少差 2px 且字重不同」与它自己的 h2=16 / body=15 冲突（只差 1px，
     两条不可能同时成立）。这里按设计意图取「或」：塌掉的 19/18/13 正是「同字重 + 只差 1px」。
     """
     ramp = ["micro", "small", "body", "h2", "h1", "hero", "display"]
@@ -108,8 +111,8 @@ def test_hierarchy_never_collapses():
         if a.weight == b.weight:
             assert gap >= 1.5, (lower, upper)     # 同字重必须靠字号拉开
     # h2/body 只差 1px，靠 bold 承担层级——这是**有意**的设计，不是漏改
-    assert (T.px("h2"), T.weight("h2")) == (15, "bold")
-    assert (T.px("body"), T.weight("body")) == (14, "normal")
+    assert (T.px("h2"), T.weight("h2")) == (16, "bold")
+    assert (T.px("body"), T.weight("body")) == (15, "normal")
 
 
 def test_headings_never_share_the_body_weight():
@@ -152,25 +155,23 @@ def test_readability_presets_match_the_design():
 def test_scaled_px_rounds_exactly_like_0_3_4():
     """取整继承 0.3.4 的 ``int(round(...))``（银行家舍入）——**外观零变化优先**。
 
-    所以 ``small`` 的设计值 12.5 在 1.0 档下渲染仍是 **12**（与 0.3.4 的 12 一致），
-    设计值不回退；要「靠取整把 12.5 抬成 13」会牵连 ``display``@1.15 / ``h1``@1.25
-    两处旧值（34/22 会变 35/23），不可接受，见
-    ``tests/test_desktop_px_wiring.py::test_rounding_matches_0_3_4_at_every_scale``。
+    2026-11-20 起字阶整体 +1px，本用例只钉**取整公式**（银行家舍入），不再与 0.3.4 数值等价；
+    0.3.4 的历史等价由 ``tests/test_desktop_px_wiring.py`` 的属性测试单独守。
     """
-    assert T.scaled_px("small", 1.0) == 12            # 12.5 → round → 12（= 0.3.4）
-    assert T.scaled_px("body", 1.0) == 14
-    assert T.scaled_px("body", 1.25) == 18            # 17.5 → 18（偶数侧）
-    assert T.scaled_px("display", 1.15) == 34         # 34.5 → 34（0.3.4 同值）
-    assert T.scaled_px("small", 1.15) == 14           # 14.375 → 14
-    assert T.scaled_line("body", 1.25) == 28          # 27.5 → 28
+    assert T.scaled_px("small", 1.0) == 14            # 13.5 → 14（偶数侧）
+    assert T.scaled_px("body", 1.0) == 15
+    assert T.scaled_px("body", 1.25) == 19            # 18.75 → 19
+    assert T.scaled_px("display", 1.15) == 36         # 35.65 → 36
+    assert T.scaled_px("small", 1.15) == 16           # 15.525 → 16
+    assert T.scaled_line("body", 1.25) == 30          # 30.0 → 30
 
 
 def test_scale_is_clamped_to_the_documented_window():
     """§5：scale 夹在 0.8–1.6，超出取边界（不静默放大到不可读）。"""
     assert (T.MIN_SCALE, T.MAX_SCALE) == (0.8, 1.6)
-    assert T.scaled_px("body", 0.1) == T.scaled_px("body", 0.8) == 11
-    assert T.scaled_px("body", 99) == T.scaled_px("body", 1.6) == 22
-    assert T.scaled_px("body", float("nan")) == 14
+    assert T.scaled_px("body", 0.1) == T.scaled_px("body", 0.8) == 12
+    assert T.scaled_px("body", 99) == T.scaled_px("body", 1.6) == 24
+    assert T.scaled_px("body", float("nan")) == 15
 
 
 def test_resolve_scale_priority_env_then_prefs_then_dpi():
@@ -197,7 +198,7 @@ def test_resolve_scale_priority_env_then_prefs_then_dpi():
 def test_tracking_is_clamped_to_eight_percent_of_the_glyph():
     assert T.tracking("display") < 0 and T.tracking("micro") > 0
     assert T.scaled_tracking("micro", 1.0) == 0.3
-    assert abs(T.scaled_tracking("display", 1.0)) <= 30 * 0.08
+    assert abs(T.scaled_tracking("display", 1.0)) <= 31 * 0.08
 
 
 # ────────────────────────────────────────────────────────────── 文本规则

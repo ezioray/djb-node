@@ -59,7 +59,8 @@ def test_overview_tree_mirrors_the_page_in_reading_order():
     assert root.name.startswith("总览")
     # 卡片按页面上出现的顺序
     cards = [node.name for _id, node in nodes if node.role == ROLE_CARD]
-    assert cards[:6] == ["今日贡献", "当前任务", "余额（可用）", "接单状态", "资源", "让路 / 节能"]
+    # 2026-11-20 文案直白化：「今日贡献」→「今日用量」，「让路 / 节能」→「暂停接单」
+    assert cards[:6] == ["今日用量", "当前任务", "余额（可用）", "接单状态", "资源", "暂停接单"]
     # 让路卡片在总览里出现的档位文案，和 M7 的「只记录偏好」口径一致
     assert "本版仅记录档位偏好" in root_text(view)
 

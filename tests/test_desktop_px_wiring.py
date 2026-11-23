@@ -9,11 +9,12 @@
 
 1. **旧名字真的没了**：``ui_kit`` 上不再有 ``PX_*``（49 行 / 69 处已清零），
    取字号只剩 :func:`djb_node.desktop.ui_kit.px` 一个入口。
-2. **值等价（0.3.4 语义下逐项相等）**：同一个名字在 0.3.4 与 0.3.5 指向**同一档角色**，
-   且新值 == 旧值 + 设计表里的有意 delta（display 0 / h1 −1 / hero +2 / h2 +2 /
-   body +1 / small +0.5 / micro +1）——逐项相加必须成立，不允许「顺手多改 1px」。
-3. **两条例外显式断言**：``PX_TABLE`` 11 → ``table`` 12（0.3.4 的表格特例档并入正表），
-   ``mono`` 无 0.3.4 对应（当时等宽借微标 10px，现在独立 12px）。
+2. **值等价（0.3.4 语义下逐项相等）**：同一个名字在 0.3.4 与当前表指向**同一档角色**，
+   且新值 == 旧值 + 设计表里的有意 delta（2026-11-20「整体上调一档」后：
+   display +1 / h1 0 / hero +3 / h2 +3 / body +2 / small +1.5 / micro +2）——
+   逐项相加必须成立，不允许「顺手多改 1px」。
+3. **两条例外显式断言**：``PX_TABLE`` 11 → ``table`` 13（0.3.4 的表格特例档并入正表），
+   ``mono`` 无 0.3.4 对应（当时等宽借微标 10px，现在独立 13px）。
 
 另附守门：角色字体派生（``ROLE_FONTS``）、**取整公式与 0.3.4 在 0.80–1.60 全档逐点等价**
 （属性测试，回退成半进位即红）、渲染层不许出现数字字号字面量（AST 扫描）。
@@ -58,7 +59,7 @@ LEGACY_CJK_MIN = 10
 
 #: 设计表里的**有意** delta（新值 − 0.3.4 值）。0 = 不变；其余逐项见 01-FONT-TYPO §2.2。
 INTENDED_DELTA: dict[str, float] = {
-    "display": 0, "h1": -1, "hero": 2, "h2": 2, "body": 1, "small": 0.5, "micro": 1,
+    "display": 1, "h1": 0, "hero": 3, "h2": 3, "body": 2, "small": 1.5, "micro": 2,
 }
 
 
@@ -117,28 +118,28 @@ def test_cjk_floor_moved_from_ten_to_eleven():
 
 # ────────────────────────────────────────────────────────────── 3) 两条例外
 def test_exception_1_table_absorbed_the_0_3_4_special_case():
-    """例外①：0.3.4 的「表格正文 11px」特例档并入正表 ``table`` = 12px。
+    """例外①：0.3.4 的「表格正文 11px」特例档并入正表 ``table`` = 13px。
 
-    当年设 11 的理由是「9px 在 CJK 上糊、10 又比微标还小」；新表把表格抬到 12px 之后，
-    这个特例不再需要——**它是唯一一个「档位数变了」的映射**，所以单列一条。
+    当年设 11 的理由是「9px 在 CJK 上糊、10 又比微标还小」；2026-11-20 全档 +1px 后为 13。
+    **它是唯一一个「档位数变了」的映射**，所以单列一条。
     """
     assert LEGACY_CONSTANTS["PX_TABLE"] == (11, "table")
-    assert T.px("table") == 12
-    assert T.px("table") - 11 == 1
-    # table 档同时携带表格行高（28），但行高接线属 T4 排版规则，不在本轮字号接线内
-    assert T.line_height("table") == 28
+    assert T.px("table") == 13
+    assert T.px("table") - 11 == 2
+    # table 档同时携带表格行高（30），但行高接线属 T4 排版规则，不在本轮字号接线内
+    assert T.line_height("table") == 30
     assert T.token("table").line_kind == "row"
 
 
 def test_exception_2_mono_had_no_0_3_4_counterpart():
     """例外②：``mono`` 是**新增档**——0.3.4 的等宽字号借的是微标 10px，没有独立真值。
 
-    所以 8 个真值只能映到 8 档；第 9 档 ``mono``（12px）没有旧名可对，单列一条。
+    所以 8 个真值只能映到 8 档；第 9 档 ``mono``（13px）没有旧名可对，单列一条。
     """
     legacy_tokens = {token for _, token in LEGACY_CONSTANTS.values()}
     assert "mono" not in legacy_tokens
     assert T.token("mono").family == "mono"
-    assert T.px("mono") == 12
+    assert T.px("mono") == 13
     # 0.3.4 的等宽确实借了微标：说明它当年不是一个独立档位
     assert LEGACY_CONSTANTS["PX_MICRO"] == (10, "micro")
 
@@ -210,7 +211,7 @@ def test_the_two_historical_divergence_points_stay_at_0_3_4_values():
     """点名哨兵：``display``@1.15 = **34**、``h1``@1.25 = **22**（半进位会变 35 / 23）。"""
     assert _fonts_at(1.15).px(LEGACY_VALUES["PX_DISPLAY"]) == 34
     assert _fonts_at(1.25).px(LEGACY_VALUES["PX_HERO"]) == 22      # hero 的 0.3.4 值就是 18
-    assert _fonts_at(1.25).px(T.px("h1")) == 22                    # 新档位 18 @1.25 同为 22
+    assert _fonts_at(1.25).px(T.px("h1")) == 24                    # 新档位 19 @1.25 → 24
     # 反证：半进位实现会得到什么（证明这条断言确实能抓到回退）
     assert [int(__import__("math").floor(v * 1.15 + 0.5)) for v in (30,)] == [35]
     assert [int(__import__("math").floor(v * 1.25 + 0.5)) for v in (18,)] == [23]
@@ -239,12 +240,16 @@ def test_only_the_two_exceptions_may_differ_from_0_3_4_rendering():
 
 
 def test_fonts_px_keeps_the_0_3_4_rounding():
-    """Tk 只认整数字号，取整必须与 0.3.4 同：``small`` 设计值 12.5 在 1.0 档渲染 **12**。"""
+    """Tk 只认整数字号，取整公式不变（银行家舍入）：``small`` 13.5 在 1.0 档渲染 **14**。
+
+    2026-11-20 字阶 +1px 后不再与 0.3.4 数值相等；这条只钉"同一公式"，
+    历史等价的属性测试见 ``test_rounding_matches_0_3_4_at_every_scale``（它直接喂旧值）。
+    """
     fonts = _fonts_at(1.0)
-    assert fonts.px(T.px("small")) == 12             # 12.5 → 12（银行家舍入，= 0.3.4）
-    assert fonts.px(T.px("body")) == 14
-    assert _fonts_at(1.25).px(T.px("h1")) == 22       # 22.5 → 22（偶数侧）
-    assert _fonts_at(1.15).px(T.px("display")) == 34  # 34.5 → 34
+    assert fonts.px(T.px("small")) == 14             # 13.5 → 14（偶数侧）
+    assert fonts.px(T.px("body")) == 15
+    assert _fonts_at(1.25).px(T.px("h1")) == 24       # 23.75 → 24
+    assert _fonts_at(1.15).px(T.px("display")) == 36  # 35.65 → 36
     assert fonts.px(0) == 1                           # 至少 1px
 
 
@@ -269,19 +274,19 @@ def test_renderer_has_no_numeric_font_size_literal():
 
 
 # ── 表格行高（0.3.4 写死 26 → typography.table 的 28）
-def test_table_rowheight_is_the_table_line_of_28():
-    """``rowheight`` 不再是 26：等于 ``typography.table`` 的行盒 28。"""
-    assert ui_kit.table_rowheight(1.0) == 28
+def test_table_rowheight_is_the_table_line_of_30():
+    """``rowheight`` 不再是 26：等于 ``typography.table`` 的行盒 30（2026-11-20 +2）。"""
+    assert ui_kit.table_rowheight(1.0) == 30
     assert ui_kit.table_rowheight(1.0) == T.scaled_line("table", 1.0)
-    assert T.token("table").line == 28.0 and T.token("table").px == 12.0
+    assert T.token("table").line == 30.0 and T.token("table").px == 13.0
 
 
 def test_table_rowheight_follows_every_scale_with_the_same_rounding():
     """0.80–1.60 全档：行高 == ``scaled_line("table")``（与字号同一条取整规则）。"""
     for scale in SCALES:
         assert ui_kit.table_rowheight(scale) == T.scaled_line("table", scale)
-    assert ui_kit.table_rowheight(1.25) == 35              # 28 × 1.25，且 ≠ 0.3.4 的 26
-    assert ui_kit.table_rowheight(0.9) == 25
+    assert ui_kit.table_rowheight(1.25) == 38              # 30 × 1.25 = 37.5 → 38
+    assert ui_kit.table_rowheight(0.9) == 27
 
 
 def test_table_rowheight_leaves_room_for_the_glyphs():

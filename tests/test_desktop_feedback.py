@@ -216,8 +216,10 @@ def test_real_tk_inline_error_marks_the_field_and_takes_focus():
         assert set(app._field_errors) == {"price_mode", "node_id", "node_secret"}
         assert app._status.cget("text").startswith("!")      # 状态栏仍然报一次（失败必报）
         view = app._last_view
-        assert view is not None and view.focus_field == "node_id"
-        assert root.focus_get() is app._entries["node_id"]   # 焦点落在**首个**错误字段
+        # R2.1 ② 之后「完整节点 ID」在「高级（排障用）」区，字段顺序在后；
+        # 表单里**第一个**错误字段变成价格模式 —— 焦点口径不变（首个错误），只是顺序变了。
+        assert view is not None and view.focus_field == "price_mode"
+        assert root.focus_get() is app._entries["price_mode"]   # 焦点落在**首个**错误字段
         inline = _labels_starting_with(app._body, "！")
         assert inline, "字段下方没有任何红字（错误还只活在状态栏里）"
         assert sum(1 for text in inline if "节点标识" in text) == 1

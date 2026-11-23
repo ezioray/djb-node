@@ -30,7 +30,7 @@ from .store import Store
 from .util import ensure_dir, iso, new_request_id, redact_obj, redact_text, utcnow
 
 MAX_LOG_BYTES = 512 * 1024
-BUNDLE_README = """DJB 联脑 · 诊断包（M15 client-runtime）
+BUNDLE_README = """TokenBank 联脑 · 诊断包（M15 client-runtime）
 
 本诊断包由 djb diagnose 生成，用于排查问题。刻意不包含：
 

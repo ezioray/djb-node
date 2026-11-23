@@ -133,7 +133,9 @@ def test_detector_disabled_and_probe_exception():
 
     detector = limits.YieldDetector([Boom()])
     result = detector.evaluate()
+    # 2026-11-24 lead 裁决（D23）：异常=保守按「用户在用」（INV-04）；degraded 只用于 UI 标注。
     assert result.in_use is True
+    assert result.degraded is True
     assert result.signals[0].state == "error"
     disabled = limits.YieldDetector([Boom()], enabled=False)
     assert disabled.evaluate().in_use is False
