@@ -3031,7 +3031,10 @@ class DesktopApp:
                             height=min(max_rows, max(3, len(table.rows) + 1)),
                             selectmode="browse")
         for column in table.columns:
-            tree.heading(column, text=column, anchor="w")
+            # R2.4 C3：表头点一下就按这一列排（再点一次反序）。排序只影响**当前视图**，
+            # 不改数据、不落盘 —— 下一次刷新按数据源顺序重画。
+            tree.heading(column, text=column, anchor="w",
+                         command=lambda col=column, view=tree: self._sort_by_column(view, col))
             tree.column(column, anchor="w", width=120, stretch=True)
         # 每一张表（含附加表）都要有名字：读屏靠它知道「这是哪张表、有哪些列」（#31①）。
         # 附加表**没有**详情抽屉，名字里就不许承诺 Enter 能开详情（#32：提示语跟着真实路径写）
@@ -3104,6 +3107,10 @@ class DesktopApp:
                                       ("<Double-1>", self._on_double_click),
                                       ("<space>", lambda _e: self._activate_row())):
                 tree.bind(sequence, handler)
+            # R2.4 C3：右键 = 行菜单（复制这一行 / 复制这一格 / 详情）。Linux 用 Button-3，
+            # macOS 触控板/鼠标右键在 Tk 里是 Button-2 或 Control-Button-1，三个都绑。
+            for sequence in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+                tree.bind(sequence, self._on_table_context_menu)
             hint = ("选中一行看详情（↑↓ 选择，Home/End 到首尾，Enter 打开详情）"
                     if not table.activate else
                     "选中一档再按 Enter（或双击这一行）＝切到它，会先问一次")
@@ -3375,6 +3382,97 @@ class DesktopApp:
             self._status.configure(text=str(text or ""))
         except Exception:                            # pragma: no cover - 控件已销毁
             pass
+
+    # ── R2.4 C3：列排序 + 右键行菜单
+    def _sort_by_column(self, tree: Any, column: str) -> None:
+        """按某列排序（同一列再点反序）：数字列按数值，其它按字符串，空值永远排最后。"""
+        state = getattr(self, "_sort_state", {})
+        key = str(id(tree))
+        ascending = not (state.get(key, {}).get("column") == column
+                         and state.get(key, {}).get("ascending", True))
+        try:
+            columns = list(tree["columns"])
+            index = columns.index(column)
+            rows = [(tree.item(iid, "values"), iid) for iid in tree.get_children("")]
+        except Exception:                              # pragma: no cover - 控件已销毁
+            return
+
+        def sort_key(item: Any) -> tuple[int, float, str]:
+            raw = item[0][index] if index < len(item[0]) else ""
+            text = str(raw).strip()
+            if text in ("", "—", "-"):
+                return (1, 0.0, "")                    # 空/缺值排最后（正序反序都一样）
+            number = self._as_number(text)
+            return (0, number, text) if number is not None else (0, float("inf"), text)
+
+        try:
+            rows.sort(key=sort_key, reverse=not ascending)
+            for position, (_values, iid) in enumerate(rows):
+                tree.move(iid, "", position)
+            self._sort_state = {**(state or {}), key: {"column": column,
+                                                      "ascending": ascending}}
+            arrow = "▲" if ascending else "▼"
+            for name in columns:
+                tree.heading(name, text=(name + " " + arrow) if name == column else name)
+            self._toast("已按「" + column + "」" + ("升序" if ascending else "降序")
+                        + "排序（只影响这一屏）", ok=True)
+        except Exception:                              # pragma: no cover - 控件已销毁
+            pass
+
+    @staticmethod
+    def _as_number(text: str) -> float | None:
+        """把「1,234 / 12.5% / 3 ms / ¥8」这类单元格尽力读成数字；读不出返回 None。"""
+        cleaned = str(text or "").replace(",", "").replace("¥", "").replace("$", "")
+        for token in ("ms", "毫秒", "%", " 个", " 条", " GB", " MB", "x"):
+            cleaned = cleaned.replace(token, "")
+        cleaned = cleaned.strip()
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    def _on_table_context_menu(self, event: Any = None) -> str:
+        """右键行菜单：复制整行 / 复制该格 / 打开详情（都在本机完成，不发请求）。"""
+        tree = getattr(self, "_tree", None)
+        if tree is None:
+            return "break"
+        try:
+            row = str(tree.identify_row(getattr(event, "y", 0)))
+            column_id = str(tree.identify_column(getattr(event, "x", 0)))   # "#2" 形式
+        except Exception:                              # pragma: no cover - 控件已销毁
+            return "break"
+        if not row:
+            return "break"
+        try:
+            tree.selection_set(row)
+            tree.focus(row)
+        except Exception:                              # pragma: no cover
+            pass
+        columns = list(tree["columns"])
+        try:
+            index = max(0, int(column_id.lstrip("#") or "1") - 1)
+        except ValueError:
+            index = 0
+        values = [str(item) for item in tree.item(row, "values")]
+        cell = values[index] if index < len(values) else ""
+
+        menu = self._tk.Menu(self._root, tearoff=0)
+        menu.add_command(label="复制这一整行", command=lambda: self._copy(
+            "\t".join(values)))
+        if cell:
+            menu.add_command(label="复制「" + (columns[index] if index < len(columns) else "这一格")
+                             + "」：" + (cell if len(cell) <= 18 else cell[:18] + "…"),
+                             command=lambda: self._copy(cell))
+        menu.add_separator()
+        menu.add_command(label="打开详情", command=self._activate_row)
+        try:
+            menu.tk_popup(int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:                          # pragma: no cover
+                pass
+        return "break"
 
     def _on_double_click(self, event: Any = None) -> None:
         row = ""
