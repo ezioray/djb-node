@@ -3228,9 +3228,13 @@ class DesktopApp:
         self._fit_columns(tree)
         tree.bind("<Configure>", lambda _event, view=tree: self._fit_columns(view), add="+")
         if not table.rows:
-            tk.Label(body, text=table.empty, font=self._fonts.sans(kit.px("small")),
-                     foreground=dual.color("muted_text"), background=dual.color("surface"),
-                     anchor="w").pack(anchor="w", pady=(10, 2))
+            # F39（2026-11-24 真机）：空表同时印了「表里一行灰字」和「表下一行灰字」，
+            # 同一个空态出现两遍。这里只保留一处，并把它放在表头正下方（视线起点）。
+            self._empty_label = tk.Label(
+                body, text=table.empty, font=self._fonts.sans(kit.px("small")),
+                foreground=dual.color("muted_text"), background=dual.color("surface"),
+                anchor="w")
+            self._empty_label.pack(anchor="w", pady=(10, 2))
         if not primary:
             # 附加表：只登记（列宽/窄窗适配要能一起遍历），不抢主表的契约字段
             self._tables = list(getattr(self, "_tables", ()) or ()) + [(table, tree)]
@@ -3269,13 +3273,20 @@ class DesktopApp:
             # macOS 触控板/鼠标右键在 Tk 里是 Button-2 或 Control-Button-1，三个都绑。
             for sequence in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
                 tree.bind(sequence, self._on_table_context_menu)
-            hint = ("选中一行看详情（↑↓ 选择，Home/End 到首尾，Enter 打开详情）"
-                    if not table.activate else
-                    "选中一档再按 Enter（或双击这一行）＝切到它，会先问一次")
-            tk.Label(body, text=hint,
-                     font=self._fonts.sans(kit.px("micro")),
-                     foreground=dual.color("muted_text"),
-                     background=dual.color("surface")).pack(anchor="w", pady=(6, 0))
+            # F43（2026-11-24 真机）：空表/不可用表也印「选中一行看详情」，客户先去点空行。
+            # 有行才给键盘提示；空表给的是「为什么空」，不是操作手册。
+            has_rows = bool(table.rows)
+            if not has_rows:
+                hint = ""
+            elif not table.activate:
+                hint = "选中一行看详情（↑↓ 选择，Home/End 到首尾，Enter 打开详情）"
+            else:
+                hint = "选中一档再按 Enter（或双击这一行）＝切到它，会先问一次"
+            if hint:
+                tk.Label(body, text=hint,
+                         font=self._fonts.sans(kit.px("micro")),
+                         foreground=dual.color("muted_text"),
+                         background=dual.color("surface")).pack(anchor="w", pady=(6, 0))
         if table.note:
             self._wrap(tk.Label(body, text=table.note, font=self._fonts.sans(kit.px("micro")),
                               foreground=dual.color("muted_text"),

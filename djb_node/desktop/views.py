@@ -679,6 +679,27 @@ def _count(snapshot: Snapshot, name: str, text: str) -> str:
     return text if snapshot.ok(name) else UNAVAILABLE
 
 
+
+def _local_time(raw: Any) -> str:
+    """云端时间戳 → 本地时间（F46：真机把 `2026-11-23T20:38:09.651933Z` 原样印出来）。
+
+    客户看到「20:38」会以为是昨晚 8 点，其实是本地凌晨 4:38；6 位微秒更是纯噪音。
+    解析不了就原样返回（宁可丑，不许编）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "—"
+    try:
+        from datetime import datetime, timezone
+        stamp = text.replace("Z", "+00:00")
+        moment = datetime.fromisoformat(stamp)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:                                   # noqa: BLE001 - 格式未知就原样
+        return text
+
+
 def _empty_text(snapshot: Snapshot, name: str, text: str) -> str:
     return text if snapshot.ok(name) else UNAVAILABLE
 
@@ -1477,7 +1498,7 @@ def _receipts(snapshot: Snapshot) -> View:
             "；不一致 " + str(mismatch) + " 张" if mismatch else "")
     return View(
         key="receipts", title="收据",
-        subtitle="双签字段 · Merkle 路径 · 本地校验",
+        subtitle="每张收据都有平台签名，本机可以独立核对；对不上就是有问题",
         cards=(Card("收据总数", _count(snapshot, "receipts", str(len(rows)) + " 张"),
                     "来源：" + _origin_text(receipts.get("origin")), "default"),
                Card("本机已验证", _count(snapshot, "receipts", str(verified) + " 张"),
@@ -1529,7 +1550,7 @@ def _earnings(snapshot: Snapshot) -> View:
                      earnings.get("balance") is None
                      else _money(snapshot, "earnings", earnings.get("balance"))),
                     # 余额卡**不许**暗示可提现（owner D-2）：meta 只留「这一列是余额」
-                    "可用余额 · 口径见本页副标题", "muted")),
+                    "可用余额以云端账单为准（本页只显示云端下发的数）", "muted")),
         table=Table(("明细", "金额", "币种", "状态", "时间"), tuple(rows),
                     narrow_hide=("币种", "时间"),
                     note=str(earnings.get("note") or ""),
@@ -2376,7 +2397,7 @@ def _account(snapshot: Snapshot) -> View:
                   group=GROUP_IDENTITY),
             Field("平台", str(profile.get("platform") or "—"), key="platform",
                   group=GROUP_IDENTITY),
-            Field("最后在线", str(profile.get("last_seen_at") or "—"), key="last_seen_at",
+            Field("最后在线", _local_time(profile.get("last_seen_at")), key="last_seen_at",
                   group=GROUP_IDENTITY),
         ])
     if node_id and email:

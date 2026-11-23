@@ -670,7 +670,9 @@ def test_account_view_shows_node_identity_from_console_api():
                            "note": ""}}
     text = vw.build_view("account", FakeDataSource(section).snapshot()).plain_text()
     assert "node-7c31" in text and "已绑定" in text
-    assert "cn-east" in text and "linux" in text and "2026-11-01T10:00:00Z" in text
+    assert "cn-east" in text and "linux" in text
+    # F46：时间要按本地时区印（原来是 UTC 原串 + 6 位微秒），但日期本身不许丢
+    assert "2026-11-01" in text and "T10:00:00Z" not in text
     assert "邮箱" not in text                      # 节点接口没有邮箱，不编一个出来
 
 
@@ -1829,3 +1831,18 @@ def test_spawn_lock_steals_stale_lock(tmp_path):
     got = bootstrap._spawn_lock(paths)
     assert got, "残锁必须被抢过来（fail-open）"
     bootstrap._spawn_unlock(got)
+
+
+def test_last_seen_is_shown_in_local_time():
+    """F46：真机把 UTC 原串（含 6 位微秒）直接印在「最后在线」上，客户读成本地时间。"""
+    assert vw._local_time("2026-11-23T20:38:09.651933Z").endswith(":38")
+    assert "." not in vw._local_time("2026-11-23T20:38:09.651933Z")
+    assert vw._local_time("") == "—"
+    assert vw._local_time("不是时间") == "不是时间"
+
+
+def test_receipts_subtitle_has_no_internal_jargon():
+    """F40：副标题原来写「Merkle 路径」，客户看不懂。"""
+    snapshot = ds.Snapshot(dict(demo_snapshot().sections))
+    view = vw.build_view("receipts", snapshot)
+    assert "Merkle" not in view.subtitle
