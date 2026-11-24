@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
@@ -149,6 +150,10 @@ class PublishResult:
     reused: int = 0
     failed: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
+    #: R8-F6：服务端返回的**最早** ``expires_at``（ISO 字符串；空 = 服务端没给）。
+    #: 报价是追加语义：内容不变时云端复用且**不续期**，所以「有效期到几点」只能取
+    #: 这份响应里的最早一条，不能拿 now+ttl 冒充（第一次上报后才有的时钟）。
+    expires_at: str = ""
 
     @property
     def total(self) -> int:
@@ -165,6 +170,7 @@ class PublishResult:
             classes[name] = classes.get(name, 0) + 1
         return {"created": self.created, "reused": self.reused,
                 "failed": self.failed, "total": self.total, "ok": self.ok,
+                "expires_at": self.expires_at,
                 "error_classes": classes,
                 "errors": [dict(item) for item in self.errors]}
 
@@ -285,8 +291,14 @@ def resolve_period(config: Any = None, *, period_s: Any = None) -> int:
 
 # ─────────────────────────────────────────────────────────── 生成报价行
 def plan_quotes(upstreams: UpstreamManager, *, now: Any = None,
-                period_s: Any = None, upstream_id: str | None = None) -> QuotePlan:
+                period_s: Any = None, upstream_id: str | None = None,
+                prices: Mapping[str, Any] | None = None) -> QuotePlan:
     """从**可公告模型**生成一轮报价计划（纯函数，不联网）。
+
+    ``prices``（R8-F6）是**可选的本机逐模型底价覆盖**（``{model: "0.35"}``）：
+    命中时优先于 `ModelEntry.min_price`。GUI 的一次性上报和开启自动续报后的
+    daemon/CLI 都传同一本账本，手动与自动才不会因为价源不同而互相顶版本；
+    未命中的模型仍按上游价走。价格门控（0 价 / 非法 / 探针）**完全不放松**。
 
     门控顺序（与 `UpstreamManager.announceable_models` 同源，另加报价专属两关）：
 
@@ -321,10 +333,13 @@ def plan_quotes(upstreams: UpstreamManager, *, now: Any = None,
             if not entry.fresh(moment, ttl=facts.PROBE_FRESH_AFTER_S):
                 plan.skip(SKIP_STALE)
                 continue
-            if entry.min_price is None:
+            raw_price = (prices[entry.id]
+                         if prices is not None and entry.id in prices
+                         else entry.min_price)
+            if raw_price is None:
                 plan.skip(SKIP_ZERO_PRICE)
                 continue
-            minor = price_to_minor(entry.min_price)
+            minor = price_to_minor(raw_price)
             if minor is None:
                 plan.skip(SKIP_INVALID_PRICE)
                 continue
@@ -347,10 +362,11 @@ def plan_quotes(upstreams: UpstreamManager, *, now: Any = None,
 
 
 def quote_rows(upstreams: UpstreamManager, *, now: Any = None,
-               period_s: Any = None, upstream_id: str | None = None) -> list[QuoteRow]:
+               period_s: Any = None, upstream_id: str | None = None,
+               prices: Mapping[str, Any] | None = None) -> list[QuoteRow]:
     """:func:`plan_quotes` 的「只要行」视图（任务单口径的入口）。"""
     return plan_quotes(upstreams, now=now, period_s=period_s,
-                       upstream_id=upstream_id).rows
+                       upstream_id=upstream_id, prices=prices).rows
 
 
 # ─────────────────────────────────────────────────────────── 发布
@@ -381,6 +397,21 @@ def _error_row(row: QuoteRow, exc: BaseException) -> dict[str, Any]:
             "error": classify_error(exc), "code": code, "status": status}
 
 
+def _earlier_expiry(current: str, candidate: Any) -> str:
+    """保留更早的 ``expires_at``（解析不了就保留先到的那条，不猜时区）。"""
+    text = str(candidate or "").strip()
+    if not text:
+        return current
+    if not current:
+        return text
+    try:
+        first = datetime.fromisoformat(current.replace("Z", "+00:00"))
+        second = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return text if second < first else current
+    except (TypeError, ValueError):                     # pragma: no cover - 服务端给怪值
+        return current
+
+
 def publish(client: Any, rows: Iterable[QuoteRow], *,
             node_id: str | None = None) -> PublishResult:
     """逐行调 ``client.publish_quote``；**一行失败不影响其它行**（不抛整批）。
@@ -388,6 +419,7 @@ def publish(client: Any, rows: Iterable[QuoteRow], *,
     ``client`` 只需要有 ``publish_quote(payload) -> dict``（鸭子类型，便于离线单测）。
     计数口径：``created`` = 服务端新建（``created`` 不为 False）；``reused`` =
     内容指纹命中、原样复用（``created=false``，不升版本、不续期）。
+    结果里带**最早**的 ``expires_at``：复用不会续期，拿 now+ttl 冒充会骗客户。
     """
     result = PublishResult()
     for row in rows:
@@ -397,8 +429,13 @@ def publish(client: Any, rows: Iterable[QuoteRow], *,
             result.failed += 1
             result.errors.append(_error_row(row, exc))
             continue
-        if isinstance(response, Mapping) and response.get("created") is False:
-            result.reused += 1
+        if isinstance(response, Mapping):
+            if response.get("created") is False:
+                result.reused += 1
+            else:
+                result.created += 1
+            result.expires_at = _earlier_expiry(result.expires_at,
+                                                response.get("expires_at"))
         else:
             result.created += 1
     return result

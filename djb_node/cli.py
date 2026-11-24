@@ -26,11 +26,12 @@ from .api import NodeApi
 from .attest import AttestationManager
 from .channel import channel_enabled
 from .config import (ClientConfig, Paths, feature_flag, load_config, resolve_home, save_config)
-from .daemon import ControlClient, Daemon, control_socket_file
+from .daemon import ControlClient, Daemon, control_socket_file, hardware_fingerprint
 from .diagnose import DiagnoseBuilder, DiagnoseError
 from .envcheck import EnvChecker
 from .platform.no_window import subprocess_window_kwargs
-from .errors import (AuthError, DjbError, NotInstalledError, NotRunningError,
+from .errors import (AuthError, ConflictError, DjbError, NetworkError,
+                     NotInstalledError, NotRunningError, RateLimitError,
                      UsageError, exit_code_of)
 from .httpclient import HttpClient
 from .limits import (Limiter, YieldDetector, in_schedule, parse_schedule_windows,
@@ -44,6 +45,7 @@ from .relay import RelayError, RelayManager, capacity_targets
 from .secure import CredentialStore
 from .state import StateMachine, Snapshot, reason_label
 from .store import ProfileRecord, Store, UpstreamRecord
+from . import bids as bids_mod
 from . import plan_router
 from . import quotes as quotes_mod
 from . import store as store_module
@@ -333,6 +335,100 @@ def _auth_status_text(value: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+#: 云端撤销节点密钥的机器码 / 原因（40102 / client_key_revoked）——不变量只在 client/api 映射出现一次
+REVOKED_KEY_CODE = 40102
+REVOKED_KEY_REASON = "client_key_revoked"
+_AUTH_INTERNAL_TERMS = ("client_key", "register", "poll", "device_code")
+
+
+def _is_revoked_key_error(exc: DjbError) -> bool:
+    """401 的「密钥已撤销」判定：只看机器码/reason，不解析文案。"""
+    if not isinstance(exc, AuthError):
+        return False
+    code = int(getattr(exc, "code", 0) or 0)
+    reason = str(getattr(exc, "reason", "") or "").strip().lower()
+    return code == REVOKED_KEY_CODE or reason == REVOKED_KEY_REASON
+
+
+def _customer_error_message(exc: DjbError, *, default: str = "云端暂不可用") -> str:
+    """错误 → 客户能看懂的一句话（不含 client_key / register / poll 等内部词）。"""
+    if isinstance(exc, NetworkError):
+        return "连不上云端"
+    if isinstance(exc, RateLimitError):
+        return "云端比较忙（限流），请稍后再试"
+    text = str(getattr(exc, "message", "") or "").strip().split(" [reason=", 1)[0].strip()
+    if isinstance(exc, ConflictError) and any(
+            token in text.lower() for token in ("fingerprint", "40903", "已注册", "注册过")):
+        return "这台电脑的节点身份在云端存在冲突"
+    lowered = text.lower()
+    if not text or any(term in lowered for term in _AUTH_INTERNAL_TERMS):
+        return default
+    return text[:120]
+
+
+def _recover_client_key(*, config: ClientConfig, credentials: CredentialStore,
+                        expected_node_id: str) -> dict[str, Any]:
+    """密钥被撤销后用**本机硬件指纹**重新注册，换回同一节点的密钥（R8 F1）。
+
+    云端 register 的同指纹路径会轮换密钥并返回同一个 ``node_id``（解绑后允许），
+    所以这里**不带旧密钥**（撤销后带旧密钥只会再吃一次 401）。
+    返回的 ``node_id`` 必须与本地一致：不一致说明机器身份已经换了（例如旧节点被清退
+    后云端新建了一个），此时**不能**悄悄改写本机身份，必须让客户联系支持。
+    """
+    api = NodeApi(config.gateway_url, client_key=None, http=HttpClient(timeout=20.0))
+    try:
+        result = api.register(hardware_fingerprint=hardware_fingerprint())
+    except DjbError as exc:
+        raise AuthError(
+            "自动恢复失败：" + _customer_error_message(exc)
+            + "；下一步：重试一次，或到网页端解绑后重新绑定",
+            code=exc.code, details={"recovery": "failed"}) from exc
+    new_node_id = str(result.get("node_id") or "").strip()
+    new_key = result.get("client_key")
+    if not new_node_id or not isinstance(new_key, str) or not new_key.strip():
+        raise AuthError(
+            "自动恢复失败：云端没有返回完整的节点身份；下一步：重试一次，或到网页端解绑后重新绑定",
+            code=50001, details={"recovery": "missing_fields"})
+    if new_node_id != str(expected_node_id or "").strip():
+        raise AuthError(
+            "节点身份变化，请联系支持（本机节点与云端返回的节点不一致）；"
+            "下一步：先把这句话截图给客服，不要重复绑定",
+            code=50001, details={"recovery": "node_id_mismatch"})
+    credentials.set_node(new_node_id, new_key)
+    return result
+
+
+def _with_revoked_key_recovery(operation: Callable[[], Any], *, config: ClientConfig,
+                               credentials: CredentialStore, expected_node_id: str,
+                               api: NodeApi | None = None) -> tuple[Any, bool]:
+    """执行原操作；仅在 401 ``client_key_revoked`` 时恢复一次，再重试原操作一次。
+
+    不做循环：一次恢复 + 一次重试就是上限；仍失败就交给客户「重试 / 网页端解绑」。
+    返回 ``(结果, 是否发生过自动恢复)``。
+    """
+    try:
+        return operation(), False
+    except AuthError as exc:
+        if not _is_revoked_key_error(exc):
+            # 其它 401（密钥不对 / 缺密钥）：文案同样不许出现内部词，且给下一步。
+            raise AuthError(
+                _customer_error_message(exc, default="节点密钥无效")
+                + "；下一步：重试一次，或到网页端解绑后重新绑定",
+                code=exc.code, details=dict(exc.details or {})) from exc
+    _recover_client_key(config=config, credentials=credentials,
+                        expected_node_id=expected_node_id)
+    if api is not None:
+        api.client_key = credentials.client_key()
+    try:
+        return operation(), True
+    except DjbError as retry_exc:
+        raise AuthError(
+            "节点密钥已自动恢复，但原操作仍未完成："
+            + _customer_error_message(retry_exc)
+            + "；下一步：重试一次，或到网页端解绑后重新绑定",
+            code=retry_exc.code, details={"recovery": "retry_failed"}) from retry_exc
+
+
 def cmd_auth(args: argparse.Namespace) -> int:
     paths, config, store = _context(args)
     credentials = CredentialStore(paths)
@@ -349,27 +445,63 @@ def cmd_auth(args: argparse.Namespace) -> int:
         credentials.set_client_key(value)
         print("已保存客户端密钥（0600 文件，未写入日志/数据库）")
         return 0
+    if getattr(args, "recover", False):
+        # R8（F1）：显式恢复入口（桌面「点此重试」也走这一条）。只恢复，不绑定。
+        if not node_id:
+            raise AuthError("尚未注册节点：先 djb init + djb start")
+        if not credentials.client_key():
+            raise AuthError("本机没有可恢复的节点密钥：先启动一次客户端完成注册")
+        _recover_client_key(config=config, credentials=credentials,
+                            expected_node_id=node_id)
+        _emit({"ok": True, "node_id": node_id, "recovered": True},
+              as_json=_json_flag(args),
+              text=lambda value: ("节点身份已恢复：密钥已换新；下一步：到网页端重新生成绑定码，"
+                                  "再回到客户端粘贴绑定。"))
+        return 0
     if getattr(args, "pair", False):
         if not node_id:
             raise AuthError("尚未注册节点：先 djb init + djb start（或 djb auth --status）")
         credentials.require_client_key()
-        result = api.pair_key(node_id, rotate=not getattr(args, "no_rotate", False),
-                              overlap_seconds=int(getattr(args, "overlap_seconds", 0) or 0))
+        rotate = not getattr(args, "no_rotate", False)
+        overlap = int(getattr(args, "overlap_seconds", 0) or 0)
+
+        def _pair_key() -> dict[str, Any]:
+            return api.pair_key(node_id, rotate=rotate, overlap_seconds=overlap)
+
+        # 401 client_key_revoked（解绑撤销旧密钥）→ 用硬件指纹恢复一次 → 重试一次。
+        result, recovered = _with_revoked_key_recovery(
+            _pair_key, config=config, credentials=credentials,
+            expected_node_id=node_id, api=api)
         new_key = str(result.get("client_key"))
         credentials.set_client_key(new_key)
         _emit({"node_id": node_id, "rotated": True,
                "previous_key_expires_at": result.get("previous_key_expires_at"),
-               "key_prefix": result.get("key_prefix")},
+               "key_prefix": result.get("key_prefix"), "recovered": recovered},
               as_json=_json_flag(args),
-              text=lambda value: "已轮换客户端密钥（旧密钥重叠至 "
-              + str(value.get("previous_key_expires_at")) + "）")
+              text=lambda value: (("已自动恢复节点密钥并完成轮换" if value.get("recovered")
+                                   else "已轮换客户端密钥")
+                                  + "（旧密钥重叠至 "
+                                  + str(value.get("previous_key_expires_at")) + "）"))
         return 0
     if getattr(args, "bind", None):
         if not node_id:
             raise AuthError("尚未注册节点：先 djb init + djb start")
-        result = api.bind(node_id, str(args.bind))
-        _emit(result, as_json=_json_flag(args),
-              text=lambda value: "绑定成功：" + json.dumps(value, ensure_ascii=False))
+        code = str(args.bind)
+
+        def _bind() -> dict[str, Any]:
+            return api.bind(node_id, code)
+
+        # 401 client_key_revoked → 用硬件指纹恢复一次 → **重试原绑定一次**（不循环）。
+        result, recovered = _with_revoked_key_recovery(
+            _bind, config=config, credentials=credentials,
+            expected_node_id=node_id, api=api)
+        payload = dict(result)
+        payload["recovered"] = recovered
+        _emit(payload, as_json=_json_flag(args),
+              text=lambda value: (("已自动恢复节点密钥并完成绑定：" if value.get("recovered")
+                                   else "绑定成功：")
+                                  + json.dumps({key: item for key, item in value.items()
+                                                if key != "recovered"}, ensure_ascii=False)))
         return 0
     if getattr(args, "unbind", False):
         if not node_id:
@@ -2157,14 +2289,20 @@ def cmd_quotes(args: argparse.Namespace) -> int:
     * `publish` 需要（1）开关 `client.quotes.publish.enabled` 打开、
       （2）本机已用 `djb auth` 拿到节点密钥 —— 报价必须挂在**自己的**节点身份上；
     * TTL 一律 = 2 × 发布周期（P2），周期取 `--period-s` > config `quotes.period_s` > 60。
+
+    价格同源（R8-F6）：``client.upstream.bid_report.enabled`` 打开时读本机逐模型
+    账本价（与桌面一次性上报、daemon 自动续报同一本账本）；关闭时回落
+    ``ModelEntry.min_price`` 旧口径。
     """
     paths, config, store = _context(args)
     credentials = CredentialStore(paths)
     manager = UpstreamManager(store, credentials)
     action = getattr(args, "quotes_action", None) or "show"
     period_s = quotes_mod.resolve_period(config, period_s=getattr(args, "period_s", None))
+    prices = bids_mod.auto_report_prices(store, config)
     plan = quotes_mod.plan_quotes(manager, now=utcnow(), period_s=period_s,
-                                  upstream_id=getattr(args, "id", None))
+                                  upstream_id=getattr(args, "id", None),
+                                  prices=prices)
     if action == "show":
         _emit(plan.to_dict(), as_json=_json_flag(args), text=_quotes_table)
         return 0
@@ -2628,6 +2766,8 @@ def build_parser() -> argparse.ArgumentParser:
     auth = add_common(cmd_auth, "auth", "节点密钥 / 绑定 / 轮换")
     auth.add_argument("--status", action="store_true", help="查看绑定状态（默认）")
     auth.add_argument("--pair", action="store_true", help="生成 / 轮换客户端密钥")
+    auth.add_argument("--recover", action="store_true",
+                      help="密钥失效后自动恢复（用本机硬件指纹换回同一节点的密钥）")
     auth.add_argument("--no-rotate", action="store_true", help="pair 时只取新密钥不轮换旧密钥")
     auth.add_argument("--overlap-seconds", type=int, default=0, help="旧密钥重叠秒数")
     auth.add_argument("--bind", metavar="CODE", help="用网页端一次性码绑定")

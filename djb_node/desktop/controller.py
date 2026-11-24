@@ -28,8 +28,11 @@ from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPP
                      validate_address)
 from .datasource import (LOG_LEVELS, SECTIONS, DataSource, LocalDataSource, ProviderError,
                          Snapshot, Unavailable, benchmark)
-from .views import (VIEW_KEYS, VIEW_TITLES, YIELD_PRESET_BY_KEY, YIELD_PRESET_BY_LABEL,
-                    View, build_view)
+from .views import (BIND_RECOVER_FAILED_TEMPLATE, BIND_RECOVER_RETRY_LABEL,
+                    BIND_RECOVER_SUCCESS_TEXT, BIND_RECOVER_WEB_LABEL,
+                    BIND_RECOVERING_TEXT, REPORT_SKIP_TEXT, VIEW_KEYS, VIEW_TITLES,
+                    YIELD_PRESET_BY_KEY, YIELD_PRESET_BY_LABEL, View, build_view,
+                    public_reason)
 from .. import facts
 
 __all__ = ["ActionResult", "ControlOutcome", "DesktopController", "LocalControlChannel",
@@ -106,6 +109,58 @@ class LocalControlChannel:
 #: 但客户端只在状态条闪一行小字，客户看到的是「点 OK 没反应」。
 BIND_CODE_HINT = "；绑定码一次性、10 分钟有效——请到网页端「节点」页重新生成后再粘贴"
 _BIND_CODE_REASONS = ("binding_code_expired", "binding_code_mismatch", "40905", "过期", "失效")
+
+#: R8-F6：一次性上报失败分类 → **下一步**（只按异常类型；不解析服务端文案）
+_BID_REPORT_NEXT_STEP = {
+    "auth": "节点密钥失效（可能已在网页端解绑）：到「账户与安全」重新绑定后再试",
+    "forbidden": "云端拒绝（403）：节点可能未审核或被冻结，先看「账户与安全」的节点状态",
+    "conflict": "云端状态冲突（409）：先刷新看云端现有报价，不要连续重试",
+    "rate_limit": "云端限流（429）：等一两分钟再试，不要连续点击",
+    "network": "网络/网关不通：检查网络与「接入配置」里的服务器地址后重试",
+    "invalid": "参数被云端拒绝（400/422）：核对模型名、价格、TTL 是否符合云端口径",
+    "verify": "协议校验失败：客户端版本可能过旧，先更新再试",
+    "other": "未知失败：详情见日志（djb logs）",
+}
+
+
+def _minor_price_text(minor: Any) -> str:
+    """整数分 → 人读的 USD/1M 价格（35 → ``0.35``；不经过 float）。"""
+    from decimal import Decimal
+
+    try:
+        return format(Decimal(int(minor)) / 100, "f")
+    except (ArithmeticError, TypeError, ValueError):
+        return str(minor)
+
+
+def _clock_text(value: Any) -> str:
+    """ISO8601 / ``datetime`` → 本地 ``HH:MM``；解析不了返回空串（不猜）。"""
+    from datetime import datetime
+
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            moment = datetime.fromisoformat(
+                text[:-1] + "+00:00" if text.endswith("Z") else text)
+        except ValueError:
+            return ""
+    try:
+        return moment.astimezone().strftime("%H:%M")
+    except (OSError, ValueError):                      # pragma: no cover - 怪时区
+        return ""
+
+
+def _skip_reason_text(skipped: Mapping[str, Any]) -> str:
+    """把 ``QuotePlan.skipped`` 翻成「模型已停用 ×2，探针未通过 ×1」这种人话。"""
+    parts: list[str] = []
+    for reason, count in sorted((skipped or {}).items()):
+        label = REPORT_SKIP_TEXT.get(str(reason), str(reason))
+        parts.append(label + " ×" + str(count))
+    return "，".join(parts)
 
 
 def _now_iso() -> str:
@@ -185,6 +240,17 @@ def _bind_failure_hint(text: str, *, available_at: str = "") -> str:
     return ""
 
 
+def _recovery_reason(exc: BaseException) -> str:
+    """自动恢复失败原因的**客户语言**版本（内部词一律不回显）。"""
+    name = type(exc).__name__
+    if name in ("TimeoutExpired", "TimeoutError"):
+        return "本机命令超时"
+    reason = str(getattr(exc, "reason", "") or "").strip()
+    if reason:
+        return public_reason(reason)
+    return public_reason(str(exc), default="本机命令没跑通")
+
+
 def _bind_already_bound_message(bound_at: Any) -> str:
     """「已经绑定该账户」的**成功**提示：重复绑定没有副作用，但要说清「本来就绑着」。"""
     stamp = str(bound_at or "").strip()
@@ -226,6 +292,11 @@ class DesktopController:
     probe_via: Callable[[], Any] | None = None
     #: RC14 C：设备码绑定 —— 设备流程状态（``djb_node.device_flow.DeviceFlow``）
     device_flow: Any | None = None
+    #: R8（F1）：节点密钥自动恢复的界面状态 —— ""（正常）/ "recovering" / "failed"。
+    #: 只存**界面状态**，密钥只在 CLI 子进程里换（本层不读不写凭据）。
+    binding_recovery: str = ""
+    #: 恢复失败时给客户看的原因（已过 :func:`views.public_reason`，无内部词）
+    binding_recovery_reason: str = ""
     #: 设备流程异步通道：``(flow) -> bool``；返回 True = 已派给 worker（轮询不在主线程）
     device_via: Callable[[Any], Any] | None = None
     #: 设备流程**状态变化**通知：``(flow) -> None``。app 用它做两件事——
@@ -248,6 +319,9 @@ class DesktopController:
     #: 联通测试异步通道 ``(payload) -> bool``；返回 True = 已派给 worker。
     #: 没有通道（单测/无 Tk）就**同步**跑一次，行为与旧版一致但会立刻写状态。
     connectivity_via: Callable[[Mapping[str, Any]], Any] | None = None
+    #: R8（F6）：一次性上报的界面状态（唯一来源；视图只读）。
+    #: 形状：``{"state": "idle"|"running"|"ok"|"fail", "text": …, "at": …}``
+    bid_report: Mapping[str, Any] | None = None
     #: CR-20261119-CLIENT-TOKENPLAN-NOOP F3：最近一次「读取模型清单」的**人话结论**
     #: （读到几个 + 有没有落成上游）。写进视图 note，不再依赖会被下一次刷新播报覆盖的状态条。
     discover_message: str = ""
@@ -319,6 +393,11 @@ class DesktopController:
             **((flow.as_dict() if hasattr(flow, "as_dict") else dict(flow))
                if isinstance(flow, Mapping) or hasattr(flow, "as_dict") else {}),
         }
+        # R8（F1）：密钥自动恢复状态也由本层注入（视图只读，不持有流程状态）。
+        merged_account["binding_recovery"] = {
+            "state": str(self.binding_recovery or ""),
+            "reason": str(self.binding_recovery_reason or ""),
+        }
         sections["account"] = merged_account
         # RC14 I：Token Plan 页的「选中行 + 该行已存底价」由本层注入（视图层不持有选中态）
         plan = sections.get("token_plan")
@@ -344,6 +423,9 @@ class DesktopController:
                 merged_plan["protocol"] = str(
                     (self.last_discover or {}).get("protocol") or
                     merged_plan.get("protocol") or "")
+            # R8（F6）：一次性上报结果常驻本页（状态条会被下一轮刷新覆盖）
+            merged_plan["report"] = dict(self.bid_report
+                                         or {"state": "idle", "text": "", "at": ""})
             sections["token_plan"] = merged_plan
         access_sec = sections.get("access")
         if isinstance(access_sec, Mapping):
@@ -896,9 +978,12 @@ class DesktopController:
             account = self.snapshot.get("account")
             security = account.get("security") if isinstance(account, Mapping) else None
             node_id = str((security or {}).get("node_id") or "")
+        # R8（F3）：云端 verify_url 是相对路径（/activate）→ 用网关基址拼绝对地址再打开；
+        # 网关地址从注入的云端客户端取（测试桩没有就是空，此时宁可不打开也不打开相对路径）。
+        base_url = str(getattr(client, "base_url", "") or "")
         runner = flow_mod.DeviceFlowRunner(post, sleep=time.sleep, clock=time.monotonic,
                                           on_update=self._device_update, stop=stop,
-                                          node_id=node_id)
+                                          node_id=node_id, base_url=base_url)
         flow = runner.run()
         self.device_flow = flow
         return self._device_result(flow)
@@ -1334,30 +1419,242 @@ class DesktopController:
         more = "（等 " + str(len(models)) + " 个）" if len(models) > 6 else ""
         return ActionResult("将上报 " + str(len(models)) + " 个模型的底价：" + lines + more
                             + "；上报目标：" + " / ".join(payload.get("paths") or ())
-                            + "（现在还不会发出去）",
+                            + "（只预览，不会发送；点「上报到云端」才真正提交）",
                             payload={"state": "preview", "payload": payload})
 
     def _act_token_plan_report(self, *, confirm=None) -> ActionResult:
-        """上报逐模型底价：开关默认关闭；云端未开通时**明确说没发**，不假成功。"""
-        from .. import bids as bids_mod
-        from ..config import Paths, load_config
+        """一次性上报逐模型底价（R8-F6）：预检 → 确认 → **交给 worker 真发**。
 
-        config = None
+        决策（owner 2026-11-24）：一次性上报**不依赖** ``client.upstream.bid_report.enabled``
+        ——该 flag 只管 daemon 自动续报。默认值保持不变；这里也不静默改任何开关。
+        Tk 主线程只做本地预检 + 弹确认；HTTP 由 app 的 ``RefreshWorker`` 调
+        :meth:`run_bid_report` 执行（单测/无窗口时调用方直接调后者）。
+        """
+        from .. import quotes as quotes_mod
+        from ..config import GATEWAY_PLACEHOLDER, Paths, load_config
+        from ..errors import UsageError
+        from ..secure import CredentialStore
+        from ..upstream import UpstreamManager
+        from ..util import utcnow
+
         home = getattr(self.source, "_home", None)
+        if not home:
+            return ActionResult("本机配置目录不可用：无法确认网关地址与节点身份（未发送任何内容）",
+                                ok=False)
+        paths = Paths(str(home))
         try:
-            if home:
-                config = load_config(Paths(str(home)))
-        except Exception:
-            config = None
-        blocker = bids_mod.report_blocker(config) if config is not None else (
-            "本机配置读不到：无法确认上报开关状态（底价只保存在本机）")
-        if blocker:
-            return ActionResult(blocker + "（未发送任何内容）", ok=False)
-        payload = self._bids().report_payload()
-        if not payload.get("models"):
-            return ActionResult("本地还没有任何底价：没有可上报的内容", ok=False)
-        return ActionResult("上报通道已打开，但云端接口仍需上线后才能提交："
-                            "本次未发送（预览见「预览将上报的内容」）", ok=False)
+            config = load_config(paths)
+        except Exception as exc:
+            return ActionResult("本机配置读不到（" + type(exc).__name__
+                                + "）：未发送任何内容", ok=False)
+        gateway = str(getattr(config, "gateway_url", "") or "").strip()
+        if not gateway or gateway == GATEWAY_PLACEHOLDER:
+            return ActionResult("还没配置云端服务器地址：先到「接入配置」填好网关地址再上报"
+                                "（未发送任何内容）", ok=False)
+        if self._bound_flag() is not True:
+            return ActionResult("节点还没绑定：先到「账户与安全」用网页端绑定码完成绑定，再上报"
+                                "（未发送任何内容）", ok=False)
+        credentials = CredentialStore(paths)
+        if not credentials.client_key():
+            return ActionResult("本机没有节点密钥（可能已在网页端解绑）：到「账户与安全」"
+                                "重新绑定后再上报（未发送任何内容）", ok=False)
+        book = self._bids()
+        try:
+            ledger = book.load()
+        except Exception as exc:
+            return ActionResult("本机底价账本读不到（" + type(exc).__name__
+                                + "）：未发送任何内容", ok=False)
+        if not ledger:
+            text = ("本地还没有任何底价：先在表格里选模型、填价、点「保存这一行」，"
+                    "再上报（未发送任何内容）")
+            self.set_bid_report("fail", text)
+            return ActionResult(text, ok=False)
+        prices = {str(model): str(item["min_price"]) for model, item in ledger.items()}
+        store = getattr(book, "store", None)
+        if store is None:
+            return ActionResult("本机数据库不可用：无法读取上游模型清单（未发送任何内容）",
+                                ok=False)
+        try:
+            period = quotes_mod.resolve_period(config)
+            plan = quotes_mod.plan_quotes(UpstreamManager(store, credentials),
+                                          now=utcnow(), period_s=period, prices=prices)
+        except UsageError as exc:
+            text = ("发布周期 / TTL 配置不合法，本轮未发送：" + str(exc.message)
+                    + "。先到「本机设置」修正 quotes.period_s / quotes.ttl_s 再试。")
+            self.set_bid_report("fail", text)
+            return ActionResult(text, ok=False)
+        except Exception as exc:
+            text = ("读取上游模型清单失败（" + type(exc).__name__
+                    + "）：未发送任何内容；先点「刷新」确认本机数据可读。")
+            self.set_bid_report("fail", text)
+            return ActionResult(text, ok=False)
+        rows = [row for row in plan.rows if row.model in prices]
+        unmatched = sorted(set(prices) - {row.model for row in plan.rows})
+        if not rows:
+            text = self._bid_report_empty_text(plan, unmatched)
+            self.set_bid_report("fail", text)
+            return ActionResult(text, ok=False)
+        message = self._bid_report_confirm_text(plan, rows, unmatched=unmatched,
+                                                node_id=credentials.node_id(),
+                                                period_s=period)
+        try:
+            approved = bool(confirm(message))
+        except Exception:                              # 确认框坏了：宁可不发
+            approved = False
+        if not approved:
+            return ActionResult("已取消上报（未发送任何内容）", ok=False, effect="cancelled")
+        self.set_bid_report("running", "正在上报 " + str(len(rows)) + " 个模型到云端（TTL "
+                            + str(plan.ttl_s) + "s）…", count=len(rows),
+                            ttl_s=plan.ttl_s)
+        return ActionResult("正在上报 " + str(len(rows)) + " 个模型到云端…"
+                            "（可以继续操作，结果会留在本页）",
+                            effect="bid_report", payload={"plan": plan})
+
+    def run_bid_report(self, plan: Any) -> ActionResult:
+        """**worker 侧**：把确认过的一轮报价逐条 POST（Tk 主线程绝不发 HTTP）。
+
+        ``plan`` 是动作在确认时生成的 :class:`~djb_node.quotes.QuotePlan`：
+        客户确认的就是这些行（不二次改价、不改条数）。这里只补一次凭据检查——
+        从确认到发送之间可能刚好被解绑；失败也要给可执行的下一步。
+        """
+        from .. import quotes as quotes_mod
+        from ..api import NodeApi
+        from ..config import Paths, load_config
+        from ..httpclient import HttpClient
+        from ..secure import CredentialStore
+
+        rows = list(getattr(plan, "rows", []) or [])
+        ttl_s = int(getattr(plan, "ttl_s", 0) or 0)
+        if not rows:
+            text = "本轮没有可上报的模型（未发送任何内容）"
+            self.set_bid_report("fail", text)
+            return ActionResult(text, ok=False)
+        home = getattr(self.source, "_home", None)
+        if not home:
+            text = "本机配置目录不可用：未发送任何内容"
+            self.set_bid_report("fail", text)
+            return ActionResult(text, ok=False)
+        try:
+            config = load_config(Paths(str(home)))
+            credentials = CredentialStore(Paths(str(home)))
+            client_key = credentials.require_client_key()
+            node_id = credentials.node_id()
+        except Exception as exc:
+            text = ("上报失败：本机凭据/配置不可用（" + type(exc).__name__
+                    + "）：到「账户与安全」重新绑定后再试（未发送任何内容）")
+            self.set_bid_report("fail", text)
+            return ActionResult(text, ok=False)
+        try:
+            api = NodeApi(config.gateway_url, client_key=client_key,
+                          http=HttpClient(timeout=20.0))
+            result = quotes_mod.publish(api, rows, node_id=node_id or None)
+        except Exception as exc:                       # 防御：publish 内部已按行隔离
+            text = ("上报失败（" + type(exc).__name__ + "）：检查网络与「接入配置」里的"
+                    "服务器地址后重试；已成功的条目不回滚，刷新可看云端状态。")
+            self.set_bid_report("fail", text)
+            return ActionResult(text, ok=False)
+        text = self._bid_report_result_text(result, ttl_s=ttl_s)
+        self.set_bid_report("ok" if result.ok else "fail", text,
+                            count=result.total, created=result.created,
+                            reused=result.reused, failed=result.failed)
+        return ActionResult(text, ok=result.ok)
+
+    def set_bid_report(self, state: str, text: str, **extra: Any) -> None:
+        """写一次性上报的界面状态（唯一来源；视图只读，状态条被刷新覆盖也不丢）。"""
+        payload: dict[str, Any] = {"state": str(state), "text": str(text), "at": _now_iso()}
+        for key, value in extra.items():
+            if value is not None:
+                payload[str(key)] = value
+        self.bid_report = payload
+
+    def _bid_report_empty_text(self, plan: Any, unmatched: Sequence[str]) -> str:
+        """空计划的人话：列门控原因与未命中模型，**绝不说已上报**。"""
+        skipped = getattr(plan, "skipped", {}) or {}
+        text = "本轮没有可上报的模型（未发送任何内容）"
+        if skipped:
+            text += ("：门控跳过 " + str(sum(int(value) for value in skipped.values()))
+                     + " 个模型——" + _skip_reason_text(skipped))
+        if unmatched:
+            preview = "、".join(str(name) for name in unmatched[:5])
+            if len(unmatched) > 5:
+                preview += " 等"
+            text += ("；账本里有 " + str(len(unmatched)) + " 条底价没命中可公告模型："
+                     + preview)
+        text += "。先确认模型已启用、探针通过，并给对应模型设底价。"
+        return text
+
+    @staticmethod
+    def _bid_report_confirm_text(plan: Any, rows: Sequence[Any], *,
+                                 unmatched: Sequence[str] = (),
+                                 node_id: str | None = None, period_s: int = 0) -> str:
+        """确认弹窗：模型 + 底价 + TTL + 条数 + 被跳过 + 「只报这一次」。"""
+        from datetime import datetime, timedelta
+        from .views import mask_node_id
+
+        ttl_s = int(getattr(plan, "ttl_s", 0) or 0)
+        lines = ["即将把 " + str(len(rows)) + " 个模型的底价上报到云端"
+                 + ("（节点 " + mask_node_id(node_id) + "）" if node_id else "") + "："]
+        for row in rows[:4]:
+            lines.append("  " + str(row.model) + " = " + _minor_price_text(row.price_min)
+                         + " USD / 百万 token")
+        if len(rows) > 4:
+            lines.append("  … 等 " + str(len(rows)) + " 个模型（完整清单见「预览将上报的内容」）")
+        lines.append("")
+        bullets = ["共 " + str(len(rows)) + " 条报价 · 每 " + str(int(period_s or 0))
+                   + "s 一轮，TTL " + str(ttl_s) + "s"
+                   + ("（约到期 " + (datetime.now().astimezone()
+                                     + timedelta(seconds=ttl_s)).strftime("%H:%M") + "）"
+                      if ttl_s else "")]
+        bullets.append("价格会进入撮合，到期自动撤下，不会自动续期")
+        bullets.append("单条失败不影响其它模型（失败的会单独列出并给下一步）")
+        if unmatched:
+            preview = "、".join(str(name) for name in unmatched[:3])
+            if len(unmatched) > 3:
+                preview += " 等"
+            bullets.append(str(len(unmatched)) + " 条底价本次不会上报"
+                           "（未映射 / 停用 / 探针未通过 / 价格无效）：" + preview)
+        skipped = getattr(plan, "skipped", {}) or {}
+        if skipped:
+            bullets.append("本轮门控跳过 " + str(sum(int(value) for value in skipped.values()))
+                           + " 个模型：" + _skip_reason_text(skipped))
+        bullets.append("本次只上报一次，不会打开自动上报（自动续报是另一个开关，默认关）")
+        marks = "①②③④⑤⑥⑦"
+        for index, bullet in enumerate(bullets):
+            lines.append((marks[index] if index < len(marks) else "·") + " " + bullet)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _bid_report_result_text(result: Any, *, ttl_s: int) -> str:
+        """结果人话：条数 / 新建·复用·失败 / 到期时刻 / 失败分类的下一步。"""
+        from datetime import datetime, timedelta
+
+        created = int(getattr(result, "created", 0) or 0)
+        reused = int(getattr(result, "reused", 0) or 0)
+        failed = int(getattr(result, "failed", 0) or 0)
+        reported = created + reused
+        head = (("已上报 " + str(reported) + " 个模型") if reported
+                else "上报失败：没有模型上报成功")
+        text = (head + "（新建 " + str(created) + " · 复用 " + str(reused)
+                + " · 失败 " + str(failed) + "）")
+        expiry = _clock_text(getattr(result, "expires_at", ""))
+        if not expiry and ttl_s:
+            expiry = (datetime.now().astimezone()
+                      + timedelta(seconds=ttl_s)).strftime("%H:%M")
+            text += "，有效期约至 " + expiry + "（TTL " + str(ttl_s) + "s）"
+        else:
+            text += "，有效期至 " + (expiry or "云端返回") + "（TTL " + str(ttl_s) + "s）"
+        if reused:
+            text += "；复用的报价云端不会续期，到期时间不变"
+        if failed:
+            classes: list[str] = []
+            for item in getattr(result, "errors", []) or []:
+                name = str(item.get("error") or "other")
+                if name not in classes:
+                    classes.append(name)
+            steps = [_BID_REPORT_NEXT_STEP.get(name, _BID_REPORT_NEXT_STEP["other"])
+                     for name in classes]
+            text += "。失败 " + str(failed) + " 条" + ("：" + "；".join(steps) if steps else "")
+        return text
 
     def _act_token_plan_add_upstream(self, *, confirm=None) -> ActionResult:
         """E（RC14 IA 拆分）：「添加上游」不再跳到「本机设置」（那里根本不能加）。
@@ -1659,12 +1956,76 @@ class DesktopController:
         return ActionResult("已登出：节点已解绑、本机密钥已清除；重新配对后才能接单。",
                             effect="refresh")
 
+    # ── R8（F1）：节点密钥被云端撤销后的自动恢复（界面状态机，一次点击只试一次）
+    def _binding_key_invalid(self) -> bool:
+        """快照是否已经说明「本机节点密钥失效」：daemon 暂停原因或凭据状态。
+
+        只是**读取本机快照**（不发请求）：daemon 心跳遇 401 会把 reason 落成
+        ``credential_invalid``；云端明确回 ``client_key_revoked`` 时也可能标记
+        ``security.key_state=revoked``。两者任一命中都先恢复密钥，再谈绑定。
+        """
+        status = self.snapshot.get("status")
+        reason_code = status.get("reason_code") if isinstance(status, Mapping) else None
+        if str(reason_code or "") == "credential_invalid":
+            return True
+        account = self.snapshot.get("account")
+        security = account.get("security") if isinstance(account, Mapping) else None
+        return str((security or {}).get("key_state") or "") == "revoked"
+
+    def recover_binding(self) -> ActionResult:
+        """自动恢复节点密钥：调本机命令 ``auth --recover``（只调一次，不循环）。
+
+        恢复期间 ``binding_recovery="recovering"``：视图据此显示「节点密钥已失效，
+        正在自动恢复…」并把绑定按钮置灰。成功 → 清状态、回到绑定输入；失败 →
+        ``"failed"`` + 「点此重试 / 到网页端解绑后重新绑定」。
+        """
+        if self.binding_recovery == "recovering":
+            return ActionResult(BIND_RECOVERING_TEXT, ok=False)
+        if self.cli is None:
+            return self._binding_recovery_failed("本机命令通道未接通")
+        self.binding_recovery = "recovering"
+        self.binding_recovery_reason = ""
+        self.message = BIND_RECOVERING_TEXT
+        try:
+            payload = self.cli(["auth", "--recover"])
+        except Exception as exc:                          # noqa: BLE001 - 文案要收敛
+            return self._binding_recovery_failed(_recovery_reason(exc))
+        if isinstance(payload, Mapping) and payload.get("ok") is False:
+            return self._binding_recovery_failed(str(payload.get("error") or "云端暂不可用"))
+        self.binding_recovery = ""
+        self.binding_recovery_reason = ""
+        self.request_refresh(("account",))
+        return ActionResult(BIND_RECOVER_SUCCESS_TEXT, effect="refresh")
+
+    def _binding_recovery_failed(self, reason: Any) -> ActionResult:
+        text = public_reason(reason)
+        self.binding_recovery = "failed"
+        self.binding_recovery_reason = text
+        # effect=refresh：失败态也要**立刻**重画（字段 + 两条下一步按钮）；
+        # 否则 app 只在成功时重画，客户要点一次刷新才看得到恢复按钮。
+        return ActionResult(BIND_RECOVER_FAILED_TEMPLATE.format(reason=text),
+                            ok=False, effect="refresh")
+
+    def _act_account_bind_recover(self, *, confirm=None) -> ActionResult:
+        """「点此重试」：只再试一次自动恢复（不做无限重试）。"""
+        return self.recover_binding()
+
+    def _act_account_recover_open_web(self, *, confirm=None) -> ActionResult:
+        """「到网页端解绑后重新绑定」：把客户送到网页端（不在客户端里清任何凭据）。"""
+        return ActionResult(
+            "网页端：" + facts.WEB_CONSOLE_URL + " → 共享算力 → 节点与绑定："
+            "先解绑这台电脑，再生成新的绑定码回来粘贴。",
+            effect="open_url", payload=facts.WEB_CONSOLE_URL)
+
     def _act_account_bind(self, code: str | None = None, *, confirm=None) -> ActionResult:
         """绑定网页端：取一次性码 → ``djb auth --bind <码>`` → 刷新快照。
 
         ``code`` 可显式传入（测试 / 调用方已有码）；为 ``None`` 时走 ``ask_code`` 输入框。
         绑定码只进子进程参数，不进日志、不回显到状态栏。
+        R8（F1）：密钥已知失效时**先恢复密钥**（恢复成功后回到绑定输入，不拿旧码硬试）。
         """
+        if self._binding_key_invalid():
+            return self.recover_binding()
         if code is None:
             if self.ask_code is None:
                 return ActionResult("暂不可用（没有绑定码输入通道）", ok=False)
@@ -1681,14 +2042,24 @@ class DesktopController:
             payload = self.cli(["auth", "--bind", code])
         except ProviderError as exc:
             reason = str(exc.reason or "")
-            return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
+            recovered = self._recover_after_bind_failure(reason)
+            if recovered is not None:
+                return recovered
+            return ActionResult("绑定未成功："
+                                + public_reason(reason, default="云端拒绝了这次绑定")
+                                + _bind_failure_hint(reason)
                                 + "；本机凭据未改动。", ok=False)
         except Exception as exc:
             return ActionResult("绑定未成功（" + type(exc).__name__ + "）；本机凭据未改动。",
                                 ok=False)
         if isinstance(payload, Mapping) and payload.get("ok") is False:
             reason = str(payload.get("error") or "服务端拒绝")
-            return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
+            recovered = self._recover_after_bind_failure(reason)
+            if recovered is not None:
+                return recovered
+            return ActionResult("绑定未成功："
+                                + public_reason(reason, default="云端拒绝了这次绑定")
+                                + _bind_failure_hint(reason)
                                 + "；本机凭据未改动。", ok=False)
         self.request_refresh(None)
         if was_bound:
@@ -1698,6 +2069,21 @@ class DesktopController:
         return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。"
                             "（USDT 收款地址是**另一件事**：在本页「③ 提交 USDT 收款地址」"
                             "里单独点一次「提交收款地址到云端」才生效）", effect="refresh")
+
+    def _recover_after_bind_failure(self, reason: str) -> ActionResult | None:
+        """绑定失败若是「密钥已失效」→ 转入自动恢复；其余失败仍走原来的下一步文案。
+
+        CLI 自己也会在 401 client_key_revoked 上恢复一次；这里兜的是另一种情况：
+        恢复失败 / 老版本 CLI / 云端在心跳后才标记失效。**只再试一次**，不做循环。
+        """
+        text = str(reason or "")
+        if "自动恢复失败" in text:
+            tail = text.split("自动恢复失败：", 1)[-1]
+            return self._binding_recovery_failed(tail.split("；", 1)[0])
+        lowered = text.lower()
+        if "client_key_revoked" in lowered or "40102" in lowered or "节点密钥已失效" in text:
+            return self.recover_binding()
+        return None
 
     def _bound_before_bind(self) -> tuple[bool, str]:
         """读「绑之前」的绑定态：``(是否已绑, bound_at 原文)``；读不到就当没绑。"""

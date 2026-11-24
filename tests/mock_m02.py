@@ -68,6 +68,12 @@ class MockServer:
         self.register_state = "active"
         self.register_returns_key = True
         self.fail_register_count = 0
+        # R8（F1）：注册响应里的节点身份（默认与既有用例一致；恢复用例可换值验证「身份变化」）
+        self.register_node_id = NODE_ID
+        self.register_client_key = CLIENT_KEY
+        # R8（F1）：绑定/轮换前先吃 401 client_key_revoked 的次数（模拟网页端刚解绑）
+        self.binding_revoked_count = 0
+        self.pair_revoked_count = 0
         # P5（CR-20261106-OFFICIAL-SUPPLY-01）：注册唯一键冲突。非 None 时注册端点按云侧
         # 40903 的真实形状回包（`{"error":{...,"code":40903,"message":...,"node_id":...}}`）。
         self.register_conflict_code: int | None = None
@@ -177,6 +183,11 @@ class MockServer:
                 if path == "/api/v1/node/binding":
                     if not outer._authed(self):
                         return
+                    if outer.binding_revoked_count > 0:
+                        outer.binding_revoked_count -= 1
+                        self._error(401, 40102, "节点密钥已失效",
+                                    reason="client_key_revoked")
+                        return
                     self._json(200, {"node_id": NODE_ID, "bound": True,
                                      "account_id": "acct-1"})
                     return
@@ -204,20 +215,31 @@ class MockServer:
                         self._error(409, outer.register_conflict_code,
                                     outer.register_conflict_message, node_id=NODE_ID)
                         return
-                    payload = {"node_id": NODE_ID, "state": outer.register_state,
+                    payload = {"node_id": outer.register_node_id,
+                               "state": outer.register_state,
                                "policy_version": outer.policy_version,
                                "protocol_version": PROTOCOL_VERSION,
                                "server_time": _iso_now()}
                     if outer.register_returns_key:
-                        payload["client_key"] = CLIENT_KEY
+                        payload["client_key"] = outer.register_client_key
                     self._json(201, payload)
                     return
                 if path == "/api/v1/node/pair":
+                    if outer.pair_revoked_count > 0:
+                        outer.pair_revoked_count -= 1
+                        self._error(401, 40102, "节点密钥已失效",
+                                    reason="client_key_revoked")
+                        return
                     self._json(201, {"node_id": NODE_ID, "client_key": NEW_CLIENT_KEY,
                                      "key_prefix": "ck_test_",
                                      "previous_key_expires_at": _iso_now()})
                     return
                 if path == "/api/v1/node/binding":
+                    if outer.binding_revoked_count > 0:
+                        outer.binding_revoked_count -= 1
+                        self._error(401, 40102, "节点密钥已失效",
+                                    reason="client_key_revoked")
+                        return
                     self._json(200, {"node_id": NODE_ID, "bound": True,
                                      "account_id": "acct-1"})
                     return

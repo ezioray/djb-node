@@ -69,7 +69,8 @@ PAGE_KICKERS = {key: page_kicker(key) for key in VIEW_KEYS}
 #:
 #: 它们在 :meth:`DesktopApp._on_action` 的通用播报里要跳过，否则「已在浏览器打开」会被
 #: 动作自带的一句「网页端：https://…」覆盖掉——那正好抹掉了「打不开」这个关键差别。
-SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "update", "probe")
+SELF_REPORTING_EFFECTS = ("open_url", "open_dir", "payout_submit", "bid_report",
+                           "update", "probe")
 
 #: RC15-039 #4：自动刷新的两档间隔（秒）与「空闲」阈值。
 #:
@@ -1787,6 +1788,73 @@ class DesktopApp:
         else:
             self._refresh_deferred = ("access",)
 
+    # ── R8-F6：逐模型底价一次性上报（与刷新/收款同一个 RefreshWorker 模板）
+    def _ensure_bid_report_worker(self) -> Any:
+        """惰性建「一次性上报」worker：主线程只做预检/确认/播报，HTTP 全在 worker。"""
+        worker = getattr(self, "_bid_report_worker", None)
+        if worker is not None:
+            return worker
+        root = self._root
+        if not callable(getattr(root, "after", None)):
+            return None
+        from .refresh_worker import RefreshWorker
+
+        def schedule(delay: int, fn: Any) -> Any:
+            return root.after(int(delay), fn)
+
+        def cancel(job: Any) -> None:
+            root.after_cancel(job)
+
+        worker = RefreshWorker(
+            lambda sections=None: self._controller.run_bid_report(self._bid_report_plan),
+            apply=self._apply_bid_report, on_start=self._bid_report_started,
+            on_busy=self._bid_report_busy, schedule=schedule, cancel=cancel)
+        self._bid_report_worker = worker
+        return worker
+
+    def _start_bid_report(self, plan: Any, message: str = "") -> None:
+        """派发一次上报；没有事件循环（截图脚本/单测）才退回同步。"""
+        self._bid_report_plan = plan
+        self._force_next_render = True
+        try:
+            self._render(self._controller.current())
+        except Exception:                          # pragma: no cover - 窗口已销毁
+            pass
+        worker = self._ensure_bid_report_worker()
+        if worker is None:
+            self._apply_bid_report(self._controller.run_bid_report(plan), None)
+            return
+        worker.start()
+
+    def _bid_report_started(self) -> None:
+        self._toast("正在上报到云端…（可以继续操作，结果会留在 Token Plan 页）", ok=True)
+
+    def _bid_report_busy(self) -> None:
+        self._toast("正在上报…上一次还没结束，已忽略这次点击", ok=True)
+
+    def _apply_bid_report(self, result: Any, error: BaseException | None,
+                          sections: Any = None) -> None:
+        """结果落地（主线程）：toast + 重画（结果写进 controller，刷新也不会丢）。"""
+        if error is not None:
+            text = ("上报失败（" + type(error).__name__ + "）：网络或本机异常；"
+                    "已成功的条目不回滚，刷新可看云端状态")
+            self._controller.set_bid_report("fail", text)
+            ok = False
+        elif result is None:
+            text = "上报失败：没有拿到结果"
+            self._controller.set_bid_report("fail", text)
+            ok = False
+        else:
+            text = str(getattr(result, "message", "") or "上报完成")
+            ok = bool(getattr(result, "ok", False))
+        self._toast(text, ok=ok)
+        self._force_next_render = True
+        try:
+            self._render(self._controller.current())
+            self._update_status()
+        except Exception:                          # pragma: no cover - 窗口已销毁
+            pass
+
     # ── 探针（RC14 D）：「立即探测」也要在 worker 里跑（网络 10 s 级）
     def _ensure_probe_worker(self) -> Any:
         """惰性建探针 worker：与刷新/更新同一个 :class:`RefreshWorker` 模板。"""
@@ -1965,6 +2033,12 @@ class DesktopApp:
         """同一个确认链接只开一次浏览器（状态反复变化不许连开窗口）。"""
         url = str(url or "")
         if not url:
+            return False
+        # R8（F3）：相对地址（旧云端只回 /activate）交给 webbrowser 等于什么都不做。
+        # device_flow 已用网关基址拼过绝对地址；这里再兜一道：只接受 http(s)。
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
             return False
         seen = getattr(self, "_opened_verify_urls", None)
         if seen is None:
@@ -4074,6 +4148,10 @@ class DesktopApp:
         elif result.effect == "payout_submit":
             # 网络调用不许在主线程：派给 worker，结果由 _apply_payout 回投（toast + 重拉状态）
             self._start_payout_submit(str(result.payload), result.message)
+        elif result.effect == "bid_report":
+            # R8-F6：一次性上报的网络在 worker 线程；结果回投 _apply_bid_report
+            payload = result.payload if isinstance(result.payload, Mapping) else {}
+            self._start_bid_report(payload.get("plan"), result.message)
         elif result.effect in ("refresh", "access", "bench", "control", "reload", "filter"):
             # 2026-11-20：「刷新」原来只在表单字段被忘掉时才强制重画；否则内容比对
             # 认为没变化就跳过 —— 客户点了刷新，屏幕一动不动（底价/上游都是后到的
@@ -4288,7 +4366,12 @@ class DesktopApp:
         dual.apply(window, ttk, self._theme_name)
         self._apply_kit_skin()                     # 同上：option 数据库是解释器级的，别被改回 11pt
         window.title("TokenBank / 确认本机控制")
-        window.geometry("560x260")
+        # 长确认文案（如逐模型底价上报要列模型+价格+TTL+跳过）按行数长高，
+        # 固定 260px 会把后几行裁掉——客户看不到「到期自动撤下」就等于没确认。
+        # wraplength=500 ⇒ 约 52 个半角字符折一行；按折行后的行数估算高度。
+        text = str(message or "")
+        wrapped = sum(max(1, (len(part) + 51) // 52) for part in text.split("\n"))
+        window.geometry("560x" + str(260 if wrapped <= 8 else min(620, 150 + wrapped * 22)))
         choice = [False]
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
@@ -4361,7 +4444,7 @@ class DesktopApp:
         # 不然销毁窗口时 Tk 会对着已消失的 lambda 打一行「invalid command name」
         # （只是 stderr 噪音，但会把真实测试输出搞脏——0.3.7 起就有的收场缺口）
         for name in ("_refresh_worker", "_payout_worker", "_update_worker", "_probe_worker",
-                     "_discover_worker"):
+                     "_discover_worker", "_bid_report_worker"):
             worker = getattr(self, name, None)
             if worker is None:
                 continue

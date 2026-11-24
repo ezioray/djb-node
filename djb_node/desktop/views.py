@@ -355,6 +355,35 @@ GROUP_IDENTITY = "① 本机与身份"
 GROUP_BIND = "② 绑定节点"
 GROUP_PAYOUT = "③ 提交 USDT 收款地址（与绑定是两件事）"
 
+# ── R8（F1/F4）绑定防呆文案（spec §2 原文；UI 与 controller 共用这一份，不许各写一遍）
+#: 节点密钥被云端撤销后的自动恢复提示（恢复期间按钮置灰、不允许重复点击）
+BIND_RECOVERING_TEXT = "节点密钥已失效，正在自动恢复…"
+#: 恢复失败的下一步（reason 是**客户语言**，内部词已由 public_reason() 过滤）
+BIND_RECOVER_FAILED_TEMPLATE = "自动恢复失败：{reason}；点此重试 / 到网页端解绑后重新绑定"
+BIND_RECOVER_RETRY_LABEL = "点此重试"
+BIND_RECOVER_WEB_LABEL = "到网页端解绑后重新绑定"
+#: 恢复成功：回到绑定输入（重新生成一次性码后粘贴；旧码可能已过期）
+BIND_RECOVER_SUCCESS_TEXT = "节点密钥已恢复：请重新生成绑定码后粘贴到这一页。"
+#: 首次启动的防火墙脚注（spec §2 原文，逐字）
+FIREWALL_NOTE = "若 Windows 弹出防火墙授权，请允许“专用网络”，否则本机镜像端口不可用"
+
+#: 内部词黑名单：失败文案里出现这些词就把原因退化成通用句（客户语言里没有这些概念）
+_INTERNAL_TERMS = ("client_key", "register", "poll", "device_code", "hardware_fingerprint")
+
+
+def public_reason(text: object, *, default: str = "云端暂不可用") -> str:
+    """把错误原因收敛成**客户语言**：去掉内部词与 ``[reason=…]`` 后缀。
+
+    失败文案的硬要求（R8 §1）：每个失败态给「下一步」，不出现 client_key / register /
+    poll 等内部词。内部原因仍保留在日志/详细字段里，这里只负责上屏那一句。
+    """
+    value = str(text or "").strip()
+    value = value.split(" [reason=", 1)[0].strip()
+    lowered = value.lower()
+    if not value or any(term in lowered for term in _INTERNAL_TERMS):
+        return default
+    return value[:120]
+
 
 def action_groups(actions: Sequence[Action]) -> list[tuple[str, list[Action]]]:
     """按 ``Action.group`` 把动作切成有序块（同组相邻的合在一块；空组名不插标题）。
@@ -1705,6 +1734,18 @@ BID_SOURCE_TEXT = {
     "none": "未设价",
 }
 
+#: 一次性上报「为什么没发」的人话（``quotes.SKIP_*`` → 客户语言）。
+#: 只用于 UI 的跳过说明；不上行、不含价格明细。
+REPORT_SKIP_TEXT = {
+    "disabled": "模型已停用",
+    "zero_price": "未定价或 0 价",
+    "invalid_price": "价格格式非法",
+    "not_probed": "探针未通过",
+    "stale_probe": "探针超过 10 分钟未复探",
+    "upstream_gated": "上游被门控（停用/审核未过）",
+    "duplicate": "同模型只发最便宜的一条",
+}
+
 
 def _bid_rows(plan: Mapping[str, Any], bids: Mapping[str, Any]) -> list[Row]:
     """逐模型底价表：``模型 | 上游 | 目录 | 探针 | 本机底价 | 生效来源``。
@@ -1839,7 +1880,20 @@ def _token_plan(snapshot: Snapshot) -> View:
                       if cloud.get("fallback_from") else ""))
                   if not cloud_pending else str(cloud.get("text") or "待云端开通"))
     priced = sum(1 for row in bid_rows if row.cells[4] != "未设价")
+    # R8-F6：一次性上报的状态 / 具体阻断（未绑定 / 无底价 / 进行中），不再用
+    # 「云端接口未开通」这种过期文案——按钮该灰就灰，但理由必须是**现在**能做的事。
+    report = plan.get("report") if isinstance(plan.get("report"), Mapping) else {}
+    report_state = str(report.get("state") or "idle")
+    report_text = str(report.get("text") or "")
     report_blocker = str(bids.get("report_blocker") or "")
+    if bound is not True:
+        report_blocker = ("节点未绑定：先到「账户与安全」用网页端绑定码完成绑定，才能上报底价"
+                          if bound is False else
+                          "绑定状态未知：先到「账户与安全」确认节点已绑定，再上报")
+    elif not report_blocker and priced == 0:
+        report_blocker = "还没有可上报的底价：先在表格里选模型、填价、保存"
+    if report_state == "running":
+        report_blocker = "正在上报…（结果出来会自动更新，不用重复点）"
     preview = bids.get("preview") if isinstance(bids.get("preview"), Mapping) else {}
     preview_models = [item for item in (preview.get("models") or [])
                       if isinstance(item, Mapping)]
@@ -1892,9 +1946,11 @@ def _token_plan(snapshot: Snapshot) -> View:
     elif ledger_rows and priced == 0:
         notes.append("本机账本里有 " + str(len(ledger_rows)) + " 条底价，但没对上当前模型表"
                      "（模型 id 不一致）：底价仍保存在本机，不会丢。")
-    if cloud_pending:
-        notes.append("云端「按模型设价」接口还没开通（ask-settings / quotes.models[]）："
-                     "底价只保存在本机，上报按钮保持关闭，不会假成功。")
+    notes.append("一次性上报只发已设价的模型：价格会进入撮合，TTL = 2 × 发布周期"
+                 "（默认 120s），到期自动撤下，不会自动续期。")
+    notes.append("「上报到云端」只报这一次，不打开自动上报；自动续报是另一个开关（默认关）。")
+    if report_text:
+        notes.append(report_text)
     plan_actions.extend([
         # CR-20261119-CLIENT-TOKENPLAN-NOOP：读清单同时**保存接入**（第 1 步与第 2 步
         # 合成一颗按钮）——旧文案只写「读取模型清单」，客户以为读完就完事，实际上
@@ -1915,9 +1971,12 @@ def _token_plan(snapshot: Snapshot) -> View:
         # 前提不满足时由动作回一句人话（「先在上面的表格里选一行模型」…）。
         Action("token_plan.save_price", "保存这一行", group="第 3 步 · 定价与上报"),
         Action("token_plan.preview_report", "预览将上报的内容", group="第 3 步 · 定价与上报"),
-        # 上报默认关闭（云端 ask-settings / quotes.models[] 未开通）：置灰 + 说清原因，
-        # 绝不点下去假成功
-        Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,
+        # R8-F6：一次性上报是**真发**（点击 + 确认 → worker 逐条 POST）。
+        # 未绑定 / 无底价 / 正在上报时置灰，并在 reason 里写具体原因（不再说「接口未开通」）。
+        Action("token_plan.report",
+               "上报中…（进行中）" if report_state == "running"
+               else "上报到云端（逐模型底价）",
+               enabled=not report_blocker and report_state != "running",
                group="第 3 步 · 定价与上报", reason=report_blocker),
     ])
     # 2026-11-19（全功能 UX 复查）：七颗按钮同一视觉权重，客户不知道「下一步是哪颗」。
@@ -2385,6 +2444,20 @@ def _account(snapshot: Snapshot) -> View:
     # 而那正是最需要「绑定网页端」的时刻（2026-11-11 正式环境实测：账户页只剩一行
     # 「账户资料暂不可用」，按钮全被隐藏，用户没有任何可点的下一步）。
     can_bind = bound is not True
+    # R8（F1）：节点密钥失效后的自动恢复状态由 controller 注入（视图只读）。
+    # 恢复中：置灰所有绑定入口 + 一句话说清「正在自动恢复」；失败：给重试/网页解绑两条路。
+    recovery = account.get("binding_recovery")
+    recovery = recovery if isinstance(recovery, Mapping) else {}
+    recovery_state = str(recovery.get("state") or "").strip().lower()
+    if recovery_state not in ("recovering", "failed"):
+        recovery_state = ""
+    recovery_reason = public_reason(recovery.get("reason"))
+    recovery_text = ""
+    if recovery_state == "recovering":
+        recovery_text = BIND_RECOVERING_TEXT
+    elif recovery_state == "failed":
+        recovery_text = BIND_RECOVER_FAILED_TEMPLATE.format(reason=recovery_reason)
+    recovery_blocked = bool(recovery_state)
     if unavailable and can_bind:
         # unavailable 是 tuple（每个不可用数据域一条原因）：只给账户这一条追加可操作解释，
         # 别把整页顶部变成一长串。
@@ -2440,6 +2513,13 @@ def _account(snapshot: Snapshot) -> View:
         fields.append(Field("网页端", facts.WEB_CONSOLE_URL, key="web_console",
                             hint="在网页端 → 共享算力 → 节点与绑定 → 生成绑定码，然后粘贴到这里",
                             group=GROUP_BIND))
+    if recovery_text:
+        fields.append(Field("节点密钥", recovery_text, key="binding_recovery",
+                            tone="amber", group=GROUP_BIND,
+                            hint=("正在自动重新登记这台电脑的节点身份：请稍候，不需要重复点击"
+                                  if recovery_state == "recovering" else
+                                  "下一步：" + BIND_RECOVER_RETRY_LABEL + " / "
+                                  + BIND_RECOVER_WEB_LABEL)))
     # E（RC14 IA 拆分）：USDT 收款地址**只在这里**（原来在「接入配置」，两处都能填、
     # 两处都以为生效）。输入框不预填掩码（prefill=False），否则一点保存就把掩码写回配置。
     payout = _payout_state(access)
@@ -2488,10 +2568,11 @@ def _account(snapshot: Snapshot) -> View:
     # RC14 C 设备码：主按钮 = 「在浏览器确认绑定」（开关关着 → 只保留老的手输码入口）
     if device_on and can_bind:
         actions.append(Action("account.bind_device", "在浏览器确认绑定", primary=True,
-                              enabled=device_state not in ("pending",),
-                              reason=("正在等待网页确认（" + format_short_code(device.get("user_code"))
-                                      + "）：确认后本机会自动接上；要重来先点「停止等待」"
-                                      if device_state == "pending" else ""),
+                              enabled=device_state not in ("pending",) and not recovery_blocked,
+                              reason=(recovery_text if recovery_blocked else
+                                      ("正在等待网页确认（" + format_short_code(device.get("user_code"))
+                                       + "）：确认后本机会自动接上；要重来先点「停止等待」"
+                                       if device_state == "pending" else "")),
                               group=GROUP_BIND))
         if device_state == "pending":
             actions.append(Action("account.bind_device_cancel", "停止等待", group=GROUP_BIND))
@@ -2501,9 +2582,18 @@ def _account(snapshot: Snapshot) -> View:
             if device.get("verify_url"):
                 actions.append(copy_action("account.copy_verify_url", "确认链接",
                                            group=GROUP_BIND))
+    if recovery_state == "failed":
+        # 失败态的两条下一步（spec §2）：点此重试 / 到网页端解绑后重新绑定。
+        actions.append(Action("account.bind_recover", BIND_RECOVER_RETRY_LABEL,
+                              primary=True, group=GROUP_BIND))
+        actions.append(Action("account.recover_open_web", BIND_RECOVER_WEB_LABEL,
+                              group=GROUP_BIND))
     if can_bind:
         actions.append(Action("account.bind", "绑定网页端" if not device_on else "手输绑定码",
-                             primary=not device_on, group=GROUP_BIND))
+                              primary=not device_on and not recovery_blocked,
+                              enabled=not recovery_blocked,
+                              reason=recovery_text if recovery_blocked else "",
+                              group=GROUP_BIND))
     # F48（2026-11-24 真机）：旧实现有一颗禁用的「启用双因素验证」+ 一颗可点的
     # 「去控制台开启 2FA」，同一件事两种说法并排，客户不知道该点哪个（禁用的那颗还点不动）。
     # 现在只留一颗：标签随状态变，理由写在动作的 reason 里。
@@ -2584,9 +2674,10 @@ def _account(snapshot: Snapshot) -> View:
         ("解绑这台电脑（登出并清本机密钥）" if bound
          else "清除本机节点身份（用于重新注册）"),
         danger=True,
-        enabled=bool(security.get("node_id")),
-        reason=("" if security.get("node_id")
-                else ("本机无凭据（解绑要清本机密钥）" if node_id else "尚未登录")),
+        enabled=bool(security.get("node_id")) and not recovery_blocked,
+        reason=(recovery_text if recovery_blocked else
+                ("" if security.get("node_id")
+                 else ("本机无凭据（解绑要清本机密钥）" if node_id else "尚未登录"))),
         group=GROUP_IDENTITY))
     if can_bind:
         actions.append(Action("account.open_web", "打开网页端", group=GROUP_IDENTITY))
@@ -2609,6 +2700,10 @@ def _account(snapshot: Snapshot) -> View:
             "（或「绑定网页端」）把码粘进去。",
             "网页端：" + facts.WEB_CONSOLE_URL,
         ] + notes
+        if not (security.get("node_id") or profile.get("node_id")):
+            # 首启脚注（spec §2）：Windows 首次监听 1717 会弹防火墙授权，没点允许
+            # 客户看到的是「客户端卡住」。把授权口径写在绑定页，别让人猜。
+            notes = [FIREWALL_NOTE] + notes
     if bound is False and (bound_node_id or security.get("node_id")):
         # RC15-039 #33：一句话说清三个状态的关系，别让「未绑定 / 在线 / 有凭据」互相打脸。
         notes = [
@@ -2677,9 +2772,13 @@ def onboarding_panel(step: int, *, total: int = 3, bound: bool | None = None,
         actions.append(Action("onboarding.skip_all", "跳过设置，直接进入"))
     if step > 1:
         actions.append(Action("onboarding.back", "上一步"))
+    body = onboarding_mod.step_body(step)
+    if step == 2:
+        # F4 首启脚注（spec §2）：绑定这一步正好是 Windows 首次监听镜像端口的时候。
+        body = body + "  " + FIREWALL_NOTE
     return OnboardingPanel(
         step=step, total=total, title=onboarding_mod.step_title(step),
-        body=onboarding_mod.step_body(step), actions=tuple(actions))
+        body=body, actions=tuple(actions))
 
 
 #: 日志级别 → 客户看到的筛选文案（值仍是契约里的 ``debug``/``info``/…）

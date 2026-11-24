@@ -111,18 +111,23 @@ def test_empty_book_preview_says_why_it_is_empty():
     assert payload["models"] == [] and payload["reason"] == "no_bid"
 
 
-def test_report_flag_is_registered_with_three_fields_and_off_by_default():
+def test_report_flag_is_registered_with_three_fields_and_still_off_by_default():
+    """R8-F6：flag 只控制**自动续报**；默认值保持 False，不被一次性上报顺手改掉。"""
     spec = facts.FEATURE_FLAGS[facts.UPSTREAM_BID_FLAG]
     assert spec["default"] is False
     for field in facts.FLAG_REQUIRED_FIELDS:
         assert spec.get(field) not in (None, ""), field
-    assert bids_mod.report_blocker({}) != ""              # 默认关：给原因
+    assert bids_mod.report_enabled({}) is False           # 自动续报：默认关
+    assert bids_mod.report_blocker({}) == ""              # 一次性上报：不再看这个 flag
     assert "待云端" not in bids_mod.report_blocker({})
 
 
 # ─────────────────────────────────────────────── 视图（三步同页）
-def _plan_snapshot(**over) -> ds.Snapshot:
+def _plan_snapshot(*, bound: bool = True, **over) -> ds.Snapshot:
     sections = dict(ds.demo_snapshot().sections) if hasattr(ds, "demo_snapshot") else {}
+    # R8-F6：一次性上报的预检会读绑定态（唯一判定源 binding_state）
+    sections["access"] = {"binding": {"bound": bool(bound)}, "config": {}}
+    sections["account"] = {"profile": {"node_id": "node-mock-1"}}
     plan = dict(sections.get("token_plan") or {})
     plan.update({
         "upstreams": [{"id": "up_1", "access_type": "B", "state": "verified",
@@ -137,8 +142,9 @@ def _plan_snapshot(**over) -> ds.Snapshot:
         ],
         "bids": {"rows": {"gpt-4o-mini": {"min_price": "0.35"}},
                  "cloud": {"state": "pending", "text": "待云端开通"},
-                 "report_blocker": "上报开关关闭（默认关闭…）",
+                 "report_blocker": "",
                  "preview": {"models": [{"model": "gpt-4o-mini", "min_price": "0.35"}]}},
+        "report": {"state": "idle", "text": "", "at": ""},
         "protocol": facts.DEFAULT_UPSTREAM_PROTOCOL,
         "base_url": "", "secret_seen": "未保存", "discover_note": "",
         "limits": {}, "usage": [], "note": "",
@@ -169,10 +175,18 @@ def test_model_table_shows_local_price_and_source():
     assert "待云端开通" in text                               # 云端没开通就说清楚
 
 
-def test_report_action_is_disabled_with_a_reason_while_the_cloud_is_closed():
+def test_report_action_is_disabled_and_says_why_when_the_node_is_unbound():
+    """R8-F6：具体 blocker（未绑定），不再说「云端接口未开通」。"""
+    view = vw.build_view("token_plan", _plan_snapshot(bound=False))
+    report = next(action for action in view.actions if action.key == "token_plan.report")
+    assert report.enabled is False and "绑定" in report.reason
+
+
+def test_report_action_is_enabled_without_the_auto_report_flag():
+    """一次性上报不看 client.upstream.bid_report.enabled（默认 False）。"""
     view = vw.build_view("token_plan", _plan_snapshot())
     report = next(action for action in view.actions if action.key == "token_plan.report")
-    assert report.enabled is False and "上报开关关闭" in report.reason
+    assert report.enabled is True and report.reason == ""
 
 
 def test_save_and_preview_stay_clickable_so_a_click_is_never_silent():
@@ -181,7 +195,7 @@ def test_save_and_preview_stay_clickable_so_a_click_is_never_silent():
     前提不满足时由**动作**回一句人话（下面两条单测验话术），界面不再靠置灰静音。
     """
     empty = _plan_snapshot(bids={"rows": {}, "cloud": {"state": "pending"},
-                                 "report_blocker": "关", "preview": {"models": []}})
+                                 "report_blocker": "", "preview": {"models": []}})
     view = vw.build_view("token_plan", empty)
     for key in ("token_plan.save_price", "token_plan.preview_report"):
         action = next(item for item in view.actions if item.key == key)
@@ -245,7 +259,8 @@ def test_zero_price_is_refused_before_it_reaches_the_cloud():
     assert bids_mod.BidBook(store).load() == {}
 
 
-def test_report_with_flag_off_says_nothing_was_sent():
+def test_report_without_a_local_config_dir_refuses_to_send():
+    """R8-F6：一次性上报会真发；没有本机配置目录时必须拒绝，绝不假成功。"""
     controller = _controller(_Source(_Store()))
     controller.selected["token_plan"] = "gpt-4o-mini"
     controller.set_draft("min_price", "0.5")
@@ -437,10 +452,12 @@ def test_token_plan_primary_follows_the_stage():
     primaries = [a.key for a in view.actions if a.primary]
     assert primaries == ["token_plan.add_upstream"]
 
-    # ② 有上游、云端上报被开关挡住 → 退到「预览将上报的内容」
+    # ② 有上游但没有可上报底价 → 退到「预览将上报的内容」
     view2 = vw.build_view(
         "token_plan",
-        _plan_snapshot(base_url="https://api.example.com/v1", secret_seen="已保存"),
+        _plan_snapshot(base_url="https://api.example.com/v1", secret_seen="已保存",
+                       bids={"rows": {}, "cloud": {"state": "ok", "source": "cloud"},
+                             "report_blocker": "", "preview": {"models": []}}),
     )
     primaries2 = [a.key for a in view2.actions if a.primary]
     assert len(primaries2) == 1

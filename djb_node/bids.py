@@ -7,10 +7,13 @@
 
 * 底价按**模型**存，最小 ``0.01``（0 在本地就拦下并说清原因，不发出去等云端静默丢弃）；
 * 本地账本落在本机 sqlite 的 kv 表（**不含凭据**），键 ``rc14/model_bids``；
-* **云端未开通**：``POST /api/v1/user/provider/ask-settings/{model}`` 与
-  ``/api/v1/schedule/quotes`` 的 ``models[]`` 到今天还没有主线实现 —— 所以上报默认**关闭**
-  （flag ``client.upstream.bid_report.enabled``，三字段齐全），UI 只说「待云端开通」，
-  绝不假成功；
+
+* R8-F6（2026-11-24）：**一次性上报**（桌面按钮）点击 + 确认后按本账本价逐模型
+  ``POST /api/v1/schedule/quotes``（到期撤下、不自动续报），**不受** flag
+  ``client.upstream.bid_report.enabled`` 限制——该 flag 只管 daemon 自动续报；
+  flag **开**时 daemon/CLI 也读本账本价（与手动同源，避免两套价互相顶版本），
+  flag **关**时维持 ``ModelEntry.min_price`` 的旧口径（rollback_rule 成立）。
+* **自动续报**仍由 daemon 负责且默认关闭；两条路共用一本账本价，绝不假成功。
 * ``preview()`` 给出「将上报什么」的确定性形状（契约字段名以 CHG §2 为准），
   便于客户核对，也便于测试断言「预览 == 本地账本」。
 """
@@ -126,6 +129,11 @@ class BidBook:
     def price_of(self, model: str) -> str:
         return str((self.load().get(str(model)) or {}).get("min_price") or "")
 
+    def prices(self) -> dict[str, str]:
+        """扁平价格覆盖表（``{model: "0.35"}``），给 ``quotes.plan_quotes(prices=…)``。"""
+        return {str(model): str(item["min_price"])
+                for model, item in self.load().items()}
+
     def mode_of(self, model: str) -> str:
         """这一行的成交模式；老账本没有 mode 就是 ``auto_best``。
 
@@ -200,18 +208,39 @@ class BidBook:
 
 
 def report_enabled(config: Any) -> bool:
-    """上报闸门（默认关闭）：flag 三字段齐全、到期强制关，求值走 config.feature_flag。"""
+    """**自动续报**闸门（默认关闭）：flag 三字段齐全、到期强制关，求值走 config.feature_flag。
+
+    R8-F6 决策：一次性上报**不读**这个 flag（那是显式点击 + 确认的一次性动作）；
+    它只决定 daemon/CLI 的自动环是否开启、以及自动环是否读本账本价。默认值保持
+    `False`，不因本次功能调整。
+    """
     from .config import feature_flag
 
     return bool(feature_flag(config, facts.UPSTREAM_BID_FLAG))
 
 
 def report_blocker(config: Any) -> str:
-    """上报不可用时的原因文案（空串 = 可以上报）。
+    """配置级阻断文案（空串 = 可以发起一次性上报）。
 
-    两种「不可用」必须分开说：开关关着（owner 未批准放开）vs 没有可上报的底价。
+    一次性上报已不再受自动续报 flag 约束（R8-F6），因此这里通常为空；
+    「未绑定 / 没有底价 / 正在上报」这些**实时**阻断由视图层按当前快照给具体原因。
+    保留本函数是为了调用方接口稳定（datasource 的底价区块仍读它）。
+    """
+    if config is None:
+        return "本机配置读不到：无法确认网关地址（底价只保存在本机，未上报）"
+    return ""
+
+
+def auto_report_prices(store: Any, config: Any) -> dict[str, str] | None:
+    """**自动续报**用的价格覆盖：flag 开 → 本机账本价；flag 关 → None（回落上游价）。
+
+    只该被 daemon 报价环和 CLI ``quotes`` 调用。桌面的一次性上报**永远**用账本价
+    （它本身就是「上报逐模型底价」），不经过这个函数，也不看 flag。
+    账本读不到时返回 None（宁可回到旧口径，也不让报价环整轮失败）。
     """
     if not report_enabled(config):
-        return ("上报开关关闭（默认关闭，等云端「按模型设价」接口开通后由 owner 放开）："
-                "底价只保存在本机，未发往云端")
-    return ""
+        return None
+    try:
+        return BidBook(store).prices()
+    except Exception:                                   # 库坏了：回落上游价，不拖垮报价
+        return None

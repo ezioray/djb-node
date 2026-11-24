@@ -1220,7 +1220,7 @@ class LocalDataSource:
             block["report_blocker"] = bids_mod.report_blocker(config)
             block["flag_on"] = bids_mod.report_enabled(config)
         except Exception:
-            block["report_blocker"] = "本机配置读不到：上报开关状态未知（底价只保存在本机）"
+            block["report_blocker"] = "本机配置读不到：无法确认网关地址（底价只保存在本机，未上报）"
             block["flag_on"] = False
         # 云端覆盖 / 生效来源（CHG §2.3：node/pricing/suggested 的 source / fallback_from）
         # 云端未开通 → 不写「未知」了事，也不假装「未覆盖」；给「待云端开通」。
