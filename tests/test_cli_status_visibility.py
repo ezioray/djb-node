@@ -347,3 +347,32 @@ def test_offline_status_does_not_fabricate_accepting_false(tmp_path, monkeypatch
     assert payload["accepting"] is None
     text = vw.build_view("overview", ds.Snapshot({"node": payload, "yield": payload})).plain_text()
     assert "不接新任务" not in text
+
+
+def test_offline_status_trusts_fresh_heartbeat(tmp_path):
+    """F50：pidfile 校验不过但心跳新鲜时，允许用快照回答，并把来源标成 heartbeat。"""
+    from djb_node.config import Paths
+
+    paths = Paths(str(tmp_path))
+    store = Store.create(paths.db_file)
+    store.set_kv("daemon_state", Snapshot(state="online", since=iso(utcnow()), next_step="").to_dict())
+    store.set_kv("heartbeat", {"last_ok_at": iso(utcnow()), "interval_s": 30})
+    payload = cli_module._offline_status(paths, store)
+    assert payload["accepting"] is True
+    assert payload["accepting_source"] == "heartbeat"
+    assert payload["heartbeat_at"]
+
+
+def test_offline_status_is_unknown_when_heartbeat_is_stale(tmp_path):
+    """心跳过期（>95s）就不许再拿快照当结论：给 None。"""
+    from datetime import timedelta
+
+    from djb_node.config import Paths
+
+    paths = Paths(str(tmp_path))
+    store = Store.create(paths.db_file)
+    store.set_kv("daemon_state", Snapshot(state="online", since=iso(utcnow()), next_step="").to_dict())
+    store.set_kv("heartbeat", {"last_ok_at": iso(utcnow() - timedelta(minutes=5)), "interval_s": 30})
+    payload = cli_module._offline_status(paths, store)
+    assert payload["accepting"] is None
+    assert payload["accepting_source"] == "unknown"

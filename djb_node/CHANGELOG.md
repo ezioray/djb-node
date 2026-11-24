@@ -6,6 +6,19 @@
 > `VERSION.txt` 是**构建期生成**的（built_at / commit / platform），由 `ops/release/build/*` 写入包内，
 > 仓库里不手写 —— 手写一份静态文件会被误读成构建时间。
 
+## 0.5.27 · 2026-11-24
+
+**接单状态：有证据就用，没证据说不知道（F50 收尾）**。`__version__` / `pyproject.toml` /
+Chart `appVersion` 同源到 `0.5.27`；无协议契约变更。
+
+- 0.5.26 把 `accepting` 改成「读不到就 None」之后，真机出现新情况：GUI 子进程里 pidfile 的
+  命令行校验常失败（没有控制台），于是永远显示「未确认」——诚实但没用。
+- 现在按**证据强度**三档：① pidfile 可校验 → 用快照；② 心跳新鲜（`heartbeat.last_ok_at`
+  ≤ 95 s，3 个心跳周期）→ 仍用快照，但把来源标成 `heartbeat`，界面写
+  「当前允许接单（按最近心跳 HH:MM）」；③ 都没有 → `None`（未确认）。
+- 新增 `accepting_source` / `heartbeat_at` 两个只读字段（status JSON 只加不改）。
+- 新增 2 条回归测试（心跳新鲜可用 / 心跳过期必须 None）。
+
 ## 0.5.26 · 2026-11-24
 
 **F50 更正 + 根治：`accepting` 不许编（客户端）**。`__version__` / `pyproject.toml` /

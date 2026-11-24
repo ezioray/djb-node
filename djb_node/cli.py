@@ -766,8 +766,31 @@ def _control_unreachable_reason(paths: Paths) -> str:
             "请在本机桌面终端执行，或直接看 logs/djb.log 的心跳")
 
 
+#: 心跳多新旧算「活着」：默认心跳 30s，留 3 个周期余量（弱网/GC 抖动不至于误判）。
+HEARTBEAT_FRESH_S = 95
+
+
+def _heartbeat_state(store: Store, now: datetime | None = None) -> tuple[bool, str]:
+    """读 ``heartbeat`` kv：返回 (是否新鲜, 最近一次心跳时间 ISO)。读不到就是 (False, "")。"""
+    try:
+        hb = store.get_kv("heartbeat", default={}) or {}
+    except Exception:                                # noqa: BLE001 - 只读诊断路径
+        return (False, "")
+    stamp = str((hb or {}).get("last_ok_at") or "")
+    if not stamp:
+        return (False, "")
+    moment = parse_iso(stamp)
+    if moment is None:
+        return (False, stamp)
+    current = now or utcnow()
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=current.tzinfo)
+    return (abs((current - moment).total_seconds()) <= HEARTBEAT_FRESH_S, stamp)
+
+
 def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
     snapshot = Snapshot.from_dict(store.get_kv("daemon_state"))
+    heartbeat_fresh, heartbeat_at = _heartbeat_state(store)
     install = store.install()
     policy = store.policy()
     runtime = store.get_kv("runtime", default={}) or {}
@@ -815,7 +838,17 @@ def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
         # `unreachable` 是空串，旧实现这里返回 False，而 `state` 仍是快照里的 online ——
         # 同一份 payload 自相矛盾（标题「正在接单」+ 副标题「当前不接新任务」）。
         # 读不到就说读不到：None = 未确认，渲染层按「待确认」显示。
-        "accepting": (snapshot.is_accepting() if unreachable else None),
+        # F50（2026-11-24 真机复核）：accepting 不许编。判据按「有没有活着的证据」分三档：
+        #   ① pidfile 可校验 → 用快照（daemon 在跑，心跳在写它）；
+        #   ② 心跳新鲜（≤ HEARTBEAT_FRESH_S）→ 也用快照，但把来源标成 heartbeat，
+        #      渲染层写「按最近心跳 HH:MM」——GUI 子进程常见 pidfile 校验不过，
+        #      这一档让它不至于永远显示「未确认」；
+        #   ③ 都没有 → None（未确认），绝不返回 False 假装「不接单」。
+        "accepting": (snapshot.is_accepting()
+                      if (unreachable or heartbeat_fresh) else None),
+        "accepting_source": ("pidfile" if unreachable
+                            else ("heartbeat" if heartbeat_fresh else "unknown")),
+        "heartbeat_at": heartbeat_at,
         "reason": snapshot.reason if snapshot.state != "stopped" else None,
         "reason_label": (reason_label(snapshot.reason)
                          if snapshot.state != "stopped" else "daemon 未运行"),

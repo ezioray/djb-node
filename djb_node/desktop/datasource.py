@@ -1458,6 +1458,8 @@ class LocalDataSource:
                 "reason": data.get("reason"),
                 "reason_label": data.get("reason_label"),
                 "accepting": data.get("accepting"),
+                "accepting_source": data.get("accepting_source"),
+                "heartbeat_at": data.get("heartbeat_at"),
                 "mode": mode,
                 "preset": preset,
                 "yield_enabled": data.get("yield_enabled")}

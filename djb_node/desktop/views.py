@@ -927,8 +927,14 @@ def _hero(snapshot: Snapshot) -> Hero:
     # 离线回退把 accepting 压成 False，而 state 仍是快照里的 online，于是一张卡里
     # 「正在接单」和「当前不接新任务」同屏。修法：accepting 读不到就是 None（未确认），
     # 不编布尔值；渲染层照实说「未确认」，并给下一步。
+    source = str(yield_state.get("accepting_source") or "")
+    hb_at = str(yield_state.get("heartbeat_at") or "")
     if accepting is None:
         tail = "；接单状态未确认（心跳/控制口还没回话，点右上「刷新」重试）"
+    elif accepting is True and source == "heartbeat":
+        # 心跳新鲜但控制口不通（GUI 子进程常见）：结论可用，但把依据写出来，别让人以为是实时
+        hhmm = hb_at[11:16] if len(hb_at) >= 16 else ""
+        tail = "；当前允许接单（按最近心跳" + (" " + hhmm if hhmm else "") + "）"
     elif accepting is True:
         tail = "；当前允许接单"
     else:
