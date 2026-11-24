@@ -1734,6 +1734,18 @@ BID_SOURCE_TEXT = {
     "none": "未设价",
 }
 
+#: 一次性上报「为什么没发」的人话（``quotes.SKIP_*`` → 客户语言）。
+#: 只用于 UI 的跳过说明；不上行、不含价格明细。
+REPORT_SKIP_TEXT = {
+    "disabled": "模型已停用",
+    "zero_price": "未定价或 0 价",
+    "invalid_price": "价格格式非法",
+    "not_probed": "探针未通过",
+    "stale_probe": "探针超过 10 分钟未复探",
+    "upstream_gated": "上游被门控（停用/审核未过）",
+    "duplicate": "同模型只发最便宜的一条",
+}
+
 
 def _bid_rows(plan: Mapping[str, Any], bids: Mapping[str, Any]) -> list[Row]:
     """逐模型底价表：``模型 | 上游 | 目录 | 探针 | 本机底价 | 生效来源``。
@@ -1868,7 +1880,20 @@ def _token_plan(snapshot: Snapshot) -> View:
                       if cloud.get("fallback_from") else ""))
                   if not cloud_pending else str(cloud.get("text") or "待云端开通"))
     priced = sum(1 for row in bid_rows if row.cells[4] != "未设价")
+    # R8-F6：一次性上报的状态 / 具体阻断（未绑定 / 无底价 / 进行中），不再用
+    # 「云端接口未开通」这种过期文案——按钮该灰就灰，但理由必须是**现在**能做的事。
+    report = plan.get("report") if isinstance(plan.get("report"), Mapping) else {}
+    report_state = str(report.get("state") or "idle")
+    report_text = str(report.get("text") or "")
     report_blocker = str(bids.get("report_blocker") or "")
+    if bound is not True:
+        report_blocker = ("节点未绑定：先到「账户与安全」用网页端绑定码完成绑定，才能上报底价"
+                          if bound is False else
+                          "绑定状态未知：先到「账户与安全」确认节点已绑定，再上报")
+    elif not report_blocker and priced == 0:
+        report_blocker = "还没有可上报的底价：先在表格里选模型、填价、保存"
+    if report_state == "running":
+        report_blocker = "正在上报…（结果出来会自动更新，不用重复点）"
     preview = bids.get("preview") if isinstance(bids.get("preview"), Mapping) else {}
     preview_models = [item for item in (preview.get("models") or [])
                       if isinstance(item, Mapping)]
@@ -1921,9 +1946,11 @@ def _token_plan(snapshot: Snapshot) -> View:
     elif ledger_rows and priced == 0:
         notes.append("本机账本里有 " + str(len(ledger_rows)) + " 条底价，但没对上当前模型表"
                      "（模型 id 不一致）：底价仍保存在本机，不会丢。")
-    if cloud_pending:
-        notes.append("云端「按模型设价」接口还没开通（ask-settings / quotes.models[]）："
-                     "底价只保存在本机，上报按钮保持关闭，不会假成功。")
+    notes.append("一次性上报只发已设价的模型：价格会进入撮合，TTL = 2 × 发布周期"
+                 "（默认 120s），到期自动撤下，不会自动续期。")
+    notes.append("「上报到云端」只报这一次，不打开自动上报；自动续报是另一个开关（默认关）。")
+    if report_text:
+        notes.append(report_text)
     plan_actions.extend([
         # CR-20261119-CLIENT-TOKENPLAN-NOOP：读清单同时**保存接入**（第 1 步与第 2 步
         # 合成一颗按钮）——旧文案只写「读取模型清单」，客户以为读完就完事，实际上
@@ -1944,9 +1971,12 @@ def _token_plan(snapshot: Snapshot) -> View:
         # 前提不满足时由动作回一句人话（「先在上面的表格里选一行模型」…）。
         Action("token_plan.save_price", "保存这一行", group="第 3 步 · 定价与上报"),
         Action("token_plan.preview_report", "预览将上报的内容", group="第 3 步 · 定价与上报"),
-        # 上报默认关闭（云端 ask-settings / quotes.models[] 未开通）：置灰 + 说清原因，
-        # 绝不点下去假成功
-        Action("token_plan.report", "上报到云端（逐模型底价）", enabled=not report_blocker,
+        # R8-F6：一次性上报是**真发**（点击 + 确认 → worker 逐条 POST）。
+        # 未绑定 / 无底价 / 正在上报时置灰，并在 reason 里写具体原因（不再说「接口未开通」）。
+        Action("token_plan.report",
+               "上报中…（进行中）" if report_state == "running"
+               else "上报到云端（逐模型底价）",
+               enabled=not report_blocker and report_state != "running",
                group="第 3 步 · 定价与上报", reason=report_blocker),
     ])
     # 2026-11-19（全功能 UX 复查）：七颗按钮同一视觉权重，客户不知道「下一步是哪颗」。

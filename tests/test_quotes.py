@@ -21,6 +21,7 @@ from datetime import timedelta
 
 import pytest
 
+from djb_node import bids as bids_mod
 from djb_node import facts, protocol, quotes
 from djb_node.api import NodeApi
 from djb_node.cli import main, preset_upstream_kind
@@ -193,6 +194,61 @@ def test_payload_matches_cloud_quote_request(store, manager):
     assert row.payload(node_id="node-1")["node_id"] == "node-1"
 
 
+def test_plan_quotes_price_override_wins_over_model_entry(store, manager):
+    """R8-F6：本机账本价优先于 ModelEntry.min_price；未覆盖的模型仍按上游价。"""
+    _seed(store, models=[{"id": "gpt-4o", "min_price": "0.75"},
+                         {"id": "mini", "min_price": "0.15"}])
+    plan = quotes.plan_quotes(manager, now=utcnow(), period_s=60,
+                              prices={"gpt-4o": "0.35"})
+    by_model = {row.model: row for row in plan.rows}
+    assert by_model["gpt-4o"].price_min == 35
+    assert by_model["mini"].price_min == 15          # 没覆盖 → 上游价（旧口径）
+
+
+def test_plan_quotes_price_override_does_not_relax_gates(store, manager):
+    """覆盖价再便宜，也不能绕过探针 / 停用 / 0 价门控。"""
+    _seed(store, models=[{"id": "stale", "min_price": "0.75",
+                          "age_s": facts.PROBE_FRESH_AFTER_S + 1},
+                         {"id": "off", "min_price": "0.75", "enabled": False},
+                         {"id": "ok", "min_price": "0.75"}])
+    plan = quotes.plan_quotes(manager, now=utcnow(), period_s=60,
+                              prices={"stale": "0.35", "off": "0.35", "ok": "0.35"})
+    assert [row.model for row in plan.rows] == ["ok"]
+    assert plan.skipped[quotes.SKIP_STALE] == 1
+    assert plan.skipped[quotes.SKIP_DISABLED] == 1
+
+    zero = quotes.plan_quotes(manager, now=utcnow(), period_s=60,
+                              prices={"ok": "0"})
+    assert zero.rows == []
+    assert zero.skipped[quotes.SKIP_ZERO_PRICE] == 1
+
+
+def test_auto_report_prices_only_when_the_bid_flag_is_on(store):
+    """daemon/CLI 的价格同源：flag 关 → None（旧口径）；开 → 账本价。"""
+    bids_mod.BidBook(store).set_price("gpt-4o", "0.35")
+    assert bids_mod.auto_report_prices(store, {}) is None
+    enabled = {"feature_flags": {facts.UPSTREAM_BID_FLAG: True}}
+    assert bids_mod.auto_report_prices(store, enabled) == {"gpt-4o": "0.35"}
+
+
+def test_publish_captures_earliest_expires_at():
+    """R8-F6：复用不续期，结果里的有效期只能取服务端返回的**最早**一条。"""
+    rows = [quotes.QuoteRow(upstream_id="u1", access="B", model="a",
+                            price_min=10, ttl_s=120),
+            quotes.QuoteRow(upstream_id="u1", access="B", model="b",
+                            price_min=10, ttl_s=120)]
+
+    class _Client:
+        def publish_quote(self, body):
+            return {"quote_id": "q-" + body["model"],
+                    "expires_at": ("2026-11-24T12:01:00Z" if body["model"] == "a"
+                                   else "2026-11-24T12:00:00Z")}
+
+    result = quotes.publish(_Client(), rows)
+    assert result.expires_at == "2026-11-24T12:00:00Z"
+    assert result.to_dict()["expires_at"] == "2026-11-24T12:00:00Z"
+
+
 def test_publish_counts_created_then_reused(mock, store, manager):
     _seed(store, models=[{"id": "gpt-4o", "min_price": "0.75"}])
     api = NodeApi(mock.base_url, client_key=CLIENT_KEY, http=HttpClient(timeout=10.0))
@@ -276,6 +332,8 @@ def test_daemon_publishes_when_flag_on(paths, store, credentials, mock, clock,
         summary = daemon._publish_quotes(60, reason="manual")
         assert summary["rows"] == 2 and summary["created"] == 2
         assert summary["ttl_s"] == 120
+        # bid_report flag 没开：自动环仍读 ModelEntry 价（旧口径，rollback_rule 成立）
+        assert sorted(body["price_min"] for body in mock.quotes) == [15, 75]
         # 内容未变再发一轮 → 全部复用（不升版本、不续期）
         again = daemon._publish_quotes(60, reason="manual")
         assert again["rows"] == 2 and again["reused"] == 2 and again["created"] == 0
@@ -443,3 +501,41 @@ def test_model_entry_defaults_stay_backward_compatible():
     assert entry.inference_ok is None and entry.last_probe_at is None
     assert entry.to_dict() == {"id": "legacy", "enabled": True, "min_price": "0.5",
                                "min_price_unit": facts.DEFAULT_MIN_PRICE_UNIT}
+
+
+def test_daemon_auto_report_uses_ledger_price_when_bid_flag_on(paths, store, credentials,
+                                                              mock, clock,
+                                                              windows_control_usable):
+    """R8-F6 价格同源：flag 开 → daemon 自动环也读本机账本价（与手动上报同一个价）。"""
+    from djb_node.config import ClientConfig
+    from tests.test_daemon import _daemon
+
+    config = ClientConfig(gateway_url=mock.base_url, mirror_port=1717,
+                          extra={"feature_flags": {facts.QUOTES_FLAG: True,
+                                                   facts.UPSTREAM_BID_FLAG: True},
+                                 "quotes.period_s": 60})
+    daemon = _daemon(paths, store, credentials, mock, clock=clock, config=config)
+    daemon.start()
+    try:
+        _seed(store, models=[{"id": "gpt-4o", "min_price": "0.75"}])
+        bids_mod.BidBook(store).set_price("gpt-4o", "0.35")
+        summary = daemon._publish_quotes(60, reason="manual")
+        assert summary["rows"] == 1 and summary["created"] == 1
+        assert mock.quotes[-1]["price_min"] == 35
+    finally:
+        daemon.stop()
+
+
+def test_cli_quotes_reads_ledger_price_when_bid_flag_on(ready, store, capsys):
+    """CLI 与 GUI/daemon 同源：flag 开 → ``quotes show`` 用账本价；关 → 上游价。"""
+    _seed(store, models=[{"id": "gpt-4o", "min_price": "0.75"}])
+    bids_mod.BidBook(store).set_price("gpt-4o", "0.35")
+    assert main(["quotes", "show", "--json"]) == 0
+    assert _json_out(capsys)["rows"][0]["price_min"] == 75      # flag 关：旧口径
+
+    config = load_config(ready)
+    config.extra = {**config.extra,
+                    "feature_flags": {facts.UPSTREAM_BID_FLAG: True}}
+    save_config(ready, config)
+    assert main(["quotes", "show", "--json"]) == 0
+    assert _json_out(capsys)["rows"][0]["price_min"] == 35

@@ -800,16 +800,19 @@ FEATURE_FLAGS["client.snapshot_cache"] = {
 }
 SNAPSHOT_CACHE_FLAG = "client.snapshot_cache"
 
-# ── RC14 I/J 逐模型底价上报（默认关闭：云端 ask-settings / schedule-quotes.models[]
-# 还没有主线实现，见 CHG-2026-11-14-RC14-IMPL §3-B.9；三字段齐全、到期强制关）
+# ── RC14 I/J / R8-F6 逐模型底价（默认关闭：只管 daemon 自动续报；三字段齐全、到期强制关）
+#
+# 语义（R8-F6，2026-11-24 owner 决策）：桌面「上报到云端（逐模型底价）」是**一次性**
+# 动作（点击 + 确认），**不看**这个 flag；flag 只控制 daemon/CLI 的自动续报，以及自动环
+# 是否读本机账本价（关 → 回落 ModelEntry.min_price 旧口径）。默认保持 False，未改默认值。
 FEATURE_FLAGS["client.upstream.bid_report.enabled"] = {
     "default": False,
     "owner": "lead",                     # 设计 §5.4：竞价/上报类开关统一 owner=lead
     "expire_at": "2027-03-31",           # 与 §5.4 表的到期日一致
-    "rollback_rule": "关闭 → 客户端不再上报逐模型底价（本地账本只读保留、报价回到原口径）；"
-                     "djb flags --disable client.upstream.bid_report.enabled 即刻生效，"
-                     "无需迁移、无残留（云端没有收到过任何底价）",
-    "description": "逐模型底价上报到云端（RC14 I/J）；云端接口未开通前保持关闭",
+    "rollback_rule": "关闭 → 停止自动续报，报价回到 ModelEntry.min_price 旧口径"
+                     "（本机账本只读保留，一次性上报仍可用）；"
+                     "djb flags --disable client.upstream.bid_report.enabled 即刻生效",
+    "description": "daemon 自动续报逐模型底价（一次性上报不受此开关限制）",
 }
 UPSTREAM_BID_FLAG = "client.upstream.bid_report.enabled"
 
@@ -837,10 +840,13 @@ def customer_pay_text(ask: object) -> str:
     except Exception:                                     # pragma: no cover - 坏输入
         return "—"
 UPSTREAM_BID_REPORT_PATHS: tuple[str, ...] = (
-    "/api/v1/user/provider/ask-settings",
     "/api/v1/schedule/quotes",
 )
-"""逐模型底价最终要写的两个云端路径（P9 / 报价 models[]）；客户端只做本地账本 + 预览。"""
+"""逐模型底价实际上行的路径（R8-F6）。
+
+ask-settings（``POST /api/v1/user/provider/ask-settings/{model}``）不在本单：一次性上报
+走契约 1.17.0 已有的 ``schedule/quotes`` 逐条 POST；预览/UI 不再把它算作「将上报」。
+"""
 
 RELAY_FLAG = "client.relay.enabled"
 ATTEST_FLAG = "supply.attestation.enabled"

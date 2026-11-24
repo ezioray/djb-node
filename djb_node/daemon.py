@@ -27,8 +27,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from . import (facts, machine_profile, pidfile, plan_router, policy as policy_mod,
-               protocol)
+from . import (bids as bids_mod, facts, machine_profile, pidfile, plan_router,
+               policy as policy_mod, protocol)
 from . import quotes as quotes_mod
 from .api import NodeApi, PolicyFetch
 from .channel import ChannelClient, channel_enabled
@@ -1193,11 +1193,17 @@ class Daemon:
 
         日志只有数字：本轮行数 / created / reused / failed / 跳过原因计数 / 失败分类。
         **不记价格明细，也不记模型清单**（模型名属于供方商业信息）。
+
+        价格同源（R8-F6）：``client.upstream.bid_report.enabled`` 打开时读本机逐模型
+        账本价（与桌面「一次性上报」同一本账本），关闭时回落 ``ModelEntry.min_price``
+        旧口径——否则两条路会拿两套价互相顶版本（云端内容指纹不同 ⇒ 每轮都升版本）。
         """
         # 走 resolve_period 而不是只看入参：配置里 `quotes.ttl_s` 与周期不自洽时
         # 必须 fail-closed（抛 UsageError，由调用方拦住这一轮），不能带病上行。
         period = quotes_mod.resolve_period(self.config, period_s=period_s)
-        plan = quotes_mod.plan_quotes(self.upstreams, now=self._now(), period_s=period)
+        prices = bids_mod.auto_report_prices(self.store, self.config)
+        plan = quotes_mod.plan_quotes(self.upstreams, now=self._now(), period_s=period,
+                                      prices=prices)
         self._quotes_period_s = period
         key = self.credentials.client_key()
         result = quotes_mod.PublishResult()

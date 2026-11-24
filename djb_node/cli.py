@@ -45,6 +45,7 @@ from .relay import RelayError, RelayManager, capacity_targets
 from .secure import CredentialStore
 from .state import StateMachine, Snapshot, reason_label
 from .store import ProfileRecord, Store, UpstreamRecord
+from . import bids as bids_mod
 from . import plan_router
 from . import quotes as quotes_mod
 from . import store as store_module
@@ -2288,14 +2289,20 @@ def cmd_quotes(args: argparse.Namespace) -> int:
     * `publish` 需要（1）开关 `client.quotes.publish.enabled` 打开、
       （2）本机已用 `djb auth` 拿到节点密钥 —— 报价必须挂在**自己的**节点身份上；
     * TTL 一律 = 2 × 发布周期（P2），周期取 `--period-s` > config `quotes.period_s` > 60。
+
+    价格同源（R8-F6）：``client.upstream.bid_report.enabled`` 打开时读本机逐模型
+    账本价（与桌面一次性上报、daemon 自动续报同一本账本）；关闭时回落
+    ``ModelEntry.min_price`` 旧口径。
     """
     paths, config, store = _context(args)
     credentials = CredentialStore(paths)
     manager = UpstreamManager(store, credentials)
     action = getattr(args, "quotes_action", None) or "show"
     period_s = quotes_mod.resolve_period(config, period_s=getattr(args, "period_s", None))
+    prices = bids_mod.auto_report_prices(store, config)
     plan = quotes_mod.plan_quotes(manager, now=utcnow(), period_s=period_s,
-                                  upstream_id=getattr(args, "id", None))
+                                  upstream_id=getattr(args, "id", None),
+                                  prices=prices)
     if action == "show":
         _emit(plan.to_dict(), as_json=_json_flag(args), text=_quotes_table)
         return 0
