@@ -811,7 +811,11 @@ def _offline_status(paths: Paths, store: Store) -> dict[str, Any]:
         "state": snapshot.state if snapshot.state != "stopped" else "stopped",
         # F35：控制口不可达时，「接单」仍按状态库快照回答（心跳在写它）。
         # 缺这一行会让 `djb status` 说「接单：否」，把在跑的节点误报成停止服务。
-        "accepting": (snapshot.is_accepting() if unreachable else False),
+        # F50（2026-11-24 真机复核）：`accepting` **不许编**。daemon 刚起、pidfile 还没写出来时
+        # `unreachable` 是空串，旧实现这里返回 False，而 `state` 仍是快照里的 online ——
+        # 同一份 payload 自相矛盾（标题「正在接单」+ 副标题「当前不接新任务」）。
+        # 读不到就说读不到：None = 未确认，渲染层按「待确认」显示。
+        "accepting": (snapshot.is_accepting() if unreachable else None),
         "reason": snapshot.reason if snapshot.state != "stopped" else None,
         "reason_label": (reason_label(snapshot.reason)
                          if snapshot.state != "stopped" else "daemon 未运行"),

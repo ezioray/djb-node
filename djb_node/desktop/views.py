@@ -922,28 +922,26 @@ def _hero(snapshot: Snapshot) -> Hero:
     mode = str(yield_state.get("mode") or "")
     summary = YIELD_MODE_SUMMARY.get(mode)
     accepting = yield_state.get("accepting")
+    # F50 更正（2026-11-24 真机复核）：0.5.25 把这里写成「云端标记不接新任务」是**错判** ——
+    # 云端从没下过这个结论。真机制是客户端自己：daemon 刚起、pidfile/控制口还没就绪时，
+    # 离线回退把 accepting 压成 False，而 state 仍是快照里的 online，于是一张卡里
+    # 「正在接单」和「当前不接新任务」同屏。修法：accepting 读不到就是 None（未确认），
+    # 不编布尔值；渲染层照实说「未确认」，并给下一步。
+    if accepting is None:
+        tail = "；接单状态未确认（心跳/控制口还没回话，点右上「刷新」重试）"
+    elif accepting is True:
+        tail = "；当前允许接单"
+    else:
+        tail = "；当前不接新任务"
     if summary:
-        body = summary
-        if accepting is True:
-            body += "；当前允许接单"
-        elif accepting is False:
-            body += "；当前不接新任务"
+        body = summary + tail
     elif snapshot.ok("yield"):
-        # F37（2026-11-24 真机）：卡片标题写「正在接单」、副标题却写「接单状态未知」，
-        # 同一张卡自相矛盾。yield 段没给 accepting 时按节点状态推断，并把口径标出来。
-        if accepting is True:
-            body = "自动暂停已开启，当前允许接单"
-        elif accepting is False:
-            # F50（2026-11-24 真机）：云端说「不接新任务」、本机状态却是 online —— 两个真相源
-            # 打架。不许只挑一边说，也不许沉默：把不一致摆到客户眼前，并给下一步。
-            body = ("云端标记「不接新任务」，但本机仍在接单 —— 两边对不上；"
-                    "点右上「刷新」重试，仍不一致请到「诊断」页导出日志")
-        elif state == "online":
-            body = "自动暂停已开启，当前允许接单（按节点状态推断）"
-        else:
-            body = "自动暂停已开启，接单状态未知（yield 数据未提供）"
+        body = "自动暂停已开启" + tail
     else:
         body = "自动暂停状态读不到（数据源未提供）"
+    # 节点整体不在线时，别把「未确认」读成「可以接单」
+    if state not in ("online", "starting") and accepting is None:
+        body += "；节点当前 " + state
     util = _seconds(device.get("utilization_pct"))
     gauge = GaugeData(None if util is None else min(100, util) / 100.0,
                       "—" if util is None else str(util) + "%", "GPU 利用率")
@@ -2232,7 +2230,7 @@ def _yield(snapshot: Snapshot) -> View:
         cards=(Card("当前状态", _yield_state_text(state),
                     str(reason or data.get("reason_label") or "无暂停原因"),
                     _yield_state_tone(state)),
-               Card("接单", _flag(data.get("accepting"), "允许", "禁止"), "", "default"),
+               Card("接单", _flag(data.get("accepting"), "允许", "禁止", "未确认"), "", "default"),
                Card("档位", now_text, now_meta, now_tone)),
         table=Table(("档位", "键", "当前"), rows, empty="档位暂不可用",
                     activate="yield.apply_mode", title="档位"),

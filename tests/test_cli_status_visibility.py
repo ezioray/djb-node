@@ -13,7 +13,10 @@ from datetime import timedelta
 
 from djb_node import cli as cli_module
 from djb_node import facts
-from djb_node.util import utcnow
+from djb_node.util import iso, utcnow
+from djb_node.state import Snapshot
+from djb_node.store import Store
+from djb_node.desktop import datasource as ds
 
 
 # ───────────────────────────────────────────── 通道三态（P4 落点 C）
@@ -327,3 +330,20 @@ def test_offline_status_stays_offline_without_pidfile(tmp_path):
     assert value["daemon_running"] is False
     assert value["control_unreachable"] == ""
     assert value["channel"]["state"] == "offline"
+
+
+def test_offline_status_does_not_fabricate_accepting_false(tmp_path, monkeypatch):
+    """F50（2026-11-24 真机）：daemon 刚起、pidfile 还没写出来时，旧实现把 accepting 压成 False，
+    而 state 仍是快照里的 online —— 同一份 payload 自相矛盾。现在读不到就给 None。"""
+    from djb_node.config import Paths
+    from djb_node.desktop import views as vw
+
+    paths = Paths(str(tmp_path))
+    store = Store.create(paths.db_file)
+    snapshot = Snapshot(state="online", since=iso(utcnow()), next_step="")
+    store.set_kv("daemon_state", snapshot.to_dict())
+    payload = cli_module._offline_status(paths, store)
+    assert payload["state"] == "online"
+    assert payload["accepting"] is None
+    text = vw.build_view("overview", ds.Snapshot({"node": payload, "yield": payload})).plain_text()
+    assert "不接新任务" not in text

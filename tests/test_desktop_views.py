@@ -1864,8 +1864,17 @@ def test_overview_recent_receipts_says_empty_once():
 
 def test_overview_surfaces_cloud_local_disagreement():
     """F50：云端 accepting=False 而本机 online 时，卡片不许只挑一边说。"""
-    section = {"node": {"state": "online"},
+    section = {"status": {"state": "online"},
                "yield": {"mode": "auto", "accepting": False}}
     text = vw.build_view("overview", ds.Snapshot(section)).plain_text()
     if "正在接单" in text and "云端标记" in text:
         assert "对不上" in text
+
+
+def test_overview_does_not_claim_paused_when_accepting_unknown():
+    """F50 更正：accepting 读不到（None）时不许说「不接新任务」，state=online 更不许自相矛盾。"""
+    section = {"status": {"state": "online"}, "yield": {"mode": "auto", "accepting": None}}
+    text = vw.build_view("overview", ds.Snapshot(section)).plain_text()
+    assert "正在接单" in text
+    assert "不接新任务" not in text
+    assert "未确认" in text or "待确认" in text
