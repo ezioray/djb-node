@@ -1892,3 +1892,27 @@ def test_overview_shows_heartbeat_time_in_local_clock():
     local = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone()
     assert local.strftime("%H:%M") in text
     assert "03:59" not in text or local.strftime("%H:%M") == "03:59"
+
+
+def test_account_page_has_one_2fa_entry_and_no_duplicate_last_check():
+    """F47/F48（2026-11-24 真机）：2FA 只留一颗能点的；「上次检查/上次结果」不许重复两行。"""
+    account = {"profile": {"email": "a@b.c"},
+               "security": {"node_id": "n_1"},
+               "update": {"checked_at": "", "verify_state": "", "package_version": "0.5.28"}}
+    section = {"account": account, "status": {"state": "online"}, "access": {}, "yield": {}}
+    view = vw.build_view("account", ds.Snapshot(section))
+    labels = [a.label for a in view.actions]
+    assert not any("启用双因素验证" == label for label in labels), labels
+    assert sum("2FA" in label or "双因素" in label for label in labels) == 1, labels
+    text = view.plain_text()
+    assert text.count("上次检查") == 1
+    assert "上次结果" not in text
+
+
+def test_binding_card_tells_where_to_bind():
+    """F49：未绑定时，卡片里要写清「去哪儿点」，不能只报状态。"""
+    account = {"profile": {"email": "a@b.c"}, "security": {"node_id": "n_1"}}
+    section = {"account": account, "status": {"state": "online"},
+               "access": {"binding": {"bound": False}}, "yield": {}}
+    text = vw.build_view("account", ds.Snapshot(section)).plain_text()
+    assert "② 绑定节点" in text

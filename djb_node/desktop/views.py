@@ -2394,10 +2394,12 @@ def _account(snapshot: Snapshot) -> View:
     twofa = profile.get("twofa_enabled", profile.get("mfa_enabled"))
     if bound is not None:
         # RC15-039 #33：「未绑定」只说**网页端账号**没绑到这个节点，不等于节点没注册。
+        # F49（2026-11-24 真机）：这张卡只说「未绑定」，不给动作，客户不知道去哪点。
+        # 卡片本身不能放按钮，就把去处写在卡里（和下方动作区的分组标题一字不差）。
         binding_meta = ("服务端视图（只读）" if bound is True else
-                        ("本机已有节点凭据，只是网页端账号还没绑到它"
+                        ("本机已有节点凭据，只是网页端账号还没绑到它 → 下方「" + GROUP_BIND + "」"
                          if (bound_node_id or security.get("node_id")) else
-                         "服务端视图（只读）"))
+                         "还没绑到网页端账号 → 下方「" + GROUP_BIND + "」里点「绑定网页端」"))
         second = Card("节点绑定", _flag(bound, "已绑定", "未绑定"),
                       binding_meta, "mint" if bound is True else "amber")
     else:
@@ -2502,14 +2504,9 @@ def _account(snapshot: Snapshot) -> View:
     if can_bind:
         actions.append(Action("account.bind", "绑定网页端" if not device_on else "手输绑定码",
                              primary=not device_on, group=GROUP_BIND))
-    # G1-2（RC14 P0）：2FA 不在本机做绑定 ⇒ ①禁用态 + 说清原因；②旁边给**真能点**的入口。
-    # 旧实现是一颗可点的按钮，点下去只回一句「暂不可用」——客户会以为客户端坏了。
-    actions.append(Action("account.enable_2fa", "启用双因素验证", enabled=False,
-                          reason=("已开启（服务端）：如需关闭或换设备，去网页控制台安全页"
-                                  if twofa is True else
-                                  "在网页控制台开启（TOTP）；本机不代理 2FA 绑定"),
-                          group=GROUP_IDENTITY))
-    # 已开启也要给入口：客户要关闭 / 换设备 / 重装 TOTP 时同样得去这一页
+    # F48（2026-11-24 真机）：旧实现有一颗禁用的「启用双因素验证」+ 一颗可点的
+    # 「去控制台开启 2FA」，同一件事两种说法并排，客户不知道该点哪个（禁用的那颗还点不动）。
+    # 现在只留一颗：标签随状态变，理由写在动作的 reason 里。
     actions.append(Action("account.open_2fa_page",
                           "去控制台管理 2FA" if twofa is True else "去控制台开启 2FA",
                           primary=not can_bind and twofa is not True,
@@ -2540,9 +2537,12 @@ def _account(snapshot: Snapshot) -> View:
               hint=version_hint,
               tone="amber" if record_stale else "muted",
               group=GROUP_IDENTITY),
-        Field("上次检查", checked_at or "还没检查过", key="update_checked_at",
-              group=GROUP_IDENTITY),
-        Field("上次结果", (update_unavailable or state_text), key="update_state",
+        # F47（2026-11-24 真机）：「上次检查 还没检查过」+「上次结果 尚未检查」两行同义并存。
+        # 合成一行：时间在前、结果在后，一个 Field 说清一件事。
+        Field("上次检查",
+              ((checked_at + " · ") if checked_at else "")
+              + (update_unavailable or state_text),
+              key="update_checked_at",
               hint=str(update.get("hint") or ""),
               tone="amber" if update_unavailable else "muted",
               group=GROUP_IDENTITY),

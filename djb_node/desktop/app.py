@@ -1027,6 +1027,46 @@ class DesktopApp:
         self._canvas.yview_moveto(1.0 if fraction >= 0.5 else 0.0)
         return "break"
 
+    def _toggle_maximize(self) -> str:
+        """F34（2026-11-24 真机）：Alt+F10 在 Linux 上就是最大化，在 Windows 上客户按 Win+Up，
+        但 Tk 收不到 Win 键 —— 所以三个键都绑，谁都别猜。连续按两次必须回到原尺寸。"""
+        try:
+            if getattr(self, "_maximized", False):
+                self._maximized = False
+                try:
+                    self._root.state("normal")        # Windows / 多数 X11 WM
+                except Exception:                     # pragma: no cover - 平台差异
+                    try:
+                        self._root.attributes("-zoomed", False)
+                    except Exception:
+                        pass
+                saved = getattr(self, "_pre_max_geometry", "")
+                if saved:
+                    try:
+                        self._root.geometry(saved)
+                    except Exception:                 # pragma: no cover
+                        pass
+                return "还原窗口"
+            try:
+                self._pre_max_geometry = self._root.geometry()
+            except Exception:                         # pragma: no cover
+                self._pre_max_geometry = ""
+            self._maximized = True
+            for attempt in (lambda: self._root.state("zoomed"),
+                            lambda: self._root.attributes("-zoomed", True),
+                            lambda: self._root.geometry(
+                                "%dx%d+0+0" % (self._root.winfo_screenwidth(),
+                                               self._root.winfo_screenheight()))):
+                try:
+                    attempt()
+                    break
+                except Exception:                     # pragma: no cover
+                    continue
+            return "已最大化"
+        except Exception:                             # pragma: no cover - 极端平台
+            self._maximized = False
+            return "这个平台不支持最大化快捷键"
+
     def _nav_scroll(self, units: int) -> None:
         canvas = getattr(self, "_nav_canvas", None)
         if canvas is None:
@@ -1336,6 +1376,12 @@ class DesktopApp:
         except Exception:
             pass
         self._root.bind("<Escape>", lambda _e: self._canvas.yview_moveto(0))
+        # F34：最大化/还原（三套键位覆盖 Windows / X11 / 键盘党）
+        for _seq in ("<Alt-F10>", "<Alt-Return>", "<F11>", "<Control-Shift-m>"):
+            try:
+                self._root.bind(_seq, lambda _e: (self._toggle_maximize(), "break")[1], add="+")
+            except Exception:                         # pragma: no cover - 平台不支持该 keysym
+                continue
 
     def _step_view(self, step: int) -> None:
         """Ctrl+PageUp/PageDown：按 IA 顺序前后切（13 个视图循环，不依赖键盘布局）。"""
