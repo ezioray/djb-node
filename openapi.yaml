@@ -2,7 +2,7 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: DJB Protocol API
-  version: 1.17.0
+  version: 1.17.1
   summary: W1 冻结 + M16 审计链 + W2/W3 契约面 + S4 TokenRouter 加性字段（覆盖 M01–M14、M16–M18）
   description: "DJB 联脑的对外可观测契约。spec 是唯一真相源：客户端 SDK、云端路由与校验、\n契约测试、文档站都从本文件生成或对照，任何一方不得绕过 spec 自行定义。\n\n- 命名空间：`/v1/*` 为 OpenAI\
     \ 兼容网关面；`/api/v1/*` 为控制面（节点/用方/协议/后台）。\n- 可用性：`x-djb-availability` 标记「不是所有部署都提供」的面；`m03` = 仅 M03 网关装配\n  （`DJB_GATEWAY_M03=1`）时挂载，默认部署返回\
@@ -13010,12 +13010,38 @@ paths:
   /api/v1/node/binding/device:
     post:
       operationId: rc14_create_device_authorization
-      summary: 客户端建码——生成一次性设备授权（匿名），返回唯一一次可见的 device_code
+      summary: 客户端建码——生成一次性设备授权（默认匿名；带 node_id 时须节点密钥），返回唯一一次可见的 device_code
       tags: [rc8]
       description: |
         `device_code` **只在这一次响应里返回**；服务端只存 `sha256(device_code)`。
         `user_code` 为 8 位大写字母数字（去掉易混字符，且**不含 `U`**，与门户 `/activate` 输入集对齐）。
         有效期 10 分钟。
+
+        **节点密钥证明（1.17.1 起）**：请求可带本机 `node_id`；一旦带上，**必须**同时带该节点
+        有效的 `X-Client-Key`（与 `/api/v1/node/*` 同一凭据体系，轮换重叠期旧钥仍可验签）。
+        缺失 / 未知 / 已撤销 / 与 `node_id` 不匹配 → **401** 且**不建码**；`node_id` 形状非法或
+        节点不存在 → **400**。不带 `node_id` 的匿名建码保持原行为：不关联任何节点，后续
+        `confirm` 也不能据此绑定。
+
+        `verify_url` 是**绝对地址**（默认 `https://tkbank.ai/activate`，部署可用 `DJB_ACTIVATE_URL`
+        覆盖；只写相对值时按默认源补全），客户端可直接 `webbrowser.open`。
+      parameters:
+      - name: X-Client-Key
+        in: header
+        required: false
+        description: 节点客户端密钥；请求带 `node_id` 时**必填**（缺失 / 未知 / 已撤销 / 与 node_id 不匹配 → 401 且不建码）
+        schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                node_id:
+                  type: string
+                  maxLength: 128
+                  description: 本机节点 ID（可选；空串等同不带 = 匿名建码）；带则必须同时带该节点的 `X-Client-Key`，并落库供 confirm 使用
       responses:
         "201":
           description: Created
@@ -13027,9 +13053,21 @@ paths:
                   id: {type: string, format: uuid}
                   device_code: {type: string, description: 仅本次可见}
                   user_code: {type: string, pattern: "^[A-Z2-9]{8}$"}
-                  verify_url: {type: string, description: 门户确认页（/activate）}
+                  verify_url: {type: string, description: 门户确认页**绝对地址**（默认 `https://tkbank.ai/activate`；部署可用 `DJB_ACTIVATE_URL` 覆盖）}
                   expires_in: {type: integer, description: 秒}
+                  node_id: {type: string, description: 1.17.1 加性：仅建码时带了 `node_id` 才出现；confirm 批准只认这个节点}
+                  state: {type: string, description: 1.17.1 加性：与响应里的 `status` 同值；建码后恒为 `pending`}
                 additionalProperties: true
+        "400":
+          description: "带 node_id 但形状非法（40001）或节点不存在（40001 node_not_found）"
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        "401":
+          description: "带 node_id 但 X-Client-Key 缺失 / 未知 / 已撤销 / 与 node_id 不匹配（40101，不建码）"
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         "429":
           description: "建码被限流（按来源 IP 滑窗；每副本配额，不是全局配额）"
           headers:
@@ -13060,8 +13098,9 @@ paths:
                 type: object
                 properties:
                   status: {type: string, enum: [pending, approved, denied, expired]}
+                  state: {type: string, enum: [pending, approved, denied, expired], description: 1.17.1 加性：与 `status` 同值（兼容只读 `state` 的客户端）}
                   expires_at: {type: string, format: date-time}
-                  node_id: {type: string, description: 仅 approved 时出现}
+                  node_id: {type: string, description: approved 时**必带**：建码时经 `X-Client-Key` 证明的节点}
                   already_consumed: {type: boolean, description: 结论已被取走过（不重放，仍报终态）}
                 additionalProperties: true
         "404": {description: "授权请求不存在（40401）"}
@@ -13075,6 +13114,16 @@ paths:
         `decision` **必填**，只认 `approve` / `deny`；缺省或非法一律 **400**，**绝不默认 approve**。
         `deny` 与 `approve` 同等实现（都落 state + decided_by/at + decision_reason）。
         **幂等**：同一 `user_code` 重复确认返回首次结论，不翻转。
+
+        **节点绑定（1.17.1 起收紧）**：`approve` 在**同一事务**内写节点绑定（`nodes.bound_account_id` /
+        `account_id` / `bound_at`，并清 `revoked_at`），失败整体回滚——不会留下「已批准但未绑定」的
+        半截状态。绑定节点**只认**建码时经 `X-Client-Key` 证明并落库的 `node_id`；请求体 `node_id`
+        只做一致性校验，不能把确认页改成「改绑到任意节点」的入口。仅 `approve` 受影响：
+        - 建码时没有节点 → **400** `node_required`；
+        - 请求体 `node_id` 与建码节点不一致 → **400** `node_id_mismatch`；
+        - 节点不存在 → **404**（40401）；
+        - 节点已绑**其它**账户且未解绑 → **409**（40902，文案不泄露对方账户）；
+        - 已绑**本**账户 → 幂等成功；已解绑（`revoked_at` 非空）→ 允许重绑。
 
         **反枚举（1.14.0 定稿）**：未知码 / 已过期 / 已消费 三者**响应体与耗时同形**，一律
         `{"status":"invalid"}`。因此本端点的 `status` 枚举**没有 `expired`** —— 对猜码者
@@ -13091,7 +13140,7 @@ paths:
                 user_code: {type: string, pattern: "^[A-Z2-9]{8}$"}
                 decision: {type: string, enum: [approve, deny]}
                 reason: {type: [string, "null"], maxLength: 200}
-                node_id: {type: [string, "null"], description: approve 时可选，指定绑定到哪台节点}
+                node_id: {type: [string, "null"], description: 1.17.1 起 approve 时可选，仅与建码时经密钥证明的节点做一致性校验（不一致 → 400 node_id_mismatch），不是绑定来源}
               additionalProperties: false
       responses:
         "200":
@@ -13102,9 +13151,19 @@ paths:
                 type: object
                 properties:
                   status: {type: string, enum: [approved, denied, invalid]}
-                  node_id: {type: string}
+                  node_id: {type: string, description: approved 时必带：建码时经密钥证明的节点}
                 additionalProperties: true
-        "400": {description: "user_code/decision/node_id 非法（40001）"}
+        "400": {description: "user_code/decision/node_id 非法（40001）；approve 另含 400 node_required（建码时无经密钥证明的节点）/ node_id_mismatch（与建码节点不一致）"}
+        "404":
+          description: "approve 时节点不存在（40401）；未知 / 过期 / 已消费的 user_code 仍返回 200 invalid，不走 404"
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        "409":
+          description: "approve 时节点已绑定其它账户且未解绑（40902 node_already_bound）"
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
 
 
 components:
