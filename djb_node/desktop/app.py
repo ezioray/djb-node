@@ -1966,6 +1966,12 @@ class DesktopApp:
         url = str(url or "")
         if not url:
             return False
+        # R8（F3）：相对地址（旧云端只回 /activate）交给 webbrowser 等于什么都不做。
+        # device_flow 已用网关基址拼过绝对地址；这里再兜一道：只接受 http(s)。
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            return False
         seen = getattr(self, "_opened_verify_urls", None)
         if seen is None:
             seen = set()

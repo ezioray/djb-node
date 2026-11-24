@@ -28,8 +28,10 @@ from .access import (RELOAD_DAEMON_DOWN, RELOAD_FAILED, RELOAD_OK, RELOAD_UNSUPP
                      validate_address)
 from .datasource import (LOG_LEVELS, SECTIONS, DataSource, LocalDataSource, ProviderError,
                          Snapshot, Unavailable, benchmark)
-from .views import (VIEW_KEYS, VIEW_TITLES, YIELD_PRESET_BY_KEY, YIELD_PRESET_BY_LABEL,
-                    View, build_view)
+from .views import (BIND_RECOVER_FAILED_TEMPLATE, BIND_RECOVER_RETRY_LABEL,
+                    BIND_RECOVER_SUCCESS_TEXT, BIND_RECOVER_WEB_LABEL,
+                    BIND_RECOVERING_TEXT, VIEW_KEYS, VIEW_TITLES, YIELD_PRESET_BY_KEY,
+                    YIELD_PRESET_BY_LABEL, View, build_view, public_reason)
 from .. import facts
 
 __all__ = ["ActionResult", "ControlOutcome", "DesktopController", "LocalControlChannel",
@@ -185,6 +187,17 @@ def _bind_failure_hint(text: str, *, available_at: str = "") -> str:
     return ""
 
 
+def _recovery_reason(exc: BaseException) -> str:
+    """自动恢复失败原因的**客户语言**版本（内部词一律不回显）。"""
+    name = type(exc).__name__
+    if name in ("TimeoutExpired", "TimeoutError"):
+        return "本机命令超时"
+    reason = str(getattr(exc, "reason", "") or "").strip()
+    if reason:
+        return public_reason(reason)
+    return public_reason(str(exc), default="本机命令没跑通")
+
+
 def _bind_already_bound_message(bound_at: Any) -> str:
     """「已经绑定该账户」的**成功**提示：重复绑定没有副作用，但要说清「本来就绑着」。"""
     stamp = str(bound_at or "").strip()
@@ -226,6 +239,11 @@ class DesktopController:
     probe_via: Callable[[], Any] | None = None
     #: RC14 C：设备码绑定 —— 设备流程状态（``djb_node.device_flow.DeviceFlow``）
     device_flow: Any | None = None
+    #: R8（F1）：节点密钥自动恢复的界面状态 —— ""（正常）/ "recovering" / "failed"。
+    #: 只存**界面状态**，密钥只在 CLI 子进程里换（本层不读不写凭据）。
+    binding_recovery: str = ""
+    #: 恢复失败时给客户看的原因（已过 :func:`views.public_reason`，无内部词）
+    binding_recovery_reason: str = ""
     #: 设备流程异步通道：``(flow) -> bool``；返回 True = 已派给 worker（轮询不在主线程）
     device_via: Callable[[Any], Any] | None = None
     #: 设备流程**状态变化**通知：``(flow) -> None``。app 用它做两件事——
@@ -318,6 +336,11 @@ class DesktopController:
             "enabled": self.device_flow_enabled(),
             **((flow.as_dict() if hasattr(flow, "as_dict") else dict(flow))
                if isinstance(flow, Mapping) or hasattr(flow, "as_dict") else {}),
+        }
+        # R8（F1）：密钥自动恢复状态也由本层注入（视图只读，不持有流程状态）。
+        merged_account["binding_recovery"] = {
+            "state": str(self.binding_recovery or ""),
+            "reason": str(self.binding_recovery_reason or ""),
         }
         sections["account"] = merged_account
         # RC14 I：Token Plan 页的「选中行 + 该行已存底价」由本层注入（视图层不持有选中态）
@@ -896,9 +919,12 @@ class DesktopController:
             account = self.snapshot.get("account")
             security = account.get("security") if isinstance(account, Mapping) else None
             node_id = str((security or {}).get("node_id") or "")
+        # R8（F3）：云端 verify_url 是相对路径（/activate）→ 用网关基址拼绝对地址再打开；
+        # 网关地址从注入的云端客户端取（测试桩没有就是空，此时宁可不打开也不打开相对路径）。
+        base_url = str(getattr(client, "base_url", "") or "")
         runner = flow_mod.DeviceFlowRunner(post, sleep=time.sleep, clock=time.monotonic,
                                           on_update=self._device_update, stop=stop,
-                                          node_id=node_id)
+                                          node_id=node_id, base_url=base_url)
         flow = runner.run()
         self.device_flow = flow
         return self._device_result(flow)
@@ -1659,12 +1685,76 @@ class DesktopController:
         return ActionResult("已登出：节点已解绑、本机密钥已清除；重新配对后才能接单。",
                             effect="refresh")
 
+    # ── R8（F1）：节点密钥被云端撤销后的自动恢复（界面状态机，一次点击只试一次）
+    def _binding_key_invalid(self) -> bool:
+        """快照是否已经说明「本机节点密钥失效」：daemon 暂停原因或凭据状态。
+
+        只是**读取本机快照**（不发请求）：daemon 心跳遇 401 会把 reason 落成
+        ``credential_invalid``；云端明确回 ``client_key_revoked`` 时也可能标记
+        ``security.key_state=revoked``。两者任一命中都先恢复密钥，再谈绑定。
+        """
+        status = self.snapshot.get("status")
+        reason_code = status.get("reason_code") if isinstance(status, Mapping) else None
+        if str(reason_code or "") == "credential_invalid":
+            return True
+        account = self.snapshot.get("account")
+        security = account.get("security") if isinstance(account, Mapping) else None
+        return str((security or {}).get("key_state") or "") == "revoked"
+
+    def recover_binding(self) -> ActionResult:
+        """自动恢复节点密钥：调本机命令 ``auth --recover``（只调一次，不循环）。
+
+        恢复期间 ``binding_recovery="recovering"``：视图据此显示「节点密钥已失效，
+        正在自动恢复…」并把绑定按钮置灰。成功 → 清状态、回到绑定输入；失败 →
+        ``"failed"`` + 「点此重试 / 到网页端解绑后重新绑定」。
+        """
+        if self.binding_recovery == "recovering":
+            return ActionResult(BIND_RECOVERING_TEXT, ok=False)
+        if self.cli is None:
+            return self._binding_recovery_failed("本机命令通道未接通")
+        self.binding_recovery = "recovering"
+        self.binding_recovery_reason = ""
+        self.message = BIND_RECOVERING_TEXT
+        try:
+            payload = self.cli(["auth", "--recover"])
+        except Exception as exc:                          # noqa: BLE001 - 文案要收敛
+            return self._binding_recovery_failed(_recovery_reason(exc))
+        if isinstance(payload, Mapping) and payload.get("ok") is False:
+            return self._binding_recovery_failed(str(payload.get("error") or "云端暂不可用"))
+        self.binding_recovery = ""
+        self.binding_recovery_reason = ""
+        self.request_refresh(("account",))
+        return ActionResult(BIND_RECOVER_SUCCESS_TEXT, effect="refresh")
+
+    def _binding_recovery_failed(self, reason: Any) -> ActionResult:
+        text = public_reason(reason)
+        self.binding_recovery = "failed"
+        self.binding_recovery_reason = text
+        # effect=refresh：失败态也要**立刻**重画（字段 + 两条下一步按钮）；
+        # 否则 app 只在成功时重画，客户要点一次刷新才看得到恢复按钮。
+        return ActionResult(BIND_RECOVER_FAILED_TEMPLATE.format(reason=text),
+                            ok=False, effect="refresh")
+
+    def _act_account_bind_recover(self, *, confirm=None) -> ActionResult:
+        """「点此重试」：只再试一次自动恢复（不做无限重试）。"""
+        return self.recover_binding()
+
+    def _act_account_recover_open_web(self, *, confirm=None) -> ActionResult:
+        """「到网页端解绑后重新绑定」：把客户送到网页端（不在客户端里清任何凭据）。"""
+        return ActionResult(
+            "网页端：" + facts.WEB_CONSOLE_URL + " → 共享算力 → 节点与绑定："
+            "先解绑这台电脑，再生成新的绑定码回来粘贴。",
+            effect="open_url", payload=facts.WEB_CONSOLE_URL)
+
     def _act_account_bind(self, code: str | None = None, *, confirm=None) -> ActionResult:
         """绑定网页端：取一次性码 → ``djb auth --bind <码>`` → 刷新快照。
 
         ``code`` 可显式传入（测试 / 调用方已有码）；为 ``None`` 时走 ``ask_code`` 输入框。
         绑定码只进子进程参数，不进日志、不回显到状态栏。
+        R8（F1）：密钥已知失效时**先恢复密钥**（恢复成功后回到绑定输入，不拿旧码硬试）。
         """
+        if self._binding_key_invalid():
+            return self.recover_binding()
         if code is None:
             if self.ask_code is None:
                 return ActionResult("暂不可用（没有绑定码输入通道）", ok=False)
@@ -1681,14 +1771,24 @@ class DesktopController:
             payload = self.cli(["auth", "--bind", code])
         except ProviderError as exc:
             reason = str(exc.reason or "")
-            return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
+            recovered = self._recover_after_bind_failure(reason)
+            if recovered is not None:
+                return recovered
+            return ActionResult("绑定未成功："
+                                + public_reason(reason, default="云端拒绝了这次绑定")
+                                + _bind_failure_hint(reason)
                                 + "；本机凭据未改动。", ok=False)
         except Exception as exc:
             return ActionResult("绑定未成功（" + type(exc).__name__ + "）；本机凭据未改动。",
                                 ok=False)
         if isinstance(payload, Mapping) and payload.get("ok") is False:
             reason = str(payload.get("error") or "服务端拒绝")
-            return ActionResult("绑定未成功：" + reason + _bind_failure_hint(reason)
+            recovered = self._recover_after_bind_failure(reason)
+            if recovered is not None:
+                return recovered
+            return ActionResult("绑定未成功："
+                                + public_reason(reason, default="云端拒绝了这次绑定")
+                                + _bind_failure_hint(reason)
                                 + "；本机凭据未改动。", ok=False)
         self.request_refresh(None)
         if was_bound:
@@ -1698,6 +1798,21 @@ class DesktopController:
         return ActionResult("已绑定网页端；daemon 会用新凭据重新上线。"
                             "（USDT 收款地址是**另一件事**：在本页「③ 提交 USDT 收款地址」"
                             "里单独点一次「提交收款地址到云端」才生效）", effect="refresh")
+
+    def _recover_after_bind_failure(self, reason: str) -> ActionResult | None:
+        """绑定失败若是「密钥已失效」→ 转入自动恢复；其余失败仍走原来的下一步文案。
+
+        CLI 自己也会在 401 client_key_revoked 上恢复一次；这里兜的是另一种情况：
+        恢复失败 / 老版本 CLI / 云端在心跳后才标记失效。**只再试一次**，不做循环。
+        """
+        text = str(reason or "")
+        if "自动恢复失败" in text:
+            tail = text.split("自动恢复失败：", 1)[-1]
+            return self._binding_recovery_failed(tail.split("；", 1)[0])
+        lowered = text.lower()
+        if "client_key_revoked" in lowered or "40102" in lowered or "节点密钥已失效" in text:
+            return self.recover_binding()
+        return None
 
     def _bound_before_bind(self) -> tuple[bool, str]:
         """读「绑之前」的绑定态：``(是否已绑, bound_at 原文)``；读不到就当没绑。"""

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+from urllib.parse import urljoin, urlparse
 
 #: 轮询间隔（秒）：5 → 15 → 30，之后恒定 30（lead 口径）
 BACKOFF_S: tuple[int, ...] = (5, 15, 30)
@@ -67,12 +68,36 @@ class DeviceFlow:
                 "node_id": self.bound_node_id}
 
 
-def parse_start(payload: Mapping[str, Any]) -> DeviceFlow:
+def absolute_verify_url(verify_url: object, base_url: object = "") -> str:
+    """把云端给的 ``verify_url`` 变成可打开的绝对地址。
+
+    云端现网回的是相对路径 ``/activate``（F3 实测）：``webbrowser.open("/activate")``
+    在 Windows 上什么都不做，客户看到的就是「点了没反应」。有网关基址时用
+    :func:`urljoin` 拼成绝对地址；已经是 http(s) 的原样返回；两者都没有就返回空串，
+    让调用方**不打开**也不假装打开了。
+    """
+    url = str(verify_url or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() in ("http", "https") and parsed.netloc:
+        return url
+    base = str(base_url or "").strip()
+    if not base:
+        return ""
+    if url.startswith("//") or url.startswith("\\\\"):
+        return ""                     # 协议相对/反斜杠路径可能指向别的主机，一律不认
+    resolved = urljoin(base.rstrip("/") + "/", url.lstrip("/"))
+    final = urlparse(resolved)
+    return resolved if final.scheme.lower() in ("http", "https") and final.netloc else ""
+
+
+def parse_start(payload: Mapping[str, Any], *, base_url: object = "") -> DeviceFlow:
     """``POST /device`` 的响应 → 初始状态。缺字段就当云端没开通（不编造码）。"""
     data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
     user_code = str((data or {}).get("user_code") or "").strip()
     device_code = str((data or {}).get("device_code") or "").strip()
-    verify_url = str((data or {}).get("verify_url") or "").strip()
+    verify_url = absolute_verify_url((data or {}).get("verify_url"), base_url)
     if not (user_code and device_code):
         return unavailable("云端没有返回设备码（user_code / device_code 缺失）")
     try:
@@ -107,7 +132,13 @@ def apply_poll(flow: DeviceFlow, payload: Mapping[str, Any] | None,
         flow.events.append("poll_unreachable")
         return flow
     data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
-    state = str((data or {}).get("state") or "").strip().lower()
+    # R8（F3）：云端现网 poll 回的是 ``status``（rc8_admin.device_auth.poll），
+    # 客户端历史只读 ``state`` → 永远「无法识别的状态」。两个字段都认：state 优先，
+    # status 兜底（旧云端给 state 时行为不变）。
+    raw_state = (data or {}).get("state")
+    if raw_state in (None, ""):
+        raw_state = (data or {}).get("status")
+    state = str(raw_state or "").strip().lower()
     if state not in ("pending", "approved", "denied", "expired"):
         flow.state = "unavailable"
         flow.reason = "云端返回了无法识别的状态：" + (state or "（空）")
@@ -173,9 +204,11 @@ class DeviceFlowRunner:
                  *, sleep: Callable[[float], None], clock: Callable[[], float],
                  on_update: Callable[[DeviceFlow], None] | None = None,
                  stop: Callable[[], bool] | None = None,
-                 node_id: str = "") -> None:
+                 node_id: str = "", base_url: str = "") -> None:
         self._post = post
         self._node_id = str(node_id or "").strip()
+        #: 网关基址：云端 ``verify_url`` 是相对路径时用它拼绝对地址（F3）
+        self._base_url = str(base_url or "").strip()
         self._sleep = sleep
         self._clock = clock
         self._on_update = on_update
@@ -218,7 +251,7 @@ class DeviceFlowRunner:
             payload = self._post(DEVICE_PATH, body)
         except Exception as exc:                           # 404 / 超时 / 连不上
             return unavailable(_error_text(exc))
-        return parse_start(payload)
+        return parse_start(payload, base_url=self._base_url)
 
     def step(self, flow: DeviceFlow, started: float) -> DeviceFlow:
         flow.attempts += 1
