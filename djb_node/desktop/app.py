@@ -1814,13 +1814,17 @@ class DesktopApp:
 
     def _start_bid_report(self, plan: Any, message: str = "") -> None:
         """派发一次上报；没有事件循环（截图脚本/单测）才退回同步。"""
+        worker = self._ensure_bid_report_worker()
+        if worker is not None and worker.busy:
+            # 先判忙再改 _bid_report_plan：否则 worker 线程可能读到**下一次**的计划
+            self._bid_report_busy()
+            return
         self._bid_report_plan = plan
         self._force_next_render = True
         try:
             self._render(self._controller.current())
         except Exception:                          # pragma: no cover - 窗口已销毁
             pass
-        worker = self._ensure_bid_report_worker()
         if worker is None:
             self._apply_bid_report(self._controller.run_bid_report(plan), None)
             return
