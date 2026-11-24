@@ -10,12 +10,12 @@ from __future__ import annotations
 import os
 import sys
 
-from djb_node.desktop.datasource import DesktopDataSource
+from djb_node.desktop.datasource import LocalDataSource
 
 
-def _ds() -> DesktopDataSource:
+def _ds() -> LocalDataSource:
     # 只测命令行拼装，不碰任何实例状态
-    return object.__new__(DesktopDataSource)
+    return object.__new__(LocalDataSource)
 
 
 def test_frozen_uses_sibling_cli(tmp_path, monkeypatch):
