@@ -466,11 +466,29 @@ class LocalDataSource:
     def log_ring(self) -> RingLog:
         return self._logs
 
+    def _cli_command(self, argv: Sequence[str]) -> list[str]:
+        """CLI 子进程命令行：打包后**优先用同目录 djb-node**，否则回落到 python -m。
+
+        为什么（owner #2 / F3）：onefile 里 `sys.executable` 是桌面端自己，`-m djb_node`
+        会让 CPython 在**同一份 onefile** 上再解包一次（真机约 6 s/次，首屏前两次 ⇒ ~12 s）。
+        同目录的 `djb-node.exe` 是独立的控制台 onefile，仍然要解包，但复用的是同一目录的
+        压缩包映像与系统缓存，实测明显更快；更重要的是：找不到兄弟文件时**行为与旧版一致**。
+        """
+        items = list(argv)
+        if bool(getattr(sys, "frozen", False)):
+            here = os.path.dirname(os.path.abspath(sys.executable))
+            names = ("djb-node.exe",) if os.name == "nt" else ("djb-node",)
+            for name in names:
+                candidate = os.path.join(here, name)
+                if os.path.isfile(candidate):
+                    return [candidate, *items]
+        return [sys.executable, "-m", "djb_node", *items]
+
     def _cli_runner(self, argv: Sequence[str]) -> Mapping[str, Any]:
         """只读子进程：``python -m djb_node <argv> --json``（与托盘同一条路径）。"""
         if "--json" not in argv:
             argv = list(argv) + ["--json"]
-        command = [sys.executable, "-m", "djb_node", *argv]
+        command = self._cli_command(argv)
         # 必须带上本数据源自己的 home：不带就会去读**真实** ~/.djb
         # （临时 home 的窗口显示别人家的节点状态，甚至因为库版本更新而整域不可用）
         env = dict(os.environ)

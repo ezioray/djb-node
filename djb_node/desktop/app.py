@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import base64
 import argparse
 import json
 import os
@@ -38,7 +39,8 @@ from .. import facts                 # WEB_CONSOLE_URL（401 横幅的「打开�
 from . import client_flags            # R2.4 S1/S3/S4：壳层开关（默认关，三字段齐全）
 from . import platform_ui
 from .views import (VIEW_KEYS, VIEW_TITLES, Action, Card, Chart, Field, Hero,
-                    Metric, RailCard, Row, Table, View, page_kicker, with_field_errors)
+                    Metric, RailCard, Row, Table, View, mask_node_id, page_kicker,
+                    with_field_errors)
 
 __all__ = ["DesktopApp", "EXIT_HEADLESS", "EXIT_OK", "HEADLESS_HINT", "HeadlessError",
            "demo_snapshot", "main", "make_controller"]
@@ -689,12 +691,32 @@ class DesktopApp:
         logo = tk.Canvas(brand, width=self._px(24), height=self._px(24), background=dual.color("surface"),
                          bd=0, highlightthickness=0, takefocus=0)
         logo.pack(side="left", pady=self._px(9))
-        logo.create_polygon(self._geom.round_rect_points(
-            0.5, 0.5, self._px(24) - 0.5, self._px(24) - 0.5, self._px(6)), smooth=True,
-            splinesteps=12, fill=dual.chart("mint_bright"),
-            outline=dual.chart("mint_bright"))
-        logo.create_text(self._px(12), self._px(12), text="D", fill=dual.color("ink"),
-                         font=fonts.sans(kit.px("h2"), bold=True))
+        # C4（owner #3）：应用头换成 TOKENBANK 品牌图形；资源读不到才回落画出来的方块。
+        # 读不到不是错误（冻结包/裁剪包都可能缺 assets），所以整段 try 兜底。
+        self._brand_img = None
+        try:
+            from ..assets import TRAY_ICON_2X, WINDOW_ICON, resource_bytes
+            # 24×24 才是这一格的尺寸（独立复核实测：256 原图直接放进来，Tk 只显示左上角，
+            # 看起来是一块空白浅紫）。优先 24px 资源；只有大图时按整数倍 subsample。
+            for name in (TRAY_ICON_2X, WINDOW_ICON):
+                raw = resource_bytes(name)
+                if not raw:
+                    continue
+                img = tk.PhotoImage(data=base64.b64encode(raw).decode("ascii"))
+                if img.width() > 48:
+                    img = img.subsample(max(1, img.width() // 24), max(1, img.height() // 24))
+                self._brand_img = img
+                logo.create_image(self._px(12), self._px(12), image=img)
+                break
+        except Exception:                              # noqa: BLE001 - 图标永不阻塞启动
+            self._brand_img = None
+        if self._brand_img is None:
+            logo.create_polygon(self._geom.round_rect_points(
+                0.5, 0.5, self._px(24) - 0.5, self._px(24) - 0.5, self._px(6)), smooth=True,
+                splinesteps=12, fill=dual.chart("mint_bright"),
+                outline=dual.chart("mint_bright"))
+            logo.create_text(self._px(12), self._px(12), text="TB", fill=dual.color("ink"),
+                             font=fonts.sans(kit.px("micro"), bold=True))
         tk.Label(brand, text="TokenBank 联脑", font=fonts.sans(kit.px("h2"), bold=True),
                  foreground=dual.color("ink"), background=dual.color("surface")).pack(
                      side="left", padx=(8, 0))
@@ -760,9 +782,18 @@ class DesktopApp:
         ident.bind("<Configure>", lambda _event: self._update_identity())
         tk.Label(ident, text="本机节点", font=fonts.sans(kit.px("micro")),
                  foreground=dual.color("muted_text"), background=ground, anchor="w").pack(fill="x")
-        self._ident_name = tk.Label(ident, text="—", font=fonts.sans(kit.px("h2"), bold=True),
+        name_row = tk.Frame(ident, background=ground)
+        name_row.pack(fill="x", pady=(2, 2))
+        self._ident_name = tk.Label(name_row, text="—", font=fonts.sans(kit.px("h2"), bold=True),
                                     foreground=dual.color("ink"), background=ground, anchor="w")
-        self._ident_name.pack(fill="x", pady=(2, 2))
+        self._ident_name.pack(side="left")
+        # R2.1 #3b/#4：侧栏只放短标签，完整节点 ID 走「复制」——不再把 n_… 长串铺在首屏。
+        self._ident_full = ""
+        self._ident_copy = tk.Label(name_row, text="复制", font=fonts.sans(kit.px("micro")),
+                                    foreground=dual.color("mint_text"), background=ground,
+                                    cursor="hand2")
+        self._ident_copy.pack(side="right")
+        self._ident_copy.bind("<Button-1>", lambda _event: self._copy_node_id())
         line = tk.Frame(ident, background=ground)
         line.pack(fill="x")
         self._ident_dot = tk.Canvas(line, width=10, height=10, background=ground, bd=0,
@@ -2318,6 +2349,16 @@ class DesktopApp:
             return "○ 已停止", "muted"
         return "? 状态未知", "muted"
 
+    def _copy_node_id(self) -> None:
+        """把**完整**节点 ID 放进剪贴板（侧栏只显示短标签，复制仍拿全量）。"""
+        if not self._ident_full:
+            self._toast("这台电脑还没有节点 ID：先完成绑定，再复制", ok=False)
+            return
+        if self.copy_text(self._ident_full):
+            self._toast("已复制完整节点 ID", ok=True)
+        else:
+            self._toast("复制失败：剪贴板被占用，请再点一次", ok=False)
+
     def _update_identity(self) -> None:
         """侧栏身份块：节点号 / 在线态 / 显卡与显存。全部来自既有数据域，缺就写「—」。"""
         snapshot = self._controller.snapshot
@@ -2326,7 +2367,8 @@ class DesktopApp:
         access = snapshot_section(snapshot, "access")
         binding = access.get("binding") if isinstance(access.get("binding"), Mapping) else {}
         node_id = str(profile.get("node_id") or binding.get("node_id") or "—")
-        self._ident_name.configure(text=node_id)
+        self._ident_full = "" if node_id in ("—", "None") else node_id
+        self._ident_name.configure(text=mask_node_id(node_id))
         pill, _tone = self._pill_text()
         self._ident_state.configure(text=pill.lstrip("●◐○✕? ").strip() or "状态未知")
         gpu = snapshot_section(snapshot, "gpu")
