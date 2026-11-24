@@ -2540,7 +2540,7 @@ def _account(snapshot: Snapshot) -> View:
         # F47（2026-11-24 真机）：「上次检查 还没检查过」+「上次结果 尚未检查」两行同义并存。
         # 合成一行：时间在前、结果在后，一个 Field 说清一件事。
         Field("上次检查",
-              ((checked_at + " · ") if checked_at else "")
+              ((_local_time(checked_at) + " · ") if checked_at else "")
               + (update_unavailable or state_text),
               key="update_checked_at",
               hint=str(update.get("hint") or ""),

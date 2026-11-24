@@ -1916,3 +1916,16 @@ def test_binding_card_tells_where_to_bind():
                "access": {"binding": {"bound": False}}, "yield": {}}
     text = vw.build_view("account", ds.Snapshot(section)).plain_text()
     assert "② 绑定节点" in text
+
+
+def test_update_checked_at_is_local_time():
+    """F51（真机 0.5.29）：上次检查印出 `2026-11-23T21:08:29.859090Z` —— UTC + 微秒。
+    和 F46/F50b 同一类，必须走 _local_time。"""
+    account = {"profile": {"email": "a@b.c"}, "security": {"node_id": "n_1"},
+               "update": {"checked_at": "2026-11-23T21:08:29.859090Z",
+                          "verify_state": "latest", "package_version": "0.5.29"}}
+    section = {"account": account, "status": {"state": "online"},
+               "access": {"binding": {"bound": False}}, "yield": {}}
+    text = vw.build_view("account", ds.Snapshot(section)).plain_text()
+    assert "T21:08" not in text and ".859090" not in text
+    assert "2026-11-24" in text
