@@ -695,11 +695,19 @@ class DesktopApp:
         # 读不到不是错误（冻结包/裁剪包都可能缺 assets），所以整段 try 兜底。
         self._brand_img = None
         try:
-            from ..assets import WINDOW_ICON, resource_bytes
-            raw = resource_bytes(WINDOW_ICON)
-            if raw:
-                self._brand_img = tk.PhotoImage(data=base64.b64encode(raw).decode("ascii"))
-                logo.create_image(self._px(12), self._px(12), image=self._brand_img)
+            from ..assets import TRAY_ICON_2X, WINDOW_ICON, resource_bytes
+            # 24×24 才是这一格的尺寸（独立复核实测：256 原图直接放进来，Tk 只显示左上角，
+            # 看起来是一块空白浅紫）。优先 24px 资源；只有大图时按整数倍 subsample。
+            for name in (TRAY_ICON_2X, WINDOW_ICON):
+                raw = resource_bytes(name)
+                if not raw:
+                    continue
+                img = tk.PhotoImage(data=base64.b64encode(raw).decode("ascii"))
+                if img.width() > 48:
+                    img = img.subsample(max(1, img.width() // 24), max(1, img.height() // 24))
+                self._brand_img = img
+                logo.create_image(self._px(12), self._px(12), image=img)
+                break
         except Exception:                              # noqa: BLE001 - 图标永不阻塞启动
             self._brand_img = None
         if self._brand_img is None:
