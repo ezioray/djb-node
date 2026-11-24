@@ -933,7 +933,10 @@ def _hero(snapshot: Snapshot) -> Hero:
         tail = "；接单状态未确认（心跳/控制口还没回话，点右上「刷新」重试）"
     elif accepting is True and source == "heartbeat":
         # 心跳新鲜但控制口不通（GUI 子进程常见）：结论可用，但把依据写出来，别让人以为是实时
-        hhmm = hb_at[11:16] if len(hb_at) >= 16 else ""
+        # F50b（真机 0.5.27）：心跳时间戳是 UTC（`...T03:59:12Z`），直接切片会印出 UTC 03:59，
+        # 客户本地是 11:59。和 F46 同一类错——一律走 _local_time 再取 HH:MM。
+        localized = _local_time(hb_at)
+        hhmm = localized[-5:] if len(localized) >= 16 else ""
         tail = "；当前允许接单（按最近心跳" + (" " + hhmm if hhmm else "") + "）"
     elif accepting is True:
         tail = "；当前允许接单"

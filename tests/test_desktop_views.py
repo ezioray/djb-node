@@ -1878,3 +1878,17 @@ def test_overview_does_not_claim_paused_when_accepting_unknown():
     assert "正在接单" in text
     assert "不接新任务" not in text
     assert "未确认" in text or "待确认" in text
+
+
+def test_overview_shows_heartbeat_time_in_local_clock():
+    """F50b：心跳时间戳是 UTC，卡片上必须印本地时间（否则 11:59 显示成 03:59）。"""
+    from datetime import datetime
+
+    stamp = "2026-11-24T03:59:12.123456Z"
+    section = {"status": {"state": "online"},
+               "yield": {"mode": "auto", "accepting": True, "accepting_source": "heartbeat",
+                         "heartbeat_at": stamp}}
+    text = vw.build_view("overview", ds.Snapshot(section)).plain_text()
+    local = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone()
+    assert local.strftime("%H:%M") in text
+    assert "03:59" not in text or local.strftime("%H:%M") == "03:59"
