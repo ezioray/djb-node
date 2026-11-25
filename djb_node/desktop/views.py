@@ -1435,7 +1435,7 @@ def _models(snapshot: Snapshot) -> View:
         key="models", title="模型与探针",
         subtitle="探针事实（L2/L3/用量/新鲜度/失败原因）· 云端目录",
         cards=(Card("可公告", str(counts["announceable"]) + " 个",
-                    "探针通过且结论新鲜才会进容量", "mint" if counts["announceable"] else "muted"),
+                    "探针通过即可供模型；复检只降分级、不停供", "mint" if counts["announceable"] else "muted"),
                Card("探针失败 / 停用", str(counts["failed"]) + " 个",
                     "看右列原因逐条修", "red" if counts["failed"] else "muted"),
                Card("从未探测", str(counts["never"]) + " 个",
@@ -1451,9 +1451,9 @@ def _models(snapshot: Snapshot) -> View:
         # 等「一 Key 多模型 + 逐模型底价」把上报端点接上再加回（见「提供 Token Plan」页）。
         actions=tuple(probe_actions),
         unavailable=_missing(snapshot, ("models",)),
-        notes=("容量公告只看 " + str(fresh_window // 60) + " 分钟内的探针结论；报价更严，只看 "
-               + str(quote_window // 60) + " 分钟内的（提前停报防半窗口）。",
-               "没有探针结论 / 结论过期的模型不会进容量、也不会报价——不是「设置没生效」。",
+        notes=("模型只要首次探针通过就持续可供（等级按 25 小时等级窗口随复检升降），"
+               "报价按 " + str(quote_window // 60) + " 分钟窗口刷新（提前停报防半窗口）。",
+               "从未通过探针的模型不可供；复检过了但窗口外只降分级，不停供——不是「设置没生效」。",
                "模型开关与底价在「提供 Token Plan」页设置；本页只读探针事实。"),
     )
 
@@ -1689,7 +1689,7 @@ def _token_plan_rate(value: Any) -> str:
 def _token_plan_rows(rows: Any) -> list[Row]:
     """上游行：``id | 接入 | 验证状态 | 模型 | 最大 QPS | 最近验证``。
 
-    「模型」列给 ``总数（已验证 n）``——只有探针 L2 通过且新鲜、且上游启用的模型才会进容量，
+    「模型」列给 ``总数（已验证 n）``——只有探针首次通过（L2+）且上游启用的模型才可供，
     所以「总数」和「已验证」必须分开，不能把申报过的模型说成已共享。
     """
     result: list[Row] = []
@@ -1842,8 +1842,8 @@ def _token_plan(snapshot: Snapshot) -> View:
                      "再把 Token Plan 共享出去。")
     if snapshot.ok("token_plan") and not rows:
         notes.append(TOKEN_PLAN_EMPTY + "（A1 直填 Key / A2 本机代理，都在「接入配置」里）。")
-    notes.append("验证状态来自本机探针（L2 推理通过 + 结论新鲜）；"
-                 "未验证 / 已过期的模型不进容量，也不会产生共享收益。")
+    notes.append("验证状态来自本机探针（L2 推理通过）；"
+                 "未验证的模型不可供，也不会产生共享收益；复检超窗只降分级。")
     notes.append("「最大 QPS」是本机按并发上限分摊给已验证模型的数值（公告口径），不是实测吞吐。")
     notes.append("逐模型底价最小 0.01（USD / 百万 token）：填 0 会被云端当「未申报」直接跳过，"
                  "所以本机就先拦下。")
@@ -2020,7 +2020,7 @@ def _token_plan(snapshot: Snapshot) -> View:
                            if snapshot.ok("token_plan") else UNAVAILABLE), title="上游报价"),
         tables=(Table(("上游", "接入", "验证状态", "模型", "最大 QPS", "最近验证"), tuple(rows),
                       narrow_hide=("最近验证",),
-                      note="验证通过且新鲜的模型才会进入共享容量",
+                      note="首次验证通过的模型即持续可供（分级随复检调整）",
                       empty=(TOKEN_PLAN_EMPTY if snapshot.ok("token_plan") else UNAVAILABLE), title="上游接入"),),
         fields=fields,
         actions=tuple(plan_actions),
